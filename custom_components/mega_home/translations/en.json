@@ -12,6 +12,18 @@
         "data_description": {
           "manager_url": "For example http://manager.example.com:8055 — the inbound port, not the interface port."
         }
+      },
+      "reconfigure": {
+        "title": "Mega Home",
+        "description": "Change the manager address or this object's token. The object keeps its history and entities.",
+        "data": {
+          "manager_url": "Manager address",
+          "token": "Object token",
+          "verify_ssl": "Verify the TLS certificate"
+        },
+        "data_description": {
+          "manager_url": "For example http://manager.example.com:8055 — the inbound port, not the interface port."
+        }
       }
     },
     "error": {
@@ -20,7 +32,8 @@
       "invalid_url": "The address must start with http:// or https://."
     },
     "abort": {
-      "already_configured": "This object is already set up."
+      "already_configured": "This object is already set up.",
+      "reconfigure_successful": "The settings were saved."
     }
   },
   "services": {

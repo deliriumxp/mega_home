@@ -12,6 +12,18 @@
         "data_description": {
           "manager_url": "Например http://manager.example.com:8055 — это inbound-порт, а не порт интерфейса."
         }
+      },
+      "reconfigure": {
+        "title": "Mega Home",
+        "description": "Смените адрес менеджера или токен объекта. Объект сохранит историю и сущности.",
+        "data": {
+          "manager_url": "Адрес менеджера",
+          "token": "Токен объекта",
+          "verify_ssl": "Проверять TLS-сертификат"
+        },
+        "data_description": {
+          "manager_url": "Например http://manager.example.com:8055 — inbound-порт, а не порт интерфейса."
+        }
       }
     },
     "error": {
@@ -20,7 +32,8 @@
       "invalid_url": "Адрес должен начинаться с http:// или https://."
     },
     "abort": {
-      "already_configured": "Этот объект уже добавлен."
+      "already_configured": "Этот объект уже добавлен.",
+      "reconfigure_successful": "Настройки сохранены."
     }
   },
   "services": {

@@ -65,6 +65,19 @@ diagnostics carries `app_error` / `app_checked_at`. Before that, a home the inte
 reached looked perfectly healthy — the app worked, the log was silent, diagnostics said
 nothing — and the cause had to be found by comparing screenshots.
 
+## The address is reconfigurable
+
+⚠ **A "reconfigure" step exists on purpose** (added 0.1.3). The manager address changes more than
+once in the life of an object: it moves behind a reverse proxy and back out, the domain changes,
+or the object is pointed straight at the inbound port because the proxy will not pass a WebSocket
+upgrade. Without the step the only way to change it was to delete the entry and add it again,
+which loses the entry and has to be explained over the phone.
+
+Re-adding the same object still works and still updates the address — one entry per object token
+— and `verify_ssl` now travels in that update too. It did not before, so moving an object from a
+proxy to port 8055 with a self-signed certificate changed the address and silently kept
+validating the certificate.
+
 ## Icons are files
 
 Scenario icons used to be images served by the manager. On an object without internet that is a

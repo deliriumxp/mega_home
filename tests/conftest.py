@@ -82,7 +82,26 @@ class _ConfigEntry:  # noqa: D101 - annotation-only stand-in
 
 _module("homeassistant")
 _module("homeassistant.core", HomeAssistant=_HomeAssistant)
-_module("homeassistant.config_entries", ConfigEntry=_ConfigEntry)
+class _ConfigFlow:  # noqa: D101 - stand-in for the HA base class
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__()
+
+
+_module(
+    "homeassistant.config_entries",
+    ConfigEntry=_ConfigEntry,
+    ConfigFlow=_ConfigFlow,
+    ConfigFlowResult=dict,
+)
+# `voluptuous` и клиентская сессия нужны только для импорта модуля потока:
+# проверяется в нём функция разбора адреса, а не формы Home Assistant.
+_module(
+    "voluptuous",
+    Schema=lambda *a, **k: None,
+    Required=lambda *a, **k: None,
+    Optional=lambda *a, **k: None,
+)
+_module("homeassistant.helpers.aiohttp_client", async_get_clientsession=lambda *a, **k: None)
 _module("homeassistant.helpers")
 _module("homeassistant.helpers.storage", STORAGE_DIR=".storage", Store=_Store)
 _module(
