@@ -153,7 +153,19 @@ class MegaHomeStatesView(_MegaHomeView):
         ]
         # Always connected: this runs inside the home, so there is no link to
         # lose between the app and Home Assistant.
-        return self.json({"connected": True, "entities": entities})
+        #
+        # `configVersion` rides along on purpose. The app polls this endpoint
+        # every few seconds anyway, so it is the cheapest possible way to tell a
+        # phone that has been open for days that the installer added a socket:
+        # the version moves, the app re-reads the config and redraws itself. No
+        # extra request, no page reload, nobody pressing anything.
+        return self.json(
+            {
+                "connected": True,
+                "configVersion": coordinator.version,
+                "entities": entities,
+            }
+        )
 
 
 class MegaHomeCommandView(_MegaHomeView):
