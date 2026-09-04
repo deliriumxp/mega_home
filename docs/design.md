@@ -86,6 +86,35 @@ blank tile, so the coordinator downloads each icon named in the config into
 that already exist, and one failed icon never fails a sync — a home is usable without a
 picture.
 
+## Room photos are the home's own data (0.1.4)
+
+The resident picks a background photo per room in the app's settings. Unlike everything else
+this integration serves, these files are **not synchronised from the manager** — the home is
+where they are created and the only place that holds them
+(`.storage/mega_home_photos/`, `photos.py`, `api/photos` + `api/photo/{room}`).
+
+Why here and not in the browser or in the manager: a background is decoration of the HOME.
+Uploaded from a phone it has to appear on the hallway tablet too, and it must survive a browser
+data wipe. (The theme, the interface scale and the blur/brightness of the background stay device
+settings and live in the browser on purpose — a wall tablet and a phone are looked at from
+different distances.)
+
+- **The file name is a hash of the room id**, never the id itself. Room ids come off the wire
+  from the manager, and hashing means there is nothing to validate and no way out of the
+  directory.
+- **Only a room the current config knows can be written.** That is the bound on the endpoint:
+  the HTTP surface still has no authentication, so without it anyone on the local network could
+  fill the object's disk. Same reason for the 4 MB cap and the JPEG magic-byte check — the app
+  re-encodes whatever the resident picked before uploading, so one format is enough.
+- ⚠ **The version in the image URL is a hash of the CONTENT, not the modification time.** The
+  image is served `immutable`, so a repeated version means the resident replaces a background
+  and never sees it change. The first implementation used `st_mtime_ns` and failed its own test
+  on the first run: two saves in a row produced the same value.
+- Photos of rooms that later disappear from the config are **not** deleted: a transient config
+  glitch must not destroy the resident's pictures. `room_photos` in diagnostics is the count on
+  disk, which is also how "this flat has no photos" is told apart from "the app is not showing
+  them".
+
 ## Platform findings (verified against a running Home Assistant, 2026-09-04)
 
 - **`hass.http.async_register_static_paths([StaticPathConfig(url, path, cache)])`** is the only

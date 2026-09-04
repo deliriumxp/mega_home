@@ -34,6 +34,7 @@ from .const import (
 )
 from .bundle import PACKAGED_DIR
 from .coordinator import MegaHomeCoordinator
+from .photos import JPEG_MAGIC, MAX_PHOTO_BYTES
 
 # Упакованная копия объявлена в `bundle.py` — она её и раздаёт как фолбэк.
 BUNDLE_DIR = PACKAGED_DIR
@@ -80,6 +81,8 @@ async def async_register_http(
         MegaHomeStatesView,
         MegaHomeCommandView,
         MegaHomeScenarioView,
+        MegaHomePhotosView,
+        MegaHomePhotoView,
         MegaHomeAppRootView,
         MegaHomeAppView,
     ):
@@ -246,6 +249,101 @@ class MegaHomeScenarioView(_MegaHomeView):
         return await _async_call(
             hass, "script", "turn_on", {"entity_id": scenario["entityId"]}, self
         )
+
+
+class MegaHomePhotosView(_MegaHomeView):
+    """Which rooms have a background photo, and what version it is."""
+
+    url = f"{URL_API}/photos"
+    name = "api:mega_home:photos"
+
+    async def get(self, request: web.Request) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        hass: HomeAssistant = request.app["hass"]
+        rooms = [
+            room["id"] for room in coordinator.data.get("rooms", []) if room.get("id")
+        ]
+        versions = await hass.async_add_executor_job(coordinator.photos.versions, rooms)
+        return self.json({"photos": versions})
+
+
+class MegaHomePhotoView(_MegaHomeView):
+    """One room's background: read it, replace it, remove it.
+
+    ⚠ `room` is a positional argument, not something to dig out of the request:
+    Home Assistant calls handlers as `handler(request, **request.match_info)`.
+
+    Only a room the current config knows can be written. That is the bound on
+    this endpoint — without it anyone on the local network could fill the
+    object's disk (there is no authentication yet, see the module docstring).
+    """
+
+    url = f"{URL_API}/photo/{{room}}"
+    name = "api:mega_home:photo"
+
+    async def get(self, request: web.Request, room: str) -> web.StreamResponse:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        hass: HomeAssistant = request.app["hass"]
+        target = coordinator.photos.path(room)
+        if not await hass.async_add_executor_job(target.is_file):
+            return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
+        # Адрес несёт версию файла (`?v=<mtime>`), поэтому картинку можно отдать
+        # неизменяемой: сменилось фото — сменился адрес.
+        return web.FileResponse(
+            target, headers={"Cache-Control": "public, max-age=31536000, immutable"}
+        )
+
+    async def post(self, request: web.Request, room: str) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        if not _room_exists(coordinator.data, room):
+            return self.json_message("Комната не найдена", HTTPStatus.NOT_FOUND)
+        # Размер проверяется по заголовку ДО чтения тела: иначе четыре мегабайта
+        # ограничения превращаются в столько памяти, сколько прислали.
+        if (request.content_length or 0) > MAX_PHOTO_BYTES:
+            return self.json_message("Фото слишком большое", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        payload = await request.read()
+        if len(payload) > MAX_PHOTO_BYTES:
+            return self.json_message("Фото слишком большое", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        if not payload.startswith(JPEG_MAGIC):
+            # Приложение всегда пережимает снимок в JPEG само, так что сюда
+            # попадает либо чужой клиент, либо оборванная загрузка.
+            return self.json_message("Ожидается фотография JPEG", HTTPStatus.BAD_REQUEST)
+
+        hass: HomeAssistant = request.app["hass"]
+        try:
+            version = await hass.async_add_executor_job(
+                coordinator.photos.save, room, payload
+            )
+        except OSError as err:
+            LOGGER.warning("Could not store the photo of room %s: %s", room, err)
+            return self.json_message(
+                "Дом не смог сохранить фото", HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+        return self.json({"accepted": True, "version": version})
+
+    async def delete(self, request: web.Request, room: str) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        hass: HomeAssistant = request.app["hass"]
+        removed = await hass.async_add_executor_job(coordinator.photos.delete, room)
+        if not removed:
+            return self.json_message("Фото не найдено", HTTPStatus.NOT_FOUND)
+        return self.json({"accepted": True})
+
+
+def _room_exists(config: dict[str, Any], room_id: str) -> bool:
+    return any(room.get("id") == room_id for room in config.get("rooms", []))
 
 
 async def _async_call(

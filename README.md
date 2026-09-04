@@ -58,6 +58,8 @@ The address and the token are checked against the manager before the entry is cr
 | `/mega-home/api/states` | current state of every tile |
 | `/mega-home/api/command` | `POST {id, command, value?}` |
 | `/mega-home/api/scenario` | `POST {id}` |
+| `/mega-home/api/photos` | room backgrounds this home holds, as `{roomId: version}` |
+| `/mega-home/api/photo/{room}` | `GET` the background, `POST` a JPEG to replace it, `DELETE` to remove it |
 
 Home Assistant's own interface is untouched: it keeps `/` and its panels, and this integration
 only adds routes under its own prefix.

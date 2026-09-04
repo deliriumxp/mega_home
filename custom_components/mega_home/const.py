@@ -40,6 +40,9 @@ STORAGE_VERSION = 1
 STORAGE_KEY = "mega_home_config"
 ICON_DIR = "mega_home_icons"
 ICON_SIZE = "300"
+# Room background photos the resident uploads from the app. They belong to the
+# home, not to a device, so they live next to the rest of our cache.
+PHOTO_DIR = "mega_home_photos"
 
 # Home Assistant domain -> what the resident app may do with the tile. Mirrors
 # the manager's smart-home-view.util.ts; the app's screens read these verbatim.

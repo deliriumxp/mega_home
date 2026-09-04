@@ -62,5 +62,9 @@ async def async_get_config_entry_diagnostics(
                 1 for tile in config.get("tiles", []) if not tile.get("entityId")
             ),
             "scenarios": len(config.get("scenarios", [])),
+            # Backgrounds the resident uploaded. Nothing synchronises them, so
+            # this is the only way to tell "this flat has no photos" from "the
+            # photos are here and the app is not showing them".
+            "room_photos": await hass.async_add_executor_job(coordinator.photos.count),
         },
     }

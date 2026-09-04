@@ -21,9 +21,11 @@ from .const import (
     ICON_SIZE,
     LOGGER,
     MAX_UPDATE_INTERVAL,
+    PHOTO_DIR,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
+from .photos import PhotoStore
 
 type MegaHomeConfigEntry = ConfigEntry["MegaHomeCoordinator"]
 
@@ -78,6 +80,10 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.last_success_at: datetime | None = None
         self._store = Store[dict[str, Any]](hass, STORAGE_VERSION, STORAGE_KEY)
         self._icons_dir = Path(hass.config.path(STORAGE_DIR, ICON_DIR))
+        # Room backgrounds the resident uploads. Unlike everything else here
+        # they are not synchronised from the manager — the home is where they
+        # are created and the only place that holds them.
+        self.photos = PhotoStore(Path(hass.config.path(STORAGE_DIR, PHOTO_DIR)))
 
     @property
     def icons_dir(self) -> Path:
