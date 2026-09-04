@@ -55,6 +55,9 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Живой канал к менеджеру; ставится в async_setup_entry после регистрации
         # HTTP, потому что сам канал ничего не раздаёт — он только будит опрос.
         self.link: Any = None
+        # Бандл интерфейса: качается с менеджера и раздаётся из кэша, поэтому
+        # новая версия приложения не требует ни HACS, ни перезапуска.
+        self.bundle: Any = None
         self.last_error: str | None = None
         # DataUpdateCoordinator tracks whether the last refresh succeeded but
         # NOT when it last did, so the timestamp the installer actually asks
@@ -114,6 +117,10 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         await self._store.async_save(config)
         await self._async_sync_icons(config)
+        # Бандл проверяем в том же цикле: отдельный таймер означал бы второй
+        # график опроса и второй набор состояний «когда мы последний раз ходили».
+        if self.bundle:
+            await self.bundle.async_sync()
         self._on_success()
         LOGGER.info("Home config updated to %s", config.get("version"))
         return config

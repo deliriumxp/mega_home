@@ -4,9 +4,19 @@ from __future__ import annotations
 
 from typing import Any
 
+from urllib.parse import quote
+
 import aiohttp
 
-from .const import API_CONFIG, API_ICON, API_VERSION, ICON_SIZE, REQUEST_TIMEOUT
+from .const import (
+    API_APP_FILE,
+    API_APP_MANIFEST,
+    API_CONFIG,
+    API_ICON,
+    API_VERSION,
+    ICON_SIZE,
+    REQUEST_TIMEOUT,
+)
 
 
 class ManagerError(Exception):
@@ -55,10 +65,12 @@ class ManagerClient:
 
     async def async_icon(self, icon: str, size: str = ICON_SIZE) -> bytes:
         """Return one scenario icon as PNG bytes."""
-        url = f"{self._base}{API_ICON}/{icon}?size={size}"
+        return await self._get_bytes(f"{API_ICON}/{icon}?size={size}")
+
+    async def _get_bytes(self, path: str) -> bytes:
         try:
             async with self._session.get(
-                url,
+                f"{self._base}{path}",
                 headers=self._headers(),
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
             ) as response:
@@ -66,6 +78,14 @@ class ManagerClient:
                 return await response.read()
         except aiohttp.ClientError as err:
             raise ManagerError(str(err)) from err
+
+    async def async_app_manifest(self) -> dict[str, Any]:
+        """Return the manifest of the resident app bundle."""
+        return await self._get_json(API_APP_MANIFEST)
+
+    async def async_app_file(self, path: str) -> bytes:
+        """Return one file of the bundle, as bytes."""
+        return await self._get_bytes(f"{API_APP_FILE}?path={quote(path)}")
 
     async def _get_json(self, path: str) -> dict[str, Any]:
         try:

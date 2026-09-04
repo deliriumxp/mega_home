@@ -34,6 +34,9 @@ async def async_get_config_entry_diagnostics(
             "link_connected": bool(
                 coordinator.link and coordinator.link.connected
             ),
+            # Пусто — раздаётся копия, упакованная в интеграцию (объект ещё не
+            # скачал бандл).
+            "app_version": coordinator.bundle.version if coordinator.bundle else None,
             "update_interval_seconds": (
                 coordinator.update_interval.total_seconds()
                 if coordinator.update_interval

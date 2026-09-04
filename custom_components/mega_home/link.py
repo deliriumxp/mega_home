@@ -111,7 +111,14 @@ class ManagerLink:
             delay = min(delay * 2, MAX_RETRY)
 
     async def _handle(self, payload: dict[str, Any]) -> None:
-        if payload.get("t") != "config_changed":
+        kind = payload.get("t")
+        if kind == "app_changed":
+            # A new interface was published. Nothing about this home changed, so
+            # the config refresh would not notice it on its own.
+            if self._coordinator.bundle:
+                await self._coordinator.bundle.async_sync(payload.get("version"))
+            return
+        if kind != "config_changed":
             return
         version = payload.get("version")
         if version and version == self._coordinator.version:

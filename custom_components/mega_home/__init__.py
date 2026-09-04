@@ -27,8 +27,9 @@ from .const import (
     LOGGER,
     SERVICE_SYNC,
 )
+from .bundle import BundleStore
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
-from .http import async_register_http
+from .http import BUNDLE_DIR, async_register_http
 from .link import ManagerLink
 
 PLATFORMS: list[Platform] = []
@@ -78,6 +79,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
             raise
         except ManagerAuthError as err:
             raise ConfigEntryAuthFailed(str(err)) from err
+
+    # Бандл интерфейса поднимаем ДО регистрации HTTP: view спрашивает активный
+    # каталог на каждый запрос, и на старте он уже должен быть известен.
+    coordinator.bundle = BundleStore(hass, client, BUNDLE_DIR)
+    await coordinator.bundle.async_load()
 
     entry.runtime_data = coordinator
     await async_register_http(hass, coordinator)

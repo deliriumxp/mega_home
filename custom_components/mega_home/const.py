@@ -17,6 +17,8 @@ CONF_VERIFY_SSL = "verify_ssl"
 API_VERSION = "/inbound/home-config/version"
 API_CONFIG = "/inbound/home-config"
 API_ICON = "/inbound/home-config/icon"
+API_APP_MANIFEST = "/inbound/home-config/app/manifest"
+API_APP_FILE = "/inbound/home-config/app/file"
 
 # Polling. The manager is asked for a cheap version hash; the body is only
 # fetched when that hash moved. An unreachable manager is a normal state on a

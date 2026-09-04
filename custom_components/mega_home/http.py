@@ -62,29 +62,24 @@ async def async_register_http(
     static = [
         StaticPathConfig(URL_ICONS, str(coordinator.icons_dir), True),
     ]
-    if BUNDLE_DIR.is_dir():
-        # ⚠ aiohttp's static resource answers 403 for a directory, not the index
-        # file — verified against a live Home Assistant: `/mega-home` and
-        # `/mega-home/` both gave "403: Forbidden" while
-        # `/mega-home/index.html` served fine. The resident is going to open the
-        # bare address, so both spellings are redirected onto the entry point.
-        # These are plain routes and must be registered BEFORE the static
-        # prefix, or the prefix resource would swallow them.
-        for path in (URL_PREFIX, f"{URL_PREFIX}/"):
-            hass.http.register_redirect(path, f"{URL_PREFIX}/index.html")
-        static.append(StaticPathConfig(URL_PREFIX, str(BUNDLE_DIR), False))
-    else:
-        LOGGER.warning(
-            "No app bundle in %s — the API is served, the interface is not",
-            BUNDLE_DIR,
-        )
     await hass.http.async_register_static_paths(static)
 
+    # ⚠ Порядок регистрации несущий. Каталог бандла раздаётся НАШИМ view, а не
+    # статическим путём: `async_register_static_paths` привязывает каталог в
+    # момент регистрации, а перерегистрировать маршруты без перезапуска Home
+    # Assistant нельзя — то есть смена версии интерфейса снова упёрлась бы в
+    # перезапуск. View читает файл из АКТИВНОГО каталога, и переключение версии
+    # это присваивание переменной.
+    #
+    # Поэтому же API-маршруты регистрируются ПЕРВЫМИ: `/mega-home/{path:.*}`
+    # накрывает и их тоже, а aiohttp отдаёт запрос первому подошедшему ресурсу.
     for view in (
         MegaHomeConfigView,
         MegaHomeStatesView,
         MegaHomeCommandView,
         MegaHomeScenarioView,
+        MegaHomeAppRootView,
+        MegaHomeAppView,
     ):
         hass.http.register_view(view())
     hass.data[DOMAIN]["http_registered"] = True
@@ -163,6 +158,10 @@ class MegaHomeStatesView(_MegaHomeView):
             {
                 "connected": True,
                 "configVersion": coordinator.version,
+                # Версия интерфейса — тем же способом: изменилась, значит на
+                # объекте лежит новый бандл, и открытая вкладка обязана на него
+                # перейти сама (docs/mega-home-updates.md).
+                "appVersion": coordinator.bundle.version if coordinator.bundle else None,
                 "entities": entities,
             }
         )
@@ -273,6 +272,66 @@ async def _async_call(
         LOGGER.warning("Service %s.%s rejected the payload: %s", domain, service, err)
         return view.json_message("Home Assistant отклонил команду", HTTPStatus.BAD_REQUEST)
     return view.json({"accepted": True})
+
+
+class MegaHomeAppRootView(_MegaHomeView):
+    """The bare prefix: hand out the app itself."""
+
+    url = URL_PREFIX
+    extra_urls = [f"{URL_PREFIX}/"]
+    name = "mega_home:app_root"
+
+    async def get(self, request: web.Request) -> web.StreamResponse:
+        return _serve(request, "index.html")
+
+
+class MegaHomeAppView(_MegaHomeView):
+    """Everything else under the prefix: bundle files.
+
+    ⚠ `path` is a positional argument, not something to dig out of the request:
+    Home Assistant calls the handler as `handler(request, **request.match_info)`,
+    so a signature without it raises `unexpected keyword argument 'path'` and the
+    browser gets a bare 500. Found by running it.
+    """
+
+    url = f"{URL_PREFIX}/{{path:.*}}"
+    name = "mega_home:app"
+
+    async def get(self, request: web.Request, path: str) -> web.StreamResponse:
+        return _serve(request, path)
+
+
+def _serve(request: web.Request, relative: str) -> web.StreamResponse:
+    """Serve one file of the ACTIVE bundle version.
+
+    The active directory is asked for per request on purpose: that is what makes
+    switching to a freshly downloaded interface a variable assignment instead of
+    a Home Assistant restart.
+    """
+    coordinator = _coordinator(request.app["hass"])
+    root = (
+        coordinator.bundle.active_dir
+        if coordinator is not None and coordinator.bundle is not None
+        else BUNDLE_DIR
+    )
+    if not relative or relative.endswith("/"):
+        relative = f"{relative}index.html"
+    try:
+        target = (root / relative).resolve()
+        target.relative_to(root.resolve())
+    except (ValueError, OSError):
+        return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
+    if not target.is_file():
+        return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
+
+    # Кэш как у менеджера: хешированные бандлы неизменяемы, index.html — никогда.
+    # Иначе браузер после обновления просит удалённые чанки.
+    headers = (
+        {"Cache-Control": "no-cache"}
+        if target.name == "index.html"
+        else {"Cache-Control": "public, max-age=31536000, immutable"}
+    )
+    return web.FileResponse(target, headers=headers)
 
 
 def _find(items: list[dict[str, Any]], item_id: Any) -> dict[str, Any] | None:
