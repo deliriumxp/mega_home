@@ -37,6 +37,14 @@ async def async_get_config_entry_diagnostics(
             # Пусто — раздаётся копия, упакованная в интеграцию (объект ещё не
             # скачал бандл).
             "app_version": coordinator.bundle.version if coordinator.bundle else None,
+            # Почему интерфейс не обновился и когда его проверяли: без этих двух
+            # полей «в доме старый интерфейс» неотличимо от нормы.
+            "app_error": coordinator.app_error,
+            "app_checked_at": (
+                coordinator.app_checked_at.isoformat()
+                if coordinator.app_checked_at
+                else None
+            ),
             "update_interval_seconds": (
                 coordinator.update_interval.total_seconds()
                 if coordinator.update_interval

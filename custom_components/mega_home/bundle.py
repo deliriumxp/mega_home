@@ -49,6 +49,13 @@ class BundleStore:
         self._root = Path(hass.config.path(STORAGE_DIR, BUNDLE_DIR))
         self._active: Path | None = None
         self.version: str | None = None
+        # ⚠ Почему бандл не обновился — НАРУЖУ, а не только в debug-журнал.
+        # `async_sync` не бросает намеренно (её зовут и опрос, и живой канал, и
+        # уронить их нельзя), но из-за этого дом, до которого новый интерфейс не
+        # доезжает, выглядел полностью здоровым: интерфейс работает, в журнале
+        # тишина, в диагностике ничего. Причина стоила разбирательства по
+        # скриншотам вместо одного взгляда в лог.
+        self.last_error: str | None = None
 
     @property
     def active_dir(self) -> Path:
@@ -76,12 +83,14 @@ class BundleStore:
         try:
             manifest = await self._client.async_app_manifest()
         except ManagerError as err:
+            self.last_error = f"manifest unavailable: {err}"
             LOGGER.debug("App manifest unavailable: %s", err)
             return False
 
         wanted = manifest.get("version")
         files = manifest.get("files")
         if not isinstance(wanted, str) or not isinstance(files, list):
+            self.last_error = "manager returned a malformed app manifest"
             LOGGER.warning("Manager returned a malformed app manifest")
             return False
         if version and version != wanted:
@@ -96,12 +105,15 @@ class BundleStore:
         # то есть открывал жильцу окно с 404 на ровном месте.
         name = _safe_name(wanted)
         if name == self.version:
+            self.last_error = None
             return False
         if len(files) > MAX_FILES:
+            self.last_error = f"manifest lists {len(files)} files — refusing"
             LOGGER.warning("App manifest lists %s files — refusing", len(files))
             return False
         total = sum(int(item.get("bytes", 0)) for item in files)
         if total > MAX_TOTAL_BYTES:
+            self.last_error = f"bundle is {total} bytes — refusing"
             LOGGER.warning("App bundle is %s bytes — refusing", total)
             return False
 
@@ -115,6 +127,7 @@ class BundleStore:
             # ⚠ Half a bundle is a white screen for the resident, so a failed
             # download never becomes the active version: the staging directory
             # is thrown away and the old bundle keeps serving.
+            self.last_error = f"download failed: {err}"
             LOGGER.warning("App bundle %s not downloaded: %s", wanted[:19], err)
             await self._hass.async_add_executor_job(
                 shutil.rmtree, staging, True
@@ -124,6 +137,7 @@ class BundleStore:
         await self._hass.async_add_executor_job(_swap, staging, target)
         self._active = target
         self.version = target.name
+        self.last_error = None
         LOGGER.info("App bundle updated to %s", self.version)
         await self._hass.async_add_executor_job(self._prune)
         return True

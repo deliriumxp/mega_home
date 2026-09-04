@@ -37,6 +37,23 @@ itself is recorded when the body is really delivered (or confirmed by a 304). Th
 object's card in the manager shows, and it is the only feedback there is — this is a pull
 model, and a push would need to reach the object from outside, which is a later phase.
 
+⚠ **"Version first, body second" applies to the CONFIG only — the app bundle is checked on
+every poll regardless** (`_async_sync_bundle`, fixed 2026-09-05). The bundle check used to sit
+past the early return, so on the common path — nothing changed in the composition, so the
+version matches — the poll returned before ever looking at the bundle. A new interface could
+then only arrive as an `app_changed` frame over the live link, and a home whose link was down
+kept serving an old bundle forever. Seen on a real object: the manager had published a new
+interface, the flat kept showing the copy packaged in the release, and nothing anywhere said
+so. The poll is the safety net for BOTH; it was one for the config only. Regression test:
+`tests/test_coordinator.py`.
+
+⚠ **A bundle that cannot be fetched is reported, not swallowed.** `BundleStore.async_sync`
+still never raises (the poll and the live link both call it and neither may break), but it now
+records `last_error`; the coordinator logs it at warning level once per state change and
+diagnostics carries `app_error` / `app_checked_at`. Before that, a home the interface never
+reached looked perfectly healthy — the app worked, the log was silent, diagnostics said
+nothing — and the cause had to be found by comparing screenshots.
+
 ## Icons are files
 
 Scenario icons used to be images served by the manager. On an object without internet that is a

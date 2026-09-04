@@ -58,6 +58,10 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Бандл интерфейса: качается с менеджера и раздаётся из кэша, поэтому
         # новая версия приложения не требует ни HACS, ни перезапуска.
         self.bundle: Any = None
+        # Почему интерфейс мог не доехать и когда его проверяли в последний раз —
+        # это уходит в диагностику: «старый интерфейс» иначе неотличим от нормы.
+        self.app_error: str | None = None
+        self.app_checked_at: datetime | None = None
         self.last_error: str | None = None
         # DataUpdateCoordinator tracks whether the last refresh succeeded but
         # NOT when it last did, so the timestamp the installer actually asks
@@ -96,6 +100,18 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self.data and version == self.data.get("version"):
                 # Nothing changed: this is the common case, and it costs one
                 # small response instead of the whole config.
+                #
+                # ⚠ The bundle is still checked here. It used to be checked only
+                # further down, past this early return, and this is the common
+                # path — so a home whose live link was down never saw a new
+                # interface at all: the composition had not changed, the version
+                # matched, and the poll returned before ever looking at the
+                # bundle. The poll is supposed to be the safety net for BOTH
+                # (docs/mega-home-updates.md); it was one for the config only.
+                # Observed on a real object: the manager had published a new
+                # interface, the object kept serving the copy packaged in the
+                # release, and nothing anywhere said so.
+                await self._async_sync_bundle()
                 self._on_success()
                 return self.data
             config = await self.client.async_config()
@@ -117,13 +133,35 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         await self._store.async_save(config)
         await self._async_sync_icons(config)
-        # Бандл проверяем в том же цикле: отдельный таймер означал бы второй
-        # график опроса и второй набор состояний «когда мы последний раз ходили».
-        if self.bundle:
-            await self.bundle.async_sync()
+        await self._async_sync_bundle()
         self._on_success()
         LOGGER.info("Home config updated to %s", config.get("version"))
         return config
+
+    async def _async_sync_bundle(self) -> None:
+        """Check the app bundle in the same cycle as the config.
+
+        Бандл проверяем в том же цикле: отдельный таймер означал бы второй
+        график опроса и второй набор состояний «когда мы последний раз ходили».
+
+        ⚠ Причина неудачи пишется в журнал ОДИН раз на смену состояния и на
+        уровне warning, а не debug (`BundleStore.last_error`). Раньше молчали:
+        дом, до которого новый интерфейс не доезжает, выглядел полностью
+        здоровым — ни строчки в журнале, ни поля в диагностике, — и это стоило
+        разбирательства по скриншотам вместо одного взгляда в лог.
+        """
+        if not self.bundle:
+            return
+        await self.bundle.async_sync()
+        self.app_checked_at = dt_util.utcnow()
+        error = self.bundle.last_error
+        if error == self.app_error:
+            return
+        if error:
+            LOGGER.warning("App bundle not updated: %s", error)
+        else:
+            LOGGER.info("App bundle checks are working again")
+        self.app_error = error
 
     def _on_success(self) -> None:
         self.last_error = None
