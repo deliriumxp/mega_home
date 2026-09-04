@@ -24,6 +24,10 @@ from .api import ManagerClient, ManagerError
 from .const import LOGGER
 
 BUNDLE_DIR = "mega_home_www"
+# Копия, упакованная в релиз: её раздаёт свежая установка, которая ещё ни разу не
+# синхронизировалась. Живёт здесь, а не в `http.py`, чтобы хранилище можно было
+# создать, ничего не импортируя из HTTP-слоя (тот сам импортирует координатор).
+PACKAGED_DIR = Path(__file__).parent / "www"
 # Сколько версий держим на диске: активная и предыдущая. Предыдущая — это откат
 # без выезда на объект.
 KEEP_VERSIONS = 2
@@ -42,10 +46,15 @@ class BundleStore:
     on every nudge (see `async_sync`).
     """
 
-    def __init__(self, hass: HomeAssistant, client: ManagerClient, packaged: Path) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        client: ManagerClient,
+        packaged: Path | None = None,
+    ) -> None:
         self._hass = hass
         self._client = client
-        self._packaged = packaged
+        self._packaged = packaged or PACKAGED_DIR
         self._root = Path(hass.config.path(STORAGE_DIR, BUNDLE_DIR))
         self._active: Path | None = None
         self.version: str | None = None

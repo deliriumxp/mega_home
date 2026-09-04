@@ -13,6 +13,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from .api import ManagerClient, ManagerError
+from .bundle import BundleStore
 from .const import (
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
@@ -57,7 +58,15 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.link: Any = None
         # Бандл интерфейса: качается с менеджера и раздаётся из кэша, поэтому
         # новая версия приложения не требует ни HACS, ни перезапуска.
-        self.bundle: Any = None
+        #
+        # ⚠ Создаётся ЗДЕСЬ, а не в `async_setup_entry`. Раньше создавался там —
+        # и уже ПОСЛЕ первого опроса: на старте `self.bundle` был None, проверка
+        # молча пропускалась, и новый интерфейс появлялся в доме не раньше
+        # следующего тика опроса (15 минут), а если тик не доживал — не появлялся
+        # вовсе. Найдено на живом объекте по диагностике: `app_checked_at: null`
+        # при `last_update_success: true`, то есть «не пробовало», а не «не
+        # смогло». Порядок инициализации теперь не решает ничего.
+        self.bundle = BundleStore(hass, client)
         # Почему интерфейс мог не доехать и когда его проверяли в последний раз —
         # это уходит в диагностику: «старый интерфейс» иначе неотличим от нормы.
         self.app_error: str | None = None

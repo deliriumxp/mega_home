@@ -32,9 +32,11 @@ from .const import (
     URL_ICONS,
     URL_PREFIX,
 )
+from .bundle import PACKAGED_DIR
 from .coordinator import MegaHomeCoordinator
 
-BUNDLE_DIR = Path(__file__).parent / "www"
+# Упакованная копия объявлена в `bundle.py` — она её и раздаёт как фолбэк.
+BUNDLE_DIR = PACKAGED_DIR
 
 
 async def async_register_http(

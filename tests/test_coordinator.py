@@ -108,3 +108,30 @@ def test_починилось_ошибка_снимается(tmp_path: Path) ->
     coordinator.data = {"version": "v1"}
     asyncio.run(coordinator._async_update_data())
     assert coordinator.app_error is None
+
+
+def test_хранилище_бандла_есть_сразу_после_создания(tmp_path: Path) -> None:
+    """Проверка бандла не должна зависеть от порядка вызовов в `async_setup_entry`.
+
+    Именно на этом и обожглись: хранилище создавалось в setup ПОСЛЕ первого
+    опроса, поэтому на старте `self.bundle` был None и проверка молча
+    пропускалась. Диагностика с живого объекта показала `app_checked_at: null`
+    при `last_update_success: true` — «не пробовало», а не «не смогло».
+    """
+    coordinator = _coordinator(tmp_path, FakeClient())
+    assert coordinator.bundle is not None
+    # Раздавать что-то надо и до первой синхронизации: это копия из релиза.
+    assert coordinator.bundle.active_dir.name == "www"
+
+
+def test_первый_же_опрос_проверяет_бандл(tmp_path: Path) -> None:
+    client = FakeClient()
+    coordinator = _coordinator(tmp_path, client)
+    bundle = FakeBundle()
+    coordinator.bundle = bundle
+
+    # Ровно то, что делает старт Home Assistant: опрос на пустом кэше.
+    asyncio.run(coordinator._async_update_data())
+
+    assert bundle.syncs == 1, "новый интерфейс обязан доехать на старте, а не через 15 минут"
+    assert coordinator.app_checked_at is not None

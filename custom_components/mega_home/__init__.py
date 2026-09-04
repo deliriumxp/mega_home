@@ -27,9 +27,8 @@ from .const import (
     LOGGER,
     SERVICE_SYNC,
 )
-from .bundle import BundleStore
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
-from .http import BUNDLE_DIR, async_register_http
+from .http import async_register_http
 from .link import ManagerLink
 
 PLATFORMS: list[Platform] = []
@@ -60,6 +59,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     )
     coordinator = MegaHomeCoordinator(hass, entry, client)
 
+    # ⚠ Что лежит на диске от прошлого запуска — узнаём ДО первого опроса: иначе
+    # опрос сравнивал бы манифест с «ничего» и качал бандл, который уже есть.
+    # Само хранилище создаёт координатор (см. его конструктор) — от порядка
+    # здесь больше ничего не зависит.
+    await coordinator.bundle.async_load()
+
     # The cache comes first, and on purpose. An object that is offline for good
     # still has to come up after a Home Assistant restart, and the only thing it
     # can come up from is the cache. Only a home that has never synchronised has
@@ -79,11 +84,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
             raise
         except ManagerAuthError as err:
             raise ConfigEntryAuthFailed(str(err)) from err
-
-    # Бандл интерфейса поднимаем ДО регистрации HTTP: view спрашивает активный
-    # каталог на каждый запрос, и на старте он уже должен быть известен.
-    coordinator.bundle = BundleStore(hass, client, BUNDLE_DIR)
-    await coordinator.bundle.async_load()
 
     entry.runtime_data = coordinator
     await async_register_http(hass, coordinator)

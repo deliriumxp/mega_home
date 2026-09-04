@@ -47,6 +47,17 @@ interface, the flat kept showing the copy packaged in the release, and nothing a
 so. The poll is the safety net for BOTH; it was one for the config only. Regression test:
 `tests/test_coordinator.py`.
 
+⚠ **The bundle store is created by the coordinator's constructor, not by
+`async_setup_entry`** (fixed 2026-09-05, one release after the above). It used to be created in
+setup — and *after* the first refresh — so at startup `self.bundle` was None and the check was
+skipped in silence. A new interface then could not appear before the next poll tick fifteen
+minutes later, and if that tick found nothing changed under the old ordering, never. Found on a
+real object from diagnostics: `app_checked_at: null` with `last_update_success: true`, i.e. "did
+not try", not "could not". Order of initialisation now decides nothing; `async_setup_entry` only
+calls `async_load()` (what is already on disk), and it does that before the first refresh so the
+poll does not re-download a bundle the object already holds. Regression test:
+`test_хранилище_бандла_есть_сразу_после_создания`.
+
 ⚠ **A bundle that cannot be fetched is reported, not swallowed.** `BundleStore.async_sync`
 still never raises (the poll and the live link both call it and neither may break), but it now
 records `last_error`; the coordinator logs it at warning level once per state change and
