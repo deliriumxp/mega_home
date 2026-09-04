@@ -32,7 +32,15 @@ MAX_TOTAL_BYTES = 32 * 1024 * 1024
 
 
 class BundleStore:
-    """Keeps downloaded bundle versions and says which one to serve."""
+    """Keeps downloaded bundle versions and says which one to serve.
+
+    ⚠ `version` here is the DIRECTORY name of the active bundle, i.e. the
+    manifest version run through `_safe_name` — after a restart that name is all
+    that is known about what lies on disk. Everything that compares versions has
+    to go through `_safe_name` too; comparing a raw `sha256:…` against the stored
+    `sha256-…` matches never, and "never" means re-downloading the whole bundle
+    on every nudge (see `async_sync`).
+    """
 
     def __init__(self, hass: HomeAssistant, client: ManagerClient, packaged: Path) -> None:
         self._hass = hass
@@ -80,7 +88,14 @@ class BundleStore:
             # The nudge and the manifest disagree — trust the manifest, it is
             # what we are about to download.
             LOGGER.debug("App nudge said %s, manifest says %s", version, wanted)
-        if wanted == self.version:
+        # ⚠ Сравниваем ИМЕНА КАТАЛОГОВ, а не сырую версию с именем: `self.version`
+        # прошло через `_safe_name` (в `sha256:…` двоеточие стало дефисом), и
+        # прямое сравнение не совпадало никогда. Ценой были полная перекачка
+        # бандла на каждый nudge и на каждое переподключение канала, а `_swap`
+        # при этом сносил каталог, из которого прямо сейчас раздаётся приложение,
+        # то есть открывал жильцу окно с 404 на ровном месте.
+        name = _safe_name(wanted)
+        if name == self.version:
             return False
         if len(files) > MAX_FILES:
             LOGGER.warning("App manifest lists %s files — refusing", len(files))
@@ -90,8 +105,8 @@ class BundleStore:
             LOGGER.warning("App bundle is %s bytes — refusing", total)
             return False
 
-        target = self._root / _safe_name(wanted)
-        staging = self._root / f".partial-{_safe_name(wanted)}"
+        target = self._root / name
+        staging = self._root / f".partial-{name}"
         try:
             await self._hass.async_add_executor_job(_reset_dir, staging)
             for item in files:

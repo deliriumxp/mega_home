@@ -79,6 +79,15 @@ Settings → Devices & services → Mega Home → ⋮ → *Download diagnostics*
 version, when the last successful sync happened, the last error, the current poll interval and
 how many tiles have no `entity_id` yet (the usual reason a tile shows "no data").
 
+## Tests
+
+`pytest tests` — no Home Assistant installation needed. `tests/conftest.py` stubs the two names
+the modules under test actually use and registers `mega_home` as a package without running its
+`__init__.py`, so a checkout plus `pip install pytest` is the whole setup. Running the
+integration in docker against a real manager stays the other half of the check: it covers what a
+stub cannot (route registration, Home Assistant's own view plumbing), and neither replaces the
+other.
+
 ## Requirements
 
 Home Assistant 2025.7 or newer (the integration uses `async_register_static_paths`; the
