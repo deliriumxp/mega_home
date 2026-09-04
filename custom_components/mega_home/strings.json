@@ -1,0 +1,32 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Mega Home",
+        "description": "Enter the Mega Manager address and this object's token. The token is the object's webhook token, the same one the router already uses.",
+        "data": {
+          "manager_url": "Manager address",
+          "token": "Object token",
+          "verify_ssl": "Verify the TLS certificate"
+        },
+        "data_description": {
+          "manager_url": "For example http://manager.example.com:8055 — the inbound port, not the interface port."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "The manager did not answer. Check the address, the port and that the object can reach it.",
+      "invalid_auth": "The manager rejected this token.",
+      "invalid_url": "The address must start with http:// or https://."
+    },
+    "abort": {
+      "already_configured": "This object is already set up."
+    }
+  },
+  "services": {
+    "sync": {
+      "name": "Synchronise now",
+      "description": "Fetch the home configuration from Mega Manager without waiting for the next poll."
+    }
+  }
+}

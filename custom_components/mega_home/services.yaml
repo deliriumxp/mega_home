@@ -1,0 +1,4 @@
+sync:
+  # Manual "fetch now". The coordinator polls on its own; this is for the
+  # installer standing in the flat who has just changed the project in the
+  # manager and does not want to wait for the next poll.

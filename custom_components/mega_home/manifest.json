@@ -1,0 +1,13 @@
+{
+  "domain": "mega_home",
+  "name": "Mega Home",
+  "codeowners": ["@deliriumxp"],
+  "config_flow": true,
+  "dependencies": ["http"],
+  "documentation": "https://github.com/deliriumxp/mega_home",
+  "integration_type": "service",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/deliriumxp/mega_home/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

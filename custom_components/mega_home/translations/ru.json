@@ -1,0 +1,32 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Mega Home",
+        "description": "Адрес Mega Manager и токен объекта. Токен — тот же webhook-токен объекта, которым уже пользуется роутер.",
+        "data": {
+          "manager_url": "Адрес менеджера",
+          "token": "Токен объекта",
+          "verify_ssl": "Проверять TLS-сертификат"
+        },
+        "data_description": {
+          "manager_url": "Например http://manager.example.com:8055 — это inbound-порт, а не порт интерфейса."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Менеджер не ответил. Проверьте адрес, порт и то, что объект до него дотягивается.",
+      "invalid_auth": "Менеджер отклонил этот токен.",
+      "invalid_url": "Адрес должен начинаться с http:// или https://."
+    },
+    "abort": {
+      "already_configured": "Этот объект уже добавлен."
+    }
+  },
+  "services": {
+    "sync": {
+      "name": "Синхронизировать сейчас",
+      "description": "Забрать конфигурацию дома у Mega Manager, не дожидаясь очередного опроса."
+    }
+  }
+}
