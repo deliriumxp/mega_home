@@ -29,6 +29,7 @@ from .const import (
 )
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
 from .http import async_register_http
+from .link import ManagerLink
 
 PLATFORMS: list[Platform] = []
 
@@ -80,6 +81,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
 
     entry.runtime_data = coordinator
     await async_register_http(hass, coordinator)
+
+    # Живой канал к менеджеру: правка состава доезжает за секунды вместо интервала
+    # опроса. Опрос при этом остаётся страховкой — канал может не подняться вовсе
+    # (объект без интернета), и это нормальный режим, а не авария.
+    coordinator.link = ManagerLink(hass, entry, coordinator)
+    coordinator.link.start()
     if PLATFORMS:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True

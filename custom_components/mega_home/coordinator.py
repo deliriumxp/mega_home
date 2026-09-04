@@ -52,6 +52,9 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=DEFAULT_UPDATE_INTERVAL,
         )
         self.client = client
+        # Живой канал к менеджеру; ставится в async_setup_entry после регистрации
+        # HTTP, потому что сам канал ничего не раздаёт — он только будит опрос.
+        self.link: Any = None
         self.last_error: str | None = None
         # DataUpdateCoordinator tracks whether the last refresh succeeded but
         # NOT when it last did, so the timestamp the installer actually asks

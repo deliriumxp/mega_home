@@ -30,6 +30,10 @@ async def async_get_config_entry_diagnostics(
                 else None
             ),
             "last_error": coordinator.last_error,
+            # Канал поднят — правки приезжают push'ем; лежит — работает опрос.
+            "link_connected": bool(
+                coordinator.link and coordinator.link.connected
+            ),
             "update_interval_seconds": (
                 coordinator.update_interval.total_seconds()
                 if coordinator.update_interval
