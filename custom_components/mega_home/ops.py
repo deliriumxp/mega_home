@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from http import HTTPStatus
 from typing import Any
+from urllib.parse import quote
 
 import voluptuous as vol
 
@@ -205,6 +206,32 @@ def _brightness_capable(attributes: Any) -> bool:
     return isinstance((attributes or {}).get("brightness"), (int, float))
 
 
+def _camera_urls(entity_id: Any, attributes: Any) -> dict[str, str]:
+    """Still frame and MJPEG stream - the very paths the HA frontend uses.
+
+    Relative, and signed with the entity's rotating `access_token`. Absolute
+    would be wrong twice over: outside the home they are unreachable anyway, and
+    inside it the app is served by this integration and shares an origin with
+    Home Assistant, so a relative path is exactly right.
+
+    Both are built EXPLICITLY rather than by patching `entity_picture`. The
+    manager builds the same shape in smart-home-view.util.ts, and "replace
+    camera_proxy with camera_proxy_stream" would drift between the two
+    implementations at the first change in Home Assistant.
+    """
+    token = (attributes or {}).get("access_token")
+    if not entity_id or not isinstance(token, str) or not token:
+        # A frame without a token will not open, so we do not promise one: a
+        # broken image on the tile reads as a broken camera.
+        return {"picture": "", "stream": ""}
+    query = f"?token={quote(token, safe='')}"
+    ident = quote(str(entity_id), safe="")
+    return {
+        "picture": f"/api/camera_proxy/{ident}{query}",
+        "stream": f"/api/camera_proxy_stream/{ident}{query}",
+    }
+
+
 def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
     """Project one Home Assistant state into what the app's screens read.
 
@@ -236,6 +263,16 @@ def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
         values["temperature"] = attributes.get("current_temperature")
         values["targetTemperature"] = attributes.get("temperature")
         values["mode"] = raw
+    elif domain == "camera":
+        # A camera has no on/off: its state is idle/recording/streaming. An
+        # invented `power` would turn the tile into a switch with nothing to
+        # switch, so we only hand over where to look.
+        values.update(_camera_urls(tile.get("entityId"), attributes))
+        # Which way Home Assistant serves live video: `hls` or `web_rtc`. Nothing
+        # reads it yet - the app shows MJPEG, which every browser plays without a
+        # single dependency. It travels from the start because remote viewing
+        # depends on it and there is nowhere to learn it after the fact.
+        values["streamType"] = attributes.get("frontend_stream_type")
 
     capabilities = list(CAPABILITIES.get(domain, []))
     # Диммируемость KNX-плитки известна из адреса ETS (`dimmable`), а у сущности,

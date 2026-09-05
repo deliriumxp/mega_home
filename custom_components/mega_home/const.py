@@ -52,6 +52,9 @@ CAPABILITIES: dict[str, list[str]] = {
     "cover": ["open_close", "position"],
     "climate": ["temperature", "mode"],
     "binary_sensor": ["read_only"],
+    # A camera is not operated, it is watched. `video` means exactly "this tile
+    # has something to show"; how it is shown is the app's business.
+    "camera": ["video"],
 }
 
 # Command -> Home Assistant service, per domain. A command outside this table is

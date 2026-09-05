@@ -161,3 +161,49 @@ def test_сценарий_запускает_скрипт():
     assert hass.services.calls == [("script", "turn_on", {"entity_id": "script.evening"})]
     with pytest.raises(ops.OpError):
         run(hass, _Coordinator(), "scenario", {"id": "нет-такого"})
+
+
+# Камера. ⚠ Форма состояния — КОНТРАКТ с менеджером (smart-home-view.util.ts):
+# приложение одно и то же, а проекций две, в разных репозиториях. Разъедутся —
+# и камера покажет кадр на одном транспорте и пустоту на другом.
+
+
+def _камера(attributes: dict) -> dict:
+    return ops.entity_view(
+        {"id": "cam1", "domain": "camera", "entityId": "camera.gate", "name": "Калитка"},
+        State("idle", attributes),
+    )
+
+
+def test_кадр_и_поток_строятся_по_entity_id_и_подписанному_токену():
+    view = _камера({"access_token": "tok en", "frontend_stream_type": "hls"})
+
+    assert view["state"]["picture"] == "/api/camera_proxy/camera.gate?token=tok%20en"
+    assert view["state"]["stream"] == "/api/camera_proxy_stream/camera.gate?token=tok%20en"
+    assert view["state"]["streamType"] == "hls"
+    assert view["capabilities"] == ["video"]
+    assert view["available"] is True
+
+
+def test_без_токена_адресов_не_обещаем():
+    # Токен ротируется; адрес без него отдаст 401, а битая картинка на плитке
+    # читается как сломанная камера.
+    view = _камера({})
+
+    assert view["state"]["picture"] == ""
+    assert view["state"]["stream"] == ""
+
+
+def test_у_камеры_нет_вкл_выкл():
+    # Состояние камеры в HA — idle/recording/streaming. Выдуманный `power`
+    # сделал бы плитку выключателем, которым нечего выключать.
+    assert "power" not in _камера({"access_token": "t"})["state"]
+
+
+def test_элемент_без_сущности_адресов_не_получает():
+    view = ops.entity_view(
+        {"id": "cam1", "domain": "camera", "entityId": None, "name": "Калитка"}, None
+    )
+
+    assert view["state"]["picture"] == ""
+    assert view["available"] is False
