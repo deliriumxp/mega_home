@@ -135,3 +135,25 @@ def test_первый_же_опрос_проверяет_бандл(tmp_path: Pa
 
     assert bundle.syncs == 1, "новый интерфейс обязан доехать на старте, а не через 15 минут"
     assert coordinator.app_checked_at is not None
+
+
+def test_опрос_включается_явно_иначе_его_нет_вовсе(tmp_path: Path) -> None:
+    """⚠ Регрессия, найденная на живом объекте: за десять часов ни одного опроса.
+
+    `DataUpdateCoordinator` заводит таймер, только пока у него есть слушатели, а
+    слушатели — это сущности; интеграция их не создаёт (`PLATFORMS` пуст).
+    Поэтому опрос включается явно, и снимается он вместе с записью конфигурации —
+    иначе «опрос как страховка» остаётся только на бумаге, и объект с лежащим
+    каналом живёт на кэше до перезапуска Home Assistant.
+    """
+    coordinator = _coordinator(tmp_path, FakeClient())
+    unloads: list[object] = []
+    entry = type("Entry", (), {"async_on_unload": lambda self, cb: unloads.append(cb)})()
+
+    coordinator.keep_polling(entry)
+
+    assert len(coordinator.listeners) == 1
+    assert len(unloads) == 1
+    # Снятие подписки возвращает координатор в исходное состояние.
+    unloads[0]()
+    assert coordinator.listeners == []

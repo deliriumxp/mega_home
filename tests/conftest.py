@@ -69,6 +69,17 @@ class _DataUpdateCoordinator:  # noqa: D101 - stand-in for the HA base class
         self.update_interval = update_interval
         self.data: object = None
         self.last_update_success = True
+        # ⚠ Таймер настоящего координатора работает, только пока есть слушатели —
+        # ради этого свойства и держим их здесь (см. `keep_polling`).
+        self.listeners: list[object] = []
+
+    def async_add_listener(self, callback: object, context: object = None):
+        self.listeners.append(callback)
+
+        def unsubscribe() -> None:
+            self.listeners.remove(callback)
+
+        return unsubscribe
 
 
 class _UpdateFailed(Exception):  # noqa: D101 - raised by the coordinator

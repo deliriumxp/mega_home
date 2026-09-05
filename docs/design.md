@@ -159,6 +159,19 @@ resident) — never a dropped frame. The manager waits with a three second timeo
 would turn every "device not found" into "the house is offline", three seconds later, for a
 resident standing in that house.
 
+## Polling has to be switched on by hand (0.1.6)
+
+`DataUpdateCoordinator` runs its timer only while it HAS LISTENERS, and listeners are entities.
+This integration creates none (`PLATFORMS` is empty — it is a transport, a cache and a file
+server), so after the first refresh at startup the home never asked the manager again. "Polling
+as the safety net" existed only on paper: the config arrived by push alone, and a home whose
+link was down lived on its cache until Home Assistant restarted.
+
+Found on a live object: `last_success_at` and `app_checked_at` ten hours old, with
+`update_interval_seconds: 900` and `last_update_success: true` — the diagnostics said "did not
+try", not "could not". `MegaHomeCoordinator.keep_polling()` registers one empty listener, tied
+to the config entry's unload.
+
 ## The states projection is a shared contract
 
 `entity_view()` in `ops.py` produces exactly what the manager's

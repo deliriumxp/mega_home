@@ -86,6 +86,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
             raise ConfigEntryAuthFailed(str(err)) from err
 
     entry.runtime_data = coordinator
+
+    # Периодический опрос (он же страховка на случай лежащего канала) включается
+    # ЯВНО — почему, написано в `keep_polling`.
+    coordinator.keep_polling(entry)
+
     await async_register_http(hass, coordinator)
 
     # Живой канал к менеджеру: правка состава доезжает за секунды вместо интервала

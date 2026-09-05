@@ -95,6 +95,24 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Version of the config currently held."""
         return (self.data or {}).get("version")
 
+    def keep_polling(self, entry: MegaHomeConfigEntry) -> None:
+        """Включить штатный периодический опрос координатора.
+
+        ⚠ Без этого опроса НЕТ ВОВСЕ. `DataUpdateCoordinator` заводит таймер,
+        только пока у него есть слушатели, а слушатели — это сущности; у нас их
+        нет (`PLATFORMS` пуст: интеграция не создаёт сущностей, она транспорт и
+        раздатчик файлов). После первого опроса на старте дом больше не
+        спрашивал менеджер ни разу, и «опрос как страховка» существовал только
+        на бумаге: конфиг доезжал исключительно push'ем, а объект с лежащим
+        каналом жил на кэше до перезапуска Home Assistant. Найдено на живом
+        объекте: `last_success_at` и `app_checked_at` десятичасовой давности при
+        `update_interval_seconds: 900` и `last_update_success: true`.
+
+        Пустой слушатель ничего не делает и снимается вместе с записью
+        конфигурации — таймер координатора при этом работает штатно.
+        """
+        entry.async_on_unload(self.async_add_listener(lambda: None))
+
     async def async_load_cache(self) -> bool:
         """Seed the coordinator from disk. Returns True if a config was found.
 
