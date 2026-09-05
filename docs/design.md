@@ -140,9 +140,28 @@ different distances.)
   no climate integration loaded, and `async_call` raises `ServiceNotFound` even with
   `blocking=False`. The command view turns that into a readable answer instead of a bare 500.
 
+## One resident, two ways in — one `ops.py` (0.1.5)
+
+A resident at home reaches this integration over HTTP. A resident who is AWAY cannot: their
+phone talks to the manager, and the manager forwards the question down the live link this
+integration already holds (`remote-access.md` in the manager repo). Both paths must give the
+same data and the same refusal wording, so the operations themselves live in `ops.py` and know
+nothing about transport: they return plain data and raise `OpError(message, status)`.
+
+⚠ Before this, the rules lived inside the view handlers, welded to `web.Request`. The link
+would have had to fake HTTP requests or grow a second copy of "which service does this command
+map to" — the kind of pair that drifts apart silently and is only noticed as "the app works at
+home but not outside".
+
+⚠ **The house always answers.** A refusal travels as an ordinary frame with `ok: false` and the
+status; an unexpected error becomes a generic message (internals are for the log, not for the
+resident) — never a dropped frame. The manager waits with a three second timeout, so silence
+would turn every "device not found" into "the house is offline", three seconds later, for a
+resident standing in that house.
+
 ## The states projection is a shared contract
 
-`_entity_view()` in `http.py` produces exactly what the manager's
+`entity_view()` in `ops.py` produces exactly what the manager's
 `smart-home-view.util.ts` produces (brightness as a percentage, cover position, the
 capabilities list, `available`, `updatedAt` in epoch milliseconds). The app's screens read that
 shape and know nothing about which side answered.

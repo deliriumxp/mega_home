@@ -9,6 +9,7 @@ import aiohttp
 
 from homeassistant.core import HomeAssistant
 
+from . import ops
 from .const import CONF_MANAGER_URL, CONF_TOKEN, CONF_VERIFY_SSL, LOGGER
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
 
@@ -31,10 +32,17 @@ class ManagerLink:
     manager pushing *into* the house would need reachability, which is a
     different (later) problem.
 
-    This only ever carries a nudge. The config itself is still fetched over the
-    same HTTPS endpoint the poll uses, so there is exactly one code path that
-    updates the cache — and the poll stays as the safety net for when this link
-    is down.
+    Two kinds of traffic ride it:
+
+    * the manager's nudge ("the config moved", "a new bundle is out"). The
+      config itself is still fetched over the same HTTPS endpoint the poll uses,
+      so exactly one code path updates the cache — and the poll stays as the
+      safety net for when this link is down;
+    * requests from a resident who is AWAY from home. Their phone talks to the
+      manager, the manager forwards the question here, and this house answers it
+      (remote-access.md in the manager repo). ⚠ The answer is produced by the
+      same `ops` module the local HTTP views use — the resident must get the
+      same data and the same refusal wording wherever they are.
     """
 
     def __init__(
@@ -88,7 +96,7 @@ class ManagerLink:
                     )
                     async for message in socket:
                         if message.type is aiohttp.WSMsgType.TEXT:
-                            await self._handle(message.json())
+                            await self._handle(message.json(), socket)
                         elif message.type in (
                             aiohttp.WSMsgType.CLOSED,
                             aiohttp.WSMsgType.ERROR,
@@ -110,8 +118,49 @@ class ManagerLink:
             await asyncio.sleep(delay)
             delay = min(delay * 2, MAX_RETRY)
 
-    async def _handle(self, payload: dict[str, Any]) -> None:
+    async def _answer(self, socket: Any, frame: dict[str, Any]) -> None:
+        """Answer one request from the manager (a resident who is away).
+
+        ⚠ A refusal travels as a normal answer with `ok: false`, never as a
+        dropped frame: the manager waits with a timeout, and silence would make
+        every "device not found" look like "the house is offline" — three
+        seconds later, and to a resident who is standing in that house.
+        """
+        request_id = frame.get("id")
+        if socket is None or not isinstance(request_id, str):
+            return
+        try:
+            payload = await ops.run(
+                self._hass, self._coordinator, frame.get("op") or "", frame.get("payload")
+            )
+            reply: dict[str, Any] = {"t": "res", "id": request_id, "ok": True, "payload": payload}
+        except ops.OpError as err:
+            reply = {
+                "t": "res",
+                "id": request_id,
+                "ok": False,
+                "error": err.message,
+                "status": err.status,
+            }
+        except Exception as err:  # noqa: BLE001 - an answer must always come back
+            LOGGER.exception("Request from the manager failed: %s", err)
+            reply = {
+                "t": "res",
+                "id": request_id,
+                "ok": False,
+                "error": "Дом не смог выполнить запрос",
+                "status": 500,
+            }
+        try:
+            await socket.send_json(reply)
+        except Exception as err:  # noqa: BLE001 - the link reconnects on its own
+            LOGGER.debug("Could not send the answer: %s", err)
+
+    async def _handle(self, payload: dict[str, Any], socket: Any = None) -> None:
         kind = payload.get("t")
+        if kind == "req":
+            await self._answer(socket, payload)
+            return
         if kind == "app_changed":
             # A new interface was published. Nothing about this home changed, so
             # the config refresh would not notice it on its own.

@@ -16,22 +16,19 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
-import voluptuous as vol
 from aiohttp import web
 
 from homeassistant.components.http import HomeAssistantView, StaticPathConfig
-from homeassistant.core import HomeAssistant, State
-from homeassistant.exceptions import ServiceNotFound
+from homeassistant.core import HomeAssistant
 
 from .const import (
-    CAPABILITIES,
-    COMMAND_SERVICES,
     DOMAIN,
     LOGGER,
     URL_API,
     URL_ICONS,
     URL_PREFIX,
 )
+from . import ops
 from .bundle import PACKAGED_DIR
 from .coordinator import MegaHomeCoordinator
 from .photos import JPEG_MAGIC, MAX_PHOTO_BYTES
@@ -120,6 +117,27 @@ class _MegaHomeView(HomeAssistantView):
             )
         return coordinator, None
 
+    # ⚠ Сами операции живут в `ops.py`, а не здесь: тот же код обслуживает
+    # запрос жильца, пришедший СНАРУЖИ через менеджер по живому каналу
+    # (`link.py`). Копия правил на каждый транспорт разъехалась бы.
+    async def run(self, request: web.Request, op: str) -> web.Response:
+        hass: HomeAssistant = request.app["hass"]
+        try:
+            return self.json(await ops.run(hass, _coordinator(hass), op, None))
+        except ops.OpError as err:
+            return self.json_message(err.message, err.status)
+
+    async def run_async(self, request: web.Request, op: str) -> web.Response:
+        try:
+            payload = await request.json()
+        except ValueError:
+            return self.json_message("Некорректный запрос", HTTPStatus.BAD_REQUEST)
+        hass: HomeAssistant = request.app["hass"]
+        try:
+            return self.json(await ops.run(hass, _coordinator(hass), op, payload))
+        except ops.OpError as err:
+            return self.json_message(err.message, err.status)
+
 
 class MegaHomeConfigView(_MegaHomeView):
     """The cached home config: floors, rooms, tiles, scenarios."""
@@ -128,11 +146,7 @@ class MegaHomeConfigView(_MegaHomeView):
     name = "api:mega_home:config"
 
     async def get(self, request: web.Request) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        return self.json(coordinator.data)
+        return await self.run(request, "config")
 
 
 class MegaHomeStatesView(_MegaHomeView):
@@ -142,34 +156,7 @@ class MegaHomeStatesView(_MegaHomeView):
     name = "api:mega_home:states"
 
     async def get(self, request: web.Request) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        hass: HomeAssistant = request.app["hass"]
-        entities = [
-            _entity_view(tile, hass.states.get(tile["entityId"]) if tile.get("entityId") else None)
-            for tile in coordinator.data.get("tiles", [])
-        ]
-        # Always connected: this runs inside the home, so there is no link to
-        # lose between the app and Home Assistant.
-        #
-        # `configVersion` rides along on purpose. The app polls this endpoint
-        # every few seconds anyway, so it is the cheapest possible way to tell a
-        # phone that has been open for days that the installer added a socket:
-        # the version moves, the app re-reads the config and redraws itself. No
-        # extra request, no page reload, nobody pressing anything.
-        return self.json(
-            {
-                "connected": True,
-                "configVersion": coordinator.version,
-                # Версия интерфейса — тем же способом: изменилась, значит на
-                # объекте лежит новый бандл, и открытая вкладка обязана на него
-                # перейти сама (docs/mega-home-updates.md).
-                "appVersion": coordinator.bundle.version if coordinator.bundle else None,
-                "entities": entities,
-            }
-        )
+        return await self.run(request, "states")
 
 
 class MegaHomeCommandView(_MegaHomeView):
@@ -179,46 +166,7 @@ class MegaHomeCommandView(_MegaHomeView):
     name = "api:mega_home:command"
 
     async def post(self, request: web.Request) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        try:
-            payload = await request.json()
-        except ValueError:
-            return self.json_message("Некорректный запрос", HTTPStatus.BAD_REQUEST)
-
-        tile = _find(coordinator.data.get("tiles", []), payload.get("id"))
-        if tile is None:
-            return self.json_message("Устройство не найдено", HTTPStatus.NOT_FOUND)
-        if not tile.get("entityId"):
-            # Same wording as the manager: the element is in the project but was
-            # never pushed to Home Assistant, so there is nothing to command.
-            return self.json_message(
-                "Элемент ещё не отправлен в Home Assistant — управлять им пока нечем",
-                HTTPStatus.BAD_REQUEST,
-            )
-
-        command = payload.get("command")
-        service = COMMAND_SERVICES.get(tile["domain"], {}).get(command)
-        if not service:
-            return self.json_message(
-                "Команда не поддерживается устройством", HTTPStatus.NOT_FOUND
-            )
-        if command == "set_brightness" and not tile.get("dimmable"):
-            return self.json_message(
-                "Устройство не поддерживает регулировку яркости", HTTPStatus.NOT_FOUND
-            )
-
-        try:
-            data = _service_data(command, payload.get("value"))
-        except ValueError as err:
-            return self.json_message(str(err), HTTPStatus.BAD_REQUEST)
-
-        hass: HomeAssistant = request.app["hass"]
-        return await _async_call(
-            hass, tile["domain"], service, {"entity_id": tile["entityId"], **data}, self
-        )
+        return await self.run_async(request, "command")
 
 
 class MegaHomeScenarioView(_MegaHomeView):
@@ -228,27 +176,7 @@ class MegaHomeScenarioView(_MegaHomeView):
     name = "api:mega_home:scenario"
 
     async def post(self, request: web.Request) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        try:
-            payload = await request.json()
-        except ValueError:
-            return self.json_message("Некорректный запрос", HTTPStatus.BAD_REQUEST)
-
-        scenario = _find(coordinator.data.get("scenarios", []), payload.get("id"))
-        if scenario is None:
-            return self.json_message("Сценарий не найден", HTTPStatus.NOT_FOUND)
-        if not scenario.get("entityId"):
-            return self.json_message(
-                "Сценарий не создан в Home Assistant", HTTPStatus.NOT_FOUND
-            )
-
-        hass: HomeAssistant = request.app["hass"]
-        return await _async_call(
-            hass, "script", "turn_on", {"entity_id": scenario["entityId"]}, self
-        )
+        return await self.run_async(request, "scenario")
 
 
 class MegaHomePhotosView(_MegaHomeView):
@@ -346,34 +274,6 @@ def _room_exists(config: dict[str, Any], room_id: str) -> bool:
     return any(room.get("id") == room_id for room in config.get("rooms", []))
 
 
-async def _async_call(
-    hass: HomeAssistant,
-    domain: str,
-    service: str,
-    data: dict[str, Any],
-    view: _MegaHomeView,
-) -> web.Response:
-    """Call a Home Assistant service and turn its refusals into plain answers.
-
-    A service can be missing outright — `climate.set_temperature` does not exist
-    on an installation with no climate integration loaded — and that raises.
-    Without this the resident would get a bare 500 for a house that is simply
-    not set up yet.
-    """
-    try:
-        await hass.services.async_call(domain, service, data, blocking=False)
-    except ServiceNotFound:
-        LOGGER.warning("Service %s.%s is not available", domain, service)
-        return view.json_message(
-            "Home Assistant не умеет выполнять эту команду на этом объекте",
-            HTTPStatus.NOT_FOUND,
-        )
-    except vol.Invalid as err:
-        LOGGER.warning("Service %s.%s rejected the payload: %s", domain, service, err)
-        return view.json_message("Home Assistant отклонил команду", HTTPStatus.BAD_REQUEST)
-    return view.json({"accepted": True})
-
-
 class MegaHomeAppRootView(_MegaHomeView):
     """The bare prefix: hand out the app itself."""
 
@@ -434,78 +334,3 @@ def _serve(request: web.Request, relative: str) -> web.StreamResponse:
     return web.FileResponse(target, headers=headers)
 
 
-def _find(items: list[dict[str, Any]], item_id: Any) -> dict[str, Any] | None:
-    if not isinstance(item_id, str):
-        return None
-    return next((item for item in items if item.get("id") == item_id), None)
-
-
-def _service_data(command: str, value: Any) -> dict[str, Any]:
-    """Validate the one numeric argument a command may carry."""
-    if command == "set_brightness":
-        return {"brightness_pct": _number(value, 0, 100)}
-    if command == "set_position":
-        return {"position": _number(value, 0, 100)}
-    if command == "set_temperature":
-        return {"temperature": _number(value, 5, 40)}
-    if command == "set_mode":
-        return {"hvac_mode": str(value or "")}
-    return {}
-
-
-def _number(value: Any, low: int, high: int) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as err:
-        raise ValueError(f"Значение должно быть от {low} до {high}") from err
-    if not low <= parsed <= high:
-        raise ValueError(f"Значение должно быть от {low} до {high}")
-    return parsed
-
-
-def _entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
-    """Project one Home Assistant state into what the app's screens read.
-
-    ⚠ This is the same projection the manager does in smart-home-view.util.ts.
-    The two live in different repositories on purpose (the whole point of the
-    phase is that the manager is out of the runtime path), so the shape is a
-    contract: change it here and there in the same breath.
-    """
-    domain = tile["domain"]
-    raw = state.state if state else None
-    attributes = state.attributes if state else {}
-    unavailable = raw in ("unavailable", "unknown")
-    values: dict[str, Any] = {"value": raw}
-
-    if domain == "light":
-        values["power"] = raw == "on"
-        brightness = attributes.get("brightness")
-        if isinstance(brightness, (int, float)):
-            values["brightness"] = round(brightness / 255 * 100)
-    elif domain in ("switch", "binary_sensor"):
-        values["power"] = raw == "on"
-        if domain == "binary_sensor":
-            values["deviceClass"] = attributes.get("device_class")
-    elif domain == "cover":
-        position = attributes.get("current_position")
-        if isinstance(position, (int, float)):
-            values["position"] = position
-    elif domain == "climate":
-        values["temperature"] = attributes.get("current_temperature")
-        values["targetTemperature"] = attributes.get("temperature")
-        values["mode"] = raw
-
-    capabilities = list(CAPABILITIES.get(domain, []))
-    if domain == "light" and tile.get("dimmable"):
-        capabilities.append("brightness")
-
-    return {
-        "id": tile["id"],
-        "roomId": tile.get("roomId"),
-        "name": tile.get("name"),
-        "domain": domain,
-        "capabilities": capabilities,
-        "state": values,
-        "available": state is not None and not unavailable,
-        "updatedAt": int(state.last_updated.timestamp() * 1000) if state else None,
-    }
