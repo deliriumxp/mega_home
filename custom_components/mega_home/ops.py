@@ -117,7 +117,16 @@ async def command(
     except ValueError as err:
         raise OpError(str(err)) from err
 
-    return await call(hass, tile["domain"], service, {"entity_id": tile["entityId"], **data})
+    await call(hass, tile["domain"], service, {"entity_id": tile["entityId"], **data})
+    # ⚠ Ответ несёт НОВОЕ состояние плитки, а не только «принято». Иначе
+    # приложению остаётся либо ждать следующего снимка (тап выглядит
+    # непринятым почти секунду), либо рисовать угаданное состояние — и то и
+    # другое неправильно там, где настоящее состояние лежит в двух шагах.
+    # Служба вызвана блокирующе, поэтому машина состояний уже обновлена.
+    return {
+        "accepted": True,
+        "entity": entity_view(tile, hass.states.get(tile["entityId"])),
+    }
 
 
 async def scenario(
@@ -143,7 +152,10 @@ async def call(
     not set up yet.
     """
     try:
-        await hass.services.async_call(domain, service, data, blocking=False)
+        # blocking=True: ответ обязан нести состояние ПОСЛЕ выполнения команды
+        # (см. command). Служба выполняется внутри того же Home Assistant, так
+        # что ожидание здесь — это доли миллисекунды, а не сетевой поход.
+        await hass.services.async_call(domain, service, data, blocking=True)
     except ServiceNotFound as err:
         LOGGER.warning("Service %s.%s is not available", domain, service)
         raise OpError(
@@ -185,6 +197,14 @@ def number(value: Any, low: int, high: int) -> float:
     return parsed
 
 
+def _brightness_capable(attributes: Any) -> bool:
+    """Поддерживает ли сущность яркость — по её живому состоянию."""
+    modes = (attributes or {}).get("supported_color_modes")
+    if isinstance(modes, (list, tuple)) and modes:
+        return any(mode != "onoff" for mode in modes)
+    return isinstance((attributes or {}).get("brightness"), (int, float))
+
+
 def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
     """Project one Home Assistant state into what the app's screens read.
 
@@ -218,7 +238,10 @@ def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
         values["mode"] = raw
 
     capabilities = list(CAPABILITIES.get(domain, []))
-    if domain == "light" and tile.get("dimmable"):
+    # Диммируемость KNX-плитки известна из адреса ETS (`dimmable`), а у сущности,
+    # найденной сканом HA, — только по живому состоянию: в реестре атрибутов нет.
+    # Та же развилка в менеджере (smart-home-view.util.ts) — контракт общий.
+    if domain == "light" and (tile.get("dimmable") or _brightness_capable(attributes)):
         capabilities.append("brightness")
 
     return {

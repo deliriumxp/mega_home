@@ -15,8 +15,9 @@ This integration removes the manager from the runtime path:
 - it **pulls one config** from the manager (floors, rooms, tiles with their `entity_id`s,
   scenarios) and **caches it on disk**, together with the scenario icons as files;
 - it **serves the app** at `http://<home-assistant>:8123/mega-home`;
-- it answers **states and commands** from `hass` directly — no round trip, no polling every
-  three seconds, and nothing to lose when the line goes down.
+- it answers **states and commands** from `hass` directly, and **pushes state changes** to the
+  app over one SSE stream (`/mega-home/api/events`) — the tile changes when the relay clicks, not
+  on the next poll; nothing to lose when the line goes down.
 
 The manager stays the source of the configuration; it just is not needed to run the home.
 

@@ -115,12 +115,15 @@ def test_состояния_несут_версии_конфига_и_бандл
 
 def test_команда_превращается_в_вызов_службы():
     hass = _Hass({"light.kitchen": State("off")})
-    assert run(hass, _Coordinator(), "command", {"id": "t1", "command": "set_brightness", "value": 40}) == {
-        "accepted": True
-    }
+    answer = run(hass, _Coordinator(), "command", {"id": "t1", "command": "set_brightness", "value": 40})
+    assert answer["accepted"] is True
     assert hass.services.calls == [
         ("light", "turn_on", {"entity_id": "light.kitchen", "brightness_pct": 40.0})
     ]
+    # ⚠ Ответ несёт НОВОЕ состояние плитки: иначе приложение либо ждёт снимка,
+    # либо рисует угаданное — и то и другое неправильно внутри дома.
+    assert answer["entity"]["id"] == "t1"
+    assert answer["entity"]["state"]["value"] == "off"
 
 
 def test_чужая_команда_и_чужое_устройство_отвергаются():

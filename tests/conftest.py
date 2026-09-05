@@ -105,7 +105,19 @@ class _ServiceNotFound(Exception):  # noqa: D101 - raised by hass.services
 
 
 _module("homeassistant")
-_module("homeassistant.core", HomeAssistant=_HomeAssistant, State=_State)
+def _callback(func: object) -> object:
+    """`@callback` в Home Assistant только помечает функцию — здесь это no-op."""
+    return func
+
+
+_module(
+    "homeassistant.core",
+    HomeAssistant=_HomeAssistant,
+    State=_State,
+    callback=_callback,
+    Event=dict,
+    EventStateChangedData=dict,
+)
 _module("homeassistant.exceptions", ServiceNotFound=_ServiceNotFound)
 class _ConfigFlow:  # noqa: D101 - stand-in for the HA base class
     def __init_subclass__(cls, **kwargs: object) -> None:
@@ -138,6 +150,18 @@ _module(
     "homeassistant.helpers.update_coordinator",
     DataUpdateCoordinator=_DataUpdateCoordinator,
     UpdateFailed=_UpdateFailed,
+)
+# Подписка на изменения состояний: тест проверяет, ЧТО уходит в поток, а не как
+# Home Assistant рассылает события, поэтому здесь запоминаются аргументы.
+def _track_state_change_event(hass: object, entity_ids: object, action: object) -> object:
+    _track_state_change_event.calls.append((list(entity_ids), action))  # type: ignore[attr-defined]
+    return lambda: None
+
+
+_track_state_change_event.calls = []  # type: ignore[attr-defined]
+_module(
+    "homeassistant.helpers.event",
+    async_track_state_change_event=_track_state_change_event,
 )
 _module("homeassistant.util")
 

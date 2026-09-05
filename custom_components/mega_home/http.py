@@ -31,6 +31,7 @@ from .const import (
 from . import ops
 from .bundle import PACKAGED_DIR
 from .coordinator import MegaHomeCoordinator
+from .events import StateStream
 from .photos import JPEG_MAGIC, MAX_PHOTO_BYTES
 
 # Упакованная копия объявлена в `bundle.py` — она её и раздаёт как фолбэк.
@@ -76,6 +77,7 @@ async def async_register_http(
     for view in (
         MegaHomeConfigView,
         MegaHomeStatesView,
+        MegaHomeEventsView,
         MegaHomeCommandView,
         MegaHomeScenarioView,
         MegaHomePhotosView,
@@ -157,6 +159,26 @@ class MegaHomeStatesView(_MegaHomeView):
 
     async def get(self, request: web.Request) -> web.Response:
         return await self.run(request, "states")
+
+
+class MegaHomeEventsView(_MegaHomeView):
+    """Live states: one Server-Sent Events stream per open app.
+
+    ⚠ Заменяет опрос `api/states` раз в 3 с. Внутри дома опрашивать нечего:
+    Home Assistant сам отдаёт нам каждое изменение состояния, и плитка обязана
+    меняться тогда же, когда щёлкнуло реле, а не на следующем тике.
+    """
+
+    url = f"{URL_API}/events"
+    name = "api:mega_home:events"
+
+    async def get(self, request: web.Request) -> web.StreamResponse:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        hass: HomeAssistant = request.app["hass"]
+        return await StateStream(hass, coordinator).run(request)
 
 
 class MegaHomeCommandView(_MegaHomeView):
