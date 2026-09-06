@@ -257,3 +257,46 @@ def test_пауза_это_включён_а_standby_нет():
 def test_подпись_плеера_берёт_имя_приложения():
     # У телевизора вместо исполнителя осмысленно только оно.
     assert _плеер("playing", {"app_name": "Netflix"})["state"]["subtitle"] == "Netflix"
+
+# Атрибуты Home Assistant. ⚠ Решение 2026-09-06: отдаём ЦЕЛИКОМ, а не выборкой —
+# приложение живёт только внутри HA, и сокращать уже посчитанное им значит
+# платить правкой в двух репозиториях за каждое поле детального экрана. Спека
+# держит именно это свойство и единственное исключение из него.
+
+def test_атрибуты_уходят_целиком():
+    view = ops.entity_view(
+        {"id": "l1", "domain": "light", "entityId": "light.hall", "name": "Холл"},
+        State(
+            "on",
+            {
+                "friendly_name": "Холл",
+                "supported_color_modes": ["color_temp", "hs"],
+                "effect_list": ["Радуга", "Свеча"],
+                "какой_то_свой_атрибут": 7,
+            },
+        ),
+    )
+
+    assert view["attributes"] == {
+        "friendly_name": "Холл",
+        "supported_color_modes": ["color_temp", "hs"],
+        "effect_list": ["Радуга", "Свеча"],
+        "какой_то_свой_атрибут": 7,
+    }
+
+def test_токен_доступа_наружу_не_уходит():
+    # Не «фильтр полезного», а секрет: из него уже собраны адреса кадра и
+    # потока, и отдать его отдельным полем значит отдать право собрать любой
+    # другой адрес того же Home Assistant.
+    view = _камера({"access_token": "секрет", "friendly_name": "Калитка"})
+
+    assert "access_token" not in view["attributes"]
+    assert view["attributes"]["friendly_name"] == "Калитка"
+    assert "секрет" in view["state"]["picture"] or "%D1%81" in view["state"]["picture"]
+
+def test_без_состояния_атрибуты_пустые():
+    view = ops.entity_view(
+        {"id": "l1", "domain": "light", "entityId": "light.hall", "name": "Холл"}, None
+    )
+
+    assert view["attributes"] == {}

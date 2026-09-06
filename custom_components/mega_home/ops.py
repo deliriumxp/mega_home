@@ -263,6 +263,26 @@ def _media_capabilities(attributes: Any) -> list[str]:
     return out
 
 
+# Что из атрибутов наружу НЕ уходит.
+#
+# ⚠ Список короткий намеренно. Это не «фильтр полезного» — атрибуты уходят
+# ЦЕЛИКОМ (решение 2026-09-06, см. смежный комментарий в
+# smart-home-view.util.ts менеджера): приложение живёт только внутри Home
+# Assistant, и сокращать то, что он уже посчитал, — работа без выгоды. Здесь
+# только то, чему в браузере жильца делать нечего: `access_token` это секрет, из
+# которого мы уже собрали адреса кадра и потока камеры, и отдать его отдельным
+# полем значит отдать право собрать любой другой адрес того же HA.
+HIDDEN_ATTRIBUTES = frozenset({"access_token"})
+
+
+def _public_attributes(attributes: Any) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in (attributes or {}).items()
+        if key not in HIDDEN_ATTRIBUTES
+    }
+
+
 def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
     """Project one Home Assistant state into what the app's screens read.
 
@@ -337,6 +357,7 @@ def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
         "domain": domain,
         "capabilities": capabilities,
         "state": values,
+        "attributes": _public_attributes(attributes),
         "available": state is not None and not unavailable,
         "updatedAt": int(state.last_updated.timestamp() * 1000) if state else None,
     }
