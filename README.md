@@ -53,7 +53,7 @@ The address and the token are checked against the manager before the entry is cr
 
 | Path | What it is |
 |---|---|
-| `/mega-home` | the app bundle (a placeholder page until the bundle ships) |
+| `/mega-home` | the app bundle, downloaded from the manager (a static "connecting" page until the first download — releases carry no copy) |
 | `/mega-home/icons/<icon>_300.png` | scenario icons, cached locally |
 | `/mega-home/api/config` | the cached home config |
 | `/mega-home/api/states` | current state of every tile |

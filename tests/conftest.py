@@ -119,6 +119,18 @@ _module(
     EventStateChangedData=dict,
 )
 _module("homeassistant.exceptions", ServiceNotFound=_ServiceNotFound)
+
+
+class _HomeAssistantView:  # noqa: D101 - stand-in for the HA base class
+    requires_auth = True
+
+
+_module("homeassistant.components")
+_module(
+    "homeassistant.components.http",
+    HomeAssistantView=_HomeAssistantView,
+    StaticPathConfig=lambda *a, **k: None,
+)
 class _ConfigFlow:  # noqa: D101 - stand-in for the HA base class
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__()

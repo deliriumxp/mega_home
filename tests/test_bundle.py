@@ -71,7 +71,16 @@ class FakeClient:
 
 
 def store(tmp_path: Path, client: FakeClient) -> BundleStore:
-    return BundleStore(FakeHass(tmp_path), client, tmp_path / "packaged")
+    return BundleStore(FakeHass(tmp_path), client)
+
+
+def test_before_the_first_download_there_is_nothing_to_serve(tmp_path: Path) -> None:
+    """The release carries no copy of the interface (2026-09-06).
+
+    `None` is what tells `http.py` to hand out the "connecting" placeholder, so
+    a fresh install must not invent a directory to serve from.
+    """
+    assert store(tmp_path, FakeClient({})).active_dir is None
 
 
 def test_holding_the_same_bundle_downloads_nothing(tmp_path: Path) -> None:

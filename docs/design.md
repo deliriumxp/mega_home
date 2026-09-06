@@ -43,7 +43,7 @@ past the early return, so on the common path — nothing changed in the composit
 version matches — the poll returned before ever looking at the bundle. A new interface could
 then only arrive as an `app_changed` frame over the live link, and a home whose link was down
 kept serving an old bundle forever. Seen on a real object: the manager had published a new
-interface, the flat kept showing the copy packaged in the release, and nothing anywhere said
+interface, the flat kept showing the copy packaged in the release (releases carried one back then), and nothing anywhere said
 so. The poll is the safety net for BOTH; it was one for the config only. Regression test:
 `tests/test_coordinator.py`.
 
@@ -195,9 +195,6 @@ synchronised yet".
 
 - **Authentication.** Views are `requires_auth = False` and anyone on the local network can
   reach them. Deliberate for development, unacceptable on a customer object.
-- **The app bundle.** `www/` currently holds a placeholder page; the real Angular build lands
-  in the next phase, together with a self-hosted font (the manager's `index.html` pulls Inter
-  from Google Fonts, which is another thing that does not exist on an offline object).
 - **SPA deep links.** With the bundle served as a static prefix, a cold load of a sub-path will
   not fall back to `index.html`. That decision belongs with the bundle.
 
@@ -225,3 +222,25 @@ synchronised yet".
   `blocking=True`. Иначе приложению остаётся ждать снимка или рисовать угаданное состояние —
   обе стратегии врут, а правда лежит в двух шагах. Тот же контракт у менеджера
   (`smart-home.service.ts`), чтобы облачный путь отвечал так же.
+
+
+## The release carries no copy of the interface (0.1.12)
+
+Until 0.1.12 a release shipped `custom_components/mega_home/www/` — the built app, served by a
+fresh install that had never synchronised. It cost ~700 KB of frontend build inside every
+release and, worse, tied the release to the frontend: a change of the interface either travelled
+through HACS (a release plus a Home Assistant restart on every object) or went stale inside the
+release while the downloaded bundle moved on.
+
+**The first start is now assumed to be online** (owner's decision, 2026-09-06). `active_dir` is
+`None` until the first successful download, and `http.py` answers the page itself with a static
+placeholder ("Подключаюсь к менеджеру…", `PLACEHOLDER`) that reloads itself every five seconds —
+the bundle arrives in the background, so there is nothing for the resident to press.
+
+⚠ **Only the page gets the placeholder; a request for a bundle file gets an honest 404.**
+Answering HTML to a request for `main-*.js` turns a clear waiting screen into a script parse
+error in the console.
+
+This does not touch offline operation: an object that has downloaded the bundle once keeps
+serving it from `.storage/mega_home_www` with no manager and no internet. What is gone is only
+the copy for an object that has never talked to the manager at all.

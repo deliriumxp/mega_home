@@ -132,8 +132,9 @@ def test_хранилище_бандла_есть_сразу_после_созд
     """
     coordinator = _coordinator(tmp_path, FakeClient())
     assert coordinator.bundle is not None
-    # Раздавать что-то надо и до первой синхронизации: это копия из релиза.
-    assert coordinator.bundle.active_dir.name == "www"
+    # ⚠ До первой синхронизации раздавать НЕЧЕГО: копии интерфейса в релизе нет,
+    # и это не поломка, а заглушка «Подключаюсь к менеджеру…» из `http.py`.
+    assert coordinator.bundle.active_dir is None
 
 
 def test_первый_же_опрос_проверяет_бандл(tmp_path: Path) -> None:

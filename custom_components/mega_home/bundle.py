@@ -24,10 +24,6 @@ from .api import ManagerClient, ManagerError
 from .const import LOGGER
 
 BUNDLE_DIR = "mega_home_www"
-# Копия, упакованная в релиз: её раздаёт свежая установка, которая ещё ни разу не
-# синхронизировалась. Живёт здесь, а не в `http.py`, чтобы хранилище можно было
-# создать, ничего не импортируя из HTTP-слоя (тот сам импортирует координатор).
-PACKAGED_DIR = Path(__file__).parent / "www"
 # Сколько версий держим на диске: активная и предыдущая. Предыдущая — это откат
 # без выезда на объект.
 KEEP_VERSIONS = 2
@@ -46,15 +42,9 @@ class BundleStore:
     on every nudge (see `async_sync`).
     """
 
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        client: ManagerClient,
-        packaged: Path | None = None,
-    ) -> None:
+    def __init__(self, hass: HomeAssistant, client: ManagerClient) -> None:
         self._hass = hass
         self._client = client
-        self._packaged = packaged or PACKAGED_DIR
         self._root = Path(hass.config.path(STORAGE_DIR, BUNDLE_DIR))
         self._active: Path | None = None
         self.version: str | None = None
@@ -67,13 +57,17 @@ class BundleStore:
         self.last_error: str | None = None
 
     @property
-    def active_dir(self) -> Path:
-        """Directory the HTTP views must read from right now.
+    def active_dir(self) -> Path | None:
+        """Directory the HTTP views must read from right now, if any.
 
-        Falls back to the copy shipped inside the integration: a fresh install
-        that has never synchronised still has to show something.
+        ⚠ `None` until the first successful download — the release carries NO
+        copy of the interface (2026-09-06). A fresh install is expected to be
+        online: it fetches the bundle from the manager, and until then `http.py`
+        hands out a static "connecting" page. Shipping a copy meant every
+        interface change either travelled through HACS or went stale inside the
+        release, and made the release ~700 KB of frontend build.
         """
-        return self._active or self._packaged
+        return self._active
 
     async def async_load(self) -> None:
         """Pick up the newest complete version left by a previous run."""

@@ -13,7 +13,6 @@ this on a customer object in this state.
 from __future__ import annotations
 
 from http import HTTPStatus
-from pathlib import Path
 from typing import Any
 
 from aiohttp import web
@@ -29,13 +28,24 @@ from .const import (
     URL_PREFIX,
 )
 from . import ops
-from .bundle import PACKAGED_DIR
 from .coordinator import MegaHomeCoordinator
 from .events import StateStream
 from .photos import JPEG_MAGIC, MAX_PHOTO_BYTES
 
-# Упакованная копия объявлена в `bundle.py` — она её и раздаёт как фолбэк.
-BUNDLE_DIR = PACKAGED_DIR
+# ⚠ Копии интерфейса в релизе НЕТ (2026-09-06): пока бандл не скачан, отдаём эту
+# страницу. Первый запуск считаем онлайн — а взамен релиз интеграции перестал
+# весить ~700 КБ собранного фронтенда и зависеть от него.
+# Перезагружается сама: бандл приезжает фоном, и жильцу нечего нажимать.
+PLACEHOLDER = (
+    "<!doctype html><html lang=ru><head><meta charset=utf-8>"
+    "<meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<meta http-equiv=refresh content=5>"
+    "<title>Mega Home</title>"
+    "<style>html{color-scheme:light dark}body{margin:0;min-height:100vh;display:flex;"
+    "align-items:center;justify-content:center;font:16px/1.5 system-ui,sans-serif;"
+    "text-align:center;padding:24px}</style></head>"
+    "<body><p>Подключаюсь к менеджеру…<br>Интерфейс загрузится сам.</p></body></html>"
+)
 
 
 async def async_register_http(
@@ -365,18 +375,26 @@ class MegaHomeAppView(_MegaHomeView):
 
 
 def _serve(request: web.Request, relative: str) -> web.StreamResponse:
-    """Serve one file of the ACTIVE bundle version.
+    """Serve one file of the ACTIVE bundle version, or the placeholder.
 
     The active directory is asked for per request on purpose: that is what makes
     switching to a freshly downloaded interface a variable assignment instead of
-    a Home Assistant restart.
+    a Home Assistant restart. Until the first download there is no directory at
+    all (the release carries no copy), and the page is the placeholder above.
     """
     coordinator = _coordinator(request.app["hass"])
-    root = (
-        coordinator.bundle.active_dir
-        if coordinator is not None and coordinator.bundle is not None
-        else BUNDLE_DIR
-    )
+    root = coordinator.bundle.active_dir if coordinator and coordinator.bundle else None
+    if root is None:
+        # Бандл ещё не скачан. Заглушку отдаём только на саму страницу: запрос
+        # файла бандла должен остаться честным 404, иначе браузер получит HTML
+        # вместо js и упадёт с ошибкой разбора вместо понятного экрана.
+        if relative in ("", "index.html") or relative.endswith("/"):
+            return web.Response(
+                text=PLACEHOLDER,
+                content_type="text/html",
+                headers={"Cache-Control": "no-cache"},
+            )
+        return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
     if not relative or relative.endswith("/"):
         relative = f"{relative}index.html"
     try:
