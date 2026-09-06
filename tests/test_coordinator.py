@@ -14,6 +14,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from mega_home.api import ManagerError
 from mega_home.coordinator import MegaHomeCoordinator
 
 
@@ -39,13 +40,24 @@ class FakeClient:
     def __init__(self, version: str = "v1") -> None:
         self.version = version
         self.config_calls = 0
+        # Комнаты конфига и походы за их фонами — для проверки синхронизации
+        # заготовок инсталлятора.
+        self.rooms: list[dict[str, Any]] = []
+        self.photo_calls: list[str] = []
+        self.photo_fails: set[str] = set()
 
     async def async_version(self) -> str:
         return self.version
 
     async def async_config(self) -> dict[str, Any]:
         self.config_calls += 1
-        return {"version": self.version, "scenarios": []}
+        return {"version": self.version, "scenarios": [], "rooms": self.rooms}
+
+    async def async_room_photo(self, room_id: str) -> bytes:
+        self.photo_calls.append(room_id)
+        if room_id in self.photo_fails:
+            raise ManagerError("HTTP 404")
+        return b"\xff\xd8\xff" + room_id.encode()
 
 
 class FakeBundle:
@@ -157,3 +169,62 @@ def test_опрос_включается_явно_иначе_его_нет_во�
     # Снятие подписки возвращает координатор в исходное состояние.
     unloads[0]()
     assert coordinator.listeners == []
+
+
+# --- заготовки фонов инсталлятора ---
+#
+# Фон, который инсталлятор загрузил в менеджере, обязан лежать ФАЙЛОМ в доме:
+# приложение раздаёт интеграция, и до менеджера у телефона жильца дороги может
+# не быть вовсе. Проверяем то, что ломается молча: качаем только недостающее,
+# выбрасываем то, что конфиг больше не называет, и одна недоступная картинка не
+# роняет синхронизацию целиком.
+def test_заготовки_качаются_один_раз(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.rooms = [
+        {"id": "r1", "photoVersion": "v1"},
+        {"id": "r2", "photoVersion": "v1"},
+        {"id": "r3"},  # комната без фона — за ней ходить не за чем
+    ]
+    coordinator = _coordinator(tmp_path, client)
+    coordinator.bundle = FakeBundle()
+
+    asyncio.run(coordinator._async_update_data())
+    assert client.photo_calls == ["r1", "r2"]
+    assert coordinator.stock_photos.has("r1", "v1")
+
+    # Второй опрос: те же версии уже лежат на диске — качать нечего.
+    coordinator.data = None
+    asyncio.run(coordinator._async_update_data())
+    assert client.photo_calls == ["r1", "r2"]
+
+
+def test_смена_и_снятие_фона_доезжают_до_дома(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.rooms = [{"id": "r1", "photoVersion": "v1"}, {"id": "r2", "photoVersion": "v1"}]
+    coordinator = _coordinator(tmp_path, client)
+    coordinator.bundle = FakeBundle()
+    asyncio.run(coordinator._async_update_data())
+
+    # Инсталлятор заменил фон первой комнаты и снял фон второй.
+    client.rooms = [{"id": "r1", "photoVersion": "v2"}, {"id": "r2"}]
+    coordinator.data = None
+    asyncio.run(coordinator._async_update_data())
+
+    assert coordinator.stock_photos.has("r1", "v2")
+    assert not coordinator.stock_photos.has("r1", "v1"), "старая версия — мусор на диске"
+    assert not coordinator.stock_photos.has("r2", "v1"), "снятый фон обязан исчезнуть"
+
+
+def test_недоступная_картинка_не_роняет_синхронизацию(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.rooms = [{"id": "r1", "photoVersion": "v1"}, {"id": "r2", "photoVersion": "v1"}]
+    client.photo_fails = {"r1"}
+    coordinator = _coordinator(tmp_path, client)
+    coordinator.bundle = FakeBundle()
+
+    asyncio.run(coordinator._async_update_data())
+
+    # Дом без одного фона работает; следующий опрос попробует снова.
+    assert not coordinator.stock_photos.has("r1", "v1")
+    assert coordinator.stock_photos.has("r2", "v1")
+    assert coordinator.last_error is None

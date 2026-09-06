@@ -22,10 +22,11 @@ from .const import (
     LOGGER,
     MAX_UPDATE_INTERVAL,
     PHOTO_DIR,
+    STOCK_PHOTO_DIR,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
-from .photos import PhotoStore
+from .photos import PhotoStore, StockPhotoStore
 
 type MegaHomeConfigEntry = ConfigEntry["MegaHomeCoordinator"]
 
@@ -84,6 +85,11 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # they are not synchronised from the manager — the home is where they
         # are created and the only place that holds them.
         self.photos = PhotoStore(Path(hass.config.path(STORAGE_DIR, PHOTO_DIR)))
+        # Заготовки инсталлятора, наоборот, синхронизируются с менеджером: дом
+        # держит их копию, чтобы фон был виден и без дороги до менеджера.
+        self.stock_photos = StockPhotoStore(
+            Path(hass.config.path(STORAGE_DIR, STOCK_PHOTO_DIR))
+        )
 
     @property
     def icons_dir(self) -> Path:
@@ -166,6 +172,7 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         await self._store.async_save(config)
         await self._async_sync_icons(config)
+        await self._async_sync_stock_photos(config)
         await self._async_sync_bundle()
         self._on_success()
         LOGGER.info("Home config updated to %s", config.get("version"))
@@ -200,6 +207,44 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.last_error = None
         self.last_success_at = dt_util.utcnow()
         self.update_interval = DEFAULT_UPDATE_INTERVAL
+
+    async def _async_sync_stock_photos(self, config: dict[str, Any]) -> None:
+        """Mirror the installer's room backgrounds the config names.
+
+        Files, not URLs to the manager — the same reason as the icons: the app
+        is served from inside the home, and the phone looking at it may have no
+        route to the manager at all.
+
+        ⚠ Pruning runs even when nothing is wanted: a background the installer
+        removed has to disappear from the home too, and that case is exactly the
+        one where the download loop below does nothing.
+        """
+        wanted = {
+            room["id"]: room["photoVersion"]
+            for room in config.get("rooms", [])
+            if isinstance(room.get("id"), str)
+            and isinstance(room.get("photoVersion"), str)
+            and room["photoVersion"]
+        }
+        for room_id, version in sorted(wanted.items()):
+            if await self.hass.async_add_executor_job(
+                self.stock_photos.has, room_id, version
+            ):
+                continue
+            try:
+                payload = await self.client.async_room_photo(room_id)
+            except ManagerError as err:
+                # Одна картинка не стоит падения синхронизации: дом без фона
+                # работает, а следующий опрос попробует снова.
+                LOGGER.warning(
+                    "Could not fetch the background of room %s: %s", room_id, err
+                )
+                continue
+            await self.hass.async_add_executor_job(
+                self.stock_photos.save, room_id, version, payload
+            )
+            LOGGER.debug("Stored the background of room %s", room_id)
+        await self.hass.async_add_executor_job(self.stock_photos.prune, wanted)
 
     async def _async_sync_icons(self, config: dict[str, Any]) -> None:
         """Download every scenario icon the config names.

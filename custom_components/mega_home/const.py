@@ -17,6 +17,7 @@ CONF_VERIFY_SSL = "verify_ssl"
 API_VERSION = "/inbound/home-config/version"
 API_CONFIG = "/inbound/home-config"
 API_ICON = "/inbound/home-config/icon"
+API_ROOM_PHOTO = "/inbound/home-config/room-photo"
 API_APP_MANIFEST = "/inbound/home-config/app/manifest"
 API_APP_FILE = "/inbound/home-config/app/file"
 
@@ -43,6 +44,11 @@ ICON_SIZE = "300"
 # Room background photos the resident uploads from the app. They belong to the
 # home, not to a device, so they live next to the rest of our cache.
 PHOTO_DIR = "mega_home_photos"
+# Фоны-ЗАГОТОВКИ, которые инсталлятор загрузил в менеджере. Они приезжают сюда
+# файлами, как иконки сценариев: приложение раздаёт эта интеграция, а дороги от
+# телефона жильца до менеджера может не быть вовсе (объект без интернета,
+# менеджер за офисным фаерволом) — картинка «из облака» была бы пустым фоном.
+STOCK_PHOTO_DIR = "mega_home_stock_photos"
 
 # Home Assistant domain -> what the resident app may do with the tile. Mirrors
 # the manager's smart-home-view.util.ts; the app's screens read these verbatim.

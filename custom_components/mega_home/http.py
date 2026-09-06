@@ -82,6 +82,7 @@ async def async_register_http(
         MegaHomeScenarioView,
         MegaHomePhotosView,
         MegaHomePhotoView,
+        MegaHomeStockPhotoView,
         MegaHomeAppRootView,
         MegaHomeAppView,
     ):
@@ -294,6 +295,46 @@ class MegaHomePhotoView(_MegaHomeView):
 
 def _room_exists(config: dict[str, Any], room_id: str) -> bool:
     return any(room.get("id") == room_id for room in config.get("rooms", []))
+
+
+class MegaHomeStockPhotoView(_MegaHomeView):
+    """The INSTALLER's background for one room, mirrored from the manager.
+
+    ⚠ Версию берём ИЗ КОНФИГА, а не из адреса: `?v=` в адресе — метка кэша для
+    браузера, и доверять ей как имени файла значило бы отдавать по чужой ссылке
+    то, чего в конфиге уже нет. Конфиг тут единственный источник правды: какая
+    заготовка у комнаты сейчас, ту дом и показывает.
+    """
+
+    url = f"{URL_API}/stock-photo/{{room}}"
+    name = "api:mega_home:stock-photo"
+
+    async def get(self, request: web.Request, room: str) -> web.StreamResponse:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        version = _stock_version(coordinator.data, room)
+        if not version:
+            return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
+        hass: HomeAssistant = request.app["hass"]
+        target = coordinator.stock_photos.path(room, version)
+        if not await hass.async_add_executor_job(target.is_file):
+            # Конфиг заготовку обещает, а файла ещё нет: синхронизация не дошла
+            # (дом только что поднялся, менеджер был недоступен). Это не ошибка
+            # приложения — оно просто нарисует градиент до следующего опроса.
+            return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
+        return web.FileResponse(
+            target, headers={"Cache-Control": "public, max-age=31536000, immutable"}
+        )
+
+
+def _stock_version(config: dict[str, Any], room_id: str) -> str | None:
+    for room in config.get("rooms", []):
+        if room.get("id") == room_id:
+            version = room.get("photoVersion")
+            return version if isinstance(version, str) and version else None
+    return None
 
 
 class MegaHomeAppRootView(_MegaHomeView):

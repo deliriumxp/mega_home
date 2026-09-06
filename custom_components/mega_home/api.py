@@ -13,6 +13,7 @@ from .const import (
     API_APP_MANIFEST,
     API_CONFIG,
     API_ICON,
+    API_ROOM_PHOTO,
     API_VERSION,
     ICON_SIZE,
     REQUEST_TIMEOUT,
@@ -66,6 +67,10 @@ class ManagerClient:
     async def async_icon(self, icon: str, size: str = ICON_SIZE) -> bytes:
         """Return one scenario icon as PNG bytes."""
         return await self._get_bytes(f"{API_ICON}/{icon}?size={size}")
+
+    async def async_room_photo(self, room_id: str) -> bytes:
+        """Return the installer's background for one room, as JPEG bytes."""
+        return await self._get_bytes(f"{API_ROOM_PHOTO}/{quote(room_id)}")
 
     async def _get_bytes(self, path: str) -> bytes:
         try:
