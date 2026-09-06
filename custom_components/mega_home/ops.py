@@ -232,6 +232,37 @@ def _camera_urls(entity_id: Any, attributes: Any) -> dict[str, str]:
     }
 
 
+# ⚠ Биты — из `MediaPlayerEntityFeature` Home Assistant, это его ПУБЛИЧНЫЙ
+# контракт (их читают интеграции по всему миру, менять их HA не может). Тот же
+# список лежит в менеджере (smart-home-view.util.ts): проекций две, и они обязаны
+# отвечать одинаково — правится в обоих местах одной правкой.
+MEDIA_FEATURES: tuple[tuple[int, str], ...] = (
+    (1, "pause"),
+    (4, "volume"),
+    (8, "mute"),
+    (16, "previous"),
+    (32, "next"),
+    (128, "turn_on"),
+    (256, "turn_off"),
+    (2048, "source"),
+    (16384, "play"),
+)
+
+
+def _media_capabilities(attributes: Any) -> list[str]:
+    """Что умеет ЭТОТ плеер — из маски `supported_features`."""
+    mask = (attributes or {}).get("supported_features")
+    if not isinstance(mask, int) or mask <= 0:
+        return []
+    out = [name for bit, name in MEDIA_FEATURES if mask & bit == bit]
+    # Плитка спрашивает одним словом: «есть ли вкл/выкл» и «есть ли пуск/пауза».
+    if "turn_on" in out or "turn_off" in out:
+        out.append("power")
+    if "play" in out or "pause" in out:
+        out.append("play_pause")
+    return out
+
+
 def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
     """Project one Home Assistant state into what the app's screens read.
 
@@ -263,6 +294,20 @@ def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
         values["temperature"] = attributes.get("current_temperature")
         values["targetTemperature"] = attributes.get("temperature")
         values["mode"] = raw
+    elif domain == "media_player":
+        # ⚠ Состояний у плеера пять (off/idle/playing/paused/standby), и сводить
+        # их к `power` нельзя: пауза — это ВКЛЮЧЁН, но не играет, и кнопка на
+        # плитке в этих двух случаях разная.
+        values["power"] = raw not in ("off", "standby") and not unavailable
+        values["playing"] = raw == "playing"
+        # Показываем ровно то, что показывает своей плиткой сам Home Assistant.
+        values["title"] = attributes.get("media_title")
+        values["subtitle"] = attributes.get("media_artist") or attributes.get("app_name")
+        values["source"] = attributes.get("source")
+        volume = attributes.get("volume_level")
+        if isinstance(volume, (int, float)):
+            values["volume"] = round(volume * 100)
+        values["muted"] = attributes.get("is_volume_muted") is True
     elif domain == "camera":
         # A camera has no on/off: its state is idle/recording/streaming. An
         # invented `power` would turn the tile into a switch with nothing to
@@ -274,7 +319,11 @@ def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
         # depends on it and there is nowhere to learn it after the fact.
         values["streamType"] = attributes.get("frontend_stream_type")
 
-    capabilities = list(CAPABILITIES.get(domain, []))
+    capabilities = (
+        _media_capabilities(attributes)
+        if domain == "media_player"
+        else list(CAPABILITIES.get(domain, []))
+    )
     # Диммируемость KNX-плитки известна из адреса ETS (`dimmable`), а у сущности,
     # найденной сканом HA, — только по живому состоянию: в реестре атрибутов нет.
     # Та же развилка в менеджере (smart-home-view.util.ts) — контракт общий.

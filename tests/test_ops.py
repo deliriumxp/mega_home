@@ -207,3 +207,53 @@ def test_элемент_без_сущности_адресов_не_получа
 
     assert view["state"]["picture"] == ""
     assert view["available"] is False
+
+# Медиаплеер. ⚠ Та же оговорка, что у камеры: форма состояния и список
+# способностей — КОНТРАКТ с менеджером (smart-home-view.util.ts). Биты взяты у
+# самого Home Assistant (`MediaPlayerEntityFeature`), поэтому «что показывать»
+# не выдумано ни здесь, ни там.
+
+def _плеер(state: str, attributes: dict) -> dict:
+    return ops.entity_view(
+        {
+            "id": "tv1",
+            "domain": "media_player",
+            "entityId": "media_player.tv",
+            "name": "Телевизор",
+        },
+        State(state, attributes),
+    )
+
+def test_кнопки_плеера_складываются_из_supported_features():
+    # PAUSE(1) + PREVIOUS(16) + NEXT(32) + TURN_OFF(256) + PLAY(16384)
+    view = _плеер("playing", {"supported_features": 1 + 16 + 32 + 256 + 16384})
+
+    assert set(view["capabilities"]) >= {
+        "pause",
+        "play",
+        "play_pause",
+        "previous",
+        "next",
+        "power",
+    }
+    assert "volume" not in view["capabilities"]
+
+def test_плеер_без_маски_способностей_не_получает():
+    # Обещать кнопку, которой у прибора нет, хуже, чем не показать её.
+    assert _плеер("idle", {})["capabilities"] == []
+
+def test_пауза_это_включён_а_standby_нет():
+    # Свести пять состояний к одному `power` нельзя: на паузе плеер ВКЛЮЧЁН, и
+    # кнопка на плитке в этих случаях разная.
+    paused = _плеер("paused", {"media_title": "Сюита №3", "volume_level": 0.42})
+    assert paused["state"]["power"] is True
+    assert paused["state"]["playing"] is False
+    assert paused["state"]["title"] == "Сюита №3"
+    assert paused["state"]["volume"] == 42
+
+    assert _плеер("standby", {})["state"]["power"] is False
+    assert _плеер("off", {})["state"]["power"] is False
+
+def test_подпись_плеера_берёт_имя_приложения():
+    # У телевизора вместо исполнителя осмысленно только оно.
+    assert _плеер("playing", {"app_name": "Netflix"})["state"]["subtitle"] == "Netflix"

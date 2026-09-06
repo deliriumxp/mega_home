@@ -58,6 +58,10 @@ CAPABILITIES: dict[str, list[str]] = {
     "cover": ["open_close", "position"],
     "climate": ["temperature", "mode"],
     "binary_sensor": ["read_only"],
+    # ⚠ У медиаплеера базовых способностей НЕТ: два телевизора одного дома
+    # умеют разное, и «умеет ли он паузу» знает только Home Assistant. Всё
+    # складывается из `supported_features` (см. `media_capabilities` в ops.py).
+    "media_player": [],
     # A camera is not operated, it is watched. `video` means exactly "this tile
     # has something to show"; how it is shown is the app's business.
     "camera": ["video"],
@@ -81,6 +85,17 @@ COMMAND_SERVICES: dict[str, dict[str, str]] = {
     "climate": {
         "set_temperature": "set_temperature",
         "set_mode": "set_hvac_mode",
+    },
+    # ⚠ `play_pause` уходит ОДНОЙ службой, а не «play или pause по состоянию»:
+    # `media_play_pause` решает это у себя, по свежему состоянию. Решай мы здесь
+    # — команда шла бы по снимку трёхсекундной давности, и нажатие на паузу
+    # иногда снимало бы плеер с паузы.
+    "media_player": {
+        "turn_on": "turn_on",
+        "turn_off": "turn_off",
+        "play_pause": "media_play_pause",
+        "previous": "media_previous_track",
+        "next": "media_next_track",
     },
 }
 
