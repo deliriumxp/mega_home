@@ -28,7 +28,7 @@ import voluptuous as vol
 from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import ServiceNotFound
 
-from .const import CAPABILITIES, COMMAND_SERVICES, LOGGER
+from .const import COMMAND_SERVICES, LOGGER
 from .coordinator import MegaHomeCoordinator
 
 
@@ -105,20 +105,18 @@ async def command(
         )
 
     name = payload.get("command")
-    service = COMMAND_SERVICES.get(tile["domain"], {}).get(name)
-    if not service:
+    spec = command_spec(tile, name)
+    if spec is None:
         raise OpError("Команда не поддерживается устройством", HTTPStatus.NOT_FOUND)
-    if name == "set_brightness" and not tile.get("dimmable"):
-        raise OpError(
-            "Устройство не поддерживает регулировку яркости", HTTPStatus.NOT_FOUND
-        )
 
     try:
-        data = service_data(name, payload.get("value"))
+        data = service_data(spec, payload.get("value"))
     except ValueError as err:
         raise OpError(str(err)) from err
 
-    await call(hass, tile["domain"], service, {"entity_id": tile["entityId"], **data})
+    await call(
+        hass, spec["domain"], spec["service"], {"entity_id": tile["entityId"], **data}
+    )
     # ⚠ Ответ несёт НОВОЕ состояние плитки, а не только «принято». Иначе
     # приложению остаётся либо ждать следующего снимка (тап выглядит
     # непринятым почти секунду), либо рисовать угаданное состояние — и то и
@@ -175,17 +173,60 @@ def find(items: list[dict[str, Any]], item_id: Any) -> dict[str, Any] | None:
     return next((item for item in items if item.get("id") == item_id), None)
 
 
-def service_data(command_name: str, value: Any) -> dict[str, Any]:
-    """Validate the one numeric argument a command may carry."""
-    if command_name == "set_brightness":
-        return {"brightness_pct": number(value, 0, 100)}
-    if command_name == "set_position":
-        return {"position": number(value, 0, 100)}
-    if command_name == "set_temperature":
-        return {"temperature": number(value, 5, 40)}
-    if command_name == "set_mode":
-        return {"hvac_mode": str(value or "")}
-    return {}
+def command_spec(tile: dict[str, Any], name: Any) -> dict[str, Any] | None:
+    """Чем исполнять команду: службой ИЗ КОНФИГА, а не из таблицы в этом файле.
+
+    ⚠ Ради этого затевался тонкий шлюз (docs/plan-thin-integration.md, фаза 2).
+    Пока карта команд жила здесь, новый управляемый домен — вентилятор, замок,
+    пылесос — стоил релиза HACS и перезапуска Home Assistant НА КАЖДОМ объекте.
+    Теперь менеджер кладёт службу в конфиг плитки, и она доезжает обычной
+    синхронизацией.
+
+    ⚠ Фолбэк на `COMMAND_SERVICES` оставлен на одну версию: конфиг в кэше дома
+    старше этого кода ровно до первой синхронизации, и без фолбэка объект после
+    обновления интеграции остался бы без управления до неё.
+    """
+    if not isinstance(name, str):
+        return None
+    described = (tile.get("commands") or {}).get(name)
+    if isinstance(described, dict) and described.get("service"):
+        return {
+            "domain": described.get("domain") or tile["domain"],
+            "service": described["service"],
+            "arg": described.get("arg"),
+            "min": described.get("min"),
+            "max": described.get("max"),
+        }
+    service = COMMAND_SERVICES.get(tile["domain"], {}).get(name)
+    if not service:
+        return None
+    return {"domain": tile["domain"], "service": service, **LEGACY_ARGS.get(name, {})}
+
+
+# Аргументы команд для домов, чей кэш конфига ещё без карты команд. Уходит
+# вместе с `COMMAND_SERVICES` следующим выпуском.
+LEGACY_ARGS: dict[str, dict[str, Any]] = {
+    "set_brightness": {"arg": "brightness_pct", "min": 0, "max": 100},
+    "set_position": {"arg": "position", "min": 0, "max": 100},
+    "set_temperature": {"arg": "temperature", "min": 5, "max": 40},
+    "set_mode": {"arg": "hvac_mode"},
+}
+
+
+def service_data(spec: dict[str, Any], value: Any) -> dict[str, Any]:
+    """Единственный аргумент команды, проверенный по описанным границам.
+
+    ⚠ Границы приходят из конфига, но проверяет их ЭТА сторона: службу зовём мы,
+    а браузеру жильца верить нельзя. Аргумент без границ — строковый (режим
+    термостата), с границами — число.
+    """
+    arg = spec.get("arg")
+    if not arg:
+        return {}
+    low, high = spec.get("min"), spec.get("max")
+    if low is None or high is None:
+        return {arg: str(value or "")}
+    return {arg: number(value, low, high)}
 
 
 def number(value: Any, low: int, high: int) -> float:
@@ -196,14 +237,6 @@ def number(value: Any, low: int, high: int) -> float:
     if not low <= parsed <= high:
         raise ValueError(f"Значение должно быть от {low} до {high}")
     return parsed
-
-
-def _brightness_capable(attributes: Any) -> bool:
-    """Поддерживает ли сущность яркость — по её живому состоянию."""
-    modes = (attributes or {}).get("supported_color_modes")
-    if isinstance(modes, (list, tuple)) and modes:
-        return any(mode != "onoff" for mode in modes)
-    return isinstance((attributes or {}).get("brightness"), (int, float))
 
 
 def _camera_urls(entity_id: Any, attributes: Any) -> dict[str, str]:
@@ -232,37 +265,6 @@ def _camera_urls(entity_id: Any, attributes: Any) -> dict[str, str]:
     }
 
 
-# ⚠ Биты — из `MediaPlayerEntityFeature` Home Assistant, это его ПУБЛИЧНЫЙ
-# контракт (их читают интеграции по всему миру, менять их HA не может). Тот же
-# список лежит в менеджере (smart-home-view.util.ts): проекций две, и они обязаны
-# отвечать одинаково — правится в обоих местах одной правкой.
-MEDIA_FEATURES: tuple[tuple[int, str], ...] = (
-    (1, "pause"),
-    (4, "volume"),
-    (8, "mute"),
-    (16, "previous"),
-    (32, "next"),
-    (128, "turn_on"),
-    (256, "turn_off"),
-    (2048, "source"),
-    (16384, "play"),
-)
-
-
-def _media_capabilities(attributes: Any) -> list[str]:
-    """Что умеет ЭТОТ плеер — из маски `supported_features`."""
-    mask = (attributes or {}).get("supported_features")
-    if not isinstance(mask, int) or mask <= 0:
-        return []
-    out = [name for bit, name in MEDIA_FEATURES if mask & bit == bit]
-    # Плитка спрашивает одним словом: «есть ли вкл/выкл» и «есть ли пуск/пауза».
-    if "turn_on" in out or "turn_off" in out:
-        out.append("power")
-    if "play" in out or "pause" in out:
-        out.append("play_pause")
-    return out
-
-
 # Что из атрибутов наружу НЕ уходит.
 #
 # ⚠ Список короткий намеренно. Это не «фильтр полезного» — атрибуты уходят
@@ -284,12 +286,24 @@ def _public_attributes(attributes: Any) -> dict[str, Any]:
 
 
 def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
-    """Project one Home Assistant state into what the app's screens read.
+    """Что дом отвечает о приборе: сырое состояние Home Assistant и атрибуты.
 
-    ⚠ This is the same projection the manager does in smart-home-view.util.ts.
-    The two live in different repositories on purpose (the manager is out of the
-    runtime path), so the shape is a contract: change it here and there in the
-    same breath.
+    ⚠ Проекции здесь БОЛЬШЕ НЕТ (docs/plan-thin-integration.md, фаза 1).
+    `power`, `playing`, яркость, позицию, температуру и способности считает
+    ПРИЛОЖЕНИЕ — в одном месте на весь продукт (`ha-entity.ts`). Раньше то же
+    самое считалось трижды: здесь, в менеджере и на экране, — и каждое новое
+    поле экрана стоило правки в двух репозиториях, из которых ЭТОТ доезжает до
+    объекта только релизом HACS и перезапуском Home Assistant. Ради того, чтобы
+    в интеграции нечему было ломаться, всё это отсюда и убрано: не возвращай.
+
+    ⚠ Камера — единственное исключение, и оно не растёт: адреса кадра и потока
+    строятся из `entity_id` и `access_token`, а наружу не уходит ни то, ни
+    другое (`entity_id` намеренно, токен как секрет).
+
+    ⚠ `name` и `roomId` пока едут: приложение берёт их из конфига только начиная
+    с бандла 2026-09-06, и убрать их можно лишь ПОСЛЕ того, как этот бандл
+    повышен в релиз (правило выпуска: поле не убирают в том же выпуске, в
+    котором появилась его замена).
     """
     domain = tile["domain"]
     raw = state.state if state else None
@@ -297,65 +311,19 @@ def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
     unavailable = raw in ("unavailable", "unknown")
     values: dict[str, Any] = {"value": raw}
 
-    if domain == "light":
-        values["power"] = raw == "on"
-        brightness = attributes.get("brightness")
-        if isinstance(brightness, (int, float)):
-            values["brightness"] = round(brightness / 255 * 100)
-    elif domain in ("switch", "binary_sensor"):
-        values["power"] = raw == "on"
-        if domain == "binary_sensor":
-            values["deviceClass"] = attributes.get("device_class")
-    elif domain == "cover":
-        position = attributes.get("current_position")
-        if isinstance(position, (int, float)):
-            values["position"] = position
-    elif domain == "climate":
-        values["temperature"] = attributes.get("current_temperature")
-        values["targetTemperature"] = attributes.get("temperature")
-        values["mode"] = raw
-    elif domain == "media_player":
-        # ⚠ Состояний у плеера пять (off/idle/playing/paused/standby), и сводить
-        # их к `power` нельзя: пауза — это ВКЛЮЧЁН, но не играет, и кнопка на
-        # плитке в этих двух случаях разная.
-        values["power"] = raw not in ("off", "standby") and not unavailable
-        values["playing"] = raw == "playing"
-        # Показываем ровно то, что показывает своей плиткой сам Home Assistant.
-        values["title"] = attributes.get("media_title")
-        values["subtitle"] = attributes.get("media_artist") or attributes.get("app_name")
-        values["source"] = attributes.get("source")
-        volume = attributes.get("volume_level")
-        if isinstance(volume, (int, float)):
-            values["volume"] = round(volume * 100)
-        values["muted"] = attributes.get("is_volume_muted") is True
-    elif domain == "camera":
-        # A camera has no on/off: its state is idle/recording/streaming. An
-        # invented `power` would turn the tile into a switch with nothing to
-        # switch, so we only hand over where to look.
+    if domain == "camera":
         values.update(_camera_urls(tile.get("entityId"), attributes))
-        # Which way Home Assistant serves live video: `hls` or `web_rtc`. Nothing
-        # reads it yet - the app shows MJPEG, which every browser plays without a
-        # single dependency. It travels from the start because remote viewing
-        # depends on it and there is nowhere to learn it after the fact.
+        # Каким способом Home Assistant отдаёт живое видео: `hls` или `web_rtc`.
+        # Пока не читает никто — приложение показывает MJPEG, который умеет любой
+        # браузер без единой зависимости, — но от поля зависит удалённый просмотр,
+        # и узнать его задним числом неоткуда.
         values["streamType"] = attributes.get("frontend_stream_type")
-
-    capabilities = (
-        _media_capabilities(attributes)
-        if domain == "media_player"
-        else list(CAPABILITIES.get(domain, []))
-    )
-    # Диммируемость KNX-плитки известна из адреса ETS (`dimmable`), а у сущности,
-    # найденной сканом HA, — только по живому состоянию: в реестре атрибутов нет.
-    # Та же развилка в менеджере (smart-home-view.util.ts) — контракт общий.
-    if domain == "light" and (tile.get("dimmable") or _brightness_capable(attributes)):
-        capabilities.append("brightness")
 
     return {
         "id": tile["id"],
         "roomId": tile.get("roomId"),
         "name": tile.get("name"),
         "domain": domain,
-        "capabilities": capabilities,
         "state": values,
         "attributes": _public_attributes(attributes),
         "available": state is not None and not unavailable,

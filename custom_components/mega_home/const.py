@@ -50,25 +50,12 @@ PHOTO_DIR = "mega_home_photos"
 # менеджер за офисным фаерволом) — картинка «из облака» была бы пустым фоном.
 STOCK_PHOTO_DIR = "mega_home_stock_photos"
 
-# Home Assistant domain -> what the resident app may do with the tile. Mirrors
-# the manager's smart-home-view.util.ts; the app's screens read these verbatim.
-CAPABILITIES: dict[str, list[str]] = {
-    "switch": ["power"],
-    "light": ["power"],
-    "cover": ["open_close", "position"],
-    "climate": ["temperature", "mode"],
-    "binary_sensor": ["read_only"],
-    # ⚠ У медиаплеера базовых способностей НЕТ: два телевизора одного дома
-    # умеют разное, и «умеет ли он паузу» знает только Home Assistant. Всё
-    # складывается из `supported_features` (см. `media_capabilities` в ops.py).
-    "media_player": [],
-    # A camera is not operated, it is watched. `video` means exactly "this tile
-    # has something to show"; how it is shown is the app's business.
-    "camera": ["video"],
-}
-
-# Command -> Home Assistant service, per domain. A command outside this table is
-# rejected: the app must not be able to call an arbitrary service through us.
+# Command -> Home Assistant service, per domain.
+#
+# ⚠ ТАБЛИЦА УМИРАЕТ. Карта команд приезжает в конфиге плитки (`commands`), и
+# зовёт службу `ops.command_spec`; здесь остался фолбэк на одну версию — для
+# дома, чей кэш конфига ещё старее этого кода. Убрать вместе с `LEGACY_ARGS`
+# следующим выпуском (docs/plan-thin-integration.md, фаза 3).
 COMMAND_SERVICES: dict[str, dict[str, str]] = {
     "switch": {"turn_on": "turn_on", "turn_off": "turn_off"},
     "light": {

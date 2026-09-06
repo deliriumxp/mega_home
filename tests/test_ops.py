@@ -68,6 +68,19 @@ _CONFIG = {
             "domain": "light",
             "entityId": "light.kitchen",
             "dimmable": True,
+            # ⚠ Чем командовать плиткой, дом узнаёт ИЗ КОНФИГА (фаза 2 плана):
+            # новый управляемый домен больше не стоит релиза HACS.
+            "commands": {
+                "turn_on": {"domain": "light", "service": "turn_on"},
+                "turn_off": {"domain": "light", "service": "turn_off"},
+                "set_brightness": {
+                    "domain": "light",
+                    "service": "turn_on",
+                    "arg": "brightness_pct",
+                    "min": 0,
+                    "max": 100,
+                },
+            },
         },
         {
             "id": "t2",
@@ -76,6 +89,7 @@ _CONFIG = {
             "domain": "switch",
             "entityId": None,
             "dimmable": False,
+            "commands": {"turn_on": {"domain": "switch", "service": "turn_on"}},
         },
     ],
     "scenarios": [{"id": "s1", "roomId": "r1", "name": "Вечер", "icon": "evening", "entityId": "script.evening"}],
@@ -108,8 +122,13 @@ def test_состояния_несут_версии_конфига_и_бандл
     # Плитка без сущности в Home Assistant остаётся в списке, но недоступна:
     # приложение показывает ВЕСЬ состав объекта, а не только отправленное.
     light, socket = answer["entities"]
-    assert light["state"]["power"] is True and light["state"]["brightness"] == 100
-    assert "brightness" in light["capabilities"]
+    # ⚠ Дом больше НЕ толкует состояние: наружу уходит сырое значение и атрибуты
+    # Home Assistant, а `power`, яркость и способности считает приложение
+    # (docs/plan-thin-integration.md, фаза 1). Вернуть сюда вычисленные поля =
+    # снова платить релизом HACS за каждое поле экрана.
+    assert light["state"] == {"value": "on"}
+    assert light["attributes"] == {"brightness": 255}
+    assert "capabilities" not in light
     assert socket["available"] is False
 
 
@@ -181,7 +200,6 @@ def test_кадр_и_поток_строятся_по_entity_id_и_подпис�
     assert view["state"]["picture"] == "/api/camera_proxy/camera.gate?token=tok%20en"
     assert view["state"]["stream"] == "/api/camera_proxy_stream/camera.gate?token=tok%20en"
     assert view["state"]["streamType"] == "hls"
-    assert view["capabilities"] == ["video"]
     assert view["available"] is True
 
 
@@ -208,10 +226,11 @@ def test_элемент_без_сущности_адресов_не_получа
     assert view["state"]["picture"] == ""
     assert view["available"] is False
 
-# Медиаплеер. ⚠ Та же оговорка, что у камеры: форма состояния и список
-# способностей — КОНТРАКТ с менеджером (smart-home-view.util.ts). Биты взяты у
-# самого Home Assistant (`MediaPlayerEntityFeature`), поэтому «что показывать»
-# не выдумано ни здесь, ни там.
+# Медиаплеер. ⚠ Проекция ЕГО СОСТОЯНИЯ отсюда убрана вместе со всеми
+# остальными: пять состояний плеера, подписи, громкость и кнопки из
+# `supported_features` толкует приложение, в одном месте на продукт
+# (`ha-entity.spec.ts`). Здесь остаётся проверка, что дом ничего не выдумывает.
+
 
 def _плеер(state: str, attributes: dict) -> dict:
     return ops.entity_view(
@@ -224,39 +243,14 @@ def _плеер(state: str, attributes: dict) -> dict:
         State(state, attributes),
     )
 
-def test_кнопки_плеера_складываются_из_supported_features():
-    # PAUSE(1) + PREVIOUS(16) + NEXT(32) + TURN_OFF(256) + PLAY(16384)
-    view = _плеер("playing", {"supported_features": 1 + 16 + 32 + 256 + 16384})
 
-    assert set(view["capabilities"]) >= {
-        "pause",
-        "play",
-        "play_pause",
-        "previous",
-        "next",
-        "power",
-    }
-    assert "volume" not in view["capabilities"]
+def test_состояние_плеера_уходит_сырым():
+    view = _плеер("paused", {"media_title": "Сюита №3", "supported_features": 1})
 
-def test_плеер_без_маски_способностей_не_получает():
-    # Обещать кнопку, которой у прибора нет, хуже, чем не показать её.
-    assert _плеер("idle", {})["capabilities"] == []
+    assert view["state"] == {"value": "paused"}
+    assert view["attributes"]["media_title"] == "Сюита №3"
+    assert "capabilities" not in view
 
-def test_пауза_это_включён_а_standby_нет():
-    # Свести пять состояний к одному `power` нельзя: на паузе плеер ВКЛЮЧЁН, и
-    # кнопка на плитке в этих случаях разная.
-    paused = _плеер("paused", {"media_title": "Сюита №3", "volume_level": 0.42})
-    assert paused["state"]["power"] is True
-    assert paused["state"]["playing"] is False
-    assert paused["state"]["title"] == "Сюита №3"
-    assert paused["state"]["volume"] == 42
-
-    assert _плеер("standby", {})["state"]["power"] is False
-    assert _плеер("off", {})["state"]["power"] is False
-
-def test_подпись_плеера_берёт_имя_приложения():
-    # У телевизора вместо исполнителя осмысленно только оно.
-    assert _плеер("playing", {"app_name": "Netflix"})["state"]["subtitle"] == "Netflix"
 
 # Атрибуты Home Assistant. ⚠ Решение 2026-09-06: отдаём ЦЕЛИКОМ, а не выборкой —
 # приложение живёт только внутри HA, и сокращать уже посчитанное им значит
@@ -300,3 +294,94 @@ def test_без_состояния_атрибуты_пустые():
     )
 
     assert view["attributes"] == {}
+
+
+# Карта команд (docs/plan-thin-integration.md, фаза 2). ⚠ Смысл всей затеи:
+# новый управляемый домен приезжает в дом ДАННЫМИ, обычной синхронизацией
+# конфига, а не релизом HACS с перезапуском Home Assistant на каждом объекте.
+
+
+def test_служба_берётся_из_конфига_плитки():
+    hass = _Hass()
+    config = {
+        **_CONFIG,
+        "tiles": [
+            {
+                "id": "t9",
+                "roomId": "r1",
+                "name": "Вытяжка",
+                # Домена `fan` эта интеграция не знает и знать не должна.
+                "domain": "fan",
+                "entityId": "fan.hood",
+                "dimmable": False,
+                "commands": {
+                    "turn_on": {"domain": "fan", "service": "turn_on"},
+                    "set_speed": {
+                        "domain": "fan",
+                        "service": "set_percentage",
+                        "arg": "percentage",
+                        "min": 0,
+                        "max": 100,
+                    },
+                },
+            }
+        ],
+    }
+
+    run(hass, _Coordinator(data=config), "command", {"id": "t9", "command": "turn_on"})
+    run(
+        hass,
+        _Coordinator(data=config),
+        "command",
+        {"id": "t9", "command": "set_speed", "value": 30},
+    )
+
+    assert hass.services.calls == [
+        ("fan", "turn_on", {"entity_id": "fan.hood"}),
+        ("fan", "set_percentage", {"entity_id": "fan.hood", "percentage": 30.0}),
+    ]
+
+
+def test_границы_из_конфига_проверяет_дом():
+    # ⚠ Границы приходят данными, но проверяет их ЭТА сторона: службу зовём мы,
+    # а браузеру жильца верить нельзя.
+    hass = _Hass()
+    with pytest.raises(ops.OpError) as err:
+        run(
+            hass,
+            _Coordinator(),
+            "command",
+            {"id": "t1", "command": "set_brightness", "value": 900},
+        )
+    assert "от 0 до 100" in err.value.message
+    assert hass.services.calls == []
+
+
+def test_дом_со_старым_конфигом_управляется_по_прежней_таблице():
+    # ⚠ Кэш конфига старше кода ровно до первой синхронизации. Без фолбэка
+    # объект после обновления интеграции остался бы без управления до неё.
+    hass = _Hass()
+    старый = {
+        **_CONFIG,
+        "tiles": [
+            {
+                "id": "t1",
+                "roomId": "r1",
+                "name": "Свет",
+                "domain": "light",
+                "entityId": "light.kitchen",
+                "dimmable": True,
+            }
+        ],
+    }
+
+    run(
+        hass,
+        _Coordinator(data=старый),
+        "command",
+        {"id": "t1", "command": "set_brightness", "value": 40},
+    )
+
+    assert hass.services.calls == [
+        ("light", "turn_on", {"entity_id": "light.kitchen", "brightness_pct": 40.0})
+    ]

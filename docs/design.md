@@ -172,16 +172,35 @@ Found on a live object: `last_success_at` and `app_checked_at` ten hours old, wi
 try", not "could not". `MegaHomeCoordinator.keep_polling()` registers one empty listener, tied
 to the config entry's unload.
 
-## The states projection is a shared contract
+## There is no states projection any more
 
-`entity_view()` in `ops.py` produces exactly what the manager's
-`smart-home-view.util.ts` produces (brightness as a percentage, cover position, the
-capabilities list, `available`, `updatedAt` in epoch milliseconds). The app's screens read that
-shape and know nothing about which side answered.
+`entity_view()` in `ops.py` used to compute what the screens read — brightness as a
+percentage, cover position, the capabilities list — and the manager's
+`smart-home-view.util.ts` computed the same thing a second time. That duplication was the
+expensive half of this integration: a new field on a screen cost an edit in two repositories,
+and this one reaches an object only through a HACS release and a Home Assistant restart.
 
-The duplication is deliberate and unavoidable: the entire point of the phase is that the
-manager is not in the runtime path. It is a contract between two repositories — change it here
-and there in the same breath.
+Since 0.1.13 both sides just forward. The home answers `{id, roomId, name, domain, state:
+{value}, attributes, available, updatedAt}` and the app derives everything else from
+`domain + state + attributes`, in one place (`ha-entity.ts` in the manager repository).
+Do not bring the projection back.
+
+Two exceptions, neither growing:
+
+- **the camera** — the still and stream URLs are built from `entity_id` and `access_token`,
+  and neither leaves the house (the token is a secret), so they cannot be built by the app;
+- **`name` and `roomId`** — they still ride along until the app bundle that reads them from
+  the config is promoted to the release channel. A field is never dropped in the same release
+  that introduces its replacement.
+
+## Commands come from the config, not from a table here
+
+`COMMAND_SERVICES` in `const.py` is a fallback, kept for one version. What actually runs is the
+`commands` map the manager puts on every tile of the home config: command name → `{domain,
+service, arg, min, max}`. A new controllable domain — a fan, a lock, a vacuum — is now a change
+in the manager and the app, delivered by the ordinary config sync: no HACS, no restart, no
+visit. The bounds travel as data but are enforced HERE: this side calls the service, and the
+resident's browser is not to be trusted.
 
 ## Registration happens once per Home Assistant run
 
