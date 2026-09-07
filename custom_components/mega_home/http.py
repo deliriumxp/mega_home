@@ -213,7 +213,18 @@ class MegaHomeScenarioView(_MegaHomeView):
 
 
 class MegaHomePhotosView(_MegaHomeView):
-    """Which rooms have a background photo, and what version it is."""
+    """What has a background photo, and what version it is.
+
+    ⚠ Не только комнаты. Фон бывает и у ОДНОЙ ПЛИТКИ: инсталлятор снимает в
+    квартире сам прибор — группу света, телевизор, шторы — и ставит снимок
+    фоном его плитки (приложение, долгое удержание). Ключ плитки — `tile:<id>`,
+    и разведён приставкой не для красоты: идентификаторы плиток и комнат
+    приходят из разных источников и совпасть могут запросто.
+
+    Перечислять их обязано именно ЗДЕСЬ: приложение спрашивает «что вообще
+    задано» одним запросом на открытие, и плитка, которой нет в этом списке,
+    покажется без фона, даже если файл на диске лежит.
+    """
 
     url = f"{URL_API}/photos"
     name = "api:mega_home:photos"
@@ -224,22 +235,26 @@ class MegaHomePhotosView(_MegaHomeView):
             return error
         assert coordinator is not None
         hass: HomeAssistant = request.app["hass"]
-        rooms = [
-            room["id"] for room in coordinator.data.get("rooms", []) if room.get("id")
-        ]
-        versions = await hass.async_add_executor_job(coordinator.photos.versions, rooms)
+        versions = await hass.async_add_executor_job(
+            coordinator.photos.versions, _photo_keys(coordinator.data)
+        )
         return self.json({"photos": versions})
 
 
 class MegaHomePhotoView(_MegaHomeView):
-    """One room's background: read it, replace it, remove it.
+    """One background: read it, replace it, remove it.
 
     ⚠ `room` is a positional argument, not something to dig out of the request:
     Home Assistant calls handlers as `handler(request, **request.match_info)`.
+    Имя параметра осталось прежним (маршрут менять нельзя — по нему ходят уже
+    работающие дома), но значением приходит КЛЮЧ ФОНА: комната (`kitchen`) или
+    плитка (`tile:light.kitchen_main`).
 
-    Only a room the current config knows can be written. That is the bound on
-    this endpoint — without it anyone on the local network could fill the
-    object's disk (there is no authentication yet, see the module docstring).
+    Only a key the current config knows can be written — комната из состава или
+    плитка из него же. That is the bound on this endpoint: без него любой в
+    локальной сети забил бы диск объекта файлами (аутентификации у HTTP-контура
+    пока нет, см. docstring модуля). Хранилище само по себе ключа не боится —
+    имя файла это хеш (`photos.py`), — но неограниченный НАБОР ключей боится.
     """
 
     url = f"{URL_API}/photo/{{room}}"
@@ -265,8 +280,8 @@ class MegaHomePhotoView(_MegaHomeView):
         if error is not None:
             return error
         assert coordinator is not None
-        if not _room_exists(coordinator.data, room):
-            return self.json_message("Комната не найдена", HTTPStatus.NOT_FOUND)
+        if not _photo_key_known(coordinator.data, room):
+            return self.json_message("Комната или плитка не найдена", HTTPStatus.NOT_FOUND)
         # Размер проверяется по заголовку ДО чтения тела: иначе четыре мегабайта
         # ограничения превращаются в столько памяти, сколько прислали.
         if (request.content_length or 0) > MAX_PHOTO_BYTES:
@@ -303,8 +318,28 @@ class MegaHomePhotoView(_MegaHomeView):
         return self.json({"accepted": True})
 
 
-def _room_exists(config: dict[str, Any], room_id: str) -> bool:
-    return any(room.get("id") == room_id for room in config.get("rooms", []))
+# Приставка ключа фона ПЛИТКИ. Та же строка стоит в приложении
+# (`room-photos.ts`, `tilePhotoKey`) — контракт двух репозиториев, как и форма
+# состояния плитки.
+TILE_PHOTO_PREFIX = "tile:"
+
+
+def _photo_keys(config: dict[str, Any]) -> list[str]:
+    """Все ключи, у которых МОЖЕТ быть фон: комнаты состава и его плитки."""
+    keys = [room["id"] for room in config.get("rooms", []) if room.get("id")]
+    keys += [
+        f"{TILE_PHOTO_PREFIX}{tile['id']}"
+        for tile in config.get("tiles", [])
+        if tile.get("id")
+    ]
+    return keys
+
+
+def _photo_key_known(config: dict[str, Any], key: str) -> bool:
+    if key.startswith(TILE_PHOTO_PREFIX):
+        tile_id = key[len(TILE_PHOTO_PREFIX) :]
+        return any(tile.get("id") == tile_id for tile in config.get("tiles", []))
+    return any(room.get("id") == key for room in config.get("rooms", []))
 
 
 class MegaHomeStockPhotoView(_MegaHomeView):
