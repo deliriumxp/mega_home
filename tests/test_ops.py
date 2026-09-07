@@ -288,6 +288,35 @@ def test_токен_доступа_наружу_не_уходит():
     assert view["attributes"]["friendly_name"] == "Калитка"
     assert "секрет" in view["state"]["picture"] or "%D1%81" in view["state"]["picture"]
 
+def test_дом_не_подмешивает_состав_в_ответ_о_приборе():
+    # ⚠ Ключи ответа закреплены ЦЕЛИКОМ, а не по одному: смысл тонкого шлюза в
+    # том, что дом отвечает только тем, что знает Home Assistant. `name` и
+    # `roomId` убраны в 0.1.14 — их берёт из конфига само приложение
+    # (`HomeTiles` в `home-shape.ts`). Спека ловит и обратное движение: любое
+    # новое поле состава, подмешанное здесь, — это вторая проекция, за которую
+    # платят релизом HACS на каждом объекте.
+    view = ops.entity_view(
+        {
+            "id": "l1",
+            "roomId": "r1",
+            "name": "Холл",
+            "domain": "light",
+            "entityId": "light.hall",
+            "dimmable": True,
+        },
+        State("on", {"friendly_name": "Холл"}),
+    )
+
+    assert set(view) == {
+        "id",
+        "domain",
+        "state",
+        "attributes",
+        "available",
+        "updatedAt",
+    }
+
+
 def test_без_состояния_атрибуты_пустые():
     view = ops.entity_view(
         {"id": "l1", "domain": "light", "entityId": "light.hall", "name": "Холл"}, None
@@ -357,11 +386,14 @@ def test_границы_из_конфига_проверяет_дом():
     assert hass.services.calls == []
 
 
-def test_дом_со_старым_конфигом_управляется_по_прежней_таблице():
-    # ⚠ Кэш конфига старше кода ровно до первой синхронизации. Без фолбэка
-    # объект после обновления интеграции остался бы без управления до неё.
+def test_плитка_без_карты_команд_не_исполняется_втихую():
+    # ⚠ Фолбэк на таблицу доменов в Python снят (0.1.14, фаза 3 тонкого шлюза).
+    # Плитка без `commands` — это конфиг старше кода, а такого дома не бывает:
+    # интеграция обновляется через HACS, то есть по интернету, и тот же интернет
+    # приносит конфиг. Важно, чтобы отказ был ЯВНЫМ: угадать службу по домену
+    # значит завести здесь вторую карту команд, расходящуюся с менеджерской.
     hass = _Hass()
-    старый = {
+    без_команд = {
         **_CONFIG,
         "tiles": [
             {
@@ -375,13 +407,13 @@ def test_дом_со_старым_конфигом_управляется_по_�
         ],
     }
 
-    run(
-        hass,
-        _Coordinator(data=старый),
-        "command",
-        {"id": "t1", "command": "set_brightness", "value": 40},
-    )
+    with pytest.raises(ops.OpError) as err:
+        run(
+            hass,
+            _Coordinator(data=без_команд),
+            "command",
+            {"id": "t1", "command": "set_brightness", "value": 40},
+        )
 
-    assert hass.services.calls == [
-        ("light", "turn_on", {"entity_id": "light.kitchen", "brightness_pct": 40.0})
-    ]
+    assert err.value.status == HTTPStatus.NOT_FOUND
+    assert hass.services.calls == []

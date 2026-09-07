@@ -50,40 +50,4 @@ PHOTO_DIR = "mega_home_photos"
 # менеджер за офисным фаерволом) — картинка «из облака» была бы пустым фоном.
 STOCK_PHOTO_DIR = "mega_home_stock_photos"
 
-# Command -> Home Assistant service, per domain.
-#
-# ⚠ ТАБЛИЦА УМИРАЕТ. Карта команд приезжает в конфиге плитки (`commands`), и
-# зовёт службу `ops.command_spec`; здесь остался фолбэк на одну версию — для
-# дома, чей кэш конфига ещё старее этого кода. Убрать вместе с `LEGACY_ARGS`
-# следующим выпуском (docs/plan-thin-integration.md, фаза 3).
-COMMAND_SERVICES: dict[str, dict[str, str]] = {
-    "switch": {"turn_on": "turn_on", "turn_off": "turn_off"},
-    "light": {
-        "turn_on": "turn_on",
-        "turn_off": "turn_off",
-        "set_brightness": "turn_on",
-    },
-    "cover": {
-        "open": "open_cover",
-        "close": "close_cover",
-        "stop": "stop_cover",
-        "set_position": "set_cover_position",
-    },
-    "climate": {
-        "set_temperature": "set_temperature",
-        "set_mode": "set_hvac_mode",
-    },
-    # ⚠ `play_pause` уходит ОДНОЙ службой, а не «play или pause по состоянию»:
-    # `media_play_pause` решает это у себя, по свежему состоянию. Решай мы здесь
-    # — команда шла бы по снимку трёхсекундной давности, и нажатие на паузу
-    # иногда снимало бы плеер с паузы.
-    "media_player": {
-        "turn_on": "turn_on",
-        "turn_off": "turn_off",
-        "play_pause": "media_play_pause",
-        "previous": "media_previous_track",
-        "next": "media_next_track",
-    },
-}
-
 SERVICE_SYNC = "sync"

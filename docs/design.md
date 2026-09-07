@@ -180,27 +180,38 @@ percentage, cover position, the capabilities list — and the manager's
 expensive half of this integration: a new field on a screen cost an edit in two repositories,
 and this one reaches an object only through a HACS release and a Home Assistant restart.
 
-Since 0.1.13 both sides just forward. The home answers `{id, roomId, name, domain, state:
-{value}, attributes, available, updatedAt}` and the app derives everything else from
+Since 0.1.13 both sides just forward. Since 0.1.14 the home answers `{id, domain, state:
+{value}, attributes, available, updatedAt}` — nothing else — and the app derives the rest from
 `domain + state + attributes`, in one place (`ha-entity.ts` in the manager repository).
 Do not bring the projection back.
 
-Two exceptions, neither growing:
+`name` and `roomId` left in 0.1.14, once the bundle that reads them from the config was
+promoted to the release channel. The app takes both from the config now (`HomeTiles` in
+`home-shape.ts`); do not restore them "to be safe", because two sources of one name drift
+apart the moment an installer renames a device and the config and the states arrive by
+different roads.
 
-- **the camera** — the still and stream URLs are built from `entity_id` and `access_token`,
-  and neither leaves the house (the token is a secret), so they cannot be built by the app;
-- **`name` and `roomId`** — they still ride along until the app bundle that reads them from
-  the config is promoted to the release channel. A field is never dropped in the same release
-  that introduces its replacement.
+⚠ The manager's `toEntityView` still sends both, and that is not a mismatch: its answer is also
+read by the preview in the object card (`ManagerHomeBackend`), which does no config merge —
+there is no config there at all.
+
+One exception remains, and it does not grow: **the camera** — the still and stream URLs are
+built from `entity_id` and `access_token`, and neither leaves the house (the token is a
+secret), so the app cannot build them itself.
 
 ## Commands come from the config, not from a table here
 
-`COMMAND_SERVICES` in `const.py` is a fallback, kept for one version. What actually runs is the
-`commands` map the manager puts on every tile of the home config: command name → `{domain,
-service, arg, min, max}`. A new controllable domain — a fan, a lock, a vacuum — is now a change
+The `commands` map the manager puts on every tile of the home config is the only source:
+command name → `{domain, service, arg, min, max}`. A new controllable domain — a fan, a lock, a vacuum — is now a change
 in the manager and the app, delivered by the ordinary config sync: no HACS, no restart, no
 visit. The bounds travel as data but are enforced HERE: this side calls the service, and the
 resident's browser is not to be trusted.
+
+The `COMMAND_SERVICES`/`LEGACY_ARGS` fallback went away in 0.1.14, having lived exactly one
+version. It covered a home whose cached config was older than the code, and that home no longer
+exists: the integration updates through HACS, which means over the internet, and the same
+internet brings the config. A tile without `commands` is now refused outright — guessing a
+service from the domain would be a second command table here, drifting away from the manager's.
 
 ## Registration happens once per Home Assistant run
 

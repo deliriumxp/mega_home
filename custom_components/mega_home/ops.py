@@ -28,7 +28,7 @@ import voluptuous as vol
 from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import ServiceNotFound
 
-from .const import COMMAND_SERVICES, LOGGER
+from .const import LOGGER
 from .coordinator import MegaHomeCoordinator
 
 
@@ -174,43 +174,33 @@ def find(items: list[dict[str, Any]], item_id: Any) -> dict[str, Any] | None:
 
 
 def command_spec(tile: dict[str, Any], name: Any) -> dict[str, Any] | None:
-    """Чем исполнять команду: службой ИЗ КОНФИГА, а не из таблицы в этом файле.
+    """Чем исполнять команду: службой ИЗ КОНФИГА — другого источника больше нет.
 
     ⚠ Ради этого затевался тонкий шлюз (docs/plan-thin-integration.md, фаза 2).
-    Пока карта команд жила здесь, новый управляемый домен — вентилятор, замок,
+    Пока карта команд жила в Python, новый управляемый домен — вентилятор, замок,
     пылесос — стоил релиза HACS и перезапуска Home Assistant НА КАЖДОМ объекте.
     Теперь менеджер кладёт службу в конфиг плитки, и она доезжает обычной
-    синхронизацией.
+    синхронизацией. Не заводи таблицу доменов здесь снова: она немедленно начнёт
+    расходиться с менеджерской (`tileCommands` в `smart-home-view.util.ts`), а
+    чинится такое расхождение только выездом.
 
-    ⚠ Фолбэк на `COMMAND_SERVICES` оставлен на одну версию: конфиг в кэше дома
-    старше этого кода ровно до первой синхронизации, и без фолбэка объект после
-    обновления интеграции остался бы без управления до неё.
+    ⚠ Фолбэк `COMMAND_SERVICES`/`LEGACY_ARGS` убран в 0.1.14 (фаза 3). Он жил
+    ровно один выпуск — на дом, чей кэш конфига старше кода. Теперь такого дома
+    не бывает: обновление интеграции идёт через HACS, то есть по интернету, а
+    тот же интернет приносит и конфиг с картой команд.
     """
     if not isinstance(name, str):
         return None
     described = (tile.get("commands") or {}).get(name)
-    if isinstance(described, dict) and described.get("service"):
-        return {
-            "domain": described.get("domain") or tile["domain"],
-            "service": described["service"],
-            "arg": described.get("arg"),
-            "min": described.get("min"),
-            "max": described.get("max"),
-        }
-    service = COMMAND_SERVICES.get(tile["domain"], {}).get(name)
-    if not service:
+    if not isinstance(described, dict) or not described.get("service"):
         return None
-    return {"domain": tile["domain"], "service": service, **LEGACY_ARGS.get(name, {})}
-
-
-# Аргументы команд для домов, чей кэш конфига ещё без карты команд. Уходит
-# вместе с `COMMAND_SERVICES` следующим выпуском.
-LEGACY_ARGS: dict[str, dict[str, Any]] = {
-    "set_brightness": {"arg": "brightness_pct", "min": 0, "max": 100},
-    "set_position": {"arg": "position", "min": 0, "max": 100},
-    "set_temperature": {"arg": "temperature", "min": 5, "max": 40},
-    "set_mode": {"arg": "hvac_mode"},
-}
+    return {
+        "domain": described.get("domain") or tile["domain"],
+        "service": described["service"],
+        "arg": described.get("arg"),
+        "min": described.get("min"),
+        "max": described.get("max"),
+    }
 
 
 def service_data(spec: dict[str, Any], value: Any) -> dict[str, Any]:
@@ -300,10 +290,17 @@ def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
     строятся из `entity_id` и `access_token`, а наружу не уходит ни то, ни
     другое (`entity_id` намеренно, токен как секрет).
 
-    ⚠ `name` и `roomId` пока едут: приложение берёт их из конфига только начиная
-    с бандла 2026-09-06, и убрать их можно лишь ПОСЛЕ того, как этот бандл
-    повышен в релиз (правило выпуска: поле не убирают в том же выпуске, в
-    котором появилась его замена).
+    ⚠ `name` и `roomId` УБРАНЫ в 0.1.14 (фаза 3), после того как бандл со
+    склейкой повышен в релиз. Подписи и комнаты приложение берёт из конфига
+    (`HomeTiles` в `home-shape.ts`) — дом отвечает только тем, что знает Home
+    Assistant. Не возвращай их «для надёжности»: два источника одного имени
+    разъедутся ровно тогда, когда инсталлятор переименует прибор, а конфиг и
+    состояния придут разными дорогами.
+
+    ⚠ У МЕНЕДЖЕРА (`toEntityView` в `smart-home-view.util.ts`) те же два поля
+    ОСТАЮТСЯ, и это не рассинхрон: его ответ читает ещё и превью в карточке
+    объекта (`ManagerHomeBackend`), а оно склейку с конфигом не делает — там
+    конфига нет вовсе.
     """
     domain = tile["domain"]
     raw = state.state if state else None
@@ -321,8 +318,6 @@ def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
 
     return {
         "id": tile["id"],
-        "roomId": tile.get("roomId"),
-        "name": tile.get("name"),
         "domain": domain,
         "state": values,
         "attributes": _public_attributes(attributes),
