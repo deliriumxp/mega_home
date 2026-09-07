@@ -25,6 +25,7 @@ from .const import (
     STOCK_PHOTO_DIR,
     STORAGE_KEY,
     STORAGE_VERSION,
+    TILE_PHOTO_PREFIX,
 )
 from .photos import PhotoStore, StockPhotoStore
 
@@ -209,7 +210,13 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.update_interval = DEFAULT_UPDATE_INTERVAL
 
     async def _async_sync_stock_photos(self, config: dict[str, Any]) -> None:
-        """Mirror the installer's room backgrounds the config names.
+        """Mirror the backgrounds the config names — of rooms AND of tiles.
+
+        A tile background is a photo of the device itself (a lighting group, the
+        TV, the blinds) shown instead of the icon. It belongs to the OBJECT: the
+        team picks it in the manager, and it arrives here exactly like a room
+        background. Its key carries the `tile:` prefix, so both kinds share one
+        store, one download loop and one prune.
 
         Files, not URLs to the manager — the same reason as the icons: the app
         is served from inside the home, and the phone looking at it may have no
@@ -226,25 +233,38 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             and isinstance(room.get("photoVersion"), str)
             and room["photoVersion"]
         }
-        for room_id, version in sorted(wanted.items()):
+        wanted.update(
+            {
+                f"{TILE_PHOTO_PREFIX}{tile['id']}": tile["photoVersion"]
+                for tile in config.get("tiles", [])
+                if isinstance(tile.get("id"), str)
+                and isinstance(tile.get("photoVersion"), str)
+                and tile["photoVersion"]
+            }
+        )
+        for key, version in sorted(wanted.items()):
             if await self.hass.async_add_executor_job(
-                self.stock_photos.has, room_id, version
+                self.stock_photos.has, key, version
             ):
                 continue
             try:
-                payload = await self.client.async_room_photo(room_id)
+                payload = await self._async_fetch_stock_photo(key)
             except ManagerError as err:
                 # Одна картинка не стоит падения синхронизации: дом без фона
                 # работает, а следующий опрос попробует снова.
-                LOGGER.warning(
-                    "Could not fetch the background of room %s: %s", room_id, err
-                )
+                LOGGER.warning("Could not fetch the background of %s: %s", key, err)
                 continue
             await self.hass.async_add_executor_job(
-                self.stock_photos.save, room_id, version, payload
+                self.stock_photos.save, key, version, payload
             )
-            LOGGER.debug("Stored the background of room %s", room_id)
+            LOGGER.debug("Stored the background of %s", key)
         await self.hass.async_add_executor_job(self.stock_photos.prune, wanted)
+
+    async def _async_fetch_stock_photo(self, key: str) -> bytes:
+        """One background from the manager: комната или плитка — по приставке."""
+        if key.startswith(TILE_PHOTO_PREFIX):
+            return await self.client.async_tile_photo(key[len(TILE_PHOTO_PREFIX) :])
+        return await self.client.async_room_photo(key)
 
     async def _async_sync_icons(self, config: dict[str, Any]) -> None:
         """Download every scenario icon the config names.

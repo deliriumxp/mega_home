@@ -23,6 +23,7 @@ from homeassistant.core import HomeAssistant
 from .const import (
     DOMAIN,
     LOGGER,
+    TILE_PHOTO_PREFIX,
     URL_API,
     URL_ICONS,
     URL_PREFIX,
@@ -318,12 +319,6 @@ class MegaHomePhotoView(_MegaHomeView):
         return self.json({"accepted": True})
 
 
-# Приставка ключа фона ПЛИТКИ. Та же строка стоит в приложении
-# (`room-photos.ts`, `tilePhotoKey`) — контракт двух репозиториев, как и форма
-# состояния плитки.
-TILE_PHOTO_PREFIX = "tile:"
-
-
 def _photo_keys(config: dict[str, Any]) -> list[str]:
     """Все ключи, у которых МОЖЕТ быть фон: комнаты состава и его плитки."""
     keys = [room["id"] for room in config.get("rooms", []) if room.get("id")]
@@ -374,9 +369,22 @@ class MegaHomeStockPhotoView(_MegaHomeView):
         )
 
 
-def _stock_version(config: dict[str, Any], room_id: str) -> str | None:
+def _stock_version(config: dict[str, Any], key: str) -> str | None:
+    """Версия заготовки по ключу: комната или `tile:<id>` плитки.
+
+    ⚠ Источник правды — КОНФИГ, а не адрес: `?v=` в адресе это метка кэша для
+    браузера, и доверять ей как имени файла значило бы отдавать по чужой ссылке
+    то, чего в конфиге уже нет.
+    """
+    if key.startswith(TILE_PHOTO_PREFIX):
+        tile_id = key[len(TILE_PHOTO_PREFIX) :]
+        for tile in config.get("tiles", []):
+            if tile.get("id") == tile_id:
+                version = tile.get("photoVersion")
+                return version if isinstance(version, str) and version else None
+        return None
     for room in config.get("rooms", []):
-        if room.get("id") == room_id:
+        if room.get("id") == key:
             version = room.get("photoVersion")
             return version if isinstance(version, str) and version else None
     return None

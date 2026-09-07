@@ -43,7 +43,9 @@ class FakeClient:
         # Комнаты конфига и походы за их фонами — для проверки синхронизации
         # заготовок инсталлятора.
         self.rooms: list[dict[str, Any]] = []
+        self.tiles: list[dict[str, Any]] = []
         self.photo_calls: list[str] = []
+        self.tile_photo_calls: list[str] = []
         self.photo_fails: set[str] = set()
 
     async def async_version(self) -> str:
@@ -51,13 +53,24 @@ class FakeClient:
 
     async def async_config(self) -> dict[str, Any]:
         self.config_calls += 1
-        return {"version": self.version, "scenarios": [], "rooms": self.rooms}
+        return {
+            "version": self.version,
+            "scenarios": [],
+            "rooms": self.rooms,
+            "tiles": self.tiles,
+        }
 
     async def async_room_photo(self, room_id: str) -> bytes:
         self.photo_calls.append(room_id)
         if room_id in self.photo_fails:
             raise ManagerError("HTTP 404")
         return b"\xff\xd8\xff" + room_id.encode()
+
+    async def async_tile_photo(self, tile_id: str) -> bytes:
+        self.tile_photo_calls.append(tile_id)
+        if tile_id in self.photo_fails:
+            raise ManagerError("HTTP 404")
+        return b"\xff\xd8\xff" + tile_id.encode()
 
 
 class FakeBundle:
@@ -229,3 +242,54 @@ def test_недоступная_картинка_не_роняет_синхро�
     assert not coordinator.stock_photos.has("r1", "v1")
     assert coordinator.stock_photos.has("r2", "v1")
     assert coordinator.last_error is None
+
+
+# --- фоны ПЛИТОК (0.1.16) ---
+#
+# Фон плитки — снимок самого прибора, который жилец видит вместо иконки. Он
+# принадлежит ОБЪЕКТУ: подбирает его команда в менеджере, а в дом он едет тем же
+# зеркалом, что и заготовка комнаты. Проверяем, что путь именно ОДИН: тот же
+# цикл, то же хранилище, та же чистка — иначе у двух видов фона разъедутся
+# правила «когда качать» и «когда выбрасывать».
+def test_фоны_плиток_едут_в_дом_тем_же_зеркалом(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.rooms = [{"id": "r1", "photoVersion": "v1"}]
+    client.tiles = [
+        {"id": "ha:light.lamp1", "photoVersion": "t1"},
+        {"id": "ha:light.lamp2", "photoVersion": "t2"},
+        {"id": "ha:light.lamp3"},  # плитка без фона — за ней не ходим
+    ]
+    coordinator = _coordinator(tmp_path, client)
+    coordinator.bundle = FakeBundle()
+
+    asyncio.run(coordinator._async_update_data())
+
+    # ⚠ Ключ несёт приставку, id плитки уходит в менеджер без неё.
+    assert client.tile_photo_calls == ["ha:light.lamp1", "ha:light.lamp2"]
+    assert client.photo_calls == ["r1"]
+    assert coordinator.stock_photos.has("tile:ha:light.lamp1", "t1")
+    assert coordinator.stock_photos.has("tile:ha:light.lamp2", "t2")
+    # У каждой плитки СВОЙ файл: пять ламп — пять фонов, а не один на род.
+    assert coordinator.stock_photos.path(
+        "tile:ha:light.lamp1", "t1"
+    ) != coordinator.stock_photos.path("tile:ha:light.lamp2", "t2")
+
+    # Второй опрос: те же версии уже на диске — качать нечего.
+    coordinator.data = None
+    asyncio.run(coordinator._async_update_data())
+    assert client.tile_photo_calls == ["ha:light.lamp1", "ha:light.lamp2"]
+
+
+def test_снятый_в_менеджере_фон_плитки_исчезает_и_в_доме(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.tiles = [{"id": "ha:light.lamp1", "photoVersion": "t1"}]
+    coordinator = _coordinator(tmp_path, client)
+    coordinator.bundle = FakeBundle()
+    asyncio.run(coordinator._async_update_data())
+    assert coordinator.stock_photos.has("tile:ha:light.lamp1", "t1")
+
+    client.tiles = [{"id": "ha:light.lamp1"}]
+    coordinator.data = None
+    asyncio.run(coordinator._async_update_data())
+
+    assert not coordinator.stock_photos.has("tile:ha:light.lamp1", "t1")

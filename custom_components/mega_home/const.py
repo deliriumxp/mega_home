@@ -18,6 +18,12 @@ API_VERSION = "/inbound/home-config/version"
 API_CONFIG = "/inbound/home-config"
 API_ICON = "/inbound/home-config/icon"
 API_ROOM_PHOTO = "/inbound/home-config/room-photo"
+# Фон ПЛИТКИ — снимок самого прибора, который жилец видит вместо иконки.
+API_TILE_PHOTO = "/inbound/home-config/tile-photo"
+# Приставка ключа такого фона. Та же строка стоит в приложении
+# (`tile-photo-stores.ts`) и в менеджере — контракт трёх сторон, как и
+# форма состояния плитки. Комнаты лежат под своими id без приставки.
+TILE_PHOTO_PREFIX = "tile:"
 API_APP_MANIFEST = "/inbound/home-config/app/manifest"
 API_APP_FILE = "/inbound/home-config/app/file"
 

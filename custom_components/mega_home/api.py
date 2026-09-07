@@ -14,6 +14,7 @@ from .const import (
     API_CONFIG,
     API_ICON,
     API_ROOM_PHOTO,
+    API_TILE_PHOTO,
     API_VERSION,
     ICON_SIZE,
     REQUEST_TIMEOUT,
@@ -71,6 +72,18 @@ class ManagerClient:
     async def async_room_photo(self, room_id: str) -> bytes:
         """Return the installer's background for one room, as JPEG bytes."""
         return await self._get_bytes(f"{API_ROOM_PHOTO}/{quote(room_id)}")
+
+    async def async_tile_photo(self, tile_id: str) -> bytes:
+        """Return the background of ONE TILE — a photo of the device itself.
+
+        Set in the manager and mirrored here for the same reason as the room
+        backgrounds: the phone looking at the app may have no route to the
+        manager at all.
+
+        ⚠ `safe=""` — идентификатор плитки содержит двоеточие
+        (`ha:light.kitchen`), и оставлять его в адресе как есть нельзя.
+        """
+        return await self._get_bytes(f"{API_TILE_PHOTO}/{quote(tile_id, safe='')}")
 
     async def _get_bytes(self, path: str) -> bytes:
         try:
