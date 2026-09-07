@@ -46,6 +46,9 @@ class FakeClient:
         self.tiles: list[dict[str, Any]] = []
         self.photo_calls: list[str] = []
         self.tile_photo_calls: list[str] = []
+        # Общий канал файлов: что назвал менеджер, за тем дом и сходил.
+        self.assets: dict[str, Any] = {}
+        self.asset_calls: list[str] = []
         self.photo_fails: set[str] = set()
 
     async def async_version(self) -> str:
@@ -58,6 +61,7 @@ class FakeClient:
             "scenarios": [],
             "rooms": self.rooms,
             "tiles": self.tiles,
+            "assets": self.assets,
         }
 
     async def async_room_photo(self, room_id: str) -> bytes:
@@ -65,6 +69,12 @@ class FakeClient:
         if room_id in self.photo_fails:
             raise ManagerError("HTTP 404")
         return b"\xff\xd8\xff" + room_id.encode()
+
+    async def async_asset(self, key: str) -> bytes:
+        self.asset_calls.append(key)
+        if key in self.photo_fails:
+            raise ManagerError("HTTP 404")
+        return b"asset:" + key.encode()
 
     async def async_tile_photo(self, tile_id: str) -> bytes:
         self.tile_photo_calls.append(tile_id)
@@ -293,3 +303,70 @@ def test_снятый_в_менеджере_фон_плитки_исчезает
     asyncio.run(coordinator._async_update_data())
 
     assert not coordinator.stock_photos.has("tile:ha:light.lamp1", "t1")
+
+
+# --- ОБЩИЙ канал файлов (0.1.17) ---
+#
+# Ради него всё и делалось: дом должен уметь забрать из менеджера ЛЮБОЙ файл,
+# ничего о нём не зная. Проверяем именно это — что цикл не знает про фото,
+# звуки и шрифты, а идёт по манифесту, и что снятое из манифеста исчезает с
+# диска. Знание о видах файлов здесь = следующий релиз HACS ради каждой мелочи.
+def test_дом_забирает_любой_файл_по_манифесту(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.assets = {
+        "photo/tile/ha:light.lamp1": {"v": "a1", "type": "image/jpeg"},
+        "sound/doorbell": {"v": "s1", "type": "audio/mpeg"},
+        "font/inter": {"v": "", "type": "font/woff2"},  # без версии — не файл
+    }
+    coordinator = _coordinator(tmp_path, client)
+    coordinator.bundle = FakeBundle()
+
+    asyncio.run(coordinator._async_update_data())
+
+    # Звук интеграции незнаком ровно так же, как и фон, — и это правильно.
+    assert client.asset_calls == ["photo/tile/ha:light.lamp1", "sound/doorbell"]
+    assert coordinator.assets.has("sound/doorbell", "s1")
+    assert coordinator.assets.path("sound/doorbell", "s1").read_bytes() == b"asset:sound/doorbell"
+
+    # Второй опрос: те же версии уже на диске — качать нечего.
+    coordinator.data = None
+    asyncio.run(coordinator._async_update_data())
+    assert client.asset_calls == ["photo/tile/ha:light.lamp1", "sound/doorbell"]
+
+
+def test_снятый_из_манифеста_файл_исчезает_из_дома(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.assets = {"sound/doorbell": {"v": "s1", "type": "audio/mpeg"}}
+    coordinator = _coordinator(tmp_path, client)
+    coordinator.bundle = FakeBundle()
+    asyncio.run(coordinator._async_update_data())
+    assert coordinator.assets.has("sound/doorbell", "s1")
+
+    # Менеджер заменил один файл и снял другой.
+    client.assets = {"sound/doorbell": {"v": "s2", "type": "audio/mpeg"}}
+    coordinator.data = None
+    asyncio.run(coordinator._async_update_data())
+
+    assert coordinator.assets.has("sound/doorbell", "s2")
+    assert not coordinator.assets.has("sound/doorbell", "s1"), "старая версия — мусор на диске"
+
+    client.assets = {}
+    coordinator.data = None
+    asyncio.run(coordinator._async_update_data())
+    assert coordinator.assets.count() == 0
+
+
+def test_недоступный_файл_не_роняет_синхронизацию(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.assets = {
+        "sound/doorbell": {"v": "s1", "type": "audio/mpeg"},
+        "photo/tile/x": {"v": "p1", "type": "image/jpeg"},
+    }
+    client.photo_fails = {"sound/doorbell"}
+    coordinator = _coordinator(tmp_path, client)
+    coordinator.bundle = FakeBundle()
+
+    asyncio.run(coordinator._async_update_data())
+
+    assert not coordinator.assets.has("sound/doorbell", "s1")
+    assert coordinator.assets.has("photo/tile/x", "p1"), "соседний файл обязан доехать"

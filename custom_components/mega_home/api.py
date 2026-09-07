@@ -10,13 +10,16 @@ import aiohttp
 
 from .const import (
     API_APP_FILE,
+    API_ASSET,
     API_APP_MANIFEST,
     API_CONFIG,
     API_ICON,
+    API_RELAY,
     API_ROOM_PHOTO,
     API_TILE_PHOTO,
     API_VERSION,
     ICON_SIZE,
+    RELAY_TIMEOUT,
     REQUEST_TIMEOUT,
 )
 
@@ -84,6 +87,35 @@ class ManagerClient:
         (`ha:light.kitchen`), и оставлять его в адресе как есть нельзя.
         """
         return await self._get_bytes(f"{API_TILE_PHOTO}/{quote(tile_id, safe='')}")
+
+    async def async_asset(self, key: str) -> bytes:
+        """Return ONE file the manager named in the config manifest.
+
+        ⚠ One method for every kind of file on purpose (`assets.py`): the
+        manager decides what the key means, the home only carries the bytes.
+        """
+        return await self._get_bytes(f"{API_ASSET}/{quote(key, safe='')}")
+
+    async def async_relay(self, payload: dict[str, Any]) -> tuple[int, Any]:
+        """Ask the manager something on behalf of the app; return status and answer.
+
+        ⚠ Deliberately opaque: the home does not read the question and does not
+        interpret the answer. That is what keeps a future feature — the AI chat
+        first of all — from needing a release of this integration.
+        """
+        try:
+            async with self._session.post(
+                f"{self._base}{API_RELAY}",
+                headers=self._headers(),
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=RELAY_TIMEOUT),
+            ) as response:
+                body = await response.json(content_type=None)
+                return response.status, body
+        except aiohttp.ClientError as err:
+            raise ManagerError(str(err)) from err
+        except ValueError as err:
+            raise ManagerError("manager answered with non-JSON content") from err
 
     async def _get_bytes(self, path: str) -> bytes:
         try:

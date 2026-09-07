@@ -23,10 +23,12 @@ from .const import (
     MAX_UPDATE_INTERVAL,
     PHOTO_DIR,
     STOCK_PHOTO_DIR,
+    ASSET_DIR,
     STORAGE_KEY,
     STORAGE_VERSION,
     TILE_PHOTO_PREFIX,
 )
+from .assets import AssetStore
 from .photos import PhotoStore, StockPhotoStore
 
 type MegaHomeConfigEntry = ConfigEntry["MegaHomeCoordinator"]
@@ -86,6 +88,9 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # they are not synchronised from the manager — the home is where they
         # are created and the only place that holds them.
         self.photos = PhotoStore(Path(hass.config.path(STORAGE_DIR, PHOTO_DIR)))
+        # ОБЩИЙ канал файлов: что именно в нём лежит, дом не знает и знать не
+        # должен — см. `assets.py`.
+        self.assets = AssetStore(Path(hass.config.path(STORAGE_DIR, ASSET_DIR)))
         # Заготовки инсталлятора, наоборот, синхронизируются с менеджером: дом
         # держит их копию, чтобы фон был виден и без дороги до менеджера.
         self.stock_photos = StockPhotoStore(
@@ -174,6 +179,7 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._store.async_save(config)
         await self._async_sync_icons(config)
         await self._async_sync_stock_photos(config)
+        await self._async_sync_assets(config)
         await self._async_sync_bundle()
         self._on_success()
         LOGGER.info("Home config updated to %s", config.get("version"))
@@ -265,6 +271,41 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if key.startswith(TILE_PHOTO_PREFIX):
             return await self.client.async_tile_photo(key[len(TILE_PHOTO_PREFIX) :])
         return await self.client.async_room_photo(key)
+
+    async def _async_sync_assets(self, config: dict[str, Any]) -> None:
+        """Mirror every file the manager named in the config manifest.
+
+        ⚠ This loop knows NOTHING about what it downloads — that is the whole
+        idea. `assets: {key: {v, type}}` is a promise the manager makes, and a
+        new kind of file must never cost a release of this integration: its code
+        is the only thing here that does not update itself.
+
+        ⚠ Pruning runs even when nothing is wanted: a file the manager stopped
+        naming has to disappear from the home too, and that is exactly the case
+        where the download loop below does nothing.
+        """
+        raw = config.get("assets")
+        wanted = {
+            key: entry["v"]
+            for key, entry in (raw or {}).items()
+            if isinstance(key, str)
+            and isinstance(entry, dict)
+            and isinstance(entry.get("v"), str)
+            and entry["v"]
+        }
+        for key, version in sorted(wanted.items()):
+            if await self.hass.async_add_executor_job(self.assets.has, key, version):
+                continue
+            try:
+                payload = await self.client.async_asset(key)
+            except ManagerError as err:
+                # Один файл не стоит падения синхронизации: следующий опрос
+                # попробует снова, а дом до тех пор работает без него.
+                LOGGER.warning("Could not fetch the asset %s: %s", key, err)
+                continue
+            await self.hass.async_add_executor_job(self.assets.save, key, version, payload)
+            LOGGER.debug("Stored the asset %s", key)
+        await self.hass.async_add_executor_job(self.assets.prune, wanted)
 
     async def _async_sync_icons(self, config: dict[str, Any]) -> None:
         """Download every scenario icon the config names.

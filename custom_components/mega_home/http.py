@@ -29,6 +29,7 @@ from .const import (
     URL_PREFIX,
 )
 from . import ops
+from .api import ManagerError
 from .coordinator import MegaHomeCoordinator
 from .events import StateStream
 from .photos import JPEG_MAGIC, MAX_PHOTO_BYTES
@@ -94,6 +95,11 @@ async def async_register_http(
         MegaHomePhotosView,
         MegaHomePhotoView,
         MegaHomeStockPhotoView,
+        # ⚠ Общий канал: один маршрут на любой файл и одна розетка на любой
+        # запрос-ответ. Оба заведены ради того, чтобы новая функция не стоила
+        # выпуска этой интеграции (`assets.py`).
+        MegaHomeAssetView,
+        MegaHomeRelayView,
         MegaHomeAppRootView,
         MegaHomeAppView,
     ):
@@ -367,6 +373,87 @@ class MegaHomeStockPhotoView(_MegaHomeView):
         return web.FileResponse(
             target, headers={"Cache-Control": "public, max-age=31536000, immutable"}
         )
+
+
+class MegaHomeAssetView(_MegaHomeView):
+    """ONE route for every file the manager hands to this home.
+
+    ⚠ The route knows nothing about what it serves: key, version and content
+    type all come from the manifest in the cached config (`assets.py`). That is
+    what keeps a new kind of file — a sound, a font, a floor plan — from costing
+    a release of this integration.
+
+    ⚠ The version comes from the CONFIG, never from `?v=` in the URL: the query
+    is a cache marker for the browser, and trusting it as a file name would mean
+    serving, by an old link, what the config no longer names.
+    """
+
+    url = f"{URL_API}/asset/{{key:.+}}"
+    name = "api:mega_home:asset"
+
+    async def get(self, request: web.Request, key: str) -> web.StreamResponse:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        entry = (coordinator.data.get("assets") or {}).get(key)
+        if not isinstance(entry, dict) or not isinstance(entry.get("v"), str):
+            return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
+        hass: HomeAssistant = request.app["hass"]
+        target = coordinator.assets.path(key, entry["v"])
+        if not await hass.async_add_executor_job(target.is_file):
+            # Манифест файл обещает, а синхронизация ещё не дошла (дом только
+            # поднялся, менеджер был недоступен). Это не ошибка приложения.
+            return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
+        content_type = entry.get("type")
+        return web.FileResponse(
+            target,
+            headers={
+                "Cache-Control": "public, max-age=31536000, immutable",
+                "Content-Type": content_type
+                if isinstance(content_type, str) and content_type
+                else "application/octet-stream",
+            },
+        )
+
+
+class MegaHomeRelayView(_MegaHomeView):
+    """Ask the MANAGER something on behalf of the app, and return the answer.
+
+    ⚠ The home does not read the question and does not interpret the answer —
+    it carries them. The app inside a flat can reach nothing but this
+    integration, so without a route like this every future request/response
+    feature (the resident's AI chat first of all) would cost a release of this
+    integration and an update on every object.
+
+    ⚠ The bound is the manager: the token belongs to the object, the endpoint is
+    a single one (`/inbound/home-config/relay`), and what may be asked through
+    it is decided there, not here. The manager answers 501 while nothing is
+    plugged in — an honest diagnosis instead of silence.
+    """
+
+    url = f"{URL_API}/relay"
+    name = "api:mega_home:relay"
+
+    async def post(self, request: web.Request) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        try:
+            payload = await request.json()
+        except ValueError:
+            return self.json_message("Ожидается JSON", HTTPStatus.BAD_REQUEST)
+        if not isinstance(payload, dict):
+            return self.json_message("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
+        try:
+            status, body = await coordinator.client.async_relay(payload)
+        except ManagerError as err:
+            # Менеджер недоступен — это нормальное состояние объекта без
+            # интернета, и приложение обязано услышать именно это.
+            LOGGER.warning("Relay to the manager failed: %s", err)
+            return self.json_message("Менеджер недоступен", HTTPStatus.BAD_GATEWAY)
+        return self.json(body if isinstance(body, dict) else {"answer": body}, status)
 
 
 def _stock_version(config: dict[str, Any], key: str) -> str | None:
