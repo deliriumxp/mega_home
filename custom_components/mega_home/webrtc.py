@@ -149,6 +149,13 @@ async def _negotiate_own(
     from homeassistant.exceptions import HomeAssistantError
 
     camera = _camera(hass, entity_id)
+    # Идентификатор как у HA-провайдера — иначе go2rtc не найдёт поток
+    try:
+        from homeassistant.components.go2rtc.util import get_camera_identifier
+
+        identifier = get_camera_identifier(camera)
+    except Exception:
+        identifier = entity_id
     stream_source = await camera.stream_source()
     if not stream_source:
         raise OpError("Камера недоступна в Home Assistant", HTTPStatus.NOT_FOUND)
@@ -162,7 +169,6 @@ async def _negotiate_own(
 
     session = async_get_clientsession(hass)
     rest = Go2RtcRestClient(session, url)
-    identifier = entity_id  # простой id, go2rtc примет любой
     # Добавить поток если его нет
     try:
         streams = await rest.streams.list()
