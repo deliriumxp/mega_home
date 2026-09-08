@@ -93,14 +93,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
 
     await async_register_http(hass, coordinator)
 
-    # Патч HA go2rtc :18555/tcp → :8555 stun:8555 (go2rtc_embed.py) — импорт
-    # патчит шаблон до старта сервера, действует со следующего старта HA.
+    # Свой go2rtc :8555 stun:8555 без патча HA core — одна схема
     try:
-        import importlib as _il  # noqa: F401
+        from .go2rtc_embed import async_start as _go2rtc_start
 
-        _il.import_module("custom_components.mega_home.go2rtc_embed")
+        await _go2rtc_start(hass)
     except Exception as err:  # noqa: BLE001
-        LOGGER.debug("go2rtc patch not applied: %s", err)
+        LOGGER.debug("go2rtc not started: %s", err)
 
     # Живой канал к менеджеру: правка состава доезжает за секунды вместо интервала
     # опроса. Опрос при этом остаётся страховкой — канал может не подняться вовсе
