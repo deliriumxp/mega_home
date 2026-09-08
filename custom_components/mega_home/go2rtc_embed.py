@@ -71,17 +71,29 @@ async def async_start(hass: HomeAssistant) -> bool:
         from homeassistant.helpers.aiohttp_client import async_get_clientsession
         from dataclasses import replace
 
+        session = async_get_clientsession(hass)
         if GO2RTC_DOMAIN in hass.data and _DATA_GO2RTC in hass.data:
             cfg = hass.data[_DATA_GO2RTC]
-            hass.data[_DATA_GO2RTC] = replace(cfg, url=_URL, session=async_get_clientsession(hass))
-            LOGGER.info("HA go2rtc provider patched to %s", _URL)
+            hass.data[_DATA_GO2RTC] = replace(cfg, url=_URL, session=session)
+            LOGGER.info("HA go2rtc provider config patched to %s", _URL)
         else:
-            # Если HA ещё не создал провайдера — создадим заготовку, она
-            # подхватится при следующем async_setup_entry go2rtc
             from homeassistant.components.go2rtc import Go2RtcConfig  # type: ignore
 
             hass.data.setdefault(GO2RTC_DOMAIN, {})
-            hass.data[_DATA_GO2RTC] = Go2RtcConfig(url=_URL, session=async_get_clientsession(hass))
+            hass.data[_DATA_GO2RTC] = Go2RtcConfig(url=_URL, session=session)
+        # Уже созданные провайдеры хранят url/rest_client в runtime_data — тоже патчим
+        for ent in hass.config_entries.async_entries(GO2RTC_DOMAIN):
+            prov = getattr(ent, "runtime_data", None)
+            if prov and hasattr(prov, "_url"):
+                try:
+                    prov._url = _URL
+                    prov._session = session
+                    from go2rtc_client import Go2RtcRestClient
+
+                    prov._rest_client = Go2RtcRestClient(session, _URL)
+                    LOGGER.info("HA go2rtc provider instance %s patched to %s", ent.entry_id, _URL)
+                except Exception as err2:  # noqa: BLE001
+                    LOGGER.debug("provider instance patch skipped: %s", err2)
     except Exception as err:  # noqa: BLE001
         LOGGER.debug("go2rtc provider patch skipped: %s", err)
     LOGGER.info("mega_home go2rtc started on :8555 stun:8555")
