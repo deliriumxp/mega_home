@@ -159,6 +159,30 @@ resident) — never a dropped frame. The manager waits with a three second timeo
 would turn every "device not found" into "the house is offline", three seconds later, for a
 resident standing in that house.
 
+## The link carries HTTP, not a list of features (0.2.0)
+
+`ops.py` gave both ways in the same *answers*, but not the same *surface*: the link knew four
+named operations (`config`, `states`, `command`, `scenario`), while the local door had a dozen
+routes. Everything else a resident can do at home — put a photo on a room or on a tile, first of
+all — had no way through from outside; the app fell back to the phone's own storage, and the
+photo reached nothing and nobody. Every new feature would have repeated that: a named operation
+here, a release, an update on every object.
+
+So the link now carries an ordinary request to **this home's own API** (`relay_api.py`, op
+`http`): method, path, body. The app talks to the same paths wherever it stands — at home
+directly, away through the manager, which is what a remote-access product does anyway (Nabu Casa
+proxies Home Assistant itself the same way). "Local" and "remote" differ in the base address and
+nothing else: no second storage, no second set of rules, no feature that exists on one side only.
+
+⚠ The bound is not the path list but the size and the method set: the manager has already
+checked the resident's session and picked the object by it, while this side keeps the caps
+(4 MB in, 8 MB out) and the very checks the local door applies — a photo key must be in the
+config, a photo must be a JPEG. Those checks moved to `photos.py` so both doors share one copy;
+two copies of "what may be written" is how a hole appears on one side only.
+
+⚠ The named operations stay for older managers and older homes. Do not add new ones — that is
+what the relay is for.
+
 ## Polling has to be switched on by hand (0.1.6)
 
 `DataUpdateCoordinator` runs its timer only while it HAS LISTENERS, and listeners are entities.

@@ -72,7 +72,7 @@ def test_без_координатора_тоже_заглушка() -> None:
 # (`room-photos.ts`, `tilePhotoKey`): чужой ключ дом не пишет, свой —
 # перечисляет, иначе фон лежит на диске и не показывается.
 
-from mega_home.http import _photo_key_known, _photo_keys
+from mega_home.photos import photo_key_known as _photo_key_known, photo_keys as _photo_keys
 
 PHOTO_CONFIG = {
     "rooms": [{"id": "kitchen"}, {"id": "hall"}],

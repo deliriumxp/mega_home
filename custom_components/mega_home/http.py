@@ -32,7 +32,13 @@ from . import ops
 from .api import ManagerError
 from .coordinator import MegaHomeCoordinator
 from .events import StateStream
-from .photos import JPEG_MAGIC, MAX_PHOTO_BYTES
+from .photos import (
+    JPEG_MAGIC,
+    MAX_PHOTO_BYTES,
+    photo_key_known,
+    photo_keys,
+    stock_version,
+)
 
 # ⚠ Копии интерфейса в релизе НЕТ (2026-09-06): пока бандл не скачан, отдаём эту
 # страницу. Первый запуск считаем онлайн — а взамен релиз интеграции перестал
@@ -243,7 +249,7 @@ class MegaHomePhotosView(_MegaHomeView):
         assert coordinator is not None
         hass: HomeAssistant = request.app["hass"]
         versions = await hass.async_add_executor_job(
-            coordinator.photos.versions, _photo_keys(coordinator.data)
+            coordinator.photos.versions, photo_keys(coordinator.data)
         )
         return self.json({"photos": versions})
 
@@ -287,7 +293,7 @@ class MegaHomePhotoView(_MegaHomeView):
         if error is not None:
             return error
         assert coordinator is not None
-        if not _photo_key_known(coordinator.data, room):
+        if not photo_key_known(coordinator.data, room):
             return self.json_message("Комната или плитка не найдена", HTTPStatus.NOT_FOUND)
         # Размер проверяется по заголовку ДО чтения тела: иначе четыре мегабайта
         # ограничения превращаются в столько памяти, сколько прислали.
@@ -325,24 +331,6 @@ class MegaHomePhotoView(_MegaHomeView):
         return self.json({"accepted": True})
 
 
-def _photo_keys(config: dict[str, Any]) -> list[str]:
-    """Все ключи, у которых МОЖЕТ быть фон: комнаты состава и его плитки."""
-    keys = [room["id"] for room in config.get("rooms", []) if room.get("id")]
-    keys += [
-        f"{TILE_PHOTO_PREFIX}{tile['id']}"
-        for tile in config.get("tiles", [])
-        if tile.get("id")
-    ]
-    return keys
-
-
-def _photo_key_known(config: dict[str, Any], key: str) -> bool:
-    if key.startswith(TILE_PHOTO_PREFIX):
-        tile_id = key[len(TILE_PHOTO_PREFIX) :]
-        return any(tile.get("id") == tile_id for tile in config.get("tiles", []))
-    return any(room.get("id") == key for room in config.get("rooms", []))
-
-
 class MegaHomeStockPhotoView(_MegaHomeView):
     """The INSTALLER's background for one room, mirrored from the manager.
 
@@ -360,7 +348,7 @@ class MegaHomeStockPhotoView(_MegaHomeView):
         if error is not None:
             return error
         assert coordinator is not None
-        version = _stock_version(coordinator.data, room)
+        version = stock_version(coordinator.data, room)
         if not version:
             return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
         hass: HomeAssistant = request.app["hass"]
@@ -455,26 +443,6 @@ class MegaHomeRelayView(_MegaHomeView):
             return self.json_message("Менеджер недоступен", HTTPStatus.BAD_GATEWAY)
         return self.json(body if isinstance(body, dict) else {"answer": body}, status)
 
-
-def _stock_version(config: dict[str, Any], key: str) -> str | None:
-    """Версия заготовки по ключу: комната или `tile:<id>` плитки.
-
-    ⚠ Источник правды — КОНФИГ, а не адрес: `?v=` в адресе это метка кэша для
-    браузера, и доверять ей как имени файла значило бы отдавать по чужой ссылке
-    то, чего в конфиге уже нет.
-    """
-    if key.startswith(TILE_PHOTO_PREFIX):
-        tile_id = key[len(TILE_PHOTO_PREFIX) :]
-        for tile in config.get("tiles", []):
-            if tile.get("id") == tile_id:
-                version = tile.get("photoVersion")
-                return version if isinstance(version, str) and version else None
-        return None
-    for room in config.get("rooms", []):
-        if room.get("id") == key:
-            version = room.get("photoVersion")
-            return version if isinstance(version, str) and version else None
-    return None
 
 
 class MegaHomeAppRootView(_MegaHomeView):

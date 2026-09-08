@@ -23,6 +23,9 @@ from __future__ import annotations
 from collections.abc import Iterable
 from hashlib import sha1
 from pathlib import Path
+from typing import Any
+
+from .const import TILE_PHOTO_PREFIX
 
 # JPEG only: the app re-encodes whatever the resident picked (HEIC from an
 # iPhone included) before uploading, so accepting one format keeps both the
@@ -157,3 +160,51 @@ class StockPhotoStore:
 def _safe_version(version: str) -> str:
     """The version comes from the manager and becomes a file name — keep it boring."""
     return "".join(char if char.isalnum() else "-" for char in version)[:32]
+
+
+# --- ключи фонов в конфиге -------------------------------------------------
+#
+# ⚠ Живут ЗДЕСЬ, в одном месте на оба входа: локальные view (`http.py`) и
+# перенос запроса снаружи (`relay_api.py`) обязаны отвечать одинаково. Пока эти
+# три функции были копиями в двух модулях, «дома работает, снаружи нет» было
+# вопросом времени, а не проектирования.
+
+
+def photo_keys(config: dict[str, Any]) -> list[str]:
+    """Все ключи, у которых МОЖЕТ быть фон: комнаты состава и его плитки."""
+    keys = [room["id"] for room in config.get("rooms", []) if room.get("id")]
+    keys += [
+        f"{TILE_PHOTO_PREFIX}{tile['id']}"
+        for tile in config.get("tiles", [])
+        if tile.get("id")
+    ]
+    return keys
+
+
+def photo_key_known(config: dict[str, Any], key: str) -> bool:
+    """Можно ли писать фон под этим ключом: он обязан быть в СОСТАВЕ дома."""
+    if key.startswith(TILE_PHOTO_PREFIX):
+        tile_id = key[len(TILE_PHOTO_PREFIX) :]
+        return any(tile.get("id") == tile_id for tile in config.get("tiles", []))
+    return any(room.get("id") == key for room in config.get("rooms", []))
+
+
+def stock_version(config: dict[str, Any], key: str) -> str | None:
+    """Версия заготовки по ключу: комната или `tile:<id>` плитки.
+
+    ⚠ Источник правды — КОНФИГ, а не адрес: `?v=` в адресе это метка кэша для
+    браузера, и доверять ей как имени файла значило бы отдавать по чужой ссылке
+    то, чего в конфиге уже нет.
+    """
+    if key.startswith(TILE_PHOTO_PREFIX):
+        tile_id = key[len(TILE_PHOTO_PREFIX) :]
+        for tile in config.get("tiles", []):
+            if tile.get("id") == tile_id:
+                version = tile.get("photoVersion")
+                return version if isinstance(version, str) and version else None
+        return None
+    for room in config.get("rooms", []):
+        if room.get("id") == key:
+            version = room.get("photoVersion")
+            return version if isinstance(version, str) and version else None
+    return None

@@ -65,6 +65,20 @@ async def run(
         return await webrtc_offer(hass, coordinator, data)
     if op == "webrtc-close":
         return webrtc_close(hass, coordinator, data)
+    if op == "http":
+        # Перенос ОБЫЧНОГО запроса к API этого дома: жилец снаружи должен уметь
+        # ровно то же, что дома, и теми же путями (`relay_api.py`).
+        #
+        # ⚠ Именованные операции выше остаются ради уже работающих домов и
+        # менеджеров. НОВЫХ сюда добавлять не надо: каждая такая операция — это
+        # функция, которой снаружи нет, пока её не написали в трёх местах и не
+        # раскатали релизом на каждый объект. Для этого и есть перенос.
+        #
+        # ⚠ Импорт ЛОКАЛЬНЫЙ: `relay_api` зовёт этот модуль, и на уровне файла
+        # это был бы цикл.
+        from .relay_api import handle
+
+        return await handle(hass, coordinator, data)
     raise OpError("Неизвестная операция", HTTPStatus.NOT_FOUND)
 
 
