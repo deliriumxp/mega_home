@@ -207,6 +207,18 @@ async def _negotiate_own(
         identifier = get_camera_identifier(camera)
     except Exception:
         identifier = entity_id
+
+    # ⚠ Источник — САМА КАМЕРА, хотя так она и отдаёт RTSP дважды: нам и go2rtc
+    # самого Home Assistant. Брать поток у HA-шного go2rtc
+    # (`rtsp://127.0.0.1:18554/<identifier>`) пробовали 2026-09-08 и отказались:
+    # поток под этим именем появляется у него, только когда камеру ПОСМОТРЕЛИ
+    # штатным интерфейсом HA — его заводит их WebRTC-провайдер, а наш путь этого
+    # провайдера не зовёт никогда. На обычном объекте потока там нет, подписка
+    # уходит в никуда, и жилец вместо камеры получает «Дом не смог начать
+    # трансляцию». Проверить наличие потока заранее нечем: API HA-шного go2rtc
+    # при выключенном UI слушает только unix-сокет. Экономия одного RTSP-сеанса
+    # не стоит выключенной камеры; вернёмся, если появится дешёвая и точная
+    # проверка.
     stream_source = await camera.stream_source()
     if not stream_source:
         raise OpError("Камера недоступна в Home Assistant", HTTPStatus.NOT_FOUND)
@@ -314,7 +326,7 @@ _frames: dict[str, tuple[float, str, bytes]] = {}
 _grabbing: set[str] = set()
 
 
-async def snapshot(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
+async def snapshot(hass: HomeAssistant, entity_id: str) -> tuple[str, bytes]:
     """One still frame, so the viewer does not open on black.
 
     ⚠ Живёт рядом с переговорами, потому что это ТА ЖЕ функция: снаружи у
@@ -326,6 +338,13 @@ async def snapshot(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
     ⚠ Свежий кадр отдаётся ИЗ ПАМЯТИ, не дожидаясь камеры, а обновляется он
     фоном (см. `SNAPSHOT_FRESH`). Иначе постер стоил бы ровно тех секунд, ради
     которых он и заведён.
+
+    ⚠ Отдаёт СЫРЫЕ байты, не base64: до 2026-09-08 кадр кодировался здесь и
+    сразу декодировался в `relay_api._dispatch`, чтобы `relay_api.handle`
+    закодировал его ОБРАТНО в base64 для менеджера, — два лишних прохода по
+    кадру до 400 КБ на каждое открытие камеры. Кому нужен base64 (перенос
+    через менеджер), кодирует сам на границе; локальная дверь (`http.py`)
+    отдаёт эти байты браузеру как есть.
     """
     from time import monotonic
 
@@ -333,8 +352,9 @@ async def snapshot(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
     if cached is not None and monotonic() - cached[0] <= SNAPSHOT_USABLE:
         # На эту камеру СЕЙЧАС смотрят: обновляем сразу, а не по общему сроку.
         warm(hass, entity_id, SNAPSHOT_FRESH)
-        return _packed(cached)
-    return _packed(await _grab(hass, entity_id))
+        return cached[1], cached[2]
+    frame = await _grab(hass, entity_id)
+    return frame[1], frame[2]
 
 
 def warm(hass: HomeAssistant, entity_id: str, max_age: float = WARM_INTERVAL) -> None:
@@ -386,15 +406,6 @@ async def _grab(hass: HomeAssistant, entity_id: str) -> tuple[float, str, bytes]
     frame = (monotonic(), image.content_type, image.content)
     _frames[entity_id] = frame
     return frame
-
-
-def _packed(frame: tuple[float, str, bytes]) -> dict[str, Any]:
-    from base64 import b64encode
-
-    return {
-        "contentType": frame[1],
-        "image": b64encode(frame[2]).decode("ascii"),
-    }
 
 
 def close(hass: HomeAssistant, entity_id: str, session_id: str) -> dict[str, Any]:

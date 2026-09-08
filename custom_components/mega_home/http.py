@@ -109,6 +109,9 @@ async def async_register_http(
         MegaHomeWebRtcView,
         MegaHomeWebRtcCloseView,
         MegaHomeRelayView,
+        # ⚠ РАНЬШЕ каталога: `/mega-home/{path:.*}` накрывает и `sw.js`, а aiohttp
+        # отдаёт запрос первому подошедшему ресурсу.
+        MegaHomeServiceWorkerView,
         MegaHomeAppRootView,
         MegaHomeAppView,
     ):
@@ -427,15 +430,17 @@ class MegaHomeCameraFrameView(_MegaHomeView):
         assert coordinator is not None
         hass: HomeAssistant = request.app["hass"]
         try:
-            frame = await ops.camera_frame(hass, coordinator, {"id": tile})
+            content_type, body = await ops.camera_frame(hass, coordinator, {"id": tile})
         except ops.OpError as err:
             return web.Response(status=err.status, text=err.message)
-        from base64 import b64decode
 
+        # ⚠ Байты как есть, без base64: `ops.camera_frame` отдаёт их уже
+        # сырыми (2026-09-08) — эта дверь не переносит запрос по каналу
+        # менеджера, кодировать здесь было бы работой ради самой себя.
         return web.Response(
-            body=b64decode(frame["image"]),
+            body=body,
             # Кадр живой: закешированный постер показывал бы вчерашний двор.
-            headers={"Content-Type": frame["contentType"], "Cache-Control": "no-store"},
+            headers={"Content-Type": content_type, "Cache-Control": "no-store"},
         )
 
 
@@ -502,22 +507,69 @@ class MegaHomeRelayView(_MegaHomeView):
 
 
 
-class MegaHomeAppRootView(_MegaHomeView):
-    """The bare prefix: hand out the app itself — но по АДРЕСУ С ВЕРСИЕЙ.
+# Наш собственный service worker. Не кэширует НИЧЕГО и не обязан: его работа —
+# ЗАНЯТЬ scope `/mega-home/`.
+#
+# ⚠ Разбор 2026-09-08, вторая итерация. Первая («адрес с версией в ?v=») не
+# сработала, и вот почему: service worker самого Home Assistant (scope `/`)
+# держит маршрут `registerRoute(/\/(\?.*)?$/, new StaleWhileRevalidate({
+# matchOptions: { ignoreSearch: true } }))` — проверено по его коду
+# (`hass_frontend/sw-modern.js`). `ignoreSearch` означает, что в кэше ищется
+# ЛЮБАЯ запись с тем же путём, а запрос с `?v=<новая>` кладётся отдельной
+# записью. То есть страница `/mega-home/` отдавалась из кэша ВСЕГДА и вечно, а
+# каждая новая версия лишь добавляла запись, которую никто не читает.
+#
+# Регистрация своего worker'а на более узком scope забирает наши страницы у
+# чужого: браузер выбирает регистрацию с самым длинным совпадающим scope. Этот
+# ничего не перехватывает — запросы идут в сеть, как будто worker'а нет вовсе, —
+# и именно этого мы и добиваемся.
+SERVICE_WORKER = (
+    "self.addEventListener('install', () => self.skipWaiting());\n"
+    "self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));\n"
+)
 
-    ⚠ Голый `/mega-home/` уводит на `/mega-home/?v=<версия бандла>`, и это
-    единственное, что делает устаревший интерфейс невозможным. Разбор
+
+class MegaHomeServiceWorkerView(_MegaHomeView):
+    """`/mega-home/sw.js` — воркер, забирающий scope у воркера Home Assistant."""
+
+    url = f"{URL_PREFIX}/sw.js"
+    name = "mega_home:sw"
+
+    async def get(self, request: web.Request) -> web.StreamResponse:
+        return web.Response(
+            text=SERVICE_WORKER,
+            headers={
+                "Content-Type": "text/javascript",
+                # Воркер меняется раз в никогда, но кэшировать его нельзя:
+                # застрявшая копия — это застрявший scope.
+                "Cache-Control": "no-store",
+                # Scope шире собственного каталога нам не нужен, но заявить его
+                # явно дешевле, чем потом гадать, почему регистрация отклонена.
+                "Service-Worker-Allowed": f"{URL_PREFIX}/",
+            },
+        )
+
+
+class MegaHomeAppRootView(_MegaHomeView):
+    """The bare prefix: hand out the app itself — но по АДРЕСУ С ВЕРСИЕЙ В ПУТИ.
+
+    ⚠ Голый `/mega-home/` уводит на `/mega-home/v/<версия бандла>/`. Разбор
     2026-09-08: дом раздавал новый бандл, а жилец видел старый до тех пор, пока
     не сделает ЖЁСТКОЕ обновление страницы. Обычная перезагрузка отдавала
-    `index.html` из кэша браузера — а его хватает, чтобы остаться на старом
-    коде целиком: имена бандлов внутри хешированные, и старый `index.html`
-    честно тянет старый `main-*.js`. Ни `no-cache`, ни `no-store` эту дыру не
-    закрывают полностью: страницу под тем же адресом может держать и service
-    worker самого Home Assistant (scope `/`), до которого нам не дотянуться.
+    `index.html` из кэша — а его хватает, чтобы остаться на старом коде целиком:
+    имена файлов внутри хешированные, и старый `index.html` честно тянет старый
+    `main-*.js`.
 
-    Адрес с версией закрывает её целиком: у нового бандла ДРУГОЙ адрес, то есть
-    другой ключ в любом кэше — браузерном, воркерном, прокси. Пусть `?v=<старая>`
-    лежит в кэше сколько угодно, ходить по нему больше некому.
+    ⚠ Версия именно В ПУТИ, а не в `?v=` — так было в первой попытке, и она НЕ
+    СРАБОТАЛА. Service worker Home Assistant (scope `/`) обслуживает страницы
+    маршрутом `StaleWhileRevalidate` с `matchOptions: {ignoreSearch: true}`
+    (проверено по `hass_frontend/sw-modern.js`): запрос со свежим `?v=` ищет в
+    кэше ЛЮБУЮ запись с тем же путём и находит вчерашнюю, а свой ответ кладёт
+    отдельной записью, которую потом никто не читает. Путь — другой ключ кэша,
+    и на нём этот маршрут промахивается честно.
+
+    Заголовки при этом не помогают вовсе: `no-store` управляет кэшем браузера,
+    а не кэшем чужого worker'а.
     """
 
     url = URL_PREFIX
@@ -525,12 +577,10 @@ class MegaHomeAppRootView(_MegaHomeView):
     name = "mega_home:app_root"
 
     async def get(self, request: web.Request) -> web.StreamResponse:
-        coordinator = _coordinator(request.app["hass"])
-        bundle = coordinator.bundle if coordinator else None
-        version = bundle.version if bundle and bundle.active_dir else None
-        if version and request.query.get("v") != version:
+        version = _active_version(request)
+        if version:
             return web.HTTPFound(
-                f"{URL_PREFIX}/?v={version}",
+                f"{URL_PREFIX}/v/{version}/",
                 headers={"Cache-Control": "no-store"},
             )
         return _serve(request, "index.html")
@@ -543,13 +593,36 @@ class MegaHomeAppView(_MegaHomeView):
     Home Assistant calls the handler as `handler(request, **request.match_info)`,
     so a signature without it raises `unexpected keyword argument 'path'` and the
     browser gets a bare 500. Found by running it.
+
+    ⚠ Префикс `v/<версия>/` СРЕЗАЕТСЯ здесь. Он существует только ради ключа
+    кэша (см. `MegaHomeAppRootView`), в бандле такого каталога нет, а сами файлы
+    приложение просит по-прежнему от `<base href="/mega-home/">`, то есть без
+    него. Версию не сверяем: пришли со старой — отдадим текущий интерфейс, и это
+    правильнее, чем 404 в лицо жильцу.
     """
 
     url = f"{URL_PREFIX}/{{path:.*}}"
     name = "mega_home:app"
 
     async def get(self, request: web.Request, path: str) -> web.StreamResponse:
-        return _serve(request, path)
+        return _serve(request, _strip_version(path))
+
+
+def _active_version(request: web.Request) -> str | None:
+    """Имя каталога активного бандла — оно же версия в адресе."""
+    coordinator = _coordinator(request.app["hass"])
+    bundle = coordinator.bundle if coordinator else None
+    if bundle is None or bundle.active_dir is None:
+        return None
+    return bundle.version
+
+
+def _strip_version(path: str) -> str:
+    """`v/<версия>/<файл>` → `<файл>`; голое `v/<версия>/` → сама страница."""
+    if not path.startswith("v/"):
+        return path
+    rest = path[2:].split("/", 1)
+    return rest[1] if len(rest) == 2 and rest[1] else "index.html"
 
 
 def _serve(request: web.Request, relative: str) -> web.StreamResponse:

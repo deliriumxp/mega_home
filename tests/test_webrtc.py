@@ -291,6 +291,7 @@ def own_go2rtc(monkeypatch):
     monkeypatch.setattr(embed, "is_running", lambda: True)
     monkeypatch.setattr(embed, "URL", "http://127.0.0.1:1985")
     monkeypatch.setattr(webrtc, "ANSWER_TIMEOUT", 0.2)
+
     _Go2RtcWsClient.instances.clear()
     _Go2RtcRestClient.instances.clear()
     try:
@@ -513,24 +514,29 @@ def test_предложение_обязательно(_ha_camera_modules):
         run(ops.run(object(), _Coordinator([CAMERA_TILE]), "webrtc", {"id": "cam1"}))
 
 
-def test_постер_едет_кадром_в_base64(_ha_camera_modules):
+def test_постер_отдаётся_сырыми_байтами(_ha_camera_modules):
     """⚠ Единственная картинка через менеджер, и она посчитана: ОДИН кадр на
     открытие камеры. Переговоры длятся секунды, адресов Home Assistant снаружи
     нет, и без кадра просмотр открывается чёрным прямоугольником.
+
+    ⚠ `ops.camera_frame` отдаёт `(contentType, bytes)`, а не base64
+    (2026-09-08): кодирование — забота двери, которой оно нужно
+    (`relay_api.handle`), а не этого обработчика пути. До этой правки кадр
+    кодировался тут же и сразу декодировался вызывающей стороной — впустую,
+    на каждый кадр до 400 КБ.
 
     ⚠ Не именованная операция, а обработчик ПУТИ `api/camera-frame/<плитка>`:
     его зовут обе двери — локальная (`http.py`) и перенос (`relay_api.py`).
     Новых операций канала мы не заводим (design.md, 0.2.0)."""
     import sys
-    from base64 import b64decode
 
     _ha_camera_modules["camera.hall"] = _Camera(frame=b"\xff\xd8jpeg")
 
-    result = run(
+    content_type, raw = run(
         ops.camera_frame(object(), _Coordinator([CAMERA_TILE]), {"id": "cam1"})
     )
-    assert b64decode(result["image"]) == b"\xff\xd8jpeg"
-    assert result["contentType"] == "image/jpeg"
+    assert raw == b"\xff\xd8jpeg"
+    assert content_type == "image/jpeg"
     # Просим уменьшенный кадр: постер показывают, пока идёт соединение.
     assert sys.modules["homeassistant.components.camera"].asked == [("camera.hall", 640)]
 
@@ -547,7 +553,7 @@ def test_кадр_отдаётся_из_памяти_а_не_с_камеры(_ha
     first = run(ops.camera_frame(hass, _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
     second = run(ops.camera_frame(hass, _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
 
-    assert second["image"] == first["image"]
+    assert second[1] == first[1]
     # Камеру дёрнули РОВНО раз, второй кадр пришёл из памяти.
     assert sys.modules["homeassistant.components.camera"].asked == [("camera.hall", 640)]
     # И свежий кадр не тянет за собой фоновое обновление.
@@ -559,7 +565,6 @@ def test_опрос_состояний_греет_кадр_заранее(_ha_ca
     который есть у дома. К моменту открытия кадр обязан уже лежать, иначе
     жилец смотрит на пустоту ровно столько, сколько идут переговоры."""
     import sys
-    from base64 import b64decode
 
     hass = _Hass()
     _ha_camera_modules["camera.hall"] = _Camera(frame=b"\xff\xd8jpeg")
@@ -568,9 +573,9 @@ def test_опрос_состояний_греет_кадр_заранее(_ha_ca
     assert len(hass.tasks) == 1
     run(hass.tasks[0])
 
-    result = run(ops.camera_frame(hass, _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
+    content_type, raw = run(ops.camera_frame(hass, _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
 
-    assert b64decode(result["image"]) == b"\xff\xd8jpeg"
+    assert raw == b"\xff\xd8jpeg"
     # Кадр снят ОДИН раз — заранее; открытие камеры не стоило похода к ней.
     assert sys.modules["homeassistant.components.camera"].asked == [("camera.hall", 640)]
 

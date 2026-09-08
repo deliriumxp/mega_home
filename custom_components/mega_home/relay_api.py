@@ -112,13 +112,19 @@ async def _dispatch(
         # Постер камеры: один кадр на открытие просмотра. ⚠ Не поток — кадр на
         # ПЛИТКЕ обновляется по таймеру, и снаружи его нет вовсе
         # (remote-access.md у менеджера).
-        frame = await ops.camera_frame(
+        #
+        # ⚠ `ops.camera_frame` отдаёт СЫРЫЕ байты (2026-09-08), не base64:
+        # раньше кадр кодировался в `webrtc.snapshot`, тут же декодировался,
+        # а `handle()` ниже кодировал ОБРАТНО — два лишних прохода по кадру
+        # до 400 КБ на каждое открытие камеры. base64 — форма ОТВЕТА этой
+        # двери, и кодируется он один раз, в `handle()`.
+        content_type, raw = await ops.camera_frame(
             hass, coordinator, {"id": unquote(path[len("api/camera-frame/") :])}
         )
         return (
             HTTPStatus.OK,
-            frame["contentType"],
-            base64.b64decode(frame["image"]),
+            content_type,
+            raw,
             # Кадр живой: закешированный постер показывал бы вчерашний двор.
             "no-store",
         )

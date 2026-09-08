@@ -72,10 +72,12 @@ def test_без_координатора_тоже_заглушка() -> None:
 # ЖЁСТКОГО обновления страницы. Обычная перезагрузка поднимала `index.html` из
 # кэша, а его достаточно, чтобы остаться на старом коде целиком: имена бандлов
 # внутри хешированные, и старый `index.html` честно тянет старый `main-*.js`.
-# Ни `no-cache`, ни `no-store` дыру не закрывают: ту же страницу под тем же
-# адресом может держать service worker самого Home Assistant (scope `/`), до
-# которого нам не дотянуться. Единственный замок — ДРУГОЙ АДРЕС у другого
-# бандла: `?v=<версия>` меняет ключ в любом кэше.
+# Ни `no-cache`, ни `no-store` дыру не закрывают: ту же страницу держит service
+# worker самого Home Assistant (scope `/`) — маршрутом `StaleWhileRevalidate` с
+# `matchOptions: {ignoreSearch: true}`, то есть в кэше ищется ЛЮБАЯ запись с тем
+# же ПУТЁМ. Поэтому первая попытка (версия в `?v=`) не сработала вовсе: свежий
+# query добавлял запись, которую никто не читает. Версия уехала в ПУТЬ, а свои
+# страницы мы забираем у чужого воркера своим — на более узком scope.
 
 
 def _root(coordinator: Any, query: dict[str, str] | None = None) -> Any:
@@ -84,26 +86,55 @@ def _root(coordinator: Any, query: dict[str, str] | None = None) -> Any:
     return asyncio.run(MegaHomeAppRootView().get(FakeRequest(coordinator, query)))
 
 
-def test_голый_адрес_уводит_на_адрес_с_версией(tmp_path) -> None:
+def test_голый_адрес_уводит_на_путь_с_версией(tmp_path) -> None:
     (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
 
     response = _root(FakeCoordinator(tmp_path, "sha256-новая"))
 
     assert response.status == 302
-    assert response.location == "/mega-home/?v=sha256-новая"
+    # ⚠ Версия в ПУТИ, а не в `?v=`: воркер Home Assistant обслуживает страницы
+    # с `ignoreSearch: true` и на свежий query отдаёт вчерашнюю запись из кэша.
+    assert response.location == "/mega-home/v/sha256-новая/"
     # Сам редирект кэшировать нельзя — иначе он сам станет тем, что устарело.
     assert response.headers["Cache-Control"] == "no-store"
 
 
-def test_адрес_с_текущей_версией_отдаёт_приложение(tmp_path) -> None:
+def test_путь_с_версией_отдаёт_приложение(tmp_path) -> None:
+    """⚠ Каталога `v/<версия>` в бандле нет: префикс срезается, файлы лежат
+    там же, где лежали, и приложение просит их от `<base href>` без него."""
+    from mega_home.http import _strip_version
+
     (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
 
-    response = _root(FakeCoordinator(tmp_path, "sha256-новая"), {"v": "sha256-новая"})
+    assert _strip_version("v/sha256-новая/") == "index.html"
+    assert _strip_version("v/sha256-новая/main-A.js") == "main-A.js"
+    assert _strip_version("main-A.js") == "main-A.js"
+
+    response = _get(FakeCoordinator(tmp_path, "sha256-новая"), "index.html")
 
     assert response.status == 200
     # ⚠ `no-store`, а не `no-cache`: второе разрешает хранить и лишь обязывает
     # переспросить — этого и не хватило.
     assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_свой_воркер_раздаётся_и_забирает_scope() -> None:
+    """⚠ Ради этого он и заведён: браузер выбирает регистрацию с самым длинным
+    совпадающим scope, и наши страницы уходят из-под воркера Home Assistant
+    (scope `/`), который отдавал их из кэша с `ignoreSearch`."""
+    import asyncio as _asyncio
+
+    from mega_home.http import MegaHomeServiceWorkerView
+
+    response = _asyncio.run(MegaHomeServiceWorkerView().get(FakeRequest(None)))
+
+    assert response.status == 200
+    assert response.headers["Content-Type"].startswith("text/javascript")
+    # Застрявшая копия воркера — это застрявший scope.
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Service-Worker-Allowed"] == "/mega-home/"
+    # Ничего не перехватывает: он нужен как ЗАНЯТЫЙ scope, а не как кэш.
+    assert "addEventListener('fetch'" not in response.text
 
 
 def test_без_бандла_редиректа_нет_а_есть_заглушка() -> None:

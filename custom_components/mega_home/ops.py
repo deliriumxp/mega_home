@@ -211,12 +211,16 @@ def webrtc_close(
 
 async def camera_frame(
     hass: HomeAssistant, coordinator: MegaHomeCoordinator, payload: dict[str, Any]
-) -> dict[str, Any]:
+) -> tuple[str, bytes]:
     """Один кадр камеры — постер, пока идут переговоры (`webrtc.snapshot`).
 
     ⚠ Не операция канала, а обработчик ПУТИ: зовётся и локальной дверью
     (`http.py`), и переносом (`relay_api.py`). Новых именованных операций мы не
     заводим — ровно для этого перенос и сделан.
+
+    ⚠ Отдаёт `(contentType, bytes)`, а не base64: base64 — форма ответа
+    `relay_api.handle` (одна форма на картинку и на JSON, см. его докстринг),
+    а не этого обработчика. Кодирование — забота двери, которой оно нужно.
     """
     from . import webrtc
 

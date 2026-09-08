@@ -200,7 +200,10 @@ def test_постер_камеры_едет_тем_же_переносом(coord
 
     async def snapshot(hass, entity_id):
         assert entity_id == "camera.hall"
-        return {"contentType": "image/jpeg", "image": base64.b64encode(JPEG).decode("ascii")}
+        # ⚠ Сырые байты, не base64: `webrtc.snapshot` отдаёт кадр как есть
+        # (2026-09-08), кодирует его в base64 только `relay_api.handle` —
+        # ровно один раз, а не дважды туда-обратно.
+        return "image/jpeg", JPEG
 
     monkeypatch.setattr(webrtc, "snapshot", snapshot)
     answer = call(coordinator, "GET", "api/camera-frame/cam1")
