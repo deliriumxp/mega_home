@@ -53,19 +53,43 @@ ANSWER_TIMEOUT = 6.0
 # Полторы секунды — с запасом: обмен со STUN укладывается в десятые доли.
 CANDIDATE_WINDOW = 1.5
 
+# Живые ws-сессии СВОЕГО go2rtc: session_id → Go2RtcWsClient.
+#
+# ⚠ Соединение обязано пережить этот запрос: go2rtc держит поток (RTSP-сессию
+# камеры) ровно до закрытия ws. Закрытие — только по `close` от жильца; иначе
+# каждая попытка просмотра оставляла бы камеру занятой до перезапуска HA.
+_own_sessions: dict[str, Any] = {}
+
+
+async def _drop_own(session_id: str) -> None:
+    """Убрать сессию своего go2rtc: закрыть ws и отпустить камеру."""
+    client = _own_sessions.pop(session_id, None)
+    if client is None:
+        return
+    try:
+        await client.close()
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("own go2rtc ws close failed", exc_info=True)
+
 
 async def negotiate(
     hass: HomeAssistant, entity_id: str, offer_sdp: str
 ) -> dict[str, Any]:
     """Trade the resident's offer for this camera's answer and ICE candidates."""
     # Свой go2rtc :8555 — без зависимости от HA :18555/tcp
+    #
+    # ⚠ try укрывает ТОЛЬКО импорт модуля: его отсутствие — нормальное состояние
+    # (go2rtc не установлен) и повод идти путём HA-провайдера ниже. Отказ САМОГО
+    # go2rtc (OpError) ловить нельзя: он замещался бы попыткой провайдера, а та
+    # на доме без go2rtc в HA отвечала «камера не умеет WebRTC» — текст уводил
+    # настройщика чинить не то, и настоящий отказ не попадал даже в лог.
     try:
         from .go2rtc_embed import URL as _OWN_URL, is_running as _own_running
-
-        if _own_running():
-            return await _negotiate_own(hass, entity_id, offer_sdp, _OWN_URL)
     except Exception as err:  # noqa: BLE001
         LOGGER.debug("own go2rtc not used: %s", err)
+    else:
+        if _own_running():
+            return await _negotiate_own(hass, entity_id, offer_sdp, _OWN_URL)
 
     from homeassistant.components.camera.const import StreamType
     from homeassistant.components.camera.webrtc import (
@@ -189,28 +213,39 @@ async def _negotiate_own(
             answer.append(msg.sdp)
             answered.set()
         elif isinstance(msg, GoCand):
-            candidates.append(msg.candidate.to_dict() if hasattr(msg.candidate, "to_dict") else {"candidate": str(msg.candidate)})
+            # ⚠ Кандидат go2rtc — СТРОКА, а `addIceCandidate` в браузере
+            # отклоняет непустого кандидата без `sdpMid`/`sdpMLineIndex`
+            # (TypeError по спеке W3C). Фронтенд глотает отказ каждого
+            # кандидата как «минус один путь» — без m-line это значило «минус
+            # ВСЕ пути», и ICE не вставал никогда. Ноль — видео-секция оффера;
+            # с rtcp-mux обе секции делят один транспорт, так делает и сам HA
+            # (`RTCIceCandidateInit`), и фронтенд go2rtc (`sdpMid: '0'`).
+            candidates.append({"candidate": str(msg.candidate), "sdpMLineIndex": 0})
         elif isinstance(msg, WsError):
             failure.append(msg.error)
             answered.set()
 
     ws = Go2RtcWsClient(session, url, source=identifier)
     ws.subscribe(_on_msg)  # type: ignore[arg-type]
+    _own_sessions[session_id] = ws
     try:
         from go2rtc_client.ws import WebRTCOffer
 
         await ws.send(WebRTCOffer(offer_sdp, []))
     except Exception as err:  # noqa: BLE001
         LOGGER.warning("own go2rtc offer for %s failed: %s", entity_id, err)
+        await _drop_own(session_id)
         raise OpError("Дом не смог начать трансляцию с этой камеры", HTTPStatus.BAD_GATEWAY) from err
 
     try:
         async with asyncio.timeout(ANSWER_TIMEOUT):
             await answered.wait()
     except TimeoutError as err:
+        await _drop_own(session_id)
         raise OpError("Камера не ответила на запрос трансляции", HTTPStatus.GATEWAY_TIMEOUT) from err
     if failure or not answer:
         LOGGER.warning("own go2rtc offer for %s refused: %s", entity_id, failure)
+        await _drop_own(session_id)
         raise OpError(failure[0] if failure else "Камера не отдала ответ", HTTPStatus.BAD_GATEWAY)
     await asyncio.sleep(CANDIDATE_WINDOW)
     return {"sessionId": session_id, "answer": answer[0], "candidates": list(candidates)}
@@ -264,9 +299,23 @@ def close(hass: HomeAssistant, entity_id: str, session_id: str) -> dict[str, Any
     до тех пор держит поток с камеры. Телефон, у которого приложение убили на
     ходу, всё равно оставит сессию висеть — на такой случай у go2rtc свои
     таймауты, — но обычный «закрыл шторку» обязан убирать за собой сразу.
+
+    ⚠ Сессия СВОЕГО go2rtc закрывается через ws-реестр (`_own_sessions`):
+    `close_webrtc_session` камеры знает только провайдеров HA и про неё молчит.
     """
+    own = _own_sessions.pop(session_id, None)
+    if own is not None:
+        hass.async_create_task(_close_own(own))
+        return {"closed": True}
     _camera(hass, entity_id).close_webrtc_session(session_id)
     return {"closed": True}
+
+
+async def _close_own(client: Any) -> None:
+    try:
+        await client.close()
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("own go2rtc ws close failed", exc_info=True)
 
 
 def _camera(hass: HomeAssistant, entity_id: str):

@@ -109,6 +109,181 @@ class _Coordinator:
         self.data = {"tiles": tiles}
 
 
+# ─── Свой go2rtc (:8555) — тот путь, что активен с 0.2.9 ──────────────────────
+#
+# ⚠ Библиотека go2rtc_client в тесте подменена ЦЕЛИКОМ: проверяются решения
+# ЭТОГО файла — форма кандидатов, реестр сессий, отказ без маскировки, — а не
+# сетевой клиент (его пишет edenhaus).
+
+
+@dataclass(frozen=True)
+class _GoAnswer:
+    sdp: str
+
+
+@dataclass(frozen=True)
+class _GoCandidate:
+    candidate: str
+
+
+@dataclass(frozen=True)
+class _GoWsError:
+    error: str
+
+
+@dataclass(frozen=True)
+class _GoOffer:
+    sdp: str
+    ice_servers: list
+
+
+class _Go2RtcWsClient:
+    """Копия публичной поверхности Go2RtcWsClient, нужной переговорам."""
+
+    instances: list[_Go2RtcWsClient] = []
+
+    def __init__(self, session, url, *, source=None, destination=None) -> None:
+        assert source or destination, "source or destination must be set"
+        self.url = url
+        self.source = source
+        self.sent: list[Any] = []
+        self.closed = False
+        self.subscribers: list = []
+        _Go2RtcWsClient.instances.append(self)
+
+    def subscribe(self, callback) -> object:
+        self.subscribers.append(callback)
+        return lambda: None
+
+    async def send(self, message) -> None:
+        self.sent.append(message)
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def receive(self, message) -> None:
+        """Доставить сообщение подписчикам — как это делает rx-таска либы."""
+        for subscriber in self.subscribers:
+            subscriber(message)
+
+
+class _Producer:
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+
+class _Stream:
+    def __init__(self, producers: list[_Producer]) -> None:
+        self.producers = producers
+
+
+class _StreamsApi:
+    def __init__(self) -> None:
+        self.streams: dict[str, _Stream] = {}
+        self.added: list[tuple[str, list]] = []
+        self.fail = False
+
+    async def list(self) -> dict[str, _Stream]:
+        if self.fail:
+            raise RuntimeError("go2rtc is down")
+        return self.streams
+
+    async def add(self, name: str, sources) -> None:
+        self.added.append((name, list(sources)))
+
+
+class _Go2RtcRestClient:
+    instances: list[_Go2RtcRestClient] = []
+    # Классовый флаг: `negotiate` строит СВОЙ клиент, инстанс из теста до него
+    # не дотянется. Сбрасывается monkeypatch'ем в самом тесте.
+    fail_next = False
+
+    def __init__(self, session, url) -> None:
+        self.streams = _StreamsApi()
+        self.streams.fail = type(self).fail_next
+        _Go2RtcRestClient.instances.append(self)
+
+
+class _OwnCamera:
+    """Камера для пути своего go2rtc: stream_source и платформа, без провайдера HA."""
+
+    def __init__(self, source: str = "rtsp://cam/stream") -> None:
+        self._source = source
+        self.offers: list[tuple[str, str]] = []
+        self.closed: list[str] = []
+
+        class _Platform:
+            platform_name = "generic"
+
+        self.platform = _Platform()
+
+    async def stream_source(self) -> str:
+        return self._source
+
+    async def async_handle_async_webrtc_offer(self, offer_sdp, session_id, send_message) -> None:
+        """Провайдерный путь HA: помечаем, если сюда всё-таки отходили."""
+        self.offers.append((offer_sdp, session_id))
+
+    def close_webrtc_session(self, session_id: str) -> None:
+        self.closed.append(session_id)
+
+
+class _OwnHass:
+    """`hass` с тем единственным, что нужно пути: планировщик задач."""
+
+    def __init__(self) -> None:
+        self.tasks: list = []
+
+    def async_create_task(self, coro) -> None:
+        import asyncio
+
+        self.tasks.append(coro)
+        asyncio.ensure_future(coro)
+
+
+@pytest.fixture
+def own_go2rtc(monkeypatch):
+    """Включить «свой go2rtc работает» и подменить библиотеку клиента."""
+    import mega_home.go2rtc_embed as embed
+    from mega_home import webrtc
+
+    go2rtc_client = types.ModuleType("go2rtc_client")
+    go2rtc_client.Go2RtcRestClient = _Go2RtcRestClient
+    go2rtc_ws = types.ModuleType("go2rtc_client.ws")
+    go2rtc_ws.Go2RtcWsClient = _Go2RtcWsClient
+    go2rtc_ws.WebRTCAnswer = _GoAnswer
+    go2rtc_ws.WebRTCCandidate = _GoCandidate
+    go2rtc_ws.WsError = _GoWsError
+    go2rtc_ws.WebRTCOffer = _GoOffer
+    go2rtc_util = types.ModuleType("homeassistant.components.go2rtc.util")
+
+    def get_camera_identifier(camera):  # type: ignore[no-untyped-def]
+        return "camera.hall"
+
+    go2rtc_util.get_camera_identifier = get_camera_identifier
+    added = {
+        "go2rtc_client": go2rtc_client,
+        "go2rtc_client.ws": go2rtc_ws,
+        "homeassistant.components.go2rtc": types.ModuleType(
+            "homeassistant.components.go2rtc"
+        ),
+        "homeassistant.components.go2rtc.util": go2rtc_util,
+    }
+    sys.modules.update(added)
+    monkeypatch.setattr(embed, "is_running", lambda: True)
+    monkeypatch.setattr(embed, "URL", "http://127.0.0.1:1985")
+    monkeypatch.setattr(webrtc, "ANSWER_TIMEOUT", 0.2)
+    _Go2RtcWsClient.instances.clear()
+    _Go2RtcRestClient.instances.clear()
+    try:
+        yield types.SimpleNamespace(ws=_Go2RtcWsClient, rest=_Go2RtcRestClient)
+    finally:
+        for name in added:
+            sys.modules.pop(name, None)
+        # Реестр сессий не должен протекать между тестами.
+        webrtc._own_sessions.clear()
+
+
 CAMERA_TILE = {"id": "cam1", "domain": "camera", "entityId": "camera.hall"}
 
 
@@ -352,3 +527,109 @@ def test_камера_без_кадра_отказывает_понятно(_ha_
     with pytest.raises(ops.OpError) as err:
         run(ops.camera_frame(object(), _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
     assert err.value.message == "Камера не отдала кадр"
+
+
+# ─── Свой go2rtc (:8555) — активный путь с 0.2.9 ─────────────────────────────
+
+
+def _own_negotiate(ws_messages):
+    """Прогнать переговоры через свой go2rtc и вернуть (ответ, ws)."""
+
+    async def scenario():
+        task = asyncio.ensure_future(
+            ops.run(
+                object(), _Coordinator([CAMERA_TILE]), "webrtc", {"id": "cam1", "offer": "v=0 offer"}
+            )
+        )
+        # Всё в подменах разрешается без уступки циклу: за один sleep(0)
+        # переговоры доходят до ожидания ответа, ws уже создан.
+        await asyncio.sleep(0)
+        ws = _Go2RtcWsClient.instances[-1]
+        for message in ws_messages:
+            ws.receive(message)
+        return await task, ws
+
+    return run(scenario())
+
+
+def test_свой_go2rtc_кандидаты_едут_с_mline(_ha_camera_modules, own_go2rtc):
+    """⚠ Спека W3C: непустой кандидат без sdpMid и sdpMLineIndex — TypeError
+    из addIceCandidate, и фронтенд глотает отказ КАЖДОГО кандидата как «минус
+    один путь». Без m-line это «минус ВСЕ пути»: ICE не вставал никогда, и
+    именно поэтому переговоры проходили, а видео — нет. Ноль — видео-секция
+    оффера; так нормализует и сам HA (RTCIceCandidateInit), и фронтенд go2rtc
+    (sdpMid: '0')."""
+    _ha_camera_modules["camera.hall"] = _OwnCamera()
+
+    result, ws = _own_negotiate(
+        [_GoAnswer("v=0 answer"), _GoCandidate("candidate:1 UDP typ srflx")]
+    )
+
+    assert result["answer"] == "v=0 answer"
+    assert result["candidates"] == [
+        {"candidate": "candidate:1 UDP typ srflx", "sdpMLineIndex": 0}
+    ]
+    # Поток добавлен своему go2rtc: generic-камера едет с ffmpeg-префиксом,
+    # как это делает провайдер HA.
+    assert _Go2RtcRestClient.instances[-1].streams.added == [
+        ("camera.hall", ["ffmpeg:rtsp://cam/stream"])
+    ]
+    # Сессия зарегистрирована: живая ws обязана пережить запрос.
+    from mega_home import webrtc
+
+    assert webrtc._own_sessions[result["sessionId"]] is ws
+
+
+def test_отказ_своего_go2rtc_не_подменяется_фолбэком(_ha_camera_modules, own_go2rtc, monkeypatch):
+    """⚠ Отказ go2rtc раньше глотался как «own не используется» и подменялся
+    попыткой HA-провайдера, которая на доме без go2rtc в HA врала «камера не
+    умеет WebRTC» — настройщик чинил не то."""
+    camera = _OwnCamera()
+    _ha_camera_modules["camera.hall"] = camera
+    monkeypatch.setattr(_Go2RtcRestClient, "fail_next", True)
+
+    with pytest.raises(ops.OpError) as err:
+        run(
+            ops.run(
+                object(), _Coordinator([CAMERA_TILE]), "webrtc", {"id": "cam1", "offer": "v=0"}
+            )
+        )
+    assert err.value.message == "Дом не смог начать трансляцию с этой камеры"
+    # К HA-провайдеру не отходили вовсе.
+    assert camera.offers == []
+
+
+def test_ошибка_своего_go2rtc_закрывает_ws(_ha_camera_modules, own_go2rtc):
+    """Сессия не должна переживать отказ: go2rtc держал бы поток с камеры."""
+    _ha_camera_modules["camera.hall"] = _OwnCamera()
+
+    with pytest.raises(ops.OpError) as err:
+        _own_negotiate([_GoWsError("Stream is busy")])
+    assert "Stream is busy" in err.value.message
+
+    from mega_home import webrtc
+
+    assert not webrtc._own_sessions
+
+
+def test_закрытие_просмотра_закрывает_сессию_своего_go2rtc(_ha_camera_modules, own_go2rtc):
+    """⚠ `close_webrtc_session` камеры про сессии своего go2rtc не знает: без
+    реестра «закрыл шторку» никогда не отпускал камеру — go2rtc держал
+    RTSP-поток до перезапуска HA."""
+    _ha_camera_modules["camera.hall"] = _OwnCamera()
+    result, ws = _own_negotiate(
+        [_GoAnswer("v=0 answer"), _GoCandidate("candidate:1 typ host")]
+    )
+
+    from mega_home import webrtc
+
+    async def scenario():
+        webrtc.close(_OwnHass(), "camera.hall", result["sessionId"])
+        # close() планирует закрытие — даём задаче выполниться.
+        await asyncio.sleep(0.01)
+
+    run(scenario())
+    assert ws.closed
+    assert not webrtc._own_sessions
+    # HA-камеру не трогали: сессия была не её.
+    assert _ha_camera_modules["camera.hall"].closed == []
