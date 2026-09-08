@@ -141,3 +141,86 @@ def test_half_a_bundle_never_becomes_active(tmp_path: Path) -> None:
     assert asyncio.run(bundle.async_sync()) is False
     assert bundle.active_dir == good
     assert (bundle.active_dir / "main-A.js").read_bytes() == b"one"
+
+
+class GatedClient(FakeClient):
+    """Менеджер, у которого одну выдачу файла можно задержать.
+
+    Нужен ровно затем, чтобы столкнуть два прогона синхронизации во времени:
+    вживую это происходит само (опрос раз в 15 минут и подсказка `app_changed`
+    по живому каналу), а в спеке порядок надо задать руками.
+    """
+
+    def __init__(self, files: dict[str, bytes], pause_on: str | None) -> None:
+        super().__init__(files)
+        self.pause_on = pause_on
+        self.reached = asyncio.Event()
+        self.go = asyncio.Event()
+
+    async def async_app_file(self, path: str) -> bytes:
+        if path == self.pause_on:
+            self.reached.set()
+            await self.go.wait()
+        return await super().async_app_file(path)
+
+
+def test_a_slow_run_cannot_bring_back_the_previous_interface(tmp_path: Path) -> None:
+    """⚠ Regression: активной становилась та версия, что финишировала ПОСЛЕДНЕЙ.
+
+    Опрос успевал взять манифест до публикации, подсказка приходила уже с новым
+    — и если опрос заканчивал позже, дом возвращался на СТАРЫЙ интерфейс и
+    раздавал его до следующего опроса, то есть до 15 минут, ничего не написав в
+    журнал. Снаружи это выглядело как «иногда прилетает другой бандл» (жалоба
+    2026-09-08) и не лечилось очисткой кэша браузера.
+    """
+
+    async def scenario() -> BundleStore:
+        client = GatedClient({"index.html": b"<html>", "main-A.js": b"one"}, "main-A.js")
+        bundle = store(tmp_path, client)
+        # Опрос: манифест уже взят, файл ещё качается.
+        slow = asyncio.ensure_future(bundle.async_sync())
+        await client.reached.wait()
+
+        # Пока он качает, вышел новый интерфейс, и менеджер толкнул подсказку.
+        client.publish(
+            {"index.html": b"<html>", "main-A.js": b"one", "main-B.js": b"two"}
+        )
+        client.pause_on = None
+        nudge = asyncio.ensure_future(bundle.async_sync())
+        await asyncio.sleep(0.01)
+
+        client.go.set()
+        await asyncio.gather(slow, nudge)
+        return bundle
+
+    bundle = asyncio.run(scenario())
+
+    assert (bundle.active_dir / "main-B.js").read_bytes() == b"two"
+
+
+def test_two_runs_of_one_version_do_not_share_a_staging_directory(tmp_path: Path) -> None:
+    """⚠ Regression: каталог-черновик один на версию, и второй прогон его вычищал.
+
+    Менеджер на каждом переподключении шлёт подсказки подряд, так что два
+    прогона ОДНОЙ версии — обычное дело. `_reset_dir` второго сносил то, что
+    писал первый, и активным мог стать неполный бандл, то есть белый экран у
+    жильца — ровно то, от чего бережёт проверка «половина бандла не активируется».
+    """
+
+    async def scenario() -> tuple[BundleStore, GatedClient]:
+        client = GatedClient({"index.html": b"<html>", "main-A.js": b"one"}, "main-A.js")
+        bundle = store(tmp_path, client)
+        first = asyncio.ensure_future(bundle.async_sync())
+        await client.reached.wait()
+        second = asyncio.ensure_future(bundle.async_sync())
+        await asyncio.sleep(0.01)
+        client.go.set()
+        await asyncio.gather(first, second)
+        return bundle, client
+
+    bundle, client = asyncio.run(scenario())
+
+    # Один комплект файлов на две подсказки: второй прогон видит уже скачанное.
+    assert sorted(client.downloads) == ["index.html", "main-A.js"]
+    assert (bundle.active_dir / "main-A.js").read_bytes() == b"one"
+    assert (bundle.active_dir / "index.html").read_bytes() == b"<html>"

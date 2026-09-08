@@ -56,8 +56,10 @@ class ManagerLink:
         self._coordinator = coordinator
         self._connected = False
         self._task: asyncio.Task[None] | None = None
-        # Запросы, на которые ещё отвечаем (см. `_handle`). Ссылку держим здесь:
-        # задача без ссылки может быть собрана сборщиком мусора на полпути.
+        # Фоновая работа канала: ответы на запросы жильца и скачивание бандла по
+        # подсказке (см. `_handle`) — всё, что нельзя делать в цикле чтения
+        # сокета. Ссылку держим здесь: задача без ссылки может быть собрана
+        # сборщиком мусора на полпути.
         self._answers: set[asyncio.Task[None]] = set()
 
     @property
@@ -197,8 +199,20 @@ class ManagerLink:
         if kind == "app_changed":
             # A new interface was published. Nothing about this home changed, so
             # the config refresh would not notice it on its own.
+            #
+            # ⚠ ОТДЕЛЬНОЙ задачей, по той же причине, что и ответы выше: тут
+            # качается бандл — сотни килобайт по уплинку квартиры, — а пока этот
+            # метод не вернётся, ни один следующий кадр из сокета не прочитан.
+            # То есть на всё скачивание дом переставал отвечать жильцу, и его
+            # запросы отваливались по таймауту менеджера. С 2026-09-08 ожидание
+            # стало ещё и длиннее: синхронизация сериализована замком
+            # (`bundle.py`), поэтому подсказка может ждать идущий опрос.
             if self._coordinator.bundle:
-                await self._coordinator.bundle.async_sync(payload.get("version"))
+                task = asyncio.ensure_future(
+                    self._coordinator.bundle.async_sync(payload.get("version"))
+                )
+                self._answers.add(task)
+                task.add_done_callback(self._answers.discard)
             return
         if kind != "config_changed":
             return
