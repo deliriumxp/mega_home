@@ -106,6 +106,8 @@ async def async_register_http(
         # выпуска этой интеграции (`assets.py`).
         MegaHomeAssetView,
         MegaHomeCameraFrameView,
+        MegaHomeWebRtcView,
+        MegaHomeWebRtcCloseView,
         MegaHomeRelayView,
         MegaHomeAppRootView,
         MegaHomeAppView,
@@ -435,6 +437,29 @@ class MegaHomeCameraFrameView(_MegaHomeView):
             # Кадр живой: закешированный постер показывал бы вчерашний двор.
             headers={"Content-Type": frame["contentType"], "Cache-Control": "no-store"},
         )
+
+
+class MegaHomeWebRtcView(_MegaHomeView):
+    """WebRTC locally — то же что снаружи, но без канала до менеджера.
+
+    ⚠ Унификация 2026-09-08: внутри дома был MJPEG (`/api/camera_proxy_stream`),
+    снаружи — WebRTC. В локалке MJPEG лагает и мылит, а WebRTC уже настроен
+    (свой go2rtc с UDP). Разница была только адресом базы — теперь и поток один.
+    """
+
+    url = f"{URL_API}/webrtc"
+    name = "api:mega_home:webrtc"
+
+    async def post(self, request: web.Request) -> web.Response:
+        return await self.run_async(request, "webrtc")
+
+
+class MegaHomeWebRtcCloseView(_MegaHomeView):
+    url = f"{URL_API}/webrtc/close"
+    name = "api:mega_home:webrtc_close"
+
+    async def post(self, request: web.Request) -> web.Response:
+        return await self.run_async(request, "webrtc-close")
 
 
 class MegaHomeRelayView(_MegaHomeView):
