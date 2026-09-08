@@ -93,15 +93,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
 
     await async_register_http(hass, coordinator)
 
-    # Встроенный go2rtc с UDP для WebRTC наружу — без аддона (server.py HA
-    # слушает :18555/tcp без UDP, srflx 0). Запускаем тот же бинарь с
-    # listen :8555 и stun:8555 (go2rtc_embed.py).
+    # Патч HA go2rtc :18555/tcp → :8555 stun:8555 (go2rtc_embed.py) — импорт
+    # патчит шаблон до старта сервера, действует со следующего старта HA.
     try:
-        from .go2rtc_embed import async_start as _go2rtc_start
+        import importlib as _il  # noqa: F401
 
-        await _go2rtc_start(hass)
+        _il.import_module("custom_components.mega_home.go2rtc_embed")
     except Exception as err:  # noqa: BLE001
-        LOGGER.debug("Embedded go2rtc not started: %s", err)
+        LOGGER.debug("go2rtc patch not applied: %s", err)
 
     # Живой канал к менеджеру: правка состава доезжает за секунды вместо интервала
     # опроса. Опрос при этом остаётся страховкой — канал может не подняться вовсе
