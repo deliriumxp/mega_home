@@ -53,23 +53,50 @@ ANSWER_TIMEOUT = 6.0
 # Полторы секунды — с запасом: обмен со STUN укладывается в десятые доли.
 CANDIDATE_WINDOW = 1.5
 
-# Живые ws-сессии СВОЕГО go2rtc: session_id → Go2RtcWsClient.
+# Живые ws-сессии СВОЕГО go2rtc: session_id → (когда открыта, Go2RtcWsClient).
 #
 # ⚠ Соединение обязано пережить этот запрос: go2rtc держит поток (RTSP-сессию
-# камеры) ровно до закрытия ws. Закрытие — только по `close` от жильца; иначе
-# каждая попытка просмотра оставляла бы камеру занятой до перезапуска HA.
-_own_sessions: dict[str, Any] = {}
+# камеры) ровно до закрытия ws. Закрытие — по `close` от жильца; иначе каждая
+# попытка просмотра оставляла бы камеру занятой до перезапуска HA.
+_own_sessions: dict[str, tuple[float, Any]] = {}
+
+# Сколько сессия живёт без закрытия. Телефон, у которого убили приложение,
+# `close` не пришлёт НИКОГДА, а ws держим мы — значит и поток с камеры держим
+# мы, и никакие таймауты go2rtc тут не помогут. Просмотр дольше этого срока —
+# случай редкий, и переоткрыть его дешевле, чем держать камеру занятой сутками.
+SESSION_TTL = 3600.0
 
 
 async def _drop_own(session_id: str) -> None:
     """Убрать сессию своего go2rtc: закрыть ws и отпустить камеру."""
-    client = _own_sessions.pop(session_id, None)
-    if client is None:
+    entry = _own_sessions.pop(session_id, None)
+    if entry is None:
         return
-    try:
-        await client.close()
-    except Exception:  # noqa: BLE001
-        LOGGER.debug("own go2rtc ws close failed", exc_info=True)
+    await _close_own(entry[1])
+
+
+def _expire_own(hass: HomeAssistant) -> None:
+    """Убрать сессии, о закрытии которых никто не сообщил."""
+    from time import monotonic
+
+    now = monotonic()
+    for session_id in [key for key, (when, _) in _own_sessions.items() if now - when > SESSION_TTL]:
+        LOGGER.info("Сессия %s просрочена — отпускаем камеру", session_id)
+        entry = _own_sessions.pop(session_id, None)
+        if entry is not None:
+            hass.async_create_task(_close_own(entry[1]))
+
+
+async def async_shutdown() -> None:
+    """Отпустить все камеры: интеграцию выгружают или Home Assistant встаёт.
+
+    ⚠ Без этого перезагрузка записи оставляла бы за собой открытые ws к
+    go2rtc — то есть занятые камеры, о которых больше некому вспомнить.
+    """
+    for session_id in list(_own_sessions):
+        entry = _own_sessions.pop(session_id, None)
+        if entry is not None:
+            await _close_own(entry[1])
 
 
 async def negotiate(
@@ -225,9 +252,12 @@ async def _negotiate_own(
             failure.append(msg.error)
             answered.set()
 
+    from time import monotonic
+
     ws = Go2RtcWsClient(session, url, source=identifier)
     ws.subscribe(_on_msg)  # type: ignore[arg-type]
-    _own_sessions[session_id] = ws
+    _expire_own(hass)
+    _own_sessions[session_id] = (monotonic(), ws)
     try:
         from go2rtc_client.ws import WebRTCOffer
 
@@ -260,6 +290,29 @@ MAX_SNAPSHOT_BYTES = 400_000
 # потоком — разрешение камеры здесь не нужно, нужен узнаваемый кадр.
 SNAPSHOT_WIDTH = 640
 
+# Кадр моложе этого отдаём как есть и камеру не тревожим.
+#
+# ⚠ Кэш здесь не про экономию, а про СМЫСЛ постера. Снять кадр стоит секунду с
+# лишним: у камеры без отдельного снапшот-адреса Home Assistant поднимает под
+# него ffmpeg и ждёт ключевого кадра. Постер, который добывается столько же,
+# сколько прикрываемые им переговоры, не прикрывает ничего — просмотр всё равно
+# открывался пустым на несколько секунд (жалоба 2026-09-08).
+SNAPSHOT_FRESH = 20.0
+# Старше этого не показываем: постер должен быть похож на то, что во дворе
+# сейчас, а не на то, что было полчаса назад.
+SNAPSHOT_USABLE = 300.0
+# Как часто греем кадр ФОНОМ, пока приложение открыто. Реже, чем «свежесть»:
+# опрос состояний идёт раз в 3 с, и грей мы по тому же порогу — на доме с
+# пятью камерами это был бы вечный ffmpeg по кругу ради кадра, на который
+# никто, возможно, не посмотрит.
+WARM_INTERVAL = 60.0
+
+# entity_id → (когда снят, тип, байты).
+_frames: dict[str, tuple[float, str, bytes]] = {}
+# Какие кадры сейчас снимаются: без этого опрос состояний раз в 3 с завёл бы
+# по граббер на каждый заход.
+_grabbing: set[str] = set()
+
 
 async def snapshot(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
     """One still frame, so the viewer does not open on black.
@@ -269,26 +322,78 @@ async def snapshot(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
     и без кадра просмотр открывается чёрным прямоугольником, что читается как
     «камера не работает». Один кадр на открытие камеры, а не поток: плитка в
     сетке снаружи по-прежнему обходится глифом (docs/remote-access.md).
+
+    ⚠ Свежий кадр отдаётся ИЗ ПАМЯТИ, не дожидаясь камеры, а обновляется он
+    фоном (см. `SNAPSHOT_FRESH`). Иначе постер стоил бы ровно тех секунд, ради
+    которых он и заведён.
     """
-    from base64 import b64encode
+    from time import monotonic
+
+    cached = _frames.get(entity_id)
+    if cached is not None and monotonic() - cached[0] <= SNAPSHOT_USABLE:
+        # На эту камеру СЕЙЧАС смотрят: обновляем сразу, а не по общему сроку.
+        warm(hass, entity_id, SNAPSHOT_FRESH)
+        return _packed(cached)
+    return _packed(await _grab(hass, entity_id))
+
+
+def warm(hass: HomeAssistant, entity_id: str, max_age: float = WARM_INTERVAL) -> None:
+    """Снять кадр ЗАРАНЕЕ, фоном, если он старше `max_age`.
+
+    ⚠ Зовётся с опроса состояний (`ops.states`): приложение открыто, значит
+    камеру могут открыть в любую секунду, и кадр к этому моменту должен уже
+    лежать. Отказ камеры сюда не выносится — это подготовка, а не запрос
+    жильца: не снялось, так снимется при открытии, с обычным сообщением.
+    """
+    from time import monotonic
+
+    if entity_id in _grabbing:
+        return
+    cached = _frames.get(entity_id)
+    if cached is not None and monotonic() - cached[0] <= max_age:
+        return
+    hass.async_create_task(_warm(hass, entity_id))
+
+
+async def _warm(hass: HomeAssistant, entity_id: str) -> None:
+    try:
+        await _grab(hass, entity_id)
+    except OpError as err:
+        LOGGER.debug("Warming %s failed: %s", entity_id, err.message)
+
+
+async def _grab(hass: HomeAssistant, entity_id: str) -> tuple[float, str, bytes]:
+    """Один настоящий кадр с камеры — и в память."""
+    from time import monotonic
 
     from homeassistant.components.camera import async_get_image
     from homeassistant.exceptions import HomeAssistantError
 
+    _grabbing.add(entity_id)
     try:
         image = await async_get_image(hass, entity_id, width=SNAPSHOT_WIDTH)
     except HomeAssistantError as err:
         LOGGER.debug("Snapshot of %s failed: %s", entity_id, err)
         raise OpError("Камера не отдала кадр", HTTPStatus.BAD_GATEWAY) from err
+    finally:
+        _grabbing.discard(entity_id)
 
     if len(image.content) > MAX_SNAPSHOT_BYTES:
         LOGGER.warning(
             "Snapshot of %s is %d bytes — too large to send", entity_id, len(image.content)
         )
         raise OpError("Кадр камеры слишком большой", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+    frame = (monotonic(), image.content_type, image.content)
+    _frames[entity_id] = frame
+    return frame
+
+
+def _packed(frame: tuple[float, str, bytes]) -> dict[str, Any]:
+    from base64 import b64encode
+
     return {
-        "contentType": image.content_type,
-        "image": b64encode(image.content).decode("ascii"),
+        "contentType": frame[1],
+        "image": b64encode(frame[2]).decode("ascii"),
     }
 
 
@@ -305,7 +410,7 @@ def close(hass: HomeAssistant, entity_id: str, session_id: str) -> dict[str, Any
     """
     own = _own_sessions.pop(session_id, None)
     if own is not None:
-        hass.async_create_task(_close_own(own))
+        hass.async_create_task(_close_own(own[1]))
         return {"closed": True}
     _camera(hass, entity_id).close_webrtc_session(session_id)
     return {"closed": True}

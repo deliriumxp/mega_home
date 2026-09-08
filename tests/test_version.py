@@ -58,11 +58,23 @@ def test_hello_carries_both_versions() -> None:
         async def async_add_executor_job(func, *args):
             return func(*args)
 
+    class _Bundle:
+        version = "561c5d8137ae5536"
+        last_error = None
+
+    class _Coordinator:
+        bundle = _Bundle()
+
     instance = ManagerLink.__new__(ManagerLink)
     instance._hass = _Hass()
+    instance._coordinator = _Coordinator()
 
     frame = asyncio.run(instance._hello())
 
     assert frame["t"] == "hello"
     assert frame["version"] == INTEGRATION_VERSION
     assert frame["disk_version"] == _disk_version()
+    # ⚠ И какой ИНТЕРФЕЙС дом раздаёт прямо сейчас: без этого «почему у меня
+    # старые кнопки» разбирается по скриншотам, а не по карточке объекта.
+    assert frame["app_version"] == "561c5d8137ae5536"
+    assert frame["app_error"] is None

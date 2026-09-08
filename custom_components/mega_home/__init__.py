@@ -12,7 +12,9 @@ exist at all.
 
 from __future__ import annotations
 
-from homeassistant.const import Platform
+from typing import Any
+
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -93,11 +95,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
 
     await async_register_http(hass, coordinator)
 
-    # Свой go2rtc :8555 stun:8555 без патча HA core — одна схема
+    # Свой go2rtc :8555 stun:8555 без патча HA core — одна схема.
+    #
+    # ⚠ Остановка процесса и закрытие ws-сессий висят на выгрузке записи И на
+    # остановке Home Assistant. Осиротевший go2rtc держит :8555, и следующий
+    # запуск слушатель уже не поднимет: снаружи камеры молча перестают
+    # открываться, а лечится это только ребутом машины.
     try:
+        from . import webrtc as _webrtc
         from .go2rtc_embed import async_start as _go2rtc_start
+        from .go2rtc_embed import async_stop as _go2rtc_stop
+
+        async def _shutdown(_event: Any = None) -> None:
+            await _webrtc.async_shutdown()
+            await _go2rtc_stop()
 
         await _go2rtc_start(hass)
+        entry.async_on_unload(
+            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _shutdown)
+        )
+        entry.async_on_unload(lambda: hass.async_create_task(_shutdown()))
     except Exception as err:  # noqa: BLE001
         LOGGER.debug("go2rtc not started: %s", err)
 

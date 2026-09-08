@@ -107,6 +107,24 @@ class _Camera:
 class _Coordinator:
     def __init__(self, tiles: list[dict[str, Any]]) -> None:
         self.data = {"tiles": tiles}
+        self.version = None
+        self.bundle = None
+
+
+class _Hass:
+    """Home Assistant ровно в том объёме, в каком его трогает постер."""
+
+    class _States:
+        def get(self, _entity_id):  # noqa: ANN001, D102
+            return None
+
+    def __init__(self) -> None:
+        self.states = _Hass._States()
+        self.tasks: list[Any] = []
+
+    def async_create_task(self, coro):  # noqa: ANN001, D102
+        self.tasks.append(coro)
+        return coro
 
 
 # ─── Свой go2rtc (:8555) — тот путь, что активен с 0.2.9 ──────────────────────
@@ -289,7 +307,15 @@ CAMERA_TILE = {"id": "cam1", "domain": "camera", "entityId": "camera.hall"}
 
 @pytest.fixture(autouse=True)
 def _ha_camera_modules():
-    """Подменить модули камеры Home Assistant на время теста."""
+    """Подменить модули камеры Home Assistant на время теста.
+
+    ⚠ Заодно чистится память постеров (`webrtc._frames`): кадр кэшируется в
+    модуле, и без уборки снимок одного теста отвечал бы за камеру другого.
+    """
+    from mega_home import webrtc as _webrtc
+
+    _webrtc._frames.clear()
+    _webrtc._grabbing.clear()
     package = types.ModuleType("homeassistant.components.camera")
     const = types.ModuleType("homeassistant.components.camera.const")
     const.StreamType = _StreamType
@@ -509,6 +535,46 @@ def test_постер_едет_кадром_в_base64(_ha_camera_modules):
     assert sys.modules["homeassistant.components.camera"].asked == [("camera.hall", 640)]
 
 
+def test_кадр_отдаётся_из_памяти_а_не_с_камеры(_ha_camera_modules):
+    """⚠ Постер прикрывает секунды переговоров, а сам стоил столько же: снимок
+    у камеры без снапшот-адреса поднимает ffmpeg и ждёт ключевого кадра. Второй
+    заход обязан отвечать из памяти — иначе просмотр открывается пустым."""
+    import sys
+
+    hass = _Hass()
+    _ha_camera_modules["camera.hall"] = _Camera(frame=b"\xff\xd8jpeg")
+
+    first = run(ops.camera_frame(hass, _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
+    second = run(ops.camera_frame(hass, _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
+
+    assert second["image"] == first["image"]
+    # Камеру дёрнули РОВНО раз, второй кадр пришёл из памяти.
+    assert sys.modules["homeassistant.components.camera"].asked == [("camera.hall", 640)]
+    # И свежий кадр не тянет за собой фоновое обновление.
+    assert hass.tasks == []
+
+
+def test_опрос_состояний_греет_кадр_заранее(_ha_camera_modules):
+    """⚠ Открытое приложение — единственный признак «камеру сейчас откроют»,
+    который есть у дома. К моменту открытия кадр обязан уже лежать, иначе
+    жилец смотрит на пустоту ровно столько, сколько идут переговоры."""
+    import sys
+    from base64 import b64decode
+
+    hass = _Hass()
+    _ha_camera_modules["camera.hall"] = _Camera(frame=b"\xff\xd8jpeg")
+
+    ops.states(hass, _Coordinator([CAMERA_TILE]))
+    assert len(hass.tasks) == 1
+    run(hass.tasks[0])
+
+    result = run(ops.camera_frame(hass, _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
+
+    assert b64decode(result["image"]) == b"\xff\xd8jpeg"
+    # Кадр снят ОДИН раз — заранее; открытие камеры не стоило похода к ней.
+    assert sys.modules["homeassistant.components.camera"].asked == [("camera.hall", 640)]
+
+
 def test_слишком_большой_кадр_отклоняется(_ha_camera_modules, monkeypatch):
     """⚠ Кадр едет кадром вебсокета до менеджера: переросший предел не
     обрезается, а ЗАКРЫВАЕТ канал — объект ушёл бы в офлайн от одного нажатия."""
@@ -577,7 +643,9 @@ def test_свой_go2rtc_кандидаты_едут_с_mline(_ha_camera_modules
     # Сессия зарегистрирована: живая ws обязана пережить запрос.
     from mega_home import webrtc
 
-    assert webrtc._own_sessions[result["sessionId"]] is ws
+    # (когда открыта, клиент): срок нужен, чтобы забытая сессия не держала
+    # камеру вечно — телефон с убитым приложением `close` не пришлёт никогда.
+    assert webrtc._own_sessions[result["sessionId"]][1] is ws
 
 
 def test_отказ_своего_go2rtc_не_подменяется_фолбэком(_ha_camera_modules, own_go2rtc, monkeypatch):

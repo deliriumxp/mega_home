@@ -93,6 +93,7 @@ def states(hass: HomeAssistant, coordinator: MegaHomeCoordinator) -> dict[str, A
         entity_view(tile, hass.states.get(tile["entityId"]) if tile.get("entityId") else None)
         for tile in coordinator.data.get("tiles", [])
     ]
+    _warm_cameras(hass, coordinator)
     return {
         # Always connected: this runs inside the home, so there is no link to
         # lose between here and Home Assistant. When the manager forwards this
@@ -106,6 +107,24 @@ def states(hass: HomeAssistant, coordinator: MegaHomeCoordinator) -> dict[str, A
         "appVersion": coordinator.bundle.version if coordinator.bundle else None,
         "entities": entities,
     }
+
+
+def _warm_cameras(hass: HomeAssistant, coordinator: MegaHomeCoordinator) -> None:
+    """Держать наготове кадр каждой камеры, пока приложение открыто.
+
+    ⚠ Опрос состояний — единственный признак «приложение открыто», который у
+    дома есть, и он же лучший момент для подготовки: камеру открывают из сетки
+    плиток, то есть через секунду-другую после этого запроса. Сам снимок стоит
+    секунду с лишним (ffmpeg у камеры без снапшот-адреса), и добывать его в
+    момент открытия — значит показывать пустой прямоугольник ровно столько,
+    сколько идут переговоры (жалоба 2026-09-08). Частоту ограничивает сам
+    `webrtc.warm`, здесь только перечень камер.
+    """
+    from . import webrtc
+
+    for tile in coordinator.data.get("tiles", []):
+        if tile.get("domain") == "camera" and tile.get("entityId"):
+            webrtc.warm(hass, tile["entityId"])
 
 
 async def command(

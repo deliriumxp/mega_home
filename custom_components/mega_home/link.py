@@ -162,6 +162,25 @@ class ManagerLink:
         except Exception as err:  # noqa: BLE001 - the link reconnects on its own
             LOGGER.debug("Could not send the answer: %s", err)
 
+    async def _sync_bundle(self, version: Any, socket: Any) -> None:
+        """Скачать новый интерфейс и СРАЗУ доложить, чем дом теперь раздаётся.
+
+        ⚠ Доклад обязателен: без него менеджер до следующего переподключения
+        показывал бы прошлый бандл, а смотрят туда как раз тогда, когда у
+        жильца «старый интерфейс». Отказ синхронизации доедет тем же кадром —
+        он лежит в `last_error`.
+        """
+        bundle = self._coordinator.bundle
+        if bundle is None:
+            return
+        await bundle.async_sync(version)
+        if socket is None:
+            return
+        try:
+            await socket.send_json(await self._hello())
+        except Exception as err:  # noqa: BLE001 - канал переподключится сам
+            LOGGER.debug("Could not report the bundle version: %s", err)
+
     async def _hello(self) -> dict[str, Any]:
         """Кадр представления: ДВЕ версии, и разница между ними осмысленна.
 
@@ -177,10 +196,19 @@ class ManagerLink:
         импортируемые позже читаются с диска новыми), поэтому «умеет ли дом
         операцию» решается только его ОТВЕТОМ.
         """
+        bundle = self._coordinator.bundle
         return {
             "t": "hello",
             "version": _integration_version(self._hass),
             "disk_version": await self._hass.async_add_executor_job(_disk_version),
+            # ⚠ Какой интерфейс дом РАЗДАЁТ прямо сейчас, и почему не новее.
+            # Без этих двух полей вопрос «почему у жильца старые кнопки»
+            # разбирался по скриншотам: у менеджера были канал и версия, а что
+            # доехало до дома — только со слов человека у телефона. Версия — имя
+            # каталога активного бандла, то есть ровно то, что отдаётся
+            # браузеру, а не то, что мы намеревались скачать.
+            "app_version": bundle.version if bundle else None,
+            "app_error": bundle.last_error if bundle else None,
         }
 
     async def _handle(self, payload: dict[str, Any], socket: Any = None) -> None:
@@ -209,7 +237,7 @@ class ManagerLink:
             # (`bundle.py`), поэтому подсказка может ждать идущий опрос.
             if self._coordinator.bundle:
                 task = asyncio.ensure_future(
-                    self._coordinator.bundle.async_sync(payload.get("version"))
+                    self._sync_bundle(payload.get("version"), socket)
                 )
                 self._answers.add(task)
                 task.add_done_callback(self._answers.discard)
