@@ -14,13 +14,14 @@ from mega_home.http import _serve
 
 
 class FakeBundle:
-    def __init__(self, active_dir: Any = None) -> None:
+    def __init__(self, active_dir: Any = None, version: Any = None) -> None:
         self.active_dir = active_dir
+        self.version = version
 
 
 class FakeCoordinator:
-    def __init__(self, active_dir: Any = None) -> None:
-        self.bundle = FakeBundle(active_dir)
+    def __init__(self, active_dir: Any = None, version: Any = None) -> None:
+        self.bundle = FakeBundle(active_dir, version)
 
 
 class FakeEntries:
@@ -35,9 +36,10 @@ class FakeEntries:
 
 
 class FakeRequest:
-    def __init__(self, coordinator: Any) -> None:
+    def __init__(self, coordinator: Any, query: dict[str, str] | None = None) -> None:
         hass = type("Hass", (), {"config_entries": FakeEntries(coordinator)})()
         self.app = {"hass": hass}
+        self.query = query or {}
 
 
 def _get(coordinator: Any, path: str) -> Any:
@@ -62,6 +64,51 @@ def test_файл_бандла_до_загрузки_это_честный_404()
 def test_без_координатора_тоже_заглушка() -> None:
     """Запись ещё не загрузилась — жилец всё равно не должен видеть 404."""
     assert _get(None, "index.html").status == 200
+
+
+# --- Адрес приложения несёт версию бандла ----------------------------------
+#
+# ⚠ Разбор 2026-09-08. Дом раздавал новый интерфейс, а жилец видел старый — до
+# ЖЁСТКОГО обновления страницы. Обычная перезагрузка поднимала `index.html` из
+# кэша, а его достаточно, чтобы остаться на старом коде целиком: имена бандлов
+# внутри хешированные, и старый `index.html` честно тянет старый `main-*.js`.
+# Ни `no-cache`, ни `no-store` дыру не закрывают: ту же страницу под тем же
+# адресом может держать service worker самого Home Assistant (scope `/`), до
+# которого нам не дотянуться. Единственный замок — ДРУГОЙ АДРЕС у другого
+# бандла: `?v=<версия>` меняет ключ в любом кэше.
+
+
+def _root(coordinator: Any, query: dict[str, str] | None = None) -> Any:
+    from mega_home.http import MegaHomeAppRootView
+
+    return asyncio.run(MegaHomeAppRootView().get(FakeRequest(coordinator, query)))
+
+
+def test_голый_адрес_уводит_на_адрес_с_версией(tmp_path) -> None:
+    (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
+
+    response = _root(FakeCoordinator(tmp_path, "sha256-новая"))
+
+    assert response.status == 302
+    assert response.location == "/mega-home/?v=sha256-новая"
+    # Сам редирект кэшировать нельзя — иначе он сам станет тем, что устарело.
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_адрес_с_текущей_версией_отдаёт_приложение(tmp_path) -> None:
+    (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
+
+    response = _root(FakeCoordinator(tmp_path, "sha256-новая"), {"v": "sha256-новая"})
+
+    assert response.status == 200
+    # ⚠ `no-store`, а не `no-cache`: второе разрешает хранить и лишь обязывает
+    # переспросить — этого и не хватило.
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_без_бандла_редиректа_нет_а_есть_заглушка() -> None:
+    """Уводить некуда: версии нет, а жилец должен видеть «подключаюсь»."""
+    assert _root(FakeCoordinator()).status == 200
 
 
 # --- Фоны: ключи комнат И ПЛИТОК ------------------------------------------

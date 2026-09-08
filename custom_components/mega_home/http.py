@@ -503,13 +503,36 @@ class MegaHomeRelayView(_MegaHomeView):
 
 
 class MegaHomeAppRootView(_MegaHomeView):
-    """The bare prefix: hand out the app itself."""
+    """The bare prefix: hand out the app itself — но по АДРЕСУ С ВЕРСИЕЙ.
+
+    ⚠ Голый `/mega-home/` уводит на `/mega-home/?v=<версия бандла>`, и это
+    единственное, что делает устаревший интерфейс невозможным. Разбор
+    2026-09-08: дом раздавал новый бандл, а жилец видел старый до тех пор, пока
+    не сделает ЖЁСТКОЕ обновление страницы. Обычная перезагрузка отдавала
+    `index.html` из кэша браузера — а его хватает, чтобы остаться на старом
+    коде целиком: имена бандлов внутри хешированные, и старый `index.html`
+    честно тянет старый `main-*.js`. Ни `no-cache`, ни `no-store` эту дыру не
+    закрывают полностью: страницу под тем же адресом может держать и service
+    worker самого Home Assistant (scope `/`), до которого нам не дотянуться.
+
+    Адрес с версией закрывает её целиком: у нового бандла ДРУГОЙ адрес, то есть
+    другой ключ в любом кэше — браузерном, воркерном, прокси. Пусть `?v=<старая>`
+    лежит в кэше сколько угодно, ходить по нему больше некому.
+    """
 
     url = URL_PREFIX
     extra_urls = [f"{URL_PREFIX}/"]
     name = "mega_home:app_root"
 
     async def get(self, request: web.Request) -> web.StreamResponse:
+        coordinator = _coordinator(request.app["hass"])
+        bundle = coordinator.bundle if coordinator else None
+        version = bundle.version if bundle and bundle.active_dir else None
+        if version and request.query.get("v") != version:
+            return web.HTTPFound(
+                f"{URL_PREFIX}/?v={version}",
+                headers={"Cache-Control": "no-store"},
+            )
         return _serve(request, "index.html")
 
 
@@ -560,10 +583,14 @@ def _serve(request: web.Request, relative: str) -> web.StreamResponse:
     if not target.is_file():
         return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
 
-    # Кэш как у менеджера: хешированные бандлы неизменяемы, index.html — никогда.
-    # Иначе браузер после обновления просит удалённые чанки.
+    # Хешированные бандлы неизменяемы, `index.html` НЕ ХРАНИМ вовсе.
+    #
+    # ⚠ `no-store`, а не `no-cache`: второе разрешает хранить и лишь обязывает
+    # переспросить, и этого оказалось мало — жилец оставался на старом
+    # интерфейсе до жёсткого обновления страницы (2026-09-08). Настоящий замок —
+    # адрес с версией (см. `MegaHomeAppRootView`), а это его подпорка.
     headers = (
-        {"Cache-Control": "no-cache"}
+        {"Cache-Control": "no-store"}
         if target.name == "index.html"
         else {"Cache-Control": "public, max-age=31536000, immutable"}
     )
