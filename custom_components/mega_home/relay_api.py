@@ -138,18 +138,23 @@ async def _photo(
 ) -> tuple[int, str, bytes, str]:
     """Фон, снятый САМИМ ЖИЛЬЦОМ: комната или плитка (`tile:<id>`).
 
-    ⚠ Проверки те же, что у локального маршрута (`http.py`), и это не
-    дублирование ради полноты: ключ ограничен составом, формат — JPEG, размер —
-    потолком. Без них перенос стал бы дырой, которой нет у той же двери дома.
+    ⚠ Проверки те же, что у локального маршрута (`http.py`), И РОВНО ТАМ ЖЕ:
+    ключ сверяется с составом только на ЗАПИСИ. Это не небрежность — это
+    единственное правило на обе двери. Сверка на чтении казалась строже, а на
+    деле разводила их: комната, которую инсталлятор скрыл в приложении или
+    переименовал, дома продолжала показывать свой фон, а снаружи отдавала 404 —
+    то самое «дома работает, снаружи нет», ради которого перенос и делался.
+    Ограничение набора ключей нужно затем, чтобы диск объекта нельзя было
+    забить, а прочитать можно только то, что там уже лежит.
     """
-    if not photo_key_known(coordinator.data, key):
-        raise ops.OpError("Комната или плитка не найдена", HTTPStatus.NOT_FOUND)
     target = coordinator.photos.path(key)
     if method == "GET":
         if not await hass.async_add_executor_job(target.is_file):
             raise ops.OpError("Фото не найдено", HTTPStatus.NOT_FOUND)
         return (HTTPStatus.OK, JPEG_TYPE, await _read(hass, target), IMMUTABLE)
     if method == "POST":
+        if not photo_key_known(coordinator.data, key):
+            raise ops.OpError("Комната или плитка не найдена", HTTPStatus.NOT_FOUND)
         if not body.startswith(JPEG_MAGIC):
             raise ops.OpError("Ожидается фотография JPEG", HTTPStatus.BAD_REQUEST)
         version = await hass.async_add_executor_job(coordinator.photos.save, key, body)

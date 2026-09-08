@@ -221,3 +221,19 @@ def test_слишком_большой_запрос_отвергается_до_
     with pytest.raises(ops.OpError) as err:
         call(coordinator, "POST", "api/photo/r1", JPEG + b"0" * (5 * 1024 * 1024))
     assert err.value.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+
+
+# ⚠ Обе двери дома обязаны отвечать ОДИНАКОВО, и сверка ключа с составом стоит
+# у обеих на ЗАПИСИ, а не на чтении. Иначе комната, скрытая инсталлятором в
+# приложении или переименованная, дома показывала бы фон, а снаружи отдавала
+# 404 — то самое «дома работает, снаружи нет».
+def test_фон_снятой_из_состава_комнаты_читается_как_и_локально(coordinator):
+    call(coordinator, "POST", "api/photo/r1", JPEG)
+    # Комната ушла из состава (скрыта, переименована, вычеркнута).
+    coordinator.data = {**CONFIG, "rooms": []}
+
+    assert body_of(call(coordinator, "GET", "api/photo/r1")) == JPEG
+    # А записать под этим ключом уже нельзя: набор ключей ограничен составом.
+    with pytest.raises(ops.OpError) as err:
+        call(coordinator, "POST", "api/photo/r1", JPEG)
+    assert err.value.status == HTTPStatus.NOT_FOUND

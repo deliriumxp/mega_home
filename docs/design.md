@@ -183,6 +183,13 @@ two copies of "what may be written" is how a hole appears on one side only.
 ⚠ The named operations stay for older managers and older homes. Do not add new ones — that is
 what the relay is for.
 
+⚠ **The photo key is checked against the config on WRITE only — on both doors (0.2.2).** The
+relay checked it on reads too, which looks stricter and is in fact a way for the two doors to
+drift: a room the installer hid from the app or renamed kept showing its background at home and
+answered 404 from outside. Limiting the set of keys exists so nobody can fill the object's disk;
+reading can only ever return a file that is already there, and the file name is a hash of the
+key anyway.
+
 ## Polling has to be switched on by hand (0.1.6)
 
 `DataUpdateCoordinator` runs its timer only while it HAS LISTENERS, and listeners are entities.
