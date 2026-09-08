@@ -371,3 +371,32 @@ Pillow/turbojpeg), so the requested 640px wide may not be what comes back. A fra
 `MAX_SNAPSHOT_BYTES` is refused: it travels as one websocket frame to the manager, and `ws` does
 not truncate an oversized frame — it CLOSES the connection, so the object would drop offline from
 a single tap.
+
+## Brand images ship with the integration (0.2.18)
+
+`custom_components/mega_home/brand/` carries `icon.png` (256×256) and `icon@2x.png` (512×512),
+rendered from `icon.svg` next to them:
+
+```
+rsvg-convert -w 256 -h 256 icon.svg -o icon.png
+rsvg-convert -w 512 -h 512 icon.svg -o 'icon@2x.png'
+```
+
+⚠ **Three different mechanisms, and they are easy to confuse.**
+
+- **Home Assistant's own UI** (Devices & services, device pages) serves a local `brand/` folder
+  through `/api/brands/integration/mega_home/icon.png`, and a local file **wins over** the
+  brands CDN. This works on **HA 2026.3+**; on older cores the folder is simply unused, which is
+  why it costs nothing to ship. Supported names are `icon.png`, `logo.png`, their `@2x` and
+  `dark_` variants — no logo here on purpose: a wordmark needs Inter, which is not installed on
+  the dev machine, and HA falls back to the icon by itself.
+- **The HACS store card** still pulls from HACS's own CDN, which knows nothing about a local
+  `brand/` (hacs/integration#5171, #5223). A picture there needs a PR to `home-assistant/brands`
+  adding `custom_integrations/mega_home/` with the same two files. Not done yet — it is a pull
+  request into somebody else's repository, not a release of ours.
+- **Service icons** are `icons.json` (`services.sync` → `mdi:sync`), a separate thing from the
+  brand entirely.
+
+The mark is deliberately family with Mega Manager's (the same rounded square, the same
+teal→blue gradient, the same white nodes) and differs only in the glyph: an "M" polyline there,
+a house here. Do not restyle one without the other.

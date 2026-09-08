@@ -1,0 +1,23 @@
+<!-- Знак Mega Home. Источник PNG рядом (icon.png 256, icon@2x.png 512) —
+     как их пересобрать, написано в docs/design.md.
+
+     ⚠ Родня знаку Mega Manager (frontend/public/favicon.svg в менеджере): тот
+     же скруглённый квадрат и градиент teal→blue, те же белые узлы. Отличается
+     глиф: у менеджера ломаная «M», здесь дом. Менять градиент в одиночку
+     нельзя — семейство должно читаться как одно. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#14b8a6"/>
+      <stop offset="1" stop-color="#2563eb"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#g)"/>
+  <path d="M13 34 32 18l19 16" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M18.5 34v14h27V34" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#fff">
+    <circle cx="13" cy="34" r="4.5"/>
+    <circle cx="32" cy="18" r="4.5"/>
+    <circle cx="51" cy="34" r="4.5"/>
+  </g>
+</svg>
