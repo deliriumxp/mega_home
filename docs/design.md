@@ -274,3 +274,51 @@ error in the console.
 This does not touch offline operation: an object that has downloaded the bundle once keeps
 serving it from `.storage/mega_home_www` with no manager and no internet. What is gone is only
 the copy for an object that has never talked to the manager at all.
+
+## Remote camera viewing: one-shot WebRTC (0.1.18)
+
+A resident who is away opens a camera, and the video must NOT travel through the manager — only
+the SDP/ICE exchange does (`remote-access.md` in the manager repo). `webrtc.py` is the whole of it
+on this side.
+
+**Non-trickle on purpose.** Home Assistant's own path is a websocket subscription
+(`camera/webrtc/offer`): the answer arrives first, ICE candidates dribble in after. Our link to the
+manager is request/response with one frame each way, so a subscription on top of it would mean
+session state ON THE MANAGER, its own timeouts and cleanup after a phone that vanished. Instead the
+offer arrives with the phone's candidates already in it, and `negotiate()` waits for the answer
+(≤ `ANSWER_TIMEOUT`) plus `CANDIDATE_WINDOW` and returns `{sessionId, answer, candidates}` as one
+packet.
+
+⚠ **The candidate window is not padding.** go2rtc answers immediately and sends its own
+server-reflexive address — the one that makes it reachable from outside — a moment later, once STUN
+answers. Returning the answer without candidates returns a connection with nowhere to go.
+
+⚠ **Every failure path closes the session.** Timeout, refusal, no answer — each calls
+`close_webrtc_session`, or go2rtc would hold a stream from the camera per failed attempt, until
+Home Assistant restarts.
+
+⚠ **The camera entity comes from the CONFIG, by tile id** (`ops.camera_entity`), never from the
+request. That is the entire defence against "show me the neighbour's camera": accepting an
+`entity_id` from the wire would open every camera in this Home Assistant, including the ones that
+are not in the resident's app.
+
+⚠ **Requests are answered in their own task now** (`link.py`). `_handle` runs inside the socket read
+loop, so until it returns no further frame is read. That was invisible while operations took
+milliseconds; a WebRTC negotiation takes seconds, and the app would have shown "the house is
+offline" exactly when the resident opened a camera.
+
+### What the object needs (not fixable in code)
+
+The go2rtc that Home Assistant manages itself runs with `webrtc: listen: ":18555/tcp"` — TCP, no
+UDP — so it gathers no reflexive candidate and has nothing to offer the outside world, whatever the
+NAT looks like. The object needs its own go2rtc (add-on or docker) with a UDP listener, pointed at
+by `go2rtc: url: …` in `configuration.yaml`.
+
+STUN needs no separate setup: Home Assistant hands go2rtc its own ICE server list along with the
+offer, and the default there is already the public `stun:stun.home-assistant.io`. Configuring the
+`web_rtc` integration on the object changes it for both sides at once.
+
+⚠ **`frontend_stream_type` is no longer a camera state attribute** in current Home Assistant (the
+stream type moved into `camera_capabilities`), so the `streamType` field `entity_view` puts in the
+state is always `None`. Nothing reads it; do not start. Whether a camera can do WebRTC is answered
+by the refusal, and the resident reads that refusal verbatim.

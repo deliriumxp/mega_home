@@ -56,6 +56,9 @@ class ManagerLink:
         self._coordinator = coordinator
         self._connected = False
         self._task: asyncio.Task[None] | None = None
+        # Запросы, на которые ещё отвечаем (см. `_handle`). Ссылку держим здесь:
+        # задача без ссылки может быть собрана сборщиком мусора на полпути.
+        self._answers: set[asyncio.Task[None]] = set()
 
     @property
     def connected(self) -> bool:
@@ -73,6 +76,9 @@ class ManagerLink:
         if self._task:
             self._task.cancel()
             self._task = None
+        for task in list(self._answers):
+            task.cancel()
+        self._answers.clear()
 
     async def _run(self) -> None:
         from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -159,7 +165,15 @@ class ManagerLink:
     async def _handle(self, payload: dict[str, Any], socket: Any = None) -> None:
         kind = payload.get("t")
         if kind == "req":
-            await self._answer(socket, payload)
+            # ⚠ ОТДЕЛЬНОЙ задачей, а не по месту. Этот метод зовётся из цикла
+            # чтения сокета, и пока он не вернётся, ни один следующий кадр не
+            # прочитан. Пока операции занимали миллисекунды, это было незаметно;
+            # переговоры WebRTC длятся секунды — и на всё это время приложение
+            # жильца перестало бы получать состояния, то есть показало бы «дом
+            # не на связи» ровно в момент, когда он открыл камеру.
+            task = asyncio.ensure_future(self._answer(socket, payload))
+            self._answers.add(task)
+            task.add_done_callback(self._answers.discard)
             return
         if kind == "app_changed":
             # A new interface was published. Nothing about this home changed, so

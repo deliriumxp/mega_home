@@ -32,6 +32,10 @@ def link(answer):
     instance = ManagerLink.__new__(ManagerLink)
     instance._hass = object()
     instance._coordinator = object()
+    # Ответы уходят отдельными задачами (иначе длинный запрос — переговоры
+    # WebRTC — застопорил бы чтение сокета), поэтому помощник ниже обязан их
+    # дождаться: без этого проверялось бы «задача создана», а не «ответ ушёл».
+    instance._answers = set()
     ops_run = ops.run
 
     async def patched(hass, coordinator, op, payload):
@@ -44,11 +48,52 @@ def link(answer):
 
 def answer(instance, frame, socket=None):
     socket = socket or _Socket()
+
+    async def run():
+        await instance._handle(frame, socket)
+        if instance._answers:
+            await asyncio.gather(*instance._answers)
+
     try:
-        asyncio.run(instance._handle(frame, socket))
+        asyncio.run(run())
     finally:
         instance._restore()
     return socket.sent
+
+
+def test_ответ_не_держит_чтение_сокета():
+    """Долгий запрос не должен останавливать разбор следующих кадров.
+
+    ⚠ Ради этого `_handle` и заводит задачу. Пока операции занимали миллисекунды,
+    разницы не было; переговоры WebRTC длятся секунды — и приложение жильца
+    показало бы «дом не на связи» ровно тогда, когда он открыл камеру.
+    """
+    started = asyncio.Event()
+
+    async def slow(op, payload):
+        started.set()
+        await asyncio.sleep(0.05)
+        return {"ok": True}
+
+    instance = ManagerLink.__new__(ManagerLink)
+    instance._hass = object()
+    instance._coordinator = object()
+    instance._answers = set()
+    ops_run = ops.run
+    ops.run = lambda hass, coordinator, op, payload: slow(op, payload)
+    socket = _Socket()
+
+    async def run():
+        await instance._handle({"t": "req", "id": "r1", "op": "webrtc"}, socket)
+        # Управление вернулось до того, как ответ готов — цикл чтения свободен.
+        assert socket.sent == []
+        await asyncio.gather(*instance._answers)
+
+    try:
+        asyncio.run(run())
+    finally:
+        ops.run = ops_run
+    assert socket.sent == [{"t": "res", "id": "r1", "ok": True, "payload": {"ok": True}}]
 
 
 def test_ответ_возвращается_с_тем_же_идентификатором():

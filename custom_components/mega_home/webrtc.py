@@ -1,0 +1,156 @@
+"""Remote camera viewing: one-shot WebRTC negotiation for a resident who is away.
+
+⚠ Медиа через менеджер НЕ идёт и идти не должно (remote-access.md в репозитории
+менеджера): через него едут только SDP и ICE-кандидаты — считанные килобайты на
+открытие камеры, — а видео течёт напрямую телефон ↔ go2rtc в этом доме. Поэтому
+здесь нет ни одного байта картинки: этот модуль только сводит две стороны.
+
+⚠ Обмен ОДНОРАЗОВЫЙ (non-trickle), а не потоковый, и это главное решение файла.
+Штатный путь Home Assistant — подписка по вебсокету (`camera/webrtc/offer`), где
+ответ и кандидаты приходят россыпью. Канал до менеджера — запрос-ответ с одним
+кадром в каждую сторону (`home-requests.ts`), и городить поверх него вторую
+подписку значило бы завести на менеджере состояние сессии, таймауты и уборку за
+отвалившимся телефоном. Вместо этого предложение уходит УЖЕ с кандидатами
+(браузер ждёт окончания сбора), а ответ дома собирается здесь в один пакет:
+`answer` + кандидаты, накопленные за `CANDIDATE_WINDOW`. Одно путешествие
+туда-обратно, на менеджере не остаётся ничего.
+
+⚠ Что нужно НА ОБЪЕКТЕ, чтобы это заработало (кодом не лечится). Встроенный в
+Home Assistant go2rtc запускается с `webrtc: listen: ":18555/tcp"` — TCP и
+только внутри дома, — поэтому телефон снаружи до него не дойдёт никогда. Нужен
+go2rtc с UDP-слушателем (аддон или docker) и `go2rtc: url: …` в
+`configuration.yaml`. STUN настраивать отдельно НЕ нужно: Home Assistant отдаёт
+go2rtc свой список ICE-серверов вместе с предложением, а по умолчанию там уже
+стоит публичный `stun:stun.home-assistant.io`. Настроенный в HA список
+(интеграция `web_rtc`) go2rtc подхватит сам.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from http import HTTPStatus
+from secrets import token_hex
+from typing import Any
+
+from homeassistant.core import HomeAssistant, callback
+
+from .const import LOGGER
+from .ops import OpError
+
+# Сколько ждём ОТВЕТА камеры. Щедро: go2rtc за это время успевает открыть RTSP у
+# самой камеры, а это единственный шаг здесь, который зависит от железа.
+ANSWER_TIMEOUT = 6.0
+# Сколько после ответа собираем кандидатов, прежде чем отдать пакет.
+#
+# ⚠ Ждать обязательно: go2rtc отдаёт ответ СРАЗУ, а свой srflx-кандидат (адрес,
+# по которому его видно снаружи) присылает следом, узнав его у STUN. Отдать
+# ответ без кандидатов значит отдать соединение, которому некуда встать.
+# Полторы секунды — с запасом: обмен со STUN укладывается в десятые доли.
+CANDIDATE_WINDOW = 1.5
+
+
+async def negotiate(
+    hass: HomeAssistant, entity_id: str, offer_sdp: str
+) -> dict[str, Any]:
+    """Trade the resident's offer for this camera's answer and ICE candidates."""
+    from homeassistant.components.camera.const import StreamType
+    from homeassistant.components.camera.webrtc import (
+        WebRTCAnswer,
+        WebRTCCandidate,
+        WebRTCError,
+        WebRTCMessage,
+    )
+    from homeassistant.exceptions import HomeAssistantError
+
+    camera = _camera(hass, entity_id)
+    if StreamType.WEB_RTC not in camera.camera_capabilities.frontend_stream_types:
+        # Честный отказ вместо чёрного прямоугольника: у камеры нет провайдера
+        # WebRTC (не поднят go2rtc, либо её поток ему не по зубам), и снаружи её
+        # не покажет ничто.
+        raise OpError(
+            "Камера не умеет WebRTC — снаружи её показать нечем",
+            HTTPStatus.NOT_IMPLEMENTED,
+        )
+
+    session_id = token_hex(8)
+    answered = asyncio.Event()
+    answer: list[str] = []
+    failure: list[str] = []
+    candidates: list[dict[str, Any]] = []
+
+    @callback
+    def send_message(message: WebRTCMessage) -> None:
+        """Собрать то, что камера присылает россыпью, в один пакет."""
+        if isinstance(message, WebRTCAnswer):
+            answer.append(message.answer)
+            answered.set()
+        elif isinstance(message, WebRTCCandidate):
+            # `to_dict()` — ровно та форма, которую ждёт `addIceCandidate` в
+            # браузере (её же отдаёт фронтенду сам Home Assistant).
+            candidates.append(message.candidate.to_dict())
+        elif isinstance(message, WebRTCError):
+            failure.append(message.message)
+            answered.set()
+
+    try:
+        await camera.async_handle_async_webrtc_offer(offer_sdp, session_id, send_message)
+    except HomeAssistantError as err:
+        LOGGER.warning("WebRTC offer for %s failed: %s", entity_id, err)
+        raise OpError(
+            "Дом не смог начать трансляцию с этой камеры", HTTPStatus.BAD_GATEWAY
+        ) from err
+
+    try:
+        async with asyncio.timeout(ANSWER_TIMEOUT):
+            await answered.wait()
+    except TimeoutError as err:
+        # ⚠ Сессию закрываем на КАЖДОМ выходе с ошибкой: без этого go2rtc держал
+        # бы соединение с камерой до перезапуска — по одному на каждую неудачную
+        # попытку жильца.
+        camera.close_webrtc_session(session_id)
+        raise OpError(
+            "Камера не ответила на запрос трансляции", HTTPStatus.GATEWAY_TIMEOUT
+        ) from err
+
+    if failure or not answer:
+        camera.close_webrtc_session(session_id)
+        LOGGER.warning("WebRTC offer for %s refused: %s", entity_id, failure)
+        raise OpError(
+            failure[0] if failure else "Камера не отдала ответ на предложение",
+            HTTPStatus.BAD_GATEWAY,
+        )
+
+    await asyncio.sleep(CANDIDATE_WINDOW)
+    return {
+        "sessionId": session_id,
+        "answer": answer[0],
+        "candidates": list(candidates),
+    }
+
+
+def close(hass: HomeAssistant, entity_id: str, session_id: str) -> dict[str, Any]:
+    """Drop a session the resident is done with.
+
+    ⚠ Без этого дом узнаёт о закрытом просмотре только по развалу соединения, а
+    до тех пор держит поток с камеры. Телефон, у которого приложение убили на
+    ходу, всё равно оставит сессию висеть — на такой случай у go2rtc свои
+    таймауты, — но обычный «закрыл шторку» обязан убирать за собой сразу.
+    """
+    _camera(hass, entity_id).close_webrtc_session(session_id)
+    return {"closed": True}
+
+
+def _camera(hass: HomeAssistant, entity_id: str):
+    """The camera entity, or a refusal the resident can read."""
+    from homeassistant.components.camera.helper import get_camera_from_entity_id
+    from homeassistant.exceptions import HomeAssistantError
+
+    try:
+        return get_camera_from_entity_id(hass, entity_id)
+    except HomeAssistantError as err:
+        # Текст Home Assistant английский («Camera is off»), жильцу он не нужен —
+        # в лог его, а на экран свою формулировку.
+        LOGGER.debug("Camera %s is not available: %s", entity_id, err)
+        raise OpError(
+            "Камера недоступна в Home Assistant", HTTPStatus.NOT_FOUND
+        ) from err

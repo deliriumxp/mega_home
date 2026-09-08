@@ -118,7 +118,15 @@ _module(
     Event=dict,
     EventStateChangedData=dict,
 )
-_module("homeassistant.exceptions", ServiceNotFound=_ServiceNotFound)
+class _HomeAssistantError(Exception):  # noqa: D101 - the base HA failure
+    pass
+
+
+_module(
+    "homeassistant.exceptions",
+    ServiceNotFound=_ServiceNotFound,
+    HomeAssistantError=_HomeAssistantError,
+)
 
 
 class _HomeAssistantView:  # noqa: D101 - stand-in for the HA base class

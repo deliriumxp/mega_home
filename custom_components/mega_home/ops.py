@@ -61,6 +61,10 @@ async def run(
         return await command(hass, coordinator, data)
     if op == "scenario":
         return await scenario(hass, coordinator, data)
+    if op == "webrtc":
+        return await webrtc_offer(hass, coordinator, data)
+    if op == "webrtc-close":
+        return webrtc_close(hass, coordinator, data)
     raise OpError("Неизвестная операция", HTTPStatus.NOT_FOUND)
 
 
@@ -138,6 +142,61 @@ async def scenario(
     if not item.get("entityId"):
         raise OpError("Сценарий не создан в Home Assistant", HTTPStatus.NOT_FOUND)
     return await call(hass, "script", "turn_on", {"entity_id": item["entityId"]})
+
+
+async def webrtc_offer(
+    hass: HomeAssistant, coordinator: MegaHomeCoordinator, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Свести телефон жильца, который СНАРУЖИ, с камерой этого дома напрямую.
+
+    Через менеджер проходит только этот обмен (килобайты SDP), видео идёт мимо
+    него — ради этого всё и затевалось (remote-access.md у менеджера).
+
+    ⚠ Импорт локальный: `webrtc.py` берёт отсюда `OpError`, и разорвать
+    кольцо иначе нечем. Заодно модуль камеры Home Assistant не грузится в домах,
+    где камер нет вовсе.
+    """
+    from . import webrtc
+
+    sdp = payload.get("offer")
+    if not isinstance(sdp, str) or not sdp:
+        raise OpError("Предложение WebRTC не передано")
+    return await webrtc.negotiate(hass, camera_entity(coordinator, payload), sdp)
+
+
+def webrtc_close(
+    hass: HomeAssistant, coordinator: MegaHomeCoordinator, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Жилец закрыл просмотр — отпустить камеру, не дожидаясь развала связи."""
+    from . import webrtc
+
+    session_id = payload.get("sessionId")
+    if not isinstance(session_id, str) or not session_id:
+        raise OpError("Сессия не указана")
+    return webrtc.close(hass, camera_entity(coordinator, payload), session_id)
+
+
+def camera_entity(
+    coordinator: MegaHomeCoordinator, payload: dict[str, Any]
+) -> str:
+    """Плитка-камера из конфига → сущность Home Assistant.
+
+    ⚠ Это и есть вся защита от «покажи мне чужую камеру»: сущность берётся не из
+    запроса, а из СОСТАВА ЭТОГО дома по id плитки. Пустить сюда `entity_id` из
+    запроса значило бы открыть жильцу любую камеру Home Assistant — включая те,
+    которых нет в его приложении.
+    """
+    tile = find(coordinator.data.get("tiles", []), payload.get("id"))
+    if tile is None:
+        raise OpError("Устройство не найдено", HTTPStatus.NOT_FOUND)
+    if tile.get("domain") != "camera":
+        raise OpError("Это устройство не камера")
+    if not tile.get("entityId"):
+        raise OpError(
+            "Элемент ещё не отправлен в Home Assistant — смотреть пока нечего",
+            HTTPStatus.NOT_FOUND,
+        )
+    return tile["entityId"]
 
 
 async def call(
