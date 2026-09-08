@@ -190,6 +190,20 @@ def webrtc_close(
     return webrtc.close(hass, camera_entity(coordinator, payload), session_id)
 
 
+async def camera_frame(
+    hass: HomeAssistant, coordinator: MegaHomeCoordinator, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Один кадр камеры — постер, пока идут переговоры (`webrtc.snapshot`).
+
+    ⚠ Не операция канала, а обработчик ПУТИ: зовётся и локальной дверью
+    (`http.py`), и переносом (`relay_api.py`). Новых именованных операций мы не
+    заводим — ровно для этого перенос и сделан.
+    """
+    from . import webrtc
+
+    return await webrtc.snapshot(hass, camera_entity(coordinator, payload))
+
+
 def camera_entity(
     coordinator: MegaHomeCoordinator, payload: dict[str, Any]
 ) -> str:

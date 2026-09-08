@@ -299,7 +299,7 @@ This does not touch offline operation: an object that has downloaded the bundle 
 serving it from `.storage/mega_home_www` with no manager and no internet. What is gone is only
 the copy for an object that has never talked to the manager at all.
 
-## Remote camera viewing: one-shot WebRTC (0.1.18)
+## Remote camera viewing: one-shot WebRTC (0.1.19)
 
 A resident who is away opens a camera, and the video must NOT travel through the manager — only
 the SDP/ICE exchange does (`remote-access.md` in the manager repo). `webrtc.py` is the whole of it
@@ -346,3 +346,21 @@ offer, and the default there is already the public `stun:stun.home-assistant.io`
 stream type moved into `camera_capabilities`), so the `streamType` field `entity_view` puts in the
 state is always `None`. Nothing reads it; do not start. Whether a camera can do WebRTC is answered
 by the refusal, and the resident reads that refusal verbatim.
+
+### The poster is the one picture that does travel through the manager (0.2.1)
+
+`snapshot()` returns ONE still frame for the viewer to show while the negotiation runs. It is
+reached as a PATH — `api/camera-frame/<tile>` — through both doors, the local one (`http.py`) and
+the relay (`relay_api.py`), not as a new named operation: the relay exists so that a new feature
+costs no release, and a still frame is a resource read like any other. WebRTC negotiation stays a
+named operation for the opposite reason — it is a session with its own timeouts, not a read.
+That looks like a contradiction with "no video through the manager" and is not: a frame on the
+grid TILE refreshes on a timer — several cameras, every few seconds, that is a stream — whereas
+this is one frame per camera opening. Without it the viewer opens on a black rectangle for the
+several seconds a negotiation takes, and a person reads that as "the camera is broken".
+
+⚠ **Size is checked, not assumed.** Home Assistant scales `async_get_image` best-effort (it needs
+Pillow/turbojpeg), so the requested 640px wide may not be what comes back. A frame over
+`MAX_SNAPSHOT_BYTES` is refused: it travels as one websocket frame to the manager, and `ws` does
+not truncate an oversized frame — it CLOSES the connection, so the object would drop offline from
+a single tap.

@@ -179,6 +179,38 @@ def test_иконка_сценария_не_выпускает_за_свой_к�
         assert err.value.status == HTTPStatus.NOT_FOUND
 
 
+def test_постер_камеры_едет_тем_же_переносом(coordinator, monkeypatch):
+    """⚠ Кадр — обработчик ПУТИ, а не новая операция канала.
+
+    Снаружи у приложения нет ни одного адреса Home Assistant, а переговоры
+    WebRTC длятся секунды: без постера просмотр открывается чёрным
+    прямоугольником. Один кадр на ОТКРЫТИЕ камеры — кадра для плитки снаружи
+    нет вовсе, он обновляется по таймеру и был бы потоком через менеджер.
+    """
+    from mega_home import webrtc
+
+    coordinator.data = {
+        **CONFIG,
+        "tiles": [
+            *CONFIG["tiles"],
+            {"id": "cam1", "roomId": "r1", "name": "Калитка", "domain": "camera",
+             "entityId": "camera.hall"},
+        ],
+    }
+
+    async def snapshot(hass, entity_id):
+        assert entity_id == "camera.hall"
+        return {"contentType": "image/jpeg", "image": base64.b64encode(JPEG).decode("ascii")}
+
+    monkeypatch.setattr(webrtc, "snapshot", snapshot)
+    answer = call(coordinator, "GET", "api/camera-frame/cam1")
+
+    assert body_of(answer) == JPEG
+    assert answer["contentType"] == "image/jpeg"
+    # Кадр живой: закешированный постер показывал бы вчерашний двор.
+    assert answer["cacheControl"] == "no-store"
+
+
 def test_неизвестный_путь_это_отказ_а_не_догадка(coordinator):
     with pytest.raises(ops.OpError) as err:
         call(coordinator, "GET", "api/чего-нибудь")

@@ -108,6 +108,20 @@ async def _dispatch(
         return await _photo(hass, coordinator, method, unquote(path[len("api/photo/") :]), body)
     if path.startswith("api/stock-photo/") and method == "GET":
         return await _stock(hass, coordinator, unquote(path[len("api/stock-photo/") :]))
+    if path.startswith("api/camera-frame/") and method == "GET":
+        # Постер камеры: один кадр на открытие просмотра. ⚠ Не поток — кадр на
+        # ПЛИТКЕ обновляется по таймеру, и снаружи его нет вовсе
+        # (remote-access.md у менеджера).
+        frame = await ops.camera_frame(
+            hass, coordinator, {"id": unquote(path[len("api/camera-frame/") :])}
+        )
+        return (
+            HTTPStatus.OK,
+            frame["contentType"],
+            base64.b64decode(frame["image"]),
+            # Кадр живой: закешированный постер показывал бы вчерашний двор.
+            "no-store",
+        )
     if path.startswith("api/asset/") and method == "GET":
         return await _asset(hass, coordinator, unquote(path[len("api/asset/") :]))
     if path.startswith("icons/") and method == "GET":

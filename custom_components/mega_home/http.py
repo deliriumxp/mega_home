@@ -105,6 +105,7 @@ async def async_register_http(
         # запрос-ответ. Оба заведены ради того, чтобы новая функция не стоила
         # выпуска этой интеграции (`assets.py`).
         MegaHomeAssetView,
+        MegaHomeCameraFrameView,
         MegaHomeRelayView,
         MegaHomeAppRootView,
         MegaHomeAppView,
@@ -402,6 +403,37 @@ class MegaHomeAssetView(_MegaHomeView):
                 if isinstance(content_type, str) and content_type
                 else "application/octet-stream",
             },
+        )
+
+
+class MegaHomeCameraFrameView(_MegaHomeView):
+    """One still frame of a camera — the poster shown while a stream starts.
+
+    ⚠ Есть и здесь, хотя ДОМА приложение берёт кадр напрямую у Home Assistant
+    (`/api/camera_proxy/...`, тот же origin, дешевле на один поход к камере).
+    Путь один и тот же с обеих сторон намеренно: расхождение поверхностей — та
+    самая болезнь, ради лечения которой заведён перенос (`relay_api.py`).
+    """
+
+    url = f"{URL_API}/camera-frame/{{tile}}"
+    name = "api:mega_home:camera-frame"
+
+    async def get(self, request: web.Request, tile: str) -> web.StreamResponse:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        hass: HomeAssistant = request.app["hass"]
+        try:
+            frame = await ops.camera_frame(hass, coordinator, {"id": tile})
+        except ops.OpError as err:
+            return web.Response(status=err.status, text=err.message)
+        from base64 import b64decode
+
+        return web.Response(
+            body=b64decode(frame["image"]),
+            # Кадр живой: закешированный постер показывал бы вчерашний двор.
+            headers={"Content-Type": frame["contentType"], "Cache-Control": "no-store"},
         )
 
 

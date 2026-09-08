@@ -1,9 +1,14 @@
 """Remote camera viewing: one-shot WebRTC negotiation for a resident who is away.
 
-⚠ Медиа через менеджер НЕ идёт и идти не должно (remote-access.md в репозитории
+⚠ ВИДЕО через менеджер НЕ идёт и идти не должно (remote-access.md в репозитории
 менеджера): через него едут только SDP и ICE-кандидаты — считанные килобайты на
-открытие камеры, — а видео течёт напрямую телефон ↔ go2rtc в этом доме. Поэтому
-здесь нет ни одного байта картинки: этот модуль только сводит две стороны.
+открытие камеры, — а поток течёт напрямую телефон ↔ go2rtc в этом доме.
+
+Исключение ровно одно и оно посчитано: ОДИН кадр-постер на открытие камеры
+(`snapshot`). Переговоры занимают секунды, снаружи у приложения нет ни одного
+адреса Home Assistant, и без кадра просмотр открывается чёрным прямоугольником —
+человек читает это как «камера не работает». Кадр в сетке плиток — уже поток
+(камер несколько, обновление по таймеру), и его здесь нет.
 
 ⚠ Обмен ОДНОРАЗОВЫЙ (non-trickle), а не потоковый, и это главное решение файла.
 Штатный путь Home Assistant — подписка по вебсокету (`camera/webrtc/offer`), где
@@ -125,6 +130,47 @@ async def negotiate(
         "sessionId": session_id,
         "answer": answer[0],
         "candidates": list(candidates),
+    }
+
+
+# Предел кадра-постера. Больше — отказ, а не обрезанная картинка: кадр едет
+# кадром вебсокета до менеджера, и переросший его закрыл бы канал в дом целиком.
+# Масштабирование в Home Assistant «по возможности» (нужен Pillow/turbojpeg), так
+# что рассчитывать на просимый размер нельзя — только проверять полученный.
+MAX_SNAPSHOT_BYTES = 400_000
+# Ширина постера. Его показывают, пока идут переговоры, и он же лежит под
+# потоком — разрешение камеры здесь не нужно, нужен узнаваемый кадр.
+SNAPSHOT_WIDTH = 640
+
+
+async def snapshot(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
+    """One still frame, so the viewer does not open on black.
+
+    ⚠ Живёт рядом с переговорами, потому что это ТА ЖЕ функция: снаружи у
+    приложения нет ни одного адреса Home Assistant, а WebRTC стартует секунды —
+    и без кадра просмотр открывается чёрным прямоугольником, что читается как
+    «камера не работает». Один кадр на открытие камеры, а не поток: плитка в
+    сетке снаружи по-прежнему обходится глифом (docs/remote-access.md).
+    """
+    from base64 import b64encode
+
+    from homeassistant.components.camera import async_get_image
+    from homeassistant.exceptions import HomeAssistantError
+
+    try:
+        image = await async_get_image(hass, entity_id, width=SNAPSHOT_WIDTH)
+    except HomeAssistantError as err:
+        LOGGER.debug("Snapshot of %s failed: %s", entity_id, err)
+        raise OpError("Камера не отдала кадр", HTTPStatus.BAD_GATEWAY) from err
+
+    if len(image.content) > MAX_SNAPSHOT_BYTES:
+        LOGGER.warning(
+            "Snapshot of %s is %d bytes — too large to send", entity_id, len(image.content)
+        )
+        raise OpError("Кадр камеры слишком большой", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+    return {
+        "contentType": image.content_type,
+        "image": b64encode(image.content).decode("ascii"),
     }
 
 

@@ -76,7 +76,9 @@ class _Camera:
         webrtc: bool = True,
         delay: float = 0.0,
         raises: Exception | None = None,
+        frame: bytes | None = None,
     ) -> None:
+        self.frame = frame
         self.camera_capabilities = _Capabilities(
             {_StreamType.WEB_RTC} if webrtc else {_StreamType.HLS}
         )
@@ -133,6 +135,23 @@ def _ha_camera_modules():
         return cameras[entity_id]
 
     helper.get_camera_from_entity_id = get_camera_from_entity_id
+
+    class _Image:
+        def __init__(self, content: bytes) -> None:
+            self.content_type = "image/jpeg"
+            self.content = content
+
+    async def async_get_image(hass, entity_id, timeout=10, width=None, height=None):
+        from homeassistant.exceptions import HomeAssistantError
+
+        camera = cameras.get(entity_id)
+        if camera is None or camera.frame is None:
+            raise HomeAssistantError("Unable to get image")
+        package.asked.append((entity_id, width))
+        return _Image(camera.frame)
+
+    package.async_get_image = async_get_image
+    package.asked = []
     added = {
         "homeassistant.components.camera": package,
         "homeassistant.components.camera.const": const,
@@ -291,3 +310,45 @@ def test_предложение_обязательно(_ha_camera_modules):
     _ha_camera_modules["camera.hall"] = _Camera([])
     with pytest.raises(ops.OpError):
         run(ops.run(object(), _Coordinator([CAMERA_TILE]), "webrtc", {"id": "cam1"}))
+
+
+def test_постер_едет_кадром_в_base64(_ha_camera_modules):
+    """⚠ Единственная картинка через менеджер, и она посчитана: ОДИН кадр на
+    открытие камеры. Переговоры длятся секунды, адресов Home Assistant снаружи
+    нет, и без кадра просмотр открывается чёрным прямоугольником.
+
+    ⚠ Не именованная операция, а обработчик ПУТИ `api/camera-frame/<плитка>`:
+    его зовут обе двери — локальная (`http.py`) и перенос (`relay_api.py`).
+    Новых операций канала мы не заводим (design.md, 0.2.0)."""
+    import sys
+    from base64 import b64decode
+
+    _ha_camera_modules["camera.hall"] = _Camera(frame=b"\xff\xd8jpeg")
+
+    result = run(
+        ops.camera_frame(object(), _Coordinator([CAMERA_TILE]), {"id": "cam1"})
+    )
+    assert b64decode(result["image"]) == b"\xff\xd8jpeg"
+    assert result["contentType"] == "image/jpeg"
+    # Просим уменьшенный кадр: постер показывают, пока идёт соединение.
+    assert sys.modules["homeassistant.components.camera"].asked == [("camera.hall", 640)]
+
+
+def test_слишком_большой_кадр_отклоняется(_ha_camera_modules, monkeypatch):
+    """⚠ Кадр едет кадром вебсокета до менеджера: переросший предел не
+    обрезается, а ЗАКРЫВАЕТ канал — объект ушёл бы в офлайн от одного нажатия."""
+    from mega_home import webrtc
+
+    monkeypatch.setattr(webrtc, "MAX_SNAPSHOT_BYTES", 4)
+    _ha_camera_modules["camera.hall"] = _Camera(frame=b"too long a frame")
+
+    with pytest.raises(ops.OpError) as err:
+        run(ops.camera_frame(object(), _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
+    assert err.value.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+
+
+def test_камера_без_кадра_отказывает_понятно(_ha_camera_modules):
+    _ha_camera_modules["camera.hall"] = _Camera()
+    with pytest.raises(ops.OpError) as err:
+        run(ops.camera_frame(object(), _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
+    assert err.value.message == "Камера не отдала кадр"
