@@ -706,3 +706,114 @@ def test_закрытие_просмотра_закрывает_сессию_с�
     assert not webrtc._own_sessions
     # HA-камеру не трогали: сессия была не её.
     assert _ha_camera_modules["camera.hall"].closed == []
+
+
+# ─── Ранний выход из окна кандидатов ─────────────────────────────────────────
+#
+# ⚠ Зеркало `GATHER_GRACE_MS` браузера: ответ go2rtc приходит сразу, а его
+# srflx — следом за обменом со STUN. Ждать всё окно ради опоздавших — лишняя
+# секунда переговоров на КАЖДОЕ открытие камеры.
+
+
+def test_ответ_не_ждёт_всё_окно_когда_srflx_уже_есть(_ha_camera_modules, monkeypatch):
+    """Ответ + srflx: пакет уходит после grace, а не через всё окно."""
+    from time import monotonic
+
+    from mega_home import webrtc
+
+    monkeypatch.setattr(webrtc, "CANDIDATE_WINDOW", 5.0)
+    monkeypatch.setattr(webrtc, "CANDIDATE_GRACE", 0.1)
+
+    class _SlowCamera(_Camera):
+        async def async_handle_async_webrtc_offer(self, offer_sdp, session_id, send_message):
+            async def replay() -> None:
+                send_message(_Answer("v=0 answer"))
+                await asyncio.sleep(0.05)
+                send_message(_Candidate(_Ice("candidate:1 udp typ srflx")))
+
+            asyncio.ensure_future(replay())
+
+    _ha_camera_modules["camera.hall"] = _SlowCamera()
+
+    start = monotonic()
+    result = run(
+        ops.run(
+            object(),
+            _Coordinator([CAMERA_TILE]),
+            "webrtc",
+            {"id": "cam1", "offer": "v=0 offer"},
+        )
+    )
+    elapsed = monotonic() - start
+
+    assert result["candidates"] == [
+        {"candidate": "candidate:1 udp typ srflx", "sdpMLineIndex": 0}
+    ]
+    # Со старым `sleep(CANDIDATE_WINDOW)` здесь было бы 5 секунд.
+    assert elapsed < 2.0
+
+
+def test_без_srflx_ждём_всё_окно_как_раньше(_ha_camera_modules, monkeypatch):
+    """Только host: внешнего адреса нет — ждём всё окно, опоздавшие важны."""
+    from time import monotonic
+
+    from mega_home import webrtc
+
+    monkeypatch.setattr(webrtc, "CANDIDATE_WINDOW", 0.3)
+
+    camera = _Camera(
+        [_Answer("v=0 answer"), _Candidate(_Ice("candidate:1 udp typ host"))]
+    )
+    _ha_camera_modules["camera.hall"] = camera
+
+    start = monotonic()
+    result = run(
+        ops.run(
+            object(),
+            _Coordinator([CAMERA_TILE]),
+            "webrtc",
+            {"id": "cam1", "offer": "v=0 offer"},
+        )
+    )
+    elapsed = monotonic() - start
+
+    assert result["candidates"] == [
+        {"candidate": "candidate:1 udp typ host", "sdpMLineIndex": 0}
+    ]
+    assert elapsed >= 0.3
+
+
+def test_свой_go2rtc_не_ждёт_всё_окно(_ha_camera_modules, own_go2rtc, monkeypatch):
+    """Тот же ранний выход на активном пути своего go2rtc."""
+    from time import monotonic
+
+    from mega_home import webrtc
+
+    monkeypatch.setattr(webrtc, "CANDIDATE_WINDOW", 5.0)
+    monkeypatch.setattr(webrtc, "CANDIDATE_GRACE", 0.1)
+    _ha_camera_modules["camera.hall"] = _OwnCamera()
+
+    async def scenario():
+        task = asyncio.ensure_future(
+            ops.run(
+                object(),
+                _Coordinator([CAMERA_TILE]),
+                "webrtc",
+                {"id": "cam1", "offer": "v=0 offer"},
+            )
+        )
+        await asyncio.sleep(0)
+        ws = _Go2RtcWsClient.instances[-1]
+        ws.receive(_GoAnswer("v=0 answer"))
+        await asyncio.sleep(0.05)
+        ws.receive(_GoCandidate("candidate:1 UDP typ srflx"))
+        return await task
+
+    start = monotonic()
+    result = run(scenario())
+    elapsed = monotonic() - start
+
+    assert result["candidates"] == [
+        {"candidate": "candidate:1 UDP typ srflx", "sdpMLineIndex": 0}
+    ]
+    assert elapsed < 2.0

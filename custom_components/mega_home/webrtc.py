@@ -16,9 +16,10 @@
 кадром в каждую сторону (`home-requests.ts`), и городить поверх него вторую
 подписку значило бы завести на менеджере состояние сессии, таймауты и уборку за
 отвалившимся телефоном. Вместо этого предложение уходит УЖЕ с кандидатами
-(браузер ждёт окончания сбора), а ответ дома собирается здесь в один пакет:
-`answer` + кандидаты, накопленные за `CANDIDATE_WINDOW`. Одно путешествие
-туда-обратно, на менеджере не остаётся ничего.
+(браузер ждёт достаточного сбора, а не всех серверов), а ответ дома собирается
+здесь в один пакет: `answer` + кандидаты — до первого `srflx` с grace, но не
+дольше `CANDIDATE_WINDOW`. Одно путешествие туда-обратно, на менеджере не
+остаётся ничего.
 
 ⚠ Что нужно НА ОБЪЕКТЕ, чтобы это заработало (кодом не лечится). Встроенный в
 Home Assistant go2rtc запускается с `webrtc: listen: ":18555/tcp"` — TCP и
@@ -33,6 +34,7 @@ go2rtc свой список ICE-серверов вместе с предлож
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from http import HTTPStatus
 from secrets import token_hex
 from typing import Any
@@ -52,6 +54,13 @@ ANSWER_TIMEOUT = 6.0
 # ответ без кандидатов значит отдать соединение, которому некуда встать.
 # Полторы секунды — с запасом: обмен со STUN укладывается в десятые доли.
 CANDIDATE_WINDOW = 1.5
+# Пауза после появления внешнего адреса, прежде чем отдать пакет.
+#
+# ⚠ Зеркало раннего выхода браузера (`GATHER_GRACE_MS` в `webrtc-stream.ts`
+# менеджера): ответ уже есть, srflx докатился — ждать всё окно ради опоздавших
+# кандидатов значит держать лишнюю секунду переговоров на КАЖДОЕ открытие
+# камеры. Без `srflx` (дому снаружи отдать нечего) ждём всё окно, как раньше.
+CANDIDATE_GRACE = 0.4
 
 # Живые ws-сессии СВОЕГО go2rtc: session_id → (когда открыта, Go2RtcWsClient).
 #
@@ -99,6 +108,30 @@ async def async_shutdown() -> None:
             await _close_own(entry[1])
 
 
+def _has_srflx(answer: list[str], candidates: list[dict[str, Any]]) -> bool:
+    """Есть ли в пакете адрес, по которому дом видно снаружи."""
+    if any("typ srflx" in line for line in answer):
+        return True
+    return any("typ srflx" in (item.get("candidate") or "") for item in candidates)
+
+
+async def _wait_candidates(new_candidate: asyncio.Event, ready: Callable[[], bool]) -> None:
+    """Дождаться достаточных кандидатов, но не дольше окна.
+
+    Достаточно — внешний адрес (`srflx`) плюс grace на опоздавших; без него
+    ждём всё окно, как раньше. Дольше `CANDIDATE_WINDOW` не бывает никогда:
+    grace тоже под сроком.
+    """
+    try:
+        async with asyncio.timeout(CANDIDATE_WINDOW):
+            while not ready():
+                await new_candidate.wait()
+                new_candidate.clear()
+            await asyncio.sleep(CANDIDATE_GRACE)
+    except TimeoutError:
+        pass
+
+
 async def negotiate(
     hass: HomeAssistant, entity_id: str, offer_sdp: str
 ) -> dict[str, Any]:
@@ -139,6 +172,7 @@ async def negotiate(
 
     session_id = token_hex(8)
     answered = asyncio.Event()
+    got_candidate = asyncio.Event()
     answer: list[str] = []
     failure: list[str] = []
     candidates: list[dict[str, Any]] = []
@@ -153,6 +187,7 @@ async def negotiate(
             # `to_dict()` — ровно та форма, которую ждёт `addIceCandidate` в
             # браузере (её же отдаёт фронтенду сам Home Assistant).
             candidates.append(message.candidate.to_dict())
+            got_candidate.set()
         elif isinstance(message, WebRTCError):
             failure.append(message.message)
             answered.set()
@@ -185,7 +220,7 @@ async def negotiate(
             HTTPStatus.BAD_GATEWAY,
         )
 
-    await asyncio.sleep(CANDIDATE_WINDOW)
+    await _wait_candidates(got_candidate, lambda: _has_srflx(answer, candidates))
     return {
         "sessionId": session_id,
         "answer": answer[0],
@@ -243,6 +278,7 @@ async def _negotiate_own(
 
     session_id = token_hex(8)
     answered = asyncio.Event()
+    got_candidate = asyncio.Event()
     answer: list[str] = []
     failure: list[str] = []
     candidates: list[dict[str, Any]] = []
@@ -260,6 +296,7 @@ async def _negotiate_own(
             # с rtcp-mux обе секции делят один транспорт, так делает и сам HA
             # (`RTCIceCandidateInit`), и фронтенд go2rtc (`sdpMid: '0'`).
             candidates.append({"candidate": str(msg.candidate), "sdpMLineIndex": 0})
+            got_candidate.set()
         elif isinstance(msg, WsError):
             failure.append(msg.error)
             answered.set()
@@ -289,7 +326,7 @@ async def _negotiate_own(
         LOGGER.warning("own go2rtc offer for %s refused: %s", entity_id, failure)
         await _drop_own(session_id)
         raise OpError(failure[0] if failure else "Камера не отдала ответ", HTTPStatus.BAD_GATEWAY)
-    await asyncio.sleep(CANDIDATE_WINDOW)
+    await _wait_candidates(got_candidate, lambda: _has_srflx(answer, candidates))
     return {"sessionId": session_id, "answer": answer[0], "candidates": list(candidates)}
 
 
