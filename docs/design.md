@@ -391,9 +391,11 @@ rsvg-convert -w 512 -h 512 icon.svg -o 'icon@2x.png'
   `dark_` variants — no logo here on purpose: a wordmark needs Inter, which is not installed on
   the dev machine, and HA falls back to the icon by itself.
 - **The HACS store card** still pulls from HACS's own CDN, which knows nothing about a local
-  `brand/` (hacs/integration#5171, #5223). A picture there needs a PR to `home-assistant/brands`
-  adding `custom_integrations/mega_home/` with the same two files. Not done yet — it is a pull
-  request into somebody else's repository, not a release of ours.
+  `brand/` (hacs/integration#5171, #5223), so it stays without a picture. The only cure would be
+  a PR to `home-assistant/brands`, and ⚠ **we do not open pull requests in other people's
+  repositories.** This integration is ours: we install it on our own objects, the store card is
+  seen by us alone, and a blank square there is not worth a dependency on somebody else's review
+  queue. Do not "finish the job" later by sending that PR.
 - **Service icons** are `icons.json` (`services.sync` → `mdi:sync`), a separate thing from the
   brand entirely.
 
