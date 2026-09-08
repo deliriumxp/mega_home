@@ -58,6 +58,15 @@ async def negotiate(
     hass: HomeAssistant, entity_id: str, offer_sdp: str
 ) -> dict[str, Any]:
     """Trade the resident's offer for this camera's answer and ICE candidates."""
+    # Свой go2rtc :8555 — без зависимости от HA :18555/tcp
+    try:
+        from .go2rtc_embed import URL as _OWN_URL, is_running as _own_running
+
+        if _own_running():
+            return await _negotiate_own(hass, entity_id, offer_sdp, _OWN_URL)
+    except Exception as err:  # noqa: BLE001
+        LOGGER.debug("own go2rtc not used: %s", err)
+
     from homeassistant.components.camera.const import StreamType
     from homeassistant.components.camera.webrtc import (
         WebRTCAnswer,
@@ -131,6 +140,74 @@ async def negotiate(
         "answer": answer[0],
         "candidates": list(candidates),
     }
+
+
+async def _negotiate_own(
+    hass: HomeAssistant, entity_id: str, offer_sdp: str, url: str
+) -> dict[str, Any]:
+    """Offer через свой go2rtc :1985 — без HA :18555/tcp."""
+    from homeassistant.exceptions import HomeAssistantError
+
+    camera = _camera(hass, entity_id)
+    stream_source = await camera.stream_source()
+    if not stream_source:
+        raise OpError("Камера недоступна в Home Assistant", HTTPStatus.NOT_FOUND)
+    # generic камера — нужен ffmpeg префикс как у HA провайдера
+    if camera.platform.platform_name == "generic" and not stream_source.startswith("ffmpeg:"):
+        stream_source = "ffmpeg:" + stream_source
+
+    from go2rtc_client import Go2RtcRestClient
+    from go2rtc_client.ws import Go2RtcWsClient, WebRTCAnswer as GoAnswer, WebRTCCandidate as GoCand, WsError
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+    session = async_get_clientsession(hass)
+    rest = Go2RtcRestClient(session, url)
+    identifier = entity_id  # простой id, go2rtc примет любой
+    # Добавить поток если его нет
+    try:
+        streams = await rest.streams.list()
+        if identifier not in streams or not any(stream_source == p.url for p in streams[identifier].producers):
+            await rest.streams.add(identifier, [stream_source])
+    except Exception as err:  # noqa: BLE001
+        LOGGER.debug("own go2rtc add stream failed: %s", err)
+        raise OpError("Дом не смог начать трансляцию с этой камеры", HTTPStatus.BAD_GATEWAY) from err
+
+    session_id = token_hex(8)
+    answered = asyncio.Event()
+    answer: list[str] = []
+    failure: list[str] = []
+    candidates: list[dict[str, Any]] = []
+
+    def _on_msg(msg):  # type: ignore[no-untyped-def]
+        if isinstance(msg, GoAnswer):
+            answer.append(msg.sdp)
+            answered.set()
+        elif isinstance(msg, GoCand):
+            candidates.append(msg.candidate.to_dict() if hasattr(msg.candidate, "to_dict") else {"candidate": str(msg.candidate)})
+        elif isinstance(msg, WsError):
+            failure.append(msg.error)
+            answered.set()
+
+    ws = Go2RtcWsClient(session, url, source=identifier)
+    ws.subscribe(_on_msg)  # type: ignore[arg-type]
+    try:
+        from go2rtc_client.ws import WebRTCOffer
+
+        await ws.send(WebRTCOffer(offer_sdp, []))
+    except Exception as err:  # noqa: BLE001
+        LOGGER.warning("own go2rtc offer for %s failed: %s", entity_id, err)
+        raise OpError("Дом не смог начать трансляцию с этой камеры", HTTPStatus.BAD_GATEWAY) from err
+
+    try:
+        async with asyncio.timeout(ANSWER_TIMEOUT):
+            await answered.wait()
+    except TimeoutError as err:
+        raise OpError("Камера не ответила на запрос трансляции", HTTPStatus.GATEWAY_TIMEOUT) from err
+    if failure or not answer:
+        LOGGER.warning("own go2rtc offer for %s refused: %s", entity_id, failure)
+        raise OpError(failure[0] if failure else "Камера не отдала ответ", HTTPStatus.BAD_GATEWAY)
+    await asyncio.sleep(CANDIDATE_WINDOW)
+    return {"sessionId": session_id, "answer": answer[0], "candidates": list(candidates)}
 
 
 # Предел кадра-постера. Больше — отказ, а не обрезанная картинка: кадр едет
