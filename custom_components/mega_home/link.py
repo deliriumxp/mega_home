@@ -97,9 +97,7 @@ class ManagerLink:
                     self._connected = True
                     delay = FIRST_RETRY
                     LOGGER.info("Manager link is up")
-                    await socket.send_json(
-                        {"t": "hello", "version": _integration_version(self._hass)}
-                    )
+                    await socket.send_json(await self._hello())
                     async for message in socket:
                         if message.type is aiohttp.WSMsgType.TEXT:
                             await self._handle(message.json(), socket)
@@ -162,6 +160,27 @@ class ManagerLink:
         except Exception as err:  # noqa: BLE001 - the link reconnects on its own
             LOGGER.debug("Could not send the answer: %s", err)
 
+    async def _hello(self) -> dict[str, Any]:
+        """Кадр представления: ДВЕ версии, и разница между ними осмысленна.
+
+        `version` — код, который сейчас исполняется (константа, попавшая в
+        память при загрузке). `disk_version` — то, что лежит на диске, то есть
+        что положил HACS. Они расходятся ровно в одном случае: обновление
+        скачано, а Home Assistant не перезапускали, — и менеджер тогда может
+        сказать инсталлятору, какие дома ждут перезапуска, вместо того чтобы
+        объезжать все.
+
+        ⚠ Ни одна из них не должна ничего запрещать: после обновления без
+        перезапуска дом в смешанном состоянии (загруженные модули прежние, а
+        импортируемые позже читаются с диска новыми), поэтому «умеет ли дом
+        операцию» решается только его ОТВЕТОМ.
+        """
+        return {
+            "t": "hello",
+            "version": _integration_version(self._hass),
+            "disk_version": await self._hass.async_add_executor_job(_disk_version),
+        }
+
     async def _handle(self, payload: dict[str, Any], socket: Any = None) -> None:
         kind = payload.get("t")
         if kind == "req":
@@ -201,12 +220,32 @@ def _ws_url(manager_url: str) -> str:
 
 
 def _integration_version(hass: HomeAssistant) -> str:
-    """Our own version, so the manager can show which objects lag behind."""
-    from homeassistant.loader import async_get_loaded_integration
+    """Версия ЗАГРУЖЕННОГО кода — константа, попавшая в память при старте.
 
-    from .const import DOMAIN
+    ⚠ Не `async_get_loaded_integration(...).version` и не чтение манифеста: обе
+    величины приходят от Home Assistant и с диска, а нам нужно число, про
+    которое ТОЧНО известно, откуда оно взялось. Константа лежит в модуле рядом с
+    исполняемым кодом и уезжает вместе с ним; что лежит на диске, дом сообщает
+    отдельным полем (`_disk_version`). Подробности — `const.py`.
+    """
+    from .const import INTEGRATION_VERSION
+
+    return INTEGRATION_VERSION
+
+
+def _disk_version() -> str:
+    """Версия из `manifest.json` РЯДОМ с этим файлом — то, что положил HACS.
+
+    ⚠ Блокирующее чтение файла, поэтому зовётся только из executor'а и только
+    на подключение канала. Ошибку глотаем: неизвестная версия на диске — это
+    минус одна подсказка инсталлятору, а не повод не поднять канал.
+    """
+    from json import loads
+    from pathlib import Path
 
     try:
-        return async_get_loaded_integration(hass, DOMAIN).version or ""
-    except Exception:  # noqa: BLE001 - a missing version must not break the link
+        manifest = loads((Path(__file__).parent / "manifest.json").read_text("utf-8"))
+        version = manifest.get("version")
+        return version if isinstance(version, str) else ""
+    except Exception:  # noqa: BLE001 - канал важнее подсказки
         return ""
