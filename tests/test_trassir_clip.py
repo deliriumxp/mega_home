@@ -159,7 +159,7 @@ def _offered(
 ) -> FakeHass:
     """Переговоры без команды: ответ ушёл, архив молчит."""
 
-    async def fake_negotiate(hass, url, identifier, source, sdp, what=""):
+    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}
 
     from mega_home import webrtc
@@ -234,7 +234,7 @@ def test_закрытие_снимает_поток_и_токен(
     dropped: list[str] = []
     closed: list[str] = []
 
-    async def fake_negotiate(hass, url, identifier, source, sdp, what=""):
+    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}
 
     from mega_home import webrtc
@@ -271,7 +271,7 @@ def test_клип_закрывается_даже_если_приложение_
 ) -> None:
     """Ключ уборки — сессия: поля `id` в закрытии может не быть."""
 
-    async def fake_negotiate(hass, url, identifier, source, sdp, what=""):
+    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
         return {"sessionId": "s7", "answer": "sdp", "candidates": []}
 
     from mega_home import webrtc
@@ -313,7 +313,7 @@ def test_сторож_стартует_вслепую_без_готовност�
     # неё, а не мимо.
     monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_ARCHIVE_SETTLE", 0.02)
 
-    async def fake_negotiate(hass, url, identifier, source, sdp, what=""):
+    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}
 
     from mega_home import webrtc
@@ -455,7 +455,7 @@ def test_закрытие_до_готовности_не_командует(
 ) -> None:
     """Шторку закрыли раньше готовности: ни команды, ни висящих задач."""
 
-    async def fake_negotiate(hass, url, identifier, source, sdp, what=""):
+    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}
 
     from mega_home import webrtc
@@ -507,3 +507,66 @@ def test_смена_качества_записи_переоткрывает_к�
     assert call["stream"] == "archive_sub"
     assert answer["positionUs"] == position
     assert answer["startUs"] == EVENT["timestampUs"] - 10_000_000, "окно не съезжает"
+
+
+def test_канал_без_постоянного_адреса_идёт_по_токену(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """⚠ Постоянный адрес есть НЕ У КАЖДОГО канала: на стенде из 12 один отвечает
+    404 на `<guid>_m/` всегда, а по `get_video` отдаётся нормально. Пока путь был
+    один, такая камера не открывалась вовсе — «wrong response on DESCRIBE»."""
+    sources: list[str] = []
+
+    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
+        sources.append(source)
+        if source.endswith("_m/"):
+            raise RuntimeError("webrtc: streams: wrong response on DESCRIBE")
+        return {"sessionId": "s1", "answer": "sdp", "candidates": []}
+
+    from mega_home import webrtc
+
+    monkeypatch.setattr(webrtc, "negotiate_source", fake_negotiate)
+    monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
+
+    async def scenario() -> dict[str, Any]:
+        hass = FakeHass()
+        answer = await gateway.clips.async_live_offer(hass, "cam1", "offer", "main")
+        # Второе открытие того же канала идёт СРАЗУ по токену: платить двумя
+        # переговорами за каждое открытие незачем.
+        await gateway.clips.async_live_offer(hass, "cam1", "offer", "main")
+        return answer
+
+    answer = asyncio.run(scenario())
+
+    assert answer["sessionId"] == "s1"
+    assert sources[0].endswith("cam1_m/"), "сначала быстрый путь"
+    assert "tok" in sources[1], "запасной — по токену"
+    assert len(sources) == 3, "второе открытие постоянный адрес уже не пробует"
+    assert sources[2] == sources[1].replace("tok1", "tok2")
+    # ⚠ Токен живого просмотра тоже надо пинговать: он живёт 10 секунд.
+    assert any("ping" in name for name in gateway.hass.names)
+
+
+def test_живой_просмотр_по_токену_ничем_не_командует(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Запасной путь — это тот же сеанс, что у записи, но БЕЗ команды архива."""
+
+    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
+        if source.endswith("_m/"):
+            raise RuntimeError("404")
+        return {"sessionId": "s1", "answer": "sdp", "candidates": []}
+
+    from mega_home import webrtc
+
+    monkeypatch.setattr(webrtc, "negotiate_source", fake_negotiate)
+    monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
+
+    async def scenario() -> None:
+        hass = FakeHass()
+        await gateway.clips.async_live_offer(hass, "cam1", "offer", "main")
+        await _quiet(hass, gateway)
+
+    asyncio.run(scenario())
+
+    assert [n for n, _ in gateway.client.calls if n == "archive_command"] == []

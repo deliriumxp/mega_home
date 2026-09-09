@@ -46,8 +46,15 @@ async def run(
     coordinator: MegaHomeCoordinator | None,
     op: str,
     payload: dict[str, Any] | None,
+    remote: bool = False,
 ) -> Any:
-    """Run one operation by name. Unknown name is a refusal, not a crash."""
+    """Run one operation by name. Unknown name is a refusal, not a crash.
+
+    ⚠ `remote` — жилец пришёл ЧЕРЕЗ МЕНЕДЖЕРА, а не локальной дверью. Ответы от
+    этого не меняются и меняться не должны: разница «дома/снаружи» живёт в
+    адресе базы, а не в наборе функций. Признак нужен ровно там, где физика
+    разная, — сколько ждать внешний адрес дома (дома он не нужен вовсе).
+    """
     if coordinator is None or not coordinator.data:
         raise OpError(
             "Дом ещё не синхронизирован с менеджером", HTTPStatus.SERVICE_UNAVAILABLE
@@ -62,7 +69,7 @@ async def run(
     if op == "scenario":
         return await scenario(hass, coordinator, data)
     if op == "webrtc":
-        return await webrtc_offer(hass, coordinator, data)
+        return await webrtc_offer(hass, coordinator, data, remote)
     if op == "webrtc-close":
         return webrtc_close(hass, coordinator, data)
     if op == "http":
@@ -178,7 +185,10 @@ async def scenario(
 
 
 async def webrtc_offer(
-    hass: HomeAssistant, coordinator: MegaHomeCoordinator, payload: dict[str, Any]
+    hass: HomeAssistant,
+    coordinator: MegaHomeCoordinator,
+    payload: dict[str, Any],
+    remote: bool = False,
 ) -> dict[str, Any]:
     """Свести телефон жильца, который СНАРУЖИ, с камерой этого дома напрямую.
 
@@ -202,7 +212,7 @@ async def webrtc_offer(
     # источник, и решает это приставка id.
     tile = payload.get("id")
     if isinstance(tile, str) and tile.startswith(CLIP_PREFIX):
-        return await trassir(coordinator).clips.async_offer(hass, tile, sdp)
+        return await trassir(coordinator).clips.async_offer(hass, tile, sdp, remote)
     guid = _trassir_guid(coordinator, tile)
     if guid:
         # Живая камера регистратора: ссылка постоянная, сеанса и токена нет —
@@ -214,20 +224,20 @@ async def webrtc_offer(
         # там, где его нет вовсе.
         quality = payload.get("quality")
         gateway = trassir(coordinator)
-        name, source = gateway.clips.live_stream(
-            guid, "sub" if quality == "sub" else "main"
-        )
-        from .go2rtc_embed import URL as OWN_URL, is_running
+        from .go2rtc_embed import is_running
 
         if not is_running():
             raise OpError(
                 "Дом не может отдать камеру: не поднят его go2rtc",
                 HTTPStatus.SERVICE_UNAVAILABLE,
             )
-        return await webrtc.negotiate_source(
-            hass, OWN_URL, name, source, sdp, "с этой камеры"
+        # ⚠ Два пути внутри: постоянный адрес канала и — если его у канала нет —
+        # документированный токен. Решает это сам сеанс, потому что там же живут
+        # пинг и уборка, которые запасному пути нужны (`async_live_offer`).
+        return await gateway.clips.async_live_offer(
+            hass, guid, sdp, "sub" if quality == "sub" else "main", remote
         )
-    return await webrtc.negotiate(hass, camera_entity(coordinator, payload), sdp)
+    return await webrtc.negotiate(hass, camera_entity(coordinator, payload), sdp, remote)
 
 
 def webrtc_close(

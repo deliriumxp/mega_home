@@ -12,12 +12,17 @@
 `stream is expired` — текст читается как таймаут и им не является. Здесь поток
 открывает go2rtc, когда к нему приходит потребитель.
 
-⚠ Между PLAY и командой нужна ПАУЗА (замер стенда 2026-09-09, `TRASSIR_ARCHIVE_SETTLE`).
-Команда, отданная в ту же миллисекунду, что RTSP PLAY, даёт РОВНО НОЛЬ байтов —
-навсегда, а не «медленно»: регистратор молчит, приложение досиживает до своего
-таймаута и показывает чёрный прямоугольник. Через секунду после PLAY первый байт
-идёт мгновенно. Поэтому старт архива не просто ждёт готовности телефона, но и не
-раньше этой паузы от конца переговоров.
+⚠ Между PLAY и командой держим ПАУЗУ (`TRASSIR_ARCHIVE_SETTLE`), и вот что о ней
+известно ТОЧНО (замеры стенда 2026-09-09, обе стороны проверены повторами):
+команда, отданная в ту же миллисекунду, что RTSP PLAY, даёт РОВНО НОЛЬ байтов —
+навсегда, а не «медленно», — но только когда регистратору приходится ИСКАТЬ
+запись (запрошенное начало не попадает в записанный кусок). Через секунду после
+PLAY та же команда с тем же окном отдаёт первый байт сразу. По наведённому окну
+нулевая пауза отработала 8 раз из 8.
+
+То есть пауза — не такса, а страховка ровно того случая, где иначе не будет
+ничего. На критический путь она при этом почти не ложится: отсчёт идёт от КОНЦА
+ПЕРЕГОВОРОВ, а готовность телефона приходит позже неё сама по себе.
 
 ⚠ Команда — ОДНА на соединение (там же проверено): повторный `play` по одному
 открытому потоку ненадёжен, со второй-третьей команды данные встают. Поэтому
@@ -133,6 +138,8 @@ class ClipSessions:
     def __init__(self, gateway: Any) -> None:
         self._gateway = gateway
         self._clips: dict[str, Clip] = {}
+        # Каналы, у которых ПОСТОЯННОГО адреса нет (см. `async_live_offer`).
+        self._no_permanent: set[str] = set()
 
     async def async_open(self, event_id: str, remote: bool = False) -> dict[str, Any]:
         """Подготовить запись к просмотру и вернуть её id приложению.
@@ -229,7 +236,9 @@ class ClipSessions:
         LOGGER.debug("Запись открыли, но смотреть не стали — убираем за собой")
         await self._drop(clip_id, clip)
 
-    async def async_offer(self, hass: HomeAssistant, clip_id: str, sdp: str) -> dict[str, Any]:
+    async def async_offer(
+        self, hass: HomeAssistant, clip_id: str, sdp: str, remote: bool = False
+    ) -> dict[str, Any]:
         """Свести телефон с записью: тот же go2rtc, что и у живой камеры."""
         from .ops import OpError
 
@@ -253,7 +262,7 @@ class ClipSessions:
         settings = self._gateway.settings
         source = f"rtsp://{settings['host']}:{settings['rtspPort']}/{clip.token}"
         answer = await webrtc.negotiate_source(
-            hass, OWN_URL, clip.stream, source, sdp, "запись события"
+            hass, OWN_URL, clip.stream, source, sdp, "запись события", remote
         )
         clip.session_id = answer.get("sessionId")
         # ⚠ Момент, от которого отсчитывается пауза перед командой архива:
@@ -409,6 +418,76 @@ class ClipSessions:
                 task.cancel()
                 setattr(clip, name, None)
         await self._async_drop_stream(clip.stream)
+
+    async def async_live_offer(
+        self,
+        hass: HomeAssistant,
+        guid: str,
+        sdp: str,
+        quality: str,
+        remote: bool = False,
+    ) -> dict[str, Any]:
+        """Свести телефон с ЖИВОЙ камерой регистратора — двумя путями.
+
+        ⚠ Постоянный адрес есть НЕ У КАЖДОГО канала. Проверено на стенде: из 12
+        каналов один отвечает на `<guid>_m/` и `<guid>_s/` кодом 404 ВСЕГДА, а
+        через `get_video` тот же канал отдаётся нормально. Пока путь был один,
+        такая камера не открывалась вовсе — жилец видел «wrong response on
+        DESCRIBE» (живой отчёт с объекта 2026-09-09, камера «Торговый зал 2»).
+
+        ⚠ Поэтому быстрый путь остаётся быстрым, а запасной — документированный
+        (`docs/docs-trassir/sdk-video.md`): токен, а значит пинг и уборка. Канал,
+        однажды ответивший отказом, дальше идёт сразу запасным путём: платить
+        двумя переговорами за каждое открытие незачем.
+        """
+        from . import webrtc
+        from .go2rtc_embed import URL as OWN_URL
+
+        if guid not in self._no_permanent:
+            name, source = self.live_stream(guid, quality)
+            try:
+                return await webrtc.negotiate_source(
+                    hass, OWN_URL, name, source, sdp, "с этой камеры", remote
+                )
+            except Exception as err:  # noqa: BLE001 — причин отказа много, путь один
+                LOGGER.info(
+                    "Постоянный адрес канала %s не сработал (%s) — идём по токену",
+                    guid,
+                    err,
+                )
+                self._no_permanent.add(guid)
+
+        client = self._gateway.client
+        if client is None:
+            raise TrassirError("Видеонаблюдение объекта не настроено")
+        settings = self._gateway.settings
+        token = await client.async_get_video(guid, quality, "rtsp")
+        # ⚠ Живой просмотр по токену — это тот же сеанс, что у записи, только
+        # без команды архива: `started=True` и говорит «командовать нечем».
+        # Отдельного вида сеанса не заводим — уборка, пинг и закрытие по сессии
+        # у него обязаны быть теми же самыми.
+        clip = Clip(
+            token=token,
+            guid=guid,
+            window_start_us=0,
+            window_stop_us=0,
+            start_us=0,
+            stream=f"trassir_live_{token}",
+            quality=quality,
+            started=True,
+        )
+        clip_id = f"{CLIP_PREFIX}{token}"
+        self._clips[clip_id] = clip
+        self._arm(clip_id, clip)
+        source = f"rtsp://{settings['host']}:{settings['rtspPort']}/{token}"
+        answer = await webrtc.negotiate_source(
+            hass, OWN_URL, clip.stream, source, sdp, "с этой камеры", remote
+        )
+        clip.session_id = answer.get("sessionId")
+        if clip.idle:
+            clip.idle.cancel()
+            clip.idle = None
+        return answer
 
     def live_stream(self, guid: str, quality: str = "main") -> tuple[str, str]:
         """Имя потока go2rtc и источник для ЖИВОЙ камеры регистратора.

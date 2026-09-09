@@ -153,7 +153,7 @@ def test_запись_идёт_той_же_операцией_что_и_каме
         def __init__(self) -> None:
             self.offered: list[str] = []
 
-        async def async_offer(self, hass, clip_id, sdp):
+        async def async_offer(self, hass, clip_id, sdp, remote=False):
             self.offered.append(clip_id)
             return {"sessionId": "s1", "answer": "sdp", "candidates": []}
 
@@ -224,7 +224,7 @@ def test_камера_регистратора_показывается_домо
     """
     negotiated: list[tuple[str, str]] = []
 
-    async def fake_negotiate(hass, url, identifier, source, sdp, what=""):
+    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
         negotiated.append((identifier, source))
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}
 
@@ -234,9 +234,19 @@ def test_камера_регистратора_показывается_домо
     monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
 
     class _Clips:
-        def live_stream(self, guid, quality="main"):
+        async def async_live_offer(self, hass, guid, sdp, quality, remote=False):
             suffix = "_s" if quality == "sub" else "_m"
-            return (f"trassir_live_{guid}", f"rtsp://192.168.1.50:555/{guid}{suffix}/")
+            from mega_home import webrtc
+
+            return await webrtc.negotiate_source(
+                hass,
+                "http://127.0.0.1:1985",
+                f"trassir_live_{guid}",
+                f"rtsp://192.168.1.50:555/{guid}{suffix}/",
+                sdp,
+                "с этой камеры",
+                remote,
+            )
 
         def clip_of_session(self, session_id):
             return None

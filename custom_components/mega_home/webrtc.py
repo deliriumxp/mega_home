@@ -54,6 +54,18 @@ ANSWER_TIMEOUT = 6.0
 # ответ без кандидатов значит отдать соединение, которому некуда встать.
 # Полторы секунды — с запасом: обмен со STUN укладывается в десятые доли.
 CANDIDATE_WINDOW = 1.5
+# ⚠ Отдельное, БОЛЬШЕЕ окно для случая «внешнего адреса ещё нет вовсе».
+#
+# Живой отчёт с объекта 2026-09-09: «Кандидаты дома: host 2», ICE застрял в
+# `checking`, переговоры 2644 мс — то есть окно в 1.5 с истекло, и дом ответил
+# ОДНИМИ host-кандидатами, по которым телефону снаружи идти некуда. Повторное
+# открытие той же камеры проходило нормально: первый раз go2rtc идёт к STUN
+# холодным (резолв имени плюс два сервера), дальше адрес у него уже есть.
+#
+# ⚠ Это НЕ «подождём подольше на всякий случай»: дожидаемся мы только там, где
+# иначе гарантированно отдали бы бесполезный ответ. Есть srflx — работает
+# прежнее окно, и ждать нечего.
+CANDIDATE_WINDOW_COLD = 4.0
 # Пауза после появления внешнего адреса, прежде чем отдать пакет.
 #
 # ⚠ Зеркало раннего выхода браузера (`GATHER_GRACE_MS` в `webrtc-stream.ts`
@@ -119,15 +131,26 @@ def _has_srflx(answer: list[str], candidates: list[dict[str, Any]]) -> bool:
     return any("typ srflx" in (item.get("candidate") or "") for item in candidates)
 
 
-async def _wait_candidates(new_candidate: asyncio.Event, ready: Callable[[], bool]) -> None:
+async def _wait_candidates(
+    new_candidate: asyncio.Event, ready: Callable[[], bool], remote: bool = False
+) -> None:
     """Дождаться достаточных кандидатов, но не дольше окна.
 
-    Достаточно — внешний адрес (`srflx`) плюс grace на опоздавших; без него
-    ждём всё окно, как раньше. Дольше `CANDIDATE_WINDOW` не бывает никогда:
-    grace тоже под сроком.
+    Достаточно — внешний адрес (`srflx`) плюс grace на опоздавших.
+
+    ⚠ Пока внешнего адреса НЕТ, ждём по `CANDIDATE_WINDOW_COLD`, а не по
+    обычному окну. Ответ без srflx телефону снаружи бесполезен — ему некуда
+    идти, — поэтому короткое окно здесь экономило секунду и стоило всего
+    просмотра (живой отчёт с объекта: «Кандидаты дома: host 2», ICE навсегда в
+    `checking`, а повторное открытие той же камеры проходило). Как только srflx
+    пришёл, всё идёт прежним темпом: ждать больше нечего.
     """
+    # ⚠ Дома ждать внешний адрес НЕ НАДО: телефон в той же сети, и host-кандидатов
+    # ему довольно. Лишнее ожидание здесь было бы платой за то, чем дома не
+    # пользуются.
+    window = CANDIDATE_WINDOW_COLD if remote else CANDIDATE_WINDOW
     try:
-        async with asyncio.timeout(CANDIDATE_WINDOW):
+        async with asyncio.timeout(window):
             while not ready():
                 await new_candidate.wait()
                 new_candidate.clear()
@@ -137,7 +160,7 @@ async def _wait_candidates(new_candidate: asyncio.Event, ready: Callable[[], boo
 
 
 async def negotiate(
-    hass: HomeAssistant, entity_id: str, offer_sdp: str
+    hass: HomeAssistant, entity_id: str, offer_sdp: str, remote: bool = False
 ) -> dict[str, Any]:
     """Trade the resident's offer for this camera's answer and ICE candidates."""
     # Свой go2rtc :8555 — без зависимости от HA :18555/tcp
@@ -224,7 +247,7 @@ async def negotiate(
             HTTPStatus.BAD_GATEWAY,
         )
 
-    await _wait_candidates(got_candidate, lambda: _has_srflx(answer, candidates))
+    await _wait_candidates(got_candidate, lambda: _has_srflx(answer, candidates), remote)
     return {
         "sessionId": session_id,
         "answer": answer[0],
@@ -277,6 +300,7 @@ async def negotiate_source(
     stream_source: str,
     offer_sdp: str,
     what: str = "",
+    remote: bool = False,
 ) -> dict[str, Any]:
     """Свести предложение телефона с ЛЮБЫМ источником своего go2rtc.
 
@@ -355,7 +379,7 @@ async def negotiate_source(
         LOGGER.warning("own go2rtc offer for %s refused: %s", identifier, failure)
         await _drop_own(session_id)
         raise OpError(failure[0] if failure else "Источник не отдал ответ", HTTPStatus.BAD_GATEWAY)
-    await _wait_candidates(got_candidate, lambda: _has_srflx(answer, candidates))
+    await _wait_candidates(got_candidate, lambda: _has_srflx(answer, candidates), remote)
     return {"sessionId": session_id, "answer": answer[0], "candidates": list(candidates)}
 
 

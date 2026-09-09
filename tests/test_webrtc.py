@@ -817,3 +817,42 @@ def test_свой_go2rtc_не_ждёт_всё_окно(_ha_camera_modules, own_g
         {"candidate": "candidate:1 UDP typ srflx", "sdpMLineIndex": 0}
     ]
     assert elapsed < 2.0
+
+
+def test_без_внешнего_адреса_ждём_дольше_только_снаружи() -> None:
+    """⚠ Ответ без `srflx` телефону СНАРУЖИ бесполезен — ему некуда идти.
+
+    Живой отчёт с объекта 2026-09-09: «Кандидаты дома: host 2», ICE навсегда в
+    `checking`, переговоры 2644 мс — короткое окно истекло, пока go2rtc холодным
+    ходил к STUN, и дом ответил одними host-кандидатами. Повторное открытие той
+    же камеры проходило нормально.
+
+    ⚠ Дома ждать нечего: телефон в той же сети, host-кандидатов ему довольно, —
+    поэтому длинное окно только для переноса.
+    """
+    from mega_home.webrtc import CANDIDATE_WINDOW, CANDIDATE_WINDOW_COLD
+
+    assert CANDIDATE_WINDOW_COLD > CANDIDATE_WINDOW
+
+
+def test_окно_кандидатов_выбирается_дверью() -> None:
+    import asyncio as aio
+
+    from mega_home import webrtc
+
+    async def scenario(remote: bool) -> float:
+        started = aio.get_event_loop().time()
+        # Готовность не наступает никогда: меряем, каким окном нас оборвало.
+        await webrtc._wait_candidates(aio.Event(), lambda: False, remote)  # noqa: SLF001
+        return aio.get_event_loop().time() - started
+
+    import pytest as _pytest
+
+    monkey = _pytest.MonkeyPatch()
+    monkey.setattr(webrtc, "CANDIDATE_WINDOW", 0.05)
+    monkey.setattr(webrtc, "CANDIDATE_WINDOW_COLD", 0.25)
+    try:
+        assert aio.run(scenario(False)) < 0.2, "дома — короткое окно"
+        assert aio.run(scenario(True)) > 0.2, "снаружи — длинное"
+    finally:
+        monkey.undo()
