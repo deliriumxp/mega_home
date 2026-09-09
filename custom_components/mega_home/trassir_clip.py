@@ -73,6 +73,22 @@ from .trassir_client import TrassirError
 CLIP_PREFIX = "trassir:"
 
 
+def _archive_stream(quality: str | None, remote: bool | None) -> str:
+    """Какой поток архива просить у регистратора.
+
+    ⚠ Приложение присылает `main`/`sub`, и это единственный ИСТОЧНИК РЕШЕНИЯ.
+    `remote` — умолчание для старых бандлов, которые качества не шлют; `None`
+    означает «умолчания нет, оставь как было» (перемотка).
+    """
+    if quality == "sub":
+        return TRASSIR_ARCHIVE_SUB
+    if quality == "main":
+        return TRASSIR_ARCHIVE_MAIN
+    if remote is None:
+        return ""
+    return TRASSIR_ARCHIVE_SUB if remote else TRASSIR_ARCHIVE_MAIN
+
+
 def _outside(first_frame: str | None, start_us: int, stop_us: int) -> bool:
     """Ближайшая запись лежит вне окна — значит кадров не будет вовсе.
 
@@ -141,15 +157,22 @@ class ClipSessions:
         # Каналы, у которых ПОСТОЯННОГО адреса нет (см. `async_live_offer`).
         self._no_permanent: set[str] = set()
 
-    async def async_open(self, event_id: str, remote: bool = False) -> dict[str, Any]:
+    async def async_open(
+        self, event_id: str, remote: bool = False, quality: str | None = None
+    ) -> dict[str, Any]:
         """Подготовить запись к просмотру и вернуть её id приложению.
 
         Само видео ещё не течёт: токен взят, поток go2rtc назван, а команда
         архива уйдёт, когда телефон подключится (см. заголовок модуля).
 
-        `remote` — жилец пришёл ПЕРЕНОСОМ через менеджер, а не локальной дверью.
-        Решает ровно одно: качество архива (§5а плана). Дома — основной архив,
-        снаружи — суб.
+        ⚠ `quality` присылает ПРИЛОЖЕНИЕ. Правило «дома основной, снаружи суб» —
+        политика, а не физика, и её место там, где её видно: приложение знает
+        свою дверь лучше нас, а политика в Python стоит релиза HACS на каждом
+        объекте (docs/plan-thin-integration.md).
+
+        ⚠ `remote` остался ТОЛЬКО умолчанием для старых бандлов, которые качества
+        не присылают, — иначе удалённый жилец получил бы основной архив на
+        мобильном канале. Снять вместе с прочими умолчаниями.
         """
         event = self._gateway.event(event_id)
         if event is None:
@@ -166,13 +189,10 @@ class ClipSessions:
         start = int(event["timestampUs"]) - TRASSIR_CLIP_LEAD * 1_000_000
         stop = int(event["timestampUs"]) + seconds * 1_000_000
 
-        # ⚠ Субархив — ТОЛЬКО снаружи. Замер стенда 2026-09-09 по прицеленному
-        # окну: основной архив 1.43 Мбит/с и 13.4 к/с, суб — 0.16 Мбит/с и
-        # 10.7 к/с, то есть вдевятеро меньше данных. Дома, где канал ничем не
-        # ограничен, суб выглядит ровно тем, чем является: мелкой картинкой с
-        # выпадающими кадрами рядом с живой камерой в полном качестве.
-        quality = TRASSIR_ARCHIVE_SUB if remote else TRASSIR_ARCHIVE_MAIN
-        token = await client.async_get_video(event["guid"], quality, "rtsp")
+        # Замер стенда 2026-09-09, ради которого приложение и выбирает: основной
+        # архив 1.43 Мбит/с и 13.4 к/с, суб — 0.16 Мбит/с и 10.7 к/с.
+        want = _archive_stream(quality, remote)
+        token = await client.async_get_video(event["guid"], want, "rtsp")
         clip = Clip(
             token=token,
             guid=event["guid"],
@@ -180,7 +200,7 @@ class ClipSessions:
             window_stop_us=stop,
             start_us=start,
             stream=f"trassir_{token}",
-            quality=quality,
+            quality=want,
         )
         clip_id = f"{CLIP_PREFIX}{token}"
         self._clips[clip_id] = clip
@@ -350,13 +370,7 @@ class ClipSessions:
         # ⚠ Кнопка качества у записи идёт ЭТИМ ЖЕ путём, а не своей операцией:
         # поток и токен привязаны к качеству, значит смена качества — это то же
         # переоткрытие, что и перемотка, только позиция остаётся прежней.
-        want = (
-            TRASSIR_ARCHIVE_SUB
-            if quality == "sub"
-            else TRASSIR_ARCHIVE_MAIN
-            if quality == "main"
-            else old.quality
-        )
+        want = _archive_stream(quality, None) or old.quality
         token = await client.async_get_video(old.guid, want, "rtsp")
         await self._drop(clip_id, old)
         clip = Clip(

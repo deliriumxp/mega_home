@@ -613,7 +613,10 @@ def trassir_events(
 
 
 async def trassir_play(
-    coordinator: MegaHomeCoordinator, event_id: str, remote: bool = False
+    coordinator: MegaHomeCoordinator,
+    event_id: str,
+    remote: bool = False,
+    quality: str | None = None,
 ) -> dict[str, Any]:
     """Открыть запись события и вернуть её id — дальше обычный просмотр.
 
@@ -622,15 +625,23 @@ async def trassir_play(
     плитки камеры, — и поэтому снаружи запись работает тем же путём, что живой
     просмотр, без единой новой трубы.
 
-    ⚠ `remote` — единственное, что здесь знают про дверь, и решает оно ровно
-    КАЧЕСТВО архива (§5а плана): дома основной, снаружи суб. Набор функций от
-    двери не зависит и зависеть не должен. Передаёт его сама дверь: `http.py` —
-    локальная, `relay_api.py` — перенос через менеджер.
+    ⚠ КАЧЕСТВО выбирает ПРИЛОЖЕНИЕ и присылает его сюда (`quality`). Оно знает
+    свою дверь лучше нас — у него для этого два разных транспорта, —  а правило
+    «дома основной, снаружи суб» это ПОЛИТИКА, а не физика. Политика, лежащая в
+    Python, стоит релиза HACS и перезапуска Home Assistant на каждом объекте
+    (docs/plan-thin-integration.md), поэтому её здесь больше нет.
+
+    ⚠ `remote` остался ТОЛЬКО как умолчание для старых бандлов, которые качества
+    не присылают: без него удалённый жилец получил бы основной архив на мобильном
+    канале. СНЯТЬ вместе со свёрткой событий, когда релизный бандл поднимут, —
+    правило выпуска запрещает убирать замену и заменяемое одним выпуском.
     """
     from .trassir_client import TrassirError
 
     try:
-        return await trassir(coordinator).clips.async_open(event_id, remote=remote)
+        return await trassir(coordinator).clips.async_open(
+            event_id, remote=remote, quality=quality
+        )
     except TrassirError as err:
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
 
@@ -675,15 +686,37 @@ async def trassir_ready(
 
 
 async def trassir_thumb(
-    coordinator: MegaHomeCoordinator, event_id: str
+    coordinator: MegaHomeCoordinator, event_id: str, lead_s: int | None = None
 ) -> tuple[str, bytes]:
-    """Превью события — кадр архива, уже уменьшенный домом."""
+    """Превью события — кадр архива, уже уменьшенный домом.
+
+    ⚠ `lead_s` — на сколько секунд ПОЗЖЕ метки взять кадр, и присылает его
+    приложение. Это решение о том, что показать человеку, а не свойство
+    регистратора: детектор срабатывает, когда причина ещё только входит в кадр.
+    Держать такое в Python значит платить за него релизом HACS на каждом
+    объекте (docs/plan-thin-integration.md).
+    """
     from .trassir_client import TrassirError
 
     try:
-        return "image/jpeg", await trassir(coordinator).async_thumb(event_id)
+        return "image/jpeg", await trassir(coordinator).async_thumb(event_id, lead_s)
     except TrassirError as err:
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
+
+
+def lead_of(value: Any) -> int | None:
+    """Сдвиг превью из запроса приложения: секунды числом или «не прислали».
+
+    ⚠ Не `_int` с умолчанием: «не прислали» и «прислали ноль» — РАЗНЫЕ вещи.
+    Ноль означает «кадр ровно на метке», а отсутствие — «реши сам» (старый
+    бандл), и склеивать их значит молча отобрать у приложения выбор.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _int(value: Any, default: int) -> int:

@@ -41,6 +41,9 @@ class FakeHass:
         self.tasks.append(name)
         return _Task()
 
+    async def async_add_executor_job(self, func: Any, *args: Any) -> Any:
+        return func(*args)
+
 
 class _Task:
     def done(self) -> bool:
@@ -74,6 +77,12 @@ class FakeClient:
         self.events_queue = events or []
         self.channels_data = [{"guid": "cam1", "name": "Вход", "rights": "8975"}]
         self.channel_calls = 0
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def async_screenshot(self, guid: str, timestamp: Any = None) -> bytes:
+        self.calls.append(("screenshot", {"guid": guid, "timestamp": timestamp}))
+        # Не картинка: `_shrink` без Pillow отдаёт байты как есть.
+        return b"jpeg"
 
     async def async_events(self) -> list[dict[str, Any]]:
         return list(self.events_queue)
@@ -426,3 +435,47 @@ def test_кроп_не_трогает_мелочь() -> None:
 
     assert _crop_margins(Image.new("RGB", (80, 60))).size == (80, 60)
     assert _crop_margins(Image.new("RGB", (600, 400))).size == (500, 300)
+
+
+def test_сдвиг_превью_присылает_приложение(tmp_path: Path) -> None:
+    """⚠ «Насколько позже метки взять кадр» — решение о том, что показать
+    человеку, а не свойство регистратора. Его место в бандле, который доезжает
+    сам, а не в Python, за который платят релизом HACS на каждом объекте."""
+    gate = gateway(tmp_path)
+    client = FakeClient([{"timestamp": "1000000", "type": "Motion Start", "origin": "cam1"}])
+
+    async def scenario() -> list[Any]:
+        await gate.async_apply(config())
+        gate._client = client  # noqa: SLF001
+        await gate._async_poll_once()  # noqa: SLF001
+        event_id = gate.events()[0]["id"]
+        await gate.async_thumb(event_id, 5)
+        await gate.async_thumb(event_id, 0)
+        # Умолчание для старого бандла, который сдвига не шлёт.
+        await gate.async_thumb(event_id)
+        return [p for n, p in client.calls if n == "screenshot"]
+
+    shots = asyncio.run(scenario())
+
+    assert shots[0]["timestamp"] == 6_000_000, "сдвиг приложения — 5 с"
+    # ⚠ Ноль и «не прислали» — РАЗНЫЕ вещи: ноль это «кадр ровно на метке».
+    assert shots[1]["timestamp"] == 1_000_000
+    assert shots[2]["timestamp"] == 2_000_000, "умолчание старому бандлу — 1 с"
+
+
+def test_разный_сдвиг_разные_кадры_в_кэше(tmp_path: Path) -> None:
+    """Сдвиг входит в ключ кэша: иначе второй запрос получил бы кадр первого."""
+    gate = gateway(tmp_path)
+    client = FakeClient([{"timestamp": "1000000", "type": "Motion Start", "origin": "cam1"}])
+
+    async def scenario() -> int:
+        await gate.async_apply(config())
+        gate._client = client  # noqa: SLF001
+        await gate._async_poll_once()  # noqa: SLF001
+        event_id = gate.events()[0]["id"]
+        await gate.async_thumb(event_id, 1)
+        await gate.async_thumb(event_id, 9)
+        await gate.async_thumb(event_id, 1)
+        return len([1 for n, _ in client.calls if n == "screenshot"])
+
+    assert asyncio.run(scenario()) == 2, "повтор того же сдвига берётся из кэша"

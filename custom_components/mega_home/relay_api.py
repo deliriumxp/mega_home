@@ -142,7 +142,17 @@ async def _dispatch(
         event = unquote(path[len("api/trassir/events/") : -len("/play")])
         # ⚠ `remote=True`: жилец пришёл переносом, значит канал у него
         # мобильный — архив отдаём субпотоком (§5а плана).
-        return _json(await ops.trassir_play(coordinator, event, remote=True))
+        # ⚠ Качество присылает приложение; не прислало — умолчание по двери, а
+        # перенос это всегда «снаружи» (мобильный канал → субархив).
+        played = _json_body(body)
+        return _json(
+            await ops.trassir_play(
+                coordinator,
+                event,
+                remote=True,
+                quality=played.get("quality") if isinstance(played, dict) else None,
+            )
+        )
     if path.startswith("api/trassir/clips/") and path.endswith("/seek") and method == "POST":
         # Перемотка переоткрытием — та же дверь, что и открытие: снаружи
         # запись идёт тем же путём, что живой просмотр, без единой новой трубы.
@@ -165,7 +175,9 @@ async def _dispatch(
         return _json(await ops.trassir_ready(coordinator, clip))
     if path.startswith("api/trassir/events/") and path.endswith("/thumb") and method == "GET":
         event = unquote(path[len("api/trassir/events/") : -len("/thumb")])
-        content_type, raw = await ops.trassir_thumb(coordinator, event)
+        content_type, raw = await ops.trassir_thumb(
+            coordinator, event, ops.lead_of(query.get("lead"))
+        )
         # Кадр за прошедшую секунду больше не изменится — пусть телефон держит
         # его у себя, лента листается вверх-вниз.
         return HTTPStatus.OK, content_type, raw, IMMUTABLE

@@ -467,7 +467,10 @@ class MegaHomeTrassirThumbView(_MegaHomeView):
             return error
         assert coordinator is not None
         try:
-            content_type, body = await ops.trassir_thumb(coordinator, event)
+            # ⚠ Сдвиг кадра — решение приложения, а не дома (см. `ops.trassir_thumb`).
+            content_type, body = await ops.trassir_thumb(
+                coordinator, event, ops.lead_of(request.query.get("lead"))
+            )
         except ops.OpError as err:
             return web.Response(status=err.status, text=err.message)
         return web.Response(
@@ -498,10 +501,17 @@ class MegaHomeTrassirPlayView(_MegaHomeView):
         if error is not None:
             return error
         assert coordinator is not None
+        # ⚠ Качество присылает ПРИЛОЖЕНИЕ телом запроса; тела нет — значит бандл
+        # старый, и умолчание берётся по двери (локальная = дома = основной).
         try:
-            # ⚠ Локальная дверь — жилец ДОМА: архив основной, а не суб.
-            # Замер стенда: 1.43 против 0.16 Мбит/с и 13.4 против 10.7 к/с.
-            return self.json(await ops.trassir_play(coordinator, event))
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        quality = payload.get("quality") if isinstance(payload, dict) else None
+        try:
+            return self.json(
+                await ops.trassir_play(coordinator, event, quality=quality)
+            )
         except ops.OpError as err:
             return self.json_message(err.message, err.status)
 

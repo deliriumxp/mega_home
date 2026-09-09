@@ -62,7 +62,7 @@ class FakeGateway:
             }
         ]
 
-    async def async_thumb(self, event_id):
+    async def async_thumb(self, event_id, lead_s=None):
         self.thumbs.append(event_id)
         return JPEG
 

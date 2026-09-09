@@ -224,7 +224,7 @@ class TrassirGateway:
             if channel.get("guid")
         ]
 
-    async def async_thumb(self, event_id: str) -> bytes:
+    async def async_thumb(self, event_id: str, lead_s: int | None = None) -> bytes:
         """Превью одного события — кадр архива на его секунду.
 
         ⚠ Кадр УМЕНЬШАЕТСЯ здесь. Trassir отдаёт полноразмерный JPEG (~530 КБ
@@ -237,27 +237,31 @@ class TrassirGateway:
         пояс. Сдвигаем только на `TRASSIR_THUMB_LEAD`, и это сдвиг внутри той же
         шкалы, а не смена шкалы.
 
-        ⚠ Кадр берётся ПОЗЖЕ метки на секунду, а не на ней. Детектор срабатывает
-        на первом же изменении картинки, то есть ровно тогда, когда причина
-        события ещё только входит в кадр (а часто — когда виден лишь её край).
-        Через секунду она в кадре целиком, и лента превращается из полосы
-        одинаковых пустых дворов в то, ради чего её открывают.
+        ⚠ Насколько ПОЗЖЕ метки взять кадр, решает ПРИЛОЖЕНИЕ (`lead_s`): это
+        решение о том, что показать человеку, а не свойство регистратора.
+        `TRASSIR_THUMB_LEAD` остался умолчанием для старых бандлов, которые
+        сдвига не присылают, и снимается вместе с прочими умолчаниями, когда
+        релизный бандл поднимут.
         """
         event = self.event(event_id)
         if event is None:
             raise TrassirError("Событие не найдено")
-        cached = self._thumbs.get(event_id)
+        lead = TRASSIR_THUMB_LEAD if lead_s is None else max(0, min(int(lead_s), 60))
+        # ⚠ Сдвиг входит в КЛЮЧ кэша: два разных сдвига — два разных кадра, и
+        # общий ключ отдавал бы второму запросу картинку первого.
+        key = f"{event_id}@{lead}"
+        cached = self._thumbs.get(key)
         if cached and cached[0] > time.monotonic():
             return cached[1]
         if not self._client:
             raise TrassirError("Видеонаблюдение объекта не настроено")
-        at = int(event["timestampUs"]) + TRASSIR_THUMB_LEAD * 1_000_000
+        at = int(event["timestampUs"]) + lead * 1_000_000
         raw = await self._client.async_screenshot(event["guid"], at)
         small = await self._hass.async_add_executor_job(_shrink, raw)
         if len(self._thumbs) >= TRASSIR_THUMB_CAP:
             oldest = min(self._thumbs, key=lambda key: self._thumbs[key][0])
             self._thumbs.pop(oldest, None)
-        self._thumbs[event_id] = (time.monotonic() + TRASSIR_THUMB_TTL, small)
+        self._thumbs[key] = (time.monotonic() + TRASSIR_THUMB_TTL, small)
         return small
 
     # --- опрос ----------------------------------------------------------

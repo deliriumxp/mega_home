@@ -570,3 +570,37 @@ def test_живой_просмотр_по_токену_ничем_не_кома�
     asyncio.run(scenario())
 
     assert [n for n, _ in gateway.client.calls if n == "archive_command"] == []
+
+
+# --- политика уехала в приложение (docs/plan-thin-integration.md) ---
+
+
+def test_качество_архива_решает_приложение(gateway: FakeGateway) -> None:
+    """⚠ `quality` от приложения ПЕРЕБИВАЕТ умолчание по двери.
+
+    Правило «дома основной, снаружи суб» — политика, а не физика: приложение
+    знает свою дверь лучше нас (у него два транспорта), а политика в Python
+    стоит релиза HACS на каждом объекте.
+    """
+    asyncio.run(gateway.clips.async_open("e1", remote=True, quality="main"))
+    call = next(p for n, p in gateway.client.calls if n == "get_video")
+    assert call["stream"] == "archive_main", "снаружи, но приложение просит основной"
+
+    gateway.client.calls.clear()
+    asyncio.run(gateway.clips.async_open("e1", remote=False, quality="sub"))
+    call = next(p for n, p in gateway.client.calls if n == "get_video")
+    assert call["stream"] == "archive_sub", "дома, но приложение просит суб"
+
+
+def test_старый_бандл_получает_умолчание_по_двери(gateway: FakeGateway) -> None:
+    """⚠ Умолчание — ТОЛЬКО для бандлов, которые качества не шлют: иначе
+    удалённый жилец получил бы основной архив на мобильном канале. Снять вместе
+    со свёрткой событий, когда релизный бандл поднимут (правило выпуска)."""
+    asyncio.run(gateway.clips.async_open("e1", remote=True))
+    call = next(p for n, p in gateway.client.calls if n == "get_video")
+    assert call["stream"] == "archive_sub"
+
+    gateway.client.calls.clear()
+    asyncio.run(gateway.clips.async_open("e1", remote=False))
+    call = next(p for n, p in gateway.client.calls if n == "get_video")
+    assert call["stream"] == "archive_main"
