@@ -55,6 +55,10 @@ ALLOWED = {
     "/mega-home/api/trassir/cameras",
     "/mega-home/api/trassir/events",
     "/mega-home/api/trassir/events/{event}/thumb",
+    # ⚠ Открыть запись — маршрут, а закрыть её — НЕТ: закрывается она тем же
+    # `webrtc/close`, что и живая камера. Просмотр записи своего сеанса не
+    # заводит вовсе (§5а плана), поэтому и двери у него своей нет.
+    "/mega-home/api/trassir/events/{event}/play",
     # Живое видео: кадр камеры и сеанс WebRTC со своими сроками. Данные HA,
     # через менеджер они не ходят.
     "/mega-home/api/camera-frame/{tile}",

@@ -110,6 +110,7 @@ async def async_register_http(
         MegaHomeTrassirCamerasView,
         MegaHomeTrassirEventsView,
         MegaHomeTrassirThumbView,
+        MegaHomeTrassirPlayView,
         MegaHomeWebRtcView,
         MegaHomeWebRtcCloseView,
         MegaHomeRelayView,
@@ -474,6 +475,29 @@ class MegaHomeTrassirThumbView(_MegaHomeView):
                 "Cache-Control": "public, max-age=31536000, immutable",
             },
         )
+
+
+class MegaHomeTrassirPlayView(_MegaHomeView):
+    """Открыть запись события: ответ — id для обычного просмотра WebRTC.
+
+    ⚠ Маршрут ровно один, и закрытия среди них нет: просмотр закрывается тем же
+    `webrtc/close`, что и живая камера (`ops.webrtc_close` узнаёт клип по
+    приставке id или по сессии). Отдельная дверь «закрыть запись» означала бы
+    две уборки, расходящиеся при первой правке.
+    """
+
+    url = f"{URL_API}/trassir/events/{{event}}/play"
+    name = "api:mega_home:trassir-play"
+
+    async def post(self, request: web.Request, event: str) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        try:
+            return self.json(await ops.trassir_play(coordinator, event))
+        except ops.OpError as err:
+            return self.json_message(err.message, err.status)
 
 
 class MegaHomeWebRtcView(_MegaHomeView):

@@ -43,6 +43,7 @@ from .const import (
     TRASSIR_STORAGE_KEY,
     STORAGE_VERSION,
 )
+from .trassir_clip import ClipSessions
 from .trassir_client import TrassirClient, TrassirError
 
 try:  # Pillow приезжает вместе с Home Assistant; на голом чекауте его может не быть.
@@ -76,10 +77,18 @@ class TrassirGateway:
         # вверх-вниз, и один и тот же кадр спрашивают несколько раз подряд; на
         # диск это класть незачем — событие живёт неделю, а интерес к нему минуты.
         self._thumbs: dict[str, tuple[float, bytes]] = {}
+        # Открытые записи: свой модуль, потому что это ДРУГАЯ тема — сеанс
+        # просмотра, а не лента (`trassir_clip.py`).
+        self.clips = ClipSessions(self)
         # Одна строка в журнал на СМЕНУ состояния, а не на каждую неудачу: опрос
         # идёт каждые пять секунд, и объект без связи с регистратором иначе
         # засыпал бы лог быстрее, чем его читают.
         self.last_error: str | None = None
+
+    @property
+    def hass(self) -> HomeAssistant:
+        """Home Assistant этого дома — сеансам клипов нужен он же."""
+        return self._hass
 
     # --- жизненный цикл -------------------------------------------------
 

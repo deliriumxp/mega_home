@@ -24,7 +24,7 @@ LOGGER = logging.getLogger(__package__)
 #
 # ⚠ Держится в паре с `manifest.json`, их сверяет `tests/test_version.py`:
 # поднимать ОБА, одним релизом.
-INTEGRATION_VERSION = "0.2.21"
+INTEGRATION_VERSION = "0.2.22"
 
 CONF_MANAGER_URL = "manager_url"
 CONF_TOKEN = "token"
@@ -121,5 +121,12 @@ TRASSIR_STORAGE_KEY = "mega_home_trassir"
 TRASSIR_THUMB_WIDTH = 480
 TRASSIR_THUMB_TTL = 600
 TRASSIR_THUMB_CAP = 50
+# Клип события: сколько показать ДО метки (движение начинается раньше, чем его
+# заметил детектор) и потолок длины, что бы ни стояло в настройке объекта.
+TRASSIR_CLIP_LEAD = 10
+TRASSIR_CLIP_MAX_SECONDS = 600
+# Продление токена видео. Дока обещает 10 секунд жизни без запросов; стенд
+# оказался щедрее, но полагаться на чужую щедрость нельзя.
+TRASSIR_PING_INTERVAL = 5
 
 SERVICE_SYNC = "sync"

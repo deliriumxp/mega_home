@@ -138,6 +138,9 @@ async def _dispatch(
         # той же кнопки. Разница «дома/снаружи» обязана оставаться только в
         # адресе базы.
         return _json(ops.trassir_events(coordinator, query))
+    if path.startswith("api/trassir/events/") and path.endswith("/play") and method == "POST":
+        event = unquote(path[len("api/trassir/events/") : -len("/play")])
+        return _json(await ops.trassir_play(coordinator, event))
     if path.startswith("api/trassir/events/") and path.endswith("/thumb") and method == "GET":
         event = unquote(path[len("api/trassir/events/") : -len("/thumb")])
         content_type, raw = await ops.trassir_thumb(coordinator, event)

@@ -130,3 +130,38 @@ def test_объект_без_видеонаблюдения_отвечает_п�
 
     assert err.value.status == HTTPStatus.NOT_FOUND
     assert "видеонаблюдение" in err.value.message
+
+
+def test_запись_идёт_той_же_операцией_что_и_камера(monkeypatch):
+    """⚠ Замок на главное решение: своей операции у записи НЕТ.
+
+    Приложение отдаёт id клипа туда же, куда id плитки камеры, — в `webrtc`.
+    Заведись у архива своя операция, и снаружи он поехал бы вторым сеансом со
+    своими сроками и своей уборкой (§5а плана).
+    """
+
+    class _Clips:
+        def __init__(self) -> None:
+            self.offered: list[str] = []
+
+        async def async_offer(self, hass, clip_id, sdp):
+            self.offered.append(clip_id)
+            return {"sessionId": "s1", "answer": "sdp", "candidates": []}
+
+        def clip_of_session(self, session_id):
+            return None
+
+    class _Gateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.clips = _Clips()
+
+    gateway = _Gateway()
+    coordinator = _Coordinator(gateway)
+
+    answer = asyncio.run(
+        ops.run(_Hass(), coordinator, "webrtc", {"id": "trassir:tok1", "offer": "sdp"})
+    )
+
+    assert answer["sessionId"] == "s1"
+    assert gateway.clips.offered == ["trassir:tok1"]

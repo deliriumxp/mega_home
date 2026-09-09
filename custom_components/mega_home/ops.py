@@ -190,10 +190,19 @@ async def webrtc_offer(
     где камер нет вовсе.
     """
     from . import webrtc
+    from .trassir_clip import CLIP_PREFIX
 
     sdp = payload.get("offer")
     if not isinstance(sdp, str) or not sdp:
         raise OpError("Предложение WebRTC не передано")
+    # ⚠ Запись события идёт ТОЙ ЖЕ операцией, что и живая камера, и это не
+    # экономия строк: своя операция под архив означала бы второй сеанс со своими
+    # сроками, своим закрытием и своей диагностикой — то есть вторую трубу
+    # (docs/trassir-integration-plan.md, §5а у менеджера). Отличается только
+    # источник, и решает это приставка id.
+    tile = payload.get("id")
+    if isinstance(tile, str) and tile.startswith(CLIP_PREFIX):
+        return await trassir(coordinator).clips.async_offer(hass, tile, sdp)
     return await webrtc.negotiate(hass, camera_entity(coordinator, payload), sdp)
 
 
@@ -202,10 +211,21 @@ def webrtc_close(
 ) -> dict[str, Any]:
     """Жилец закрыл просмотр — отпустить камеру, не дожидаясь развала связи."""
     from . import webrtc
+    from .trassir_clip import CLIP_PREFIX
 
     session_id = payload.get("sessionId")
     if not isinstance(session_id, str) or not session_id:
         raise OpError("Сессия не указана")
+    tile = payload.get("id")
+    gateway = getattr(coordinator, "trassir", None)
+    clip_id = tile if isinstance(tile, str) and tile.startswith(CLIP_PREFIX) else None
+    if clip_id is None and gateway is not None:
+        # Приложение могло закрыть просмотр, не назвав клип: сессия — тот же
+        # ключ, и потерять уборку из-за отсутствующего поля нельзя.
+        clip_id = gateway.clips.clip_of_session(session_id)
+    if clip_id is not None and gateway is not None:
+        hass.async_create_task(gateway.clips.async_close(hass, clip_id, session_id))
+        return {"closed": True}
     return webrtc.close(hass, camera_entity(coordinator, payload), session_id)
 
 
@@ -477,6 +497,24 @@ def trassir_events(
             before=_int(query.get("before"), 0) or None,
         )
     }
+
+
+async def trassir_play(
+    coordinator: MegaHomeCoordinator, event_id: str
+) -> dict[str, Any]:
+    """Открыть запись события и вернуть её id — дальше обычный просмотр.
+
+    ⚠ Возвращает НЕ ссылку на видео: адрес потока наружу не уходит вовсе.
+    Приложение получает id, который отдаёт в `webrtc` ровно так же, как id
+    плитки камеры, — и поэтому снаружи запись работает тем же путём, что живой
+    просмотр, без единой новой трубы.
+    """
+    from .trassir_client import TrassirError
+
+    try:
+        return await trassir(coordinator).clips.async_open(event_id)
+    except TrassirError as err:
+        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
 
 
 async def trassir_thumb(

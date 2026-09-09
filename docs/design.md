@@ -449,3 +449,30 @@ made from outside is the SAME request, and a query string is part of one.
 WebRTC path as a live camera, with the archive entering go2rtc as an ephemeral
 stream — see §5а of the plan in the manager repository. A second way to show
 video would be a second set of timeouts, posters and diagnostics.
+
+
+## Watching a recording adds no transport (0.2.22)
+
+The clip of an event opens through the SAME WebRTC path as a live camera. The
+ephemeral TRASSIR token becomes a source in our own go2rtc, `webrtc.py` was split
+so its go2rtc half (`negotiate_source`) knows nothing about cameras, and the app
+hands the clip id to the same `webrtc` op it uses for a tile. Hence: no second
+video kind in the app, no second session with its own timeouts, no second
+cleanup — and remote viewing works for recordings the day it works for cameras.
+
+Three things here are load-bearing:
+
+* **Order.** Token → a consumer opens the stream → `archive_command`. Sent
+  earlier the recorder answers `stream is expired`, which reads like a timeout
+  and is not one. go2rtc opens the source when a viewer arrives, so the command
+  goes out AFTER the offer is answered.
+* **The event timestamp goes into the window untouched** — TRASSIR's scale, not
+  ours (see the note above).
+* **The substream is what remote viewers get** (`archive_sub`): 0.45 Mbit/s
+  against 3 on the stand. The difference between home and away is quality, never
+  the set of features.
+
+Closing has no route of its own: `webrtc/close` finds the clip by its id prefix
+or by the session, cancels the token ping and drops the temporary go2rtc stream.
+A forgotten clip holds a connection to the recorder, and the object may have no
+connection limit at all.

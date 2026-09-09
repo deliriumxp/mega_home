@@ -76,6 +76,10 @@ _own_sessions: dict[str, tuple[float, Any]] = {}
 SESSION_TTL = 3600.0
 
 
+def _cannot_stream(what: str) -> str:
+    return "Дом не смог начать трансляцию" + (f" {what}" if what else "")
+
+
 async def _drop_own(session_id: str) -> None:
     """Убрать сессию своего go2rtc: закрыть ws и отпустить камеру."""
     entry = _own_sessions.pop(session_id, None)
@@ -261,6 +265,31 @@ async def _negotiate_own(
     if camera.platform.platform_name == "generic" and not stream_source.startswith("ffmpeg:"):
         stream_source = "ffmpeg:" + stream_source
 
+    return await negotiate_source(
+        hass, url, identifier, stream_source, offer_sdp, "с этой камеры"
+    )
+
+
+async def negotiate_source(
+    hass: HomeAssistant,
+    url: str,
+    identifier: str,
+    stream_source: str,
+    offer_sdp: str,
+    what: str = "",
+) -> dict[str, Any]:
+    """Свести предложение телефона с ЛЮБЫМ источником своего go2rtc.
+
+    `what` — чем закончить отказ («с этой камеры», «запись события»): текст
+    видит жилец, и «трансляция не пошла» без предмета читается как поломка
+    всего дома.
+
+    ⚠ Вынесено из `_negotiate_own` ради записи архива: клип Trassir — это тот же
+    поток go2rtc, только источник у него эфемерный (`rtsp://…/<token>`), а не
+    камера Home Assistant. Второй способ показывать видео мы не заводим —
+    ровно поэтому здесь нет ни слова про то, чей это источник
+    (docs/trassir-integration-plan.md, §5а у менеджера).
+    """
     from go2rtc_client import Go2RtcRestClient
     from go2rtc_client.ws import Go2RtcWsClient, WebRTCAnswer as GoAnswer, WebRTCCandidate as GoCand, WsError
     from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -274,7 +303,7 @@ async def _negotiate_own(
             await rest.streams.add(identifier, [stream_source])
     except Exception as err:  # noqa: BLE001
         LOGGER.debug("own go2rtc add stream failed: %s", err)
-        raise OpError("Дом не смог начать трансляцию с этой камеры", HTTPStatus.BAD_GATEWAY) from err
+        raise OpError(_cannot_stream(what), HTTPStatus.BAD_GATEWAY) from err
 
     session_id = token_hex(8)
     answered = asyncio.Event()
@@ -312,20 +341,20 @@ async def _negotiate_own(
 
         await ws.send(WebRTCOffer(offer_sdp, []))
     except Exception as err:  # noqa: BLE001
-        LOGGER.warning("own go2rtc offer for %s failed: %s", entity_id, err)
+        LOGGER.warning("own go2rtc offer for %s failed: %s", identifier, err)
         await _drop_own(session_id)
-        raise OpError("Дом не смог начать трансляцию с этой камеры", HTTPStatus.BAD_GATEWAY) from err
+        raise OpError(_cannot_stream(what), HTTPStatus.BAD_GATEWAY) from err
 
     try:
         async with asyncio.timeout(ANSWER_TIMEOUT):
             await answered.wait()
     except TimeoutError as err:
         await _drop_own(session_id)
-        raise OpError("Камера не ответила на запрос трансляции", HTTPStatus.GATEWAY_TIMEOUT) from err
+        raise OpError("Источник не ответил на запрос трансляции", HTTPStatus.GATEWAY_TIMEOUT) from err
     if failure or not answer:
-        LOGGER.warning("own go2rtc offer for %s refused: %s", entity_id, failure)
+        LOGGER.warning("own go2rtc offer for %s refused: %s", identifier, failure)
         await _drop_own(session_id)
-        raise OpError(failure[0] if failure else "Камера не отдала ответ", HTTPStatus.BAD_GATEWAY)
+        raise OpError(failure[0] if failure else "Источник не отдал ответ", HTTPStatus.BAD_GATEWAY)
     await _wait_candidates(got_candidate, lambda: _has_srflx(answer, candidates))
     return {"sessionId": session_id, "answer": answer[0], "candidates": list(candidates)}
 
@@ -445,6 +474,20 @@ async def _grab(hass: HomeAssistant, entity_id: str) -> tuple[float, str, bytes]
     return frame
 
 
+def close_own(hass: HomeAssistant, session_id: str) -> bool:
+    """Закрыть сессию СВОЕГО go2rtc, ничего не зная про её источник.
+
+    ⚠ Нужно записи архива: у клипа нет сущности камеры, а `close` ниже её
+    спрашивает. Возвращает False, если сессия не наша, — тогда закрывать её
+    штатным путём Home Assistant.
+    """
+    own = _own_sessions.pop(session_id, None)
+    if own is None:
+        return False
+    hass.async_create_task(_close_own(own[1]))
+    return True
+
+
 def close(hass: HomeAssistant, entity_id: str, session_id: str) -> dict[str, Any]:
     """Drop a session the resident is done with.
 
@@ -456,9 +499,7 @@ def close(hass: HomeAssistant, entity_id: str, session_id: str) -> dict[str, Any
     ⚠ Сессия СВОЕГО go2rtc закрывается через ws-реестр (`_own_sessions`):
     `close_webrtc_session` камеры знает только провайдеров HA и про неё молчит.
     """
-    own = _own_sessions.pop(session_id, None)
-    if own is not None:
-        hass.async_create_task(_close_own(own[1]))
+    if close_own(hass, session_id):
         return {"closed": True}
     _camera(hass, entity_id).close_webrtc_session(session_id)
     return {"closed": True}
