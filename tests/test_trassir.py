@@ -255,6 +255,29 @@ def test_события_не_от_камер_в_ленту_не_попадают
     assert [row["guid"] for row in gate.events()] == ["cam1"]
 
 
+def test_накопленный_мусор_вычищается_следующим_опросом(tmp_path: Path) -> None:
+    """Событие не от камеры, уже лежащее в хранилище, уходит из ленты.
+
+    ⚠ Иначе оно доживало бы в доме до вытеснения по возрасту — неделю, — и
+    жилец всё это время видел бы в ленте кадр-обломок.
+    """
+    gate = gateway(tmp_path)
+    client = FakeClient([{"timestamp": "5", "type": "Motion Start", "origin": "cam1"}])
+
+    async def scenario() -> None:
+        await gate.async_apply(config())
+        gate._client = client  # noqa: SLF001
+        gate._events = [  # noqa: SLF001
+            {"id": "old", "type": "Login", "guid": "user7", "cameraName": "user7", "timestampUs": 1}
+        ]
+        gate._seen = {"old"}  # noqa: SLF001
+        await gate._async_poll_once()  # noqa: SLF001
+
+    asyncio.run(scenario())
+
+    assert [row["guid"] for row in gate.events()] == ["cam1"]
+
+
 def test_feed_is_trimmed_by_age_in_trassir_scale(tmp_path: Path) -> None:
     newest = 1_788_960_000_000_000
     old = newest - 8 * 24 * 3600 * 1_000_000  # старше недели

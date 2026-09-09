@@ -286,6 +286,13 @@ class TrassirGateway:
         if not raw:
             return
         names = {c.get("guid"): c.get("name") for c in await self._async_channels()}
+        # ⚠ Чистим и УЖЕ НАКОПЛЕННОЕ: события не от камер лежали в хранилище
+        # объекта неделю (пока не вытеснит возраст), и без этой строки жилец
+        # видел бы их в ленте всё это время, хотя новые уже не пускаются.
+        kept = [row for row in self._events if row.get("guid") in names]
+        if len(kept) != len(self._events):
+            self._events = kept
+            self._seen = {row["id"] for row in kept}
         added = 0
         for item in raw:
             row = self._row(item, names)
