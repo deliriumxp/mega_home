@@ -15,6 +15,7 @@ from .const import (
     API_CONFIG,
     API_ICON,
     API_RELAY,
+    API_TRASSIR,
     API_VERSION,
     ICON_SIZE,
     RELAY_TIMEOUT,
@@ -77,6 +78,21 @@ class ManagerClient:
         manager decides what the key means, the home only carries the bytes.
         """
         return await self._get_bytes(f"{API_ASSET}/{quote(key, safe='')}")
+
+    async def async_trassir_credentials(self) -> dict[str, str]:
+        """Credentials for the object's TRASSIR recorder.
+
+        ⚠ A separate request instead of a field in the config, and that is the
+        security boundary, not a stylistic choice: the config body is handed to
+        the resident's browser verbatim (`ops.config`) over a local contour that
+        has no authentication yet. What travels here never leaves this process.
+        """
+        payload = await self._get_json(API_TRASSIR)
+        return {
+            key: value
+            for key, value in payload.items()
+            if key in ("username", "password", "sdkPassword") and isinstance(value, str)
+        }
 
     async def async_relay(self, payload: dict[str, Any]) -> tuple[int, Any]:
         """Ask the manager something on behalf of the app; return status and answer.

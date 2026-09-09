@@ -30,6 +30,7 @@ from .const import (
     SERVICE_SYNC,
 )
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
+from .trassir import TrassirGateway
 from .http import async_register_http
 from .link import ManagerLink
 
@@ -117,6 +118,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
         entry.async_on_unload(lambda: hass.async_create_task(_shutdown()))
     except Exception as err:  # noqa: BLE001
         LOGGER.debug("go2rtc not started: %s", err)
+
+    # Видеонаблюдение объекта, если оно у него есть. Заводится ДО живого канала
+    # и сразу получает уже загруженный конфиг: адрес регистратора приезжает
+    # обычной синхронизацией, и ждать следующего тика опроса (15 минут) ради
+    # первой ленты событий незачем.
+    gateway = TrassirGateway(
+        hass,
+        client,
+        async_get_clientsession(hass, entry.data.get(CONF_VERIFY_SSL, True)),
+    )
+    await gateway.async_load()
+    coordinator.trassir = gateway
+    entry.async_on_unload(lambda: hass.async_create_task(gateway.async_stop()))
+    if coordinator.data:
+        await gateway.async_apply(coordinator.data)
 
     # Живой канал к менеджеру: правка состава доезжает за секунды вместо интервала
     # опроса. Опрос при этом остаётся страховкой — канал может не подняться вовсе

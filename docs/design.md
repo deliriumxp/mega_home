@@ -402,3 +402,50 @@ rsvg-convert -w 512 -h 512 icon.svg -o 'icon@2x.png'
 The mark is deliberately family with Mega Manager's (the same rounded square, the same
 teal→blue gradient, the same white nodes) and differs only in the glyph: an "M" polyline there,
 a house here. Do not restyle one without the other.
+
+
+## TRASSIR: two doors, one feed (0.2.21)
+
+The object's video recorder is ours to talk to and nobody else's: the manager
+has no route into the flat, and the resident's app never speaks to TRASSIR
+directly. What the manager provides is the address and the credentials; the
+rest — sessions, polling, the feed — lives here, in `trassir_client.py` and
+`trassir.py`.
+
+Three findings from a live recorder (4.8.2.0) shaped this code, and all three
+are silent failures rather than crashes:
+
+* **Two identities, neither of them enough.** A session opened with a user login
+  serves `/channels`, `/get_video` and `archive_command`, but answers
+  `no session` on `/events`; a session opened with the SDK password (a login
+  with no username) is the exact opposite. So the client keeps both and says so
+  in the refusal text — "no session" on the event feed means the wrong door, not
+  an expired one, and reading it as an expired session costs an afternoon.
+* **`/events` is a per-session QUEUE**, not "the last N events". It returns what
+  happened since the previous call and is drained by reading; a fresh session
+  gets a backlog capped at 100. Hence deduplication is mandatory — not because
+  the stream repeats itself, but because a relogin replays it — and hence the
+  five-second poll: loss starts when more than a hundred events pile up between
+  reads, which on a twelve-camera object is about nine minutes.
+* **TRASSIR has its own time scale**: unix microseconds shifted by the server's
+  timezone. Its timestamps go back to it untouched — that is what makes a clip
+  open on the right second — and only OUR clock ever needs converting. The feed
+  therefore ages events in TRASSIR's scale too, never against `utcnow()`.
+
+The credentials arrive by their own request (`/inbound/home-config/trassir`) and
+never enter the config body, because that body is handed to the browser as-is by
+`ops.config`. They are refetched when the fingerprint in the config changes:
+fetching them every poll would be a trip to the manager for nothing, and
+never refetching them means running with a changed password until Home Assistant
+restarts.
+
+⚠ **The relay used to drop the query string**, and the event feed is what found
+it: `?guid=` decides whether the resident sees one camera or the whole object,
+so outside the flat the same button quietly did something else. `_path()` now
+returns the parsed query as well — the promise of the relay is that a request
+made from outside is the SAME request, and a query string is part of one.
+
+⚠ **Watching the recording adds no route here.** The clip opens through the same
+WebRTC path as a live camera, with the archive entering go2rtc as an ephemeral
+stream — see §5а of the plan in the manager repository. A second way to show
+video would be a second set of timeouts, posters and diagnostics.

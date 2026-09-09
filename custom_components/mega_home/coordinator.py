@@ -62,6 +62,10 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Живой канал к менеджеру; ставится в async_setup_entry после регистрации
         # HTTP, потому что сам канал ничего не раздаёт — он только будит опрос.
         self.link: Any = None
+        # Видеонаблюдение объекта (`trassir.py`), если оно у него есть. Ставится
+        # снаружи, как и канал: координатор его не создаёт, он только приносит
+        # ему свежий конфиг — адрес, порты и отпечаток учётки живут там.
+        self.trassir: Any = None
         # Бандл интерфейса: качается с менеджера и раздаётся из кэша, поэтому
         # новая версия приложения не требует ни HACS, ни перезапуска.
         #
@@ -161,6 +165,7 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # interface, the object kept serving the copy packaged in the
                 # release, and nothing anywhere said so.
                 await self._async_sync_bundle()
+                await self._async_apply_trassir(self.data)
                 self._on_success()
                 return self.data
             config = await self.client.async_config()
@@ -184,6 +189,7 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._async_sync_icons(config)
         await self._async_sync_assets(config)
         await self._async_sync_bundle()
+        await self._async_apply_trassir(config)
         self._on_success()
         LOGGER.info("Home config updated to %s", config.get("version"))
         return config
@@ -212,6 +218,21 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         else:
             LOGGER.info("App bundle checks are working again")
         self.app_error = error
+
+    async def _async_apply_trassir(self, config: dict[str, Any] | None) -> None:
+        """Отдать видеонаблюдению свежие настройки объекта.
+
+        ⚠ Зовётся и на «версия не изменилась»: сам конфиг тот же, но учётку
+        Trassir могли сменить, а её отпечаток живёт В КОНФИГЕ. Пропустить эту
+        ветку — значит работать сменённым паролем до перезапуска Home Assistant,
+        то есть до приезда инсталлятора.
+        """
+        if not self.trassir or not config:
+            return
+        try:
+            await self.trassir.async_apply(config)
+        except Exception as err:  # noqa: BLE001 — видеонаблюдение не роняет синхронизацию
+            LOGGER.warning("Настройки Trassir не применились: %s", err)
 
     def _on_success(self) -> None:
         self.last_error = None

@@ -434,3 +434,65 @@ def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
         "available": state is not None and not unavailable,
         "updatedAt": int(state.last_updated.timestamp() * 1000) if state else None,
     }
+
+
+# --- TRASSIR: лента событий объекта ---
+#
+# ⚠ Обработчики ПУТЕЙ, а не именованные операции канала: их зовут обе двери —
+# локальная (`http.py`) и перенос запроса снаружи (`relay_api.py`). Ровно ради
+# этого перенос и заведён, и заводить под видеонаблюдение свою операцию значило
+# бы строить вторую трубу (docs/trassir-integration-plan.md, §5а у менеджера).
+
+
+def trassir(coordinator: MegaHomeCoordinator) -> Any:
+    """Шлюз к регистратору объекта — или понятный отказ, если его нет."""
+    gateway = getattr(coordinator, "trassir", None)
+    if gateway is None or not gateway.configured:
+        raise OpError(
+            "У этого объекта не настроено видеонаблюдение", HTTPStatus.NOT_FOUND
+        )
+    return gateway
+
+
+async def trassir_cameras(coordinator: MegaHomeCoordinator) -> dict[str, Any]:
+    """Камеры регистратора: id, имя, кодек и есть ли у них архив."""
+    return {"cameras": await trassir(coordinator).async_cameras()}
+
+
+def trassir_events(
+    coordinator: MegaHomeCoordinator, query: dict[str, Any]
+) -> dict[str, Any]:
+    """Лента событий, новые сверху; можно по одной камере и постранично.
+
+    ⚠ `timestampUs` уходит наружу КАК ЕСТЬ — в шкале самого Trassir. Приложение
+    показывает время из него же и возвращает его обратно, открывая запись; наши
+    часы в этой цепочке не участвуют вовсе, и это единственный способ не
+    промахнуться на часовой пояс сервера.
+    """
+    gateway = trassir(coordinator)
+    return {
+        "events": gateway.events(
+            guid=query.get("guid") or None,
+            limit=_int(query.get("limit"), 50),
+            before=_int(query.get("before"), 0) or None,
+        )
+    }
+
+
+async def trassir_thumb(
+    coordinator: MegaHomeCoordinator, event_id: str
+) -> tuple[str, bytes]:
+    """Превью события — кадр архива, уже уменьшенный домом."""
+    from .trassir_client import TrassirError
+
+    try:
+        return "image/jpeg", await trassir(coordinator).async_thumb(event_id)
+    except TrassirError as err:
+        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
+
+
+def _int(value: Any, default: int) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default

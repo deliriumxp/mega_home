@@ -28,7 +28,7 @@ import json
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import parse_qsl, unquote
 
 from homeassistant.core import HomeAssistant
 
@@ -63,13 +63,13 @@ async def handle(
     сторон и вопрос «а это точно текст?» в каждой.
     """
     method = str(payload.get("method") or "GET").upper()
-    path = _path(payload.get("path"))
+    path, query = _path(payload.get("path"))
     body = _body(payload.get("body"))
 
     if len(body) > MAX_PHOTO_BYTES:
         raise ops.OpError("Запрос слишком большой", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
 
-    result = await _dispatch(hass, coordinator, method, path, body)
+    result = await _dispatch(hass, coordinator, method, path, body, query)
     if len(result[2]) > MAX_RESPONSE_BYTES:
         raise ops.OpError("Ответ слишком большой", HTTPStatus.INSUFFICIENT_STORAGE)
     status, content_type, raw, cache = result
@@ -89,8 +89,10 @@ async def _dispatch(
     method: str,
     path: str,
     body: bytes,
+    query: dict[str, str] | None = None,
 ) -> tuple[int, str, bytes, str]:
     """(status, content-type, тело, cache-control) для одного пути."""
+    query = query or {}
     if path == "api/config" and method == "GET":
         return _json(ops.config(coordinator))
     if path == "api/states" and method == "GET":
@@ -128,6 +130,20 @@ async def _dispatch(
             # Кадр живой: закешированный постер показывал бы вчерашний двор.
             "no-store",
         )
+    if path == "api/trassir/cameras" and method == "GET":
+        return _json(await ops.trassir_cameras(coordinator))
+    if path == "api/trassir/events" and method == "GET":
+        # ⚠ Именно здесь query и понадобился впервые: без него жилец СНАРУЖИ
+        # получал бы всю ленту вместо одной камеры — то есть другое поведение
+        # той же кнопки. Разница «дома/снаружи» обязана оставаться только в
+        # адресе базы.
+        return _json(ops.trassir_events(coordinator, query))
+    if path.startswith("api/trassir/events/") and path.endswith("/thumb") and method == "GET":
+        event = unquote(path[len("api/trassir/events/") : -len("/thumb")])
+        content_type, raw = await ops.trassir_thumb(coordinator, event)
+        # Кадр за прошедшую секунду больше не изменится — пусть телефон держит
+        # его у себя, лента листается вверх-вниз.
+        return HTTPStatus.OK, content_type, raw, IMMUTABLE
     if path.startswith("api/asset/") and method == "GET":
         return await _asset(hass, coordinator, unquote(path[len("api/asset/") :]))
     if path.startswith("icons/") and method == "GET":
@@ -241,12 +257,22 @@ def _json_body(body: bytes) -> dict[str, Any]:
     return parsed
 
 
-def _path(value: Any) -> str:
-    """Путь запроса без ведущего слэша и без выхода за пределы своего API."""
-    path = str(value or "").split("?", 1)[0].lstrip("/")
+def _path(value: Any) -> tuple[str, dict[str, str]]:
+    """Путь и РАЗОБРАННЫЙ query запроса, без выхода за пределы своего API.
+
+    ⚠ Query здесь не отбрасывается, и это не украшение. Перенос обещает, что
+    приложение снаружи делает то же самое, что дома, — а «то же самое» у
+    HTTP-запроса включает `?guid=…&before=…`. Пока query выбрасывался, любой
+    будущий маршрут с параметрами молча вёл бы себя снаружи иначе: не отказ, не
+    ошибка, а тихо другой ответ. Менеджер их присылает (`resident-proxy`
+    передаёт `originalUrl` целиком), терял их только дом.
+    """
+    raw = str(value or "")
+    path = raw.split("?", 1)[0].lstrip("/")
     if ".." in path:
         raise ops.OpError("Дом не знает такого запроса", HTTPStatus.NOT_FOUND)
-    return path
+    query = dict(parse_qsl(raw.split("?", 1)[1])) if "?" in raw else {}
+    return path, query
 
 
 def _body(value: Any) -> bytes:

@@ -1,0 +1,275 @@
+"""SDK client for one TRASSIR recorder standing next to this home.
+
+Everything here is local: the recorder lives on the object's own LAN and this
+integration is the only thing that talks to it. The manager never does — it has
+no route to the object (docs/trassir-integration-plan.md in the manager repo).
+
+⚠ TWO identities, and neither covers everything. Verified against a live
+recorder (4.8.2.0): a session opened with a USER login serves `/channels`,
+`/get_video` and `archive_command` but answers `no session` on `/events`, while
+a session opened with the SDK PASSWORD (login without a username — TRASSIR calls
+that user "Script") is the exact opposite. So "no session" on the event feed is
+not an expired sid; it is the wrong door, and the log has to say so, or the next
+person spends an afternoon on reconnect logic.
+
+⚠ The recorder's certificate is self-signed, so TLS verification is off here and
+only here: the address is a private one the installer typed in.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from typing import Any
+
+import aiohttp
+
+from .const import (
+    LOGGER,
+    TRASSIR_LOGIN_GAP,
+    TRASSIR_SESSION_TTL,
+    TRASSIR_TIMEOUT,
+)
+
+# Which door a request goes through. `USER` is the operator account, `SDK` is
+# the "Script" identity behind the SDK password.
+USER = "user"
+SDK = "sdk"
+
+
+class TrassirError(Exception):
+    """The recorder could not be reached or refused the request."""
+
+
+class TrassirAuthError(TrassirError):
+    """Credentials were rejected, or the wrong identity was used."""
+
+
+class TrassirClient:
+    """One recorder, two sessions, no interpretation of what comes back."""
+
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        sdk_password: str,
+    ) -> None:
+        self._session = session
+        self._base = f"https://{host}:{port}"
+        self._username = username
+        self._password = password
+        self._sdk_password = sdk_password
+        self._sids: dict[str, tuple[str, float]] = {}
+        self._locks = {USER: asyncio.Lock(), SDK: asyncio.Lock()}
+        # ⚠ ONE gate for both doors: TRASSIR bans the IP for logging in more
+        # often than once every five seconds, and it counts the address, not the
+        # account. Two independent limiters would race each other into the ban.
+        self._login_gate = asyncio.Lock()
+        self._last_login = 0.0
+
+    # --- public surface -------------------------------------------------
+
+    async def async_channels(self) -> list[dict[str, Any]]:
+        """Every channel of the recorder, as the recorder describes it.
+
+        ⚠ The codec reported here is the ONLY trustworthy one: the SDP of the
+        RTSP stream announces H264 even for channels that really send H265.
+        """
+        payload = await self._json("channels", USER)
+        channels = payload.get("channels")
+        return channels if isinstance(channels, list) else []
+
+    async def async_events(self) -> list[dict[str, Any]]:
+        """Events that happened SINCE THE PREVIOUS CALL on this session.
+
+        ⚠ Not "the last N events": the feed is a per-session queue and it is
+        drained by reading it. A fresh session receives a backlog capped at 100,
+        which is why the caller must deduplicate — a relogin replays them.
+        """
+        payload = await self._request("events", SDK)
+        return payload if isinstance(payload, list) else []
+
+    async def async_screenshot(self, guid: str, timestamp: int | str | None = None) -> bytes:
+        """One JPEG frame: from the archive with a timestamp, live without one.
+
+        ⚠ A timestamp in the FUTURE silently returns the live frame instead of
+        an error, so "the archive does not go back that far" looks exactly like
+        success. And the frame is the full-size one (~530 KB on the stand):
+        whoever shows a list of these has to shrink them first.
+        """
+        params: dict[str, Any] = {}
+        if timestamp is not None:
+            params["timestamp"] = timestamp
+        return await self._bytes(f"screenshot/{guid}", USER, **params)
+
+    async def async_get_video(
+        self, guid: str, stream: str = "archive_main", container: str = "rtsp"
+    ) -> str:
+        """Open a video session and return its EPHEMERAL token."""
+        payload = await self._json("get_video", USER, channel=guid, stream=stream, container=container)
+        token = payload.get("token")
+        if not isinstance(token, str) or not token:
+            raise TrassirError("Trassir не выдал токен видеопотока")
+        return token
+
+    async def async_archive_command(
+        self, token: str, command: str = "play", **params: Any
+    ) -> dict[str, Any]:
+        """Drive the archive of an ALREADY OPEN stream.
+
+        ⚠ Order matters and the recorder will not explain it: token → someone
+        opens the stream → this command. Called before the stream is open it
+        answers `stream is expired`, which reads like a timeout and is not one.
+        """
+        return await self._json("archive_command", USER, command=command, token=token, **params)
+
+    async def async_ping(self, token: str) -> None:
+        """Keep a video token alive (documented as 10 s without traffic).
+
+        ⚠ Plain HTTP on the video port, which speaks both RTSP and HTTP. On the
+        stand a token survived 25 s of silence anyway — that is the recorder
+        being generous, not a contract, so the ping stays.
+        """
+        url = self._base.replace("https://", "http://").rsplit(":", 1)[0] + f":555/{token}?ping"
+        try:
+            async with self._session.get(
+                url, timeout=aiohttp.ClientTimeout(total=TRASSIR_TIMEOUT), ssl=False
+            ) as response:
+                await response.read()
+        except aiohttp.ClientError as err:
+            raise TrassirError(f"Trassir не отвечает на продление токена: {err}") from err
+
+    # --- transport ------------------------------------------------------
+
+    async def _json(self, path: str, door: str, **params: Any) -> dict[str, Any]:
+        payload = await self._request(path, door, **params)
+        if not isinstance(payload, dict):
+            raise TrassirError(f"Trassir ответил неожиданным телом на {path}")
+        return payload
+
+    async def _request(self, path: str, door: str, **params: Any) -> Any:
+        """One SDK call, with a single retry after re-authenticating."""
+        for attempt in (1, 2):
+            sid = await self._async_sid(door)
+            try:
+                async with self._session.get(
+                    f"{self._base}/{path}",
+                    params={**{k: str(v) for k, v in params.items()}, "sid": sid},
+                    timeout=aiohttp.ClientTimeout(total=TRASSIR_TIMEOUT),
+                    ssl=False,
+                ) as response:
+                    body = await response.json(content_type=None)
+            except aiohttp.ClientError as err:
+                raise TrassirError(f"Trassir не отвечает: {err}") from err
+            except ValueError as err:
+                raise TrassirError(f"Trassir ответил не-JSON на {path}") from err
+            if self._is_no_session(body):
+                self._sids.pop(door, None)
+                if attempt == 1:
+                    continue
+                raise TrassirAuthError(self._no_session_hint(door, path))
+            if isinstance(body, dict) and body.get("success") in (0, "0"):
+                raise TrassirError(
+                    f"Trassir отклонил запрос {path}: {body.get('error_code') or 'без причины'}"
+                )
+            return body
+        raise TrassirError(f"Trassir не ответил на {path}")
+
+    async def _bytes(self, path: str, door: str, **params: Any) -> bytes:
+        for attempt in (1, 2):
+            sid = await self._async_sid(door)
+            try:
+                async with self._session.get(
+                    f"{self._base}/{path}",
+                    params={**{k: str(v) for k, v in params.items()}, "sid": sid},
+                    timeout=aiohttp.ClientTimeout(total=TRASSIR_TIMEOUT),
+                    ssl=False,
+                ) as response:
+                    payload = await response.read()
+            except aiohttp.ClientError as err:
+                raise TrassirError(f"Trassir не отвечает: {err}") from err
+            # An error comes back as JSON even where bytes were asked for.
+            if payload[:1] == b"{" and b"no session" in payload:
+                self._sids.pop(door, None)
+                if attempt == 1:
+                    continue
+                raise TrassirAuthError(self._no_session_hint(door, path))
+            return payload
+        raise TrassirError(f"Trassir не ответил на {path}")
+
+    async def _async_sid(self, door: str) -> str:
+        cached = self._sids.get(door)
+        if cached and cached[1] > time.monotonic():
+            return cached[0]
+        async with self._locks[door]:
+            cached = self._sids.get(door)
+            if cached and cached[1] > time.monotonic():
+                return cached[0]
+            sid = await self._async_login(door)
+            self._sids[door] = (sid, time.monotonic() + TRASSIR_SESSION_TTL)
+            return sid
+
+    async def _async_login(self, door: str) -> str:
+        if door == SDK and not self._sdk_password:
+            raise TrassirAuthError(
+                "Не задан пароль SDK Trassir — без него сервер не отдаёт события"
+            )
+        params = (
+            {"password": self._sdk_password}
+            if door == SDK
+            else {"username": self._username, "password": self._password}
+        )
+        async with self._login_gate:
+            wait = TRASSIR_LOGIN_GAP - (time.monotonic() - self._last_login)
+            if wait > 0:
+                # Logging in more often than that gets the address banned, and a
+                # banned address takes the whole feature down, not one request.
+                await asyncio.sleep(wait)
+            try:
+                async with self._session.get(
+                    f"{self._base}/login",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=TRASSIR_TIMEOUT),
+                    ssl=False,
+                ) as response:
+                    raw = await response.read()
+            except aiohttp.ClientError as err:
+                raise TrassirError(f"Trassir не отвечает на вход: {err}") from err
+            finally:
+                self._last_login = time.monotonic()
+        sid = self._sid_of(raw)
+        if not sid:
+            raise TrassirAuthError(
+                "Trassir отклонил пароль SDK" if door == SDK
+                else "Trassir отклонил логин или пароль"
+            )
+        LOGGER.debug("Opened a %s session with Trassir", door)
+        return sid
+
+    @staticmethod
+    def _sid_of(raw: bytes) -> str:
+        """⚠ An unset SDK password answers with an EMPTY body, not an error."""
+        import json
+
+        try:
+            body = json.loads(raw.decode() or "{}")
+        except ValueError:
+            return ""
+        sid = body.get("sid") if isinstance(body, dict) else None
+        return sid if isinstance(sid, str) else ""
+
+    @staticmethod
+    def _is_no_session(body: Any) -> bool:
+        return isinstance(body, dict) and body.get("error_code") == "no session"
+
+    @staticmethod
+    def _no_session_hint(door: str, path: str) -> str:
+        if door == SDK:
+            return (
+                f"Trassir не пустил к {path}: проверьте пароль SDK "
+                "(Настройки → Веб-сервер → SDK) — учётка пользователя сюда не подходит"
+            )
+        return f"Trassir не пустил к {path}: проверьте логин и пароль пользователя"

@@ -105,6 +105,11 @@ async def async_register_http(
         # выпуска этой интеграции (`assets.py`).
         MegaHomeAssetView,
         MegaHomeCameraFrameView,
+        # Видеонаблюдение объекта: лента событий и превью к ней. Просмотр записи
+        # идёт тем же WebRTC, что и живая камера, — своей двери у него нет.
+        MegaHomeTrassirCamerasView,
+        MegaHomeTrassirEventsView,
+        MegaHomeTrassirThumbView,
         MegaHomeWebRtcView,
         MegaHomeWebRtcCloseView,
         MegaHomeRelayView,
@@ -408,6 +413,66 @@ class MegaHomeCameraFrameView(_MegaHomeView):
             body=body,
             # Кадр живой: закешированный постер показывал бы вчерашний двор.
             headers={"Content-Type": content_type, "Cache-Control": "no-store"},
+        )
+
+
+class MegaHomeTrassirCamerasView(_MegaHomeView):
+    """Камеры регистратора — чтобы плитку дома можно было связать с событиями."""
+
+    url = f"{URL_API}/trassir/cameras"
+    name = "api:mega_home:trassir-cameras"
+
+    async def get(self, request: web.Request) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        try:
+            return self.json(await ops.trassir_cameras(coordinator))
+        except ops.OpError as err:
+            return self.json_message(err.message, err.status)
+
+
+class MegaHomeTrassirEventsView(_MegaHomeView):
+    """Лента событий: `?guid=` — одна камера, `?before=` — страница постарше."""
+
+    url = f"{URL_API}/trassir/events"
+    name = "api:mega_home:trassir-events"
+
+    async def get(self, request: web.Request) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        try:
+            return self.json(ops.trassir_events(coordinator, dict(request.query)))
+        except ops.OpError as err:
+            return self.json_message(err.message, err.status)
+
+
+class MegaHomeTrassirThumbView(_MegaHomeView):
+    """Кадр архива на секунду события — уже ужатый (`trassir.py`)."""
+
+    url = f"{URL_API}/trassir/events/{{event}}/thumb"
+    name = "api:mega_home:trassir-thumb"
+
+    async def get(self, request: web.Request, event: str) -> web.StreamResponse:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        try:
+            content_type, body = await ops.trassir_thumb(coordinator, event)
+        except ops.OpError as err:
+            return web.Response(status=err.status, text=err.message)
+        return web.Response(
+            body=body,
+            # Кадр архива за прошедшую секунду больше не изменится никогда —
+            # пусть телефон держит его у себя, лента листается вверх-вниз.
+            headers={
+                "Content-Type": content_type,
+                "Cache-Control": "public, max-age=31536000, immutable",
+            },
         )
 
 

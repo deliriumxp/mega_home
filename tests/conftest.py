@@ -45,6 +45,10 @@ class _Store:  # noqa: D101 - the coordinator only calls save/load on it
     async def async_save(self, data: object) -> None:
         self._data = data
 
+    def async_delay_save(self, data_func: object, delay: float = 0) -> None:
+        """Настоящий Store откладывает запись; тесту важен только её факт."""
+        self._data = data_func()  # type: ignore[operator]
+
     async def async_load(self) -> object:
         return self._data
 
