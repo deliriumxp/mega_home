@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from time import monotonic
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from .bundle import BundleStore
 from .const import (
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
+    ICE_CACHE_SECONDS,
     ICON_DIR,
     ICON_SIZE,
     LOGGER,
@@ -78,6 +80,12 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.app_error: str | None = None
         self.app_checked_at: datetime | None = None
         self.last_error: str | None = None
+        # Ретранслятор видео: список ICE, выданный менеджером, и когда он выдан.
+        # ⚠ Кэш нужен не ради экономии запросов, а ради НЕЗАВИСИМОСТИ локального
+        # просмотра от связи с облаком: квартира без интернета — нормальное
+        # состояние, и камера в ней обязана открываться.
+        self._ice: list[dict[str, Any]] = []
+        self._ice_at: float = 0.0
         # DataUpdateCoordinator tracks whether the last refresh succeeded but
         # NOT when it last did, so the timestamp the installer actually asks
         # about ("when did this home last hear from the manager?") is ours.
@@ -138,6 +146,24 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.data = cached
         LOGGER.debug("Loaded cached home config %s", cached.get("version"))
         return True
+
+    async def async_ice_servers(self) -> list[dict[str, Any]]:
+        """ICE-серверы для приложения: из кэша, иначе спросить менеджера.
+
+        ⚠ Отказ менеджера — не ошибка: возвращаем пустой список, приложение
+        берёт встроенный STUN и работает ровно как до появления ретранслятора.
+        Внутри дома он и не нужен — там LAN.
+        """
+        now = monotonic()
+        if self._ice and now - self._ice_at < ICE_CACHE_SECONDS:
+            return self._ice
+        try:
+            self._ice = await self.client.async_ice_servers()
+            self._ice_at = now
+        except ManagerError as err:
+            LOGGER.debug("ICE servers unavailable: %s", err)
+            return self._ice
+        return self._ice
 
     async def _async_update_data(self) -> dict[str, Any]:
         try:

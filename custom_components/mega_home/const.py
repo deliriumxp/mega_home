@@ -24,7 +24,7 @@ LOGGER = logging.getLogger(__package__)
 #
 # ⚠ Держится в паре с `manifest.json`, их сверяет `tests/test_version.py`:
 # поднимать ОБА, одним релизом.
-INTEGRATION_VERSION = "0.2.18"
+INTEGRATION_VERSION = "0.2.19"
 
 CONF_MANAGER_URL = "manager_url"
 CONF_TOKEN = "token"
@@ -42,6 +42,15 @@ API_TILE_PHOTO = "/inbound/home-config/tile-photo"
 # (`tile-photo-stores.ts`) и в менеджере — контракт трёх сторон, как и
 # форма состояния плитки. Комнаты лежат под своими id без приставки.
 TILE_PHOTO_PREFIX = "tile:"
+# Учётка ретранслятора видео (TURN) для приложения, открытого НА ДОМЕНЕ ОБЪЕКТА:
+# там приложение раздаём мы, и списка ICE ему взять больше негде. Общий секрет
+# менеджер не отдаёт — только готовую учётку со сроком (docs/remote-access.md).
+API_ICE = "/inbound/home-config/ice"
+# Сколько держим выданный список, прежде чем спросить заново. ⚠ Не «подольше
+# ради экономии»: учётка живёт часами, но менеджер бывает недоступен, и просить
+# её на каждое открытие камеры значило бы ставить просмотр в зависимость от
+# связи с облаком. Десять минут — свежо и дёшево.
+ICE_CACHE_SECONDS = 600
 API_APP_MANIFEST = "/inbound/home-config/app/manifest"
 API_APP_FILE = "/inbound/home-config/app/file"
 

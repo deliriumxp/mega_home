@@ -132,6 +132,27 @@ _module(
 class _HomeAssistantView:  # noqa: D101 - stand-in for the HA base class
     requires_auth = True
 
+    # ⚠ Настоящий `HomeAssistantView` умеет `json`/`json_message`; заглушка без
+    # них молча роняла бы КАЖДУЮ спеку на вьюху с AttributeError вместо
+    # проверки поведения.
+    @staticmethod
+    def json(payload: object, status_code: int = 200) -> object:
+        import json as _json
+
+        return type(
+            "Response",
+            (),
+            {
+                "status": status_code,
+                "body": _json.dumps(payload).encode(),
+                "headers": {"Content-Type": "application/json"},
+            },
+        )()
+
+    @classmethod
+    def json_message(cls, message: str, status_code: int = 400) -> object:
+        return cls.json({"message": message}, status_code)
+
 
 _module("homeassistant.components")
 _module(

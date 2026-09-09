@@ -13,6 +13,7 @@ from .const import (
     API_ASSET,
     API_APP_MANIFEST,
     API_CONFIG,
+    API_ICE,
     API_ICON,
     API_RELAY,
     API_ROOM_PHOTO,
@@ -67,6 +68,15 @@ class ManagerClient:
         if not isinstance(payload.get("tiles"), list):
             raise ManagerError("manager returned a config without tiles")
         return payload
+
+    async def async_ice_servers(self) -> list[dict[str, Any]]:
+        """Return ICE servers for the app: public STUN and, if the manager has
+        one configured, a relay with fresh short-lived credentials."""
+        payload = await self._get_json(API_ICE)
+        servers = payload.get("iceServers")
+        if not isinstance(servers, list):
+            raise ManagerError("manager returned no ICE servers")
+        return [item for item in servers if isinstance(item, dict)]
 
     async def async_icon(self, icon: str, size: str = ICON_SIZE) -> bytes:
         """Return one scenario icon as PNG bytes."""

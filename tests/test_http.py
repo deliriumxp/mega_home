@@ -180,3 +180,41 @@ def test_писать_можно_только_то_что_есть_в_соста
     assert not _photo_key_known(PHOTO_CONFIG, "light.kitchen_main")
     # Приставка без идентификатора — тоже не ключ.
     assert not _photo_key_known(PHOTO_CONFIG, "tile:")
+
+
+class FakeIceCoordinator(FakeCoordinator):
+    """Координатор, который умеет отдать список ICE (или отказать)."""
+
+    def __init__(self, servers: list[dict[str, Any]] | None = None) -> None:
+        super().__init__()
+        self._servers = servers or []
+
+    async def async_ice_servers(self) -> list[dict[str, Any]]:
+        return self._servers
+
+
+def test_ice_отдаётся_приложению_на_домене_объекта() -> None:
+    """⚠ Второй адрес выдачи учётки, и он обязателен.
+
+    Приложение открывают ДВУМЯ дверями: через менеджер (там список выдаёт он
+    сам) и на домене объекта — там раздаём его мы, и списка ICE приложению взять
+    больше негде. Без этого маршрута ретранслятор работал бы только у одной
+    двери, а бандл у обеих один и тот же.
+    """
+    from mega_home.http import MegaHomeIceView
+
+    servers = [{"urls": ["turn:turn.example:3478"], "username": "u", "credential": "p"}]
+    answer = asyncio.run(MegaHomeIceView().get(FakeRequest(FakeIceCoordinator(servers))))
+
+    assert answer.status == 200
+    assert b"turn:turn.example:3478" in answer.body
+
+
+def test_без_координатора_список_пустой_а_не_ошибка() -> None:
+    """⚠ Отказ не ломает просмотр: приложение возьмёт встроенный STUN."""
+    from mega_home.http import MegaHomeIceView
+
+    answer = asyncio.run(MegaHomeIceView().get(FakeRequest(None)))
+
+    assert answer.status == 200
+    assert b'"iceServers": []' in answer.body or b'"iceServers":[]' in answer.body

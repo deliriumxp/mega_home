@@ -108,6 +108,7 @@ async def async_register_http(
         MegaHomeCameraFrameView,
         MegaHomeWebRtcView,
         MegaHomeWebRtcCloseView,
+        MegaHomeIceView,
         MegaHomeRelayView,
         # ⚠ РАНЬШЕ каталога: `/mega-home/{path:.*}` накрывает и `sw.js`, а aiohttp
         # отдаёт запрос первому подошедшему ресурсу.
@@ -465,6 +466,35 @@ class MegaHomeWebRtcCloseView(_MegaHomeView):
 
     async def post(self, request: web.Request) -> web.Response:
         return await self.run_async(request, "webrtc-close")
+
+
+class MegaHomeIceView(_MegaHomeView):
+    """Чем приложению пробовать соединиться с камерой: STUN и ретранслятор.
+
+    ⚠ Нужен ровно там, где приложение открыто НА ДОМЕНЕ ОБЪЕКТА: тогда его
+    раздаём мы, и менеджера приложение не спрашивает ни о чём — списка ICE ему
+    взять негде. На пути через менеджер список выдаёт он сам, и этот маршрут
+    не участвует.
+
+    ⚠ Список КЭШИРУЕТСЯ (`ICE_CACHE_SECONDS`), и это не экономия запросов:
+    учётка живёт часами, а менеджер бывает недоступен (квартира без интернета —
+    нормальное состояние). Ходить к нему на каждое открытие камеры значило бы
+    поставить локальный просмотр в зависимость от связи с облаком.
+
+    ⚠ Отказ НЕ ошибка: отдаём пустой список, приложение берёт встроенный STUN и
+    работает ровно как до появления ретранслятора. Внутри дома он и не нужен —
+    там LAN.
+    """
+
+    url = f"{URL_API}/ice"
+    name = "api:mega_home:ice"
+
+    async def get(self, request: web.Request) -> web.Response:
+        hass: HomeAssistant = request.app["hass"]
+        coordinator = _coordinator(hass)
+        if coordinator is None:
+            return self.json({"iceServers": []})
+        return self.json({"iceServers": await coordinator.async_ice_servers()})
 
 
 class MegaHomeRelayView(_MegaHomeView):
