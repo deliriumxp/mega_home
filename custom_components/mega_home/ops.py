@@ -97,6 +97,15 @@ async def run(
         from .probe import run as run_probe
 
         return await run_probe(hass, data)
+    if op == "scan":
+        # Обход локальной сети объекта по заказу МЕНЕДЖЕРА (`scan.py`): какие
+        # устройства стоят и куда из них можно войти по веб-интерфейсу. Список
+        # DHCP-аренд роутера этого не даёт — статика в нём не появляется.
+        #
+        # ⚠ Импорт ЛОКАЛЬНЫЙ по той же причине, что у `probe`.
+        from .scan import run as run_scan
+
+        return await run_scan(hass, data)
     raise OpError("Неизвестная операция", HTTPStatus.NOT_FOUND)
 
 
