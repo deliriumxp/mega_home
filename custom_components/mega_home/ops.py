@@ -86,6 +86,17 @@ async def run(
         from .relay_api import handle
 
         return await handle(hass, coordinator, data)
+    if op == "probe":
+        # Проба устройства объекта по заданию МЕНЕДЖЕРА (`probe.py`): мониторинг
+        # больше не ходит в LAN объекта по WG-туннелю, которого у части парка
+        # нет вовсе. Здесь только примитивы — что и зачем спрашивать, знает
+        # менеджер, и меняется это его деплоем, а не релизом HACS.
+        #
+        # ⚠ Импорт ЛОКАЛЬНЫЙ: `probe` берёт `OpError` отсюда, и на уровне файла
+        # это был бы цикл (то же, что у `relay_api`).
+        from .probe import run as run_probe
+
+        return await run_probe(hass, data)
     raise OpError("Неизвестная операция", HTTPStatus.NOT_FOUND)
 
 
