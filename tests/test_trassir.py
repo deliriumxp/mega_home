@@ -264,11 +264,19 @@ def test_cameras_carry_the_codec_and_the_archive_flag(tmp_path: Path) -> None:
     async def scenario() -> list[dict[str, Any]]:
         await gate.async_apply(config())
         gate._client = client  # noqa: SLF001
-        return await gate.async_cameras()
+        # Карта «guid → плитка» приходит снаружи: её собирает `ops` по АДРЕСУ
+        # потока камеры, а не по имени.
+        return await gate.async_cameras({"cam1": "tile-1"})
 
     cameras = asyncio.run(scenario())
 
-    assert cameras[0] == {"guid": "cam1", "name": "Вход", "codec": "h264", "hasArchive": True}
+    assert cameras[0] == {
+        "guid": "cam1",
+        "name": "Вход",
+        "codec": "h264",
+        "hasArchive": True,
+        "tile": "tile-1",
+    }
     assert cameras[1]["hasArchive"] is False, "бит архива снят — так и показываем"
     # ⚠ Неизвестная маска = «архив есть»: на живом регистраторе раскладка битов
     # не совпала с документированной, и запрет по ней спрятал бы работающую камеру.

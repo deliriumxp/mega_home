@@ -191,19 +191,27 @@ class TrassirGateway:
         """One event by the id this gateway gave it."""
         return next((e for e in self._events if e.get("id") == event_id), None)
 
-    async def async_cameras(self) -> list[dict[str, Any]]:
+    async def async_cameras(self, tiles: dict[str, str] | None = None) -> list[dict[str, Any]]:
         """Channels of the recorder, in the shape the app needs.
 
         ⚠ `codec` comes from `/channels` and only from there: the SDP of the
         RTSP stream announces H264 even for channels that send H265, and a
         WebRTC viewer that trusts it shows a black rectangle.
+
+        ⚠ `tile` is how the app learns that a camera it already shows has an
+        event feed. It is resolved from the camera's own STREAM ADDRESS, which
+        carries the channel guid (`rtsp://host:555/<guid>_m/`) — not by matching
+        names. Names get edited on both sides and would silently pair the wrong
+        camera with the wrong recording, which is worse than no pairing at all.
         """
+        by_guid = tiles or {}
         return [
             {
                 "guid": channel.get("guid"),
                 "name": channel.get("name"),
                 "codec": channel.get("codec"),
                 "hasArchive": self._has_archive(channel),
+                "tile": by_guid.get(channel.get("guid")),
             }
             for channel in await self._async_channels()
             if channel.get("guid")

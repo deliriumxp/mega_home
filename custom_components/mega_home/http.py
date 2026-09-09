@@ -429,7 +429,9 @@ class MegaHomeTrassirCamerasView(_MegaHomeView):
             return error
         assert coordinator is not None
         try:
-            return self.json(await ops.trassir_cameras(coordinator))
+            return self.json(
+                await ops.trassir_cameras(request.app["hass"], coordinator)
+            )
         except ops.OpError as err:
             return self.json_message(err.message, err.status)
 

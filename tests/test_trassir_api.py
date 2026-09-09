@@ -50,8 +50,17 @@ class FakeGateway:
     def event(self, event_id):
         return next((e for e in EVENTS if e["id"] == event_id), None)
 
-    async def async_cameras(self):
-        return [{"guid": "cam1", "name": "Вход", "codec": "h264", "hasArchive": True}]
+    async def async_cameras(self, tiles=None):
+        self.asked_tiles = tiles
+        return [
+            {
+                "guid": "cam1",
+                "name": "Вход",
+                "codec": "h264",
+                "hasArchive": True,
+                "tile": (tiles or {}).get("cam1"),
+            }
+        ]
 
     async def async_thumb(self, event_id):
         self.thumbs.append(event_id)
@@ -165,3 +174,41 @@ def test_запись_идёт_той_же_операцией_что_и_каме
 
     assert answer["sessionId"] == "s1"
     assert gateway.clips.offered == ["trassir:tok1"]
+
+
+def test_плитка_опознаётся_по_адресу_потока(monkeypatch):
+    """⚠ Связь «плитка ↔ канал» — по guid В АДРЕСЕ, а не по имени.
+
+    Имена правят с обеих сторон: у камеры в Home Assistant и у канала в
+    Trassir. Совпадение по ним однажды подсунуло бы жильцу записи ЧУЖОЙ
+    камеры — а это хуже, чем отсутствие ленты вовсе.
+    """
+    from mega_home import ops as ops_module
+
+    class _Camera:
+        def __init__(self, source: str) -> None:
+            self._source = source
+
+        async def stream_source(self) -> str:
+            return self._source
+
+    sources = {
+        "camera.vhod": "rtsp://192.168.1.50:555/IAtwTYwK_m/",
+        "camera.dvor": "rtsp://192.168.1.77:554/stream1",  # чужая камера
+    }
+    monkeypatch.setattr(
+        "mega_home.webrtc._camera", lambda hass, entity_id: _Camera(sources[entity_id])
+    )
+
+    coordinator = _Coordinator(FakeGateway())
+    coordinator.data = {
+        "tiles": [
+            {"id": "t1", "domain": "camera", "entityId": "camera.vhod"},
+            {"id": "t2", "domain": "camera", "entityId": "camera.dvor"},
+            {"id": "t3", "domain": "light", "entityId": "light.hall"},
+        ]
+    }
+
+    found = asyncio.run(ops_module._tiles_by_guid(_Hass(), coordinator))
+
+    assert found == {"IAtwTYwK": "t1"}, "чужой адрес плиткой Trassir не становится"

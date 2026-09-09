@@ -131,7 +131,7 @@ async def _dispatch(
             "no-store",
         )
     if path == "api/trassir/cameras" and method == "GET":
-        return _json(await ops.trassir_cameras(coordinator))
+        return _json(await ops.trassir_cameras(hass, coordinator))
     if path == "api/trassir/events" and method == "GET":
         # ⚠ Именно здесь query и понадобился впервые: без него жилец СНАРУЖИ
         # получал бы всю ленту вместо одной камеры — то есть другое поведение

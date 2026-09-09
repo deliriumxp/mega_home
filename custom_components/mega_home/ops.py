@@ -474,9 +474,52 @@ def trassir(coordinator: MegaHomeCoordinator) -> Any:
     return gateway
 
 
-async def trassir_cameras(coordinator: MegaHomeCoordinator) -> dict[str, Any]:
-    """Камеры регистратора: id, имя, кодек и есть ли у них архив."""
-    return {"cameras": await trassir(coordinator).async_cameras()}
+async def trassir_cameras(
+    hass: HomeAssistant, coordinator: MegaHomeCoordinator
+) -> dict[str, Any]:
+    """Камеры регистратора: id, имя, кодек, архив и ПЛИТКА дома, если она есть."""
+    return {"cameras": await trassir(coordinator).async_cameras(await _tiles_by_guid(hass, coordinator))}
+
+
+async def _tiles_by_guid(
+    hass: HomeAssistant, coordinator: MegaHomeCoordinator
+) -> dict[str, str]:
+    """Плитки-камеры дома, разложенные по guid канала Trassir.
+
+    ⚠ Опознаём по АДРЕСУ ПОТОКА камеры, а не по имени: постоянная ссылка
+    Trassir несёт guid прямо в пути (`rtsp://host:555/<guid>_m/`). Имена правят
+    с обеих сторон, и совпадение по ним однажды подсунуло бы жильцу записи
+    ЧУЖОЙ камеры — это хуже, чем отсутствие связи вовсе.
+
+    Ошибка одной камеры не роняет список: у дома их несколько, и молчать обо
+    всех из-за одной нельзя.
+    """
+    found: dict[str, str] = {}
+    for tile in (coordinator.data or {}).get("tiles", []):
+        if tile.get("domain") != "camera" or not tile.get("entityId"):
+            continue
+        try:
+            from . import webrtc
+
+            camera = webrtc._camera(hass, tile["entityId"])  # noqa: SLF001
+            source = await camera.stream_source()
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("Адрес потока камеры %s не прочитан: %s", tile.get("id"), err)
+            continue
+        guid = _guid_of(source)
+        if guid:
+            found[guid] = str(tile.get("id"))
+    return found
+
+
+def _guid_of(source: str | None) -> str | None:
+    """`rtsp://host:555/<guid>_m/` → guid. Не наш адрес — None."""
+    if not source:
+        return None
+    import re
+
+    match = re.search(r"/([A-Za-z0-9]{6,})_(?:m|s)/?$", source.split("?")[0])
+    return match.group(1) if match else None
 
 
 def trassir_events(
