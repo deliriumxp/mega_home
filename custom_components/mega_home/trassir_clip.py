@@ -12,11 +12,23 @@
 `stream is expired` — текст читается как таймаут и им не является. Здесь поток
 открывает go2rtc, когда к нему приходит потребитель.
 
+⚠ Между PLAY и командой нужна ПАУЗА (замер стенда 2026-09-09, `TRASSIR_ARCHIVE_SETTLE`).
+Команда, отданная в ту же миллисекунду, что RTSP PLAY, даёт РОВНО НОЛЬ байтов —
+навсегда, а не «медленно»: регистратор молчит, приложение досиживает до своего
+таймаута и показывает чёрный прямоугольник. Через секунду после PLAY первый байт
+идёт мгновенно. Поэтому старт архива не просто ждёт готовности телефона, но и не
+раньше этой паузы от конца переговоров.
+
 ⚠ Команда — ОДНА на соединение (там же проверено): повторный `play` по одному
 открытому потоку ненадёжен, со второй-третьей команды данные встают. Поэтому
 здесь НЕТ перемотки повтором команды: возврат на начало и жест по таймлайну —
 это ПЕРЕОТКРЫТИЕ (новый токен, новый поток, новые переговоры), а старт архива
 ждёт готовности телефона (`ready`), чтобы первый кадр и был началом окна.
+
+⚠ ОКНО записи и ПОЗИЦИЯ — разные вещи, и их нельзя сливать в одно поле. Окно
+задаёт событие и живёт всё открытие; позиция — то, откуда играем сейчас. Пока
+перемотка подменяла окно позицией, шкала после каждого жеста начиналась заново:
+жилец перематывал на середину и снова оказывался «в начале записи».
 
 ⚠ Часы архива идут в РЕАЛЬНОМ времени с момента команды `play`, а телефон
 показывает первый кадр позже: переговоры ICE/DTLS, раскрутка чтения архива с
@@ -29,14 +41,21 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
+from datetime import datetime
 from dataclasses import dataclass, field
 from http import HTTPStatus
+from time import monotonic
 from typing import Any
 
 from homeassistant.core import HomeAssistant
 
 from .const import (
     LOGGER,
+    TRASSIR_ARCHIVE_MAIN,
+    TRASSIR_ARCHIVE_SETTLE,
+    TRASSIR_ARCHIVE_SUB,
+    TRASSIR_CLIP_IDLE_TIMEOUT,
     TRASSIR_CLIP_LEAD,
     TRASSIR_CLIP_MAX_SECONDS,
     TRASSIR_PING_INTERVAL,
@@ -49,27 +68,63 @@ from .trassir_client import TrassirError
 CLIP_PREFIX = "trassir:"
 
 
+def _outside(first_frame: str | None, start_us: int, stop_us: int) -> bool:
+    """Ближайшая запись лежит вне окна — значит кадров не будет вовсе.
+
+    ⚠ Метка разбирается в шкале САМОГО Trassir (UTC-геттеры), той же, в которой
+    считалось окно: «починить» её местным поясом значит прибавить смещение
+    второй раз и объявить дырой каждую нормальную запись.
+    """
+    if not first_frame:
+        return False
+    try:
+        moment = datetime.strptime(first_frame, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        # Регистратор ответил меткой незнакомого вида — молчим, а не врём про
+        # отсутствие записи: пустой экран честнее выдуманного объяснения.
+        return False
+    at_us = int(calendar.timegm(moment.timetuple())) * 1_000_000
+    return at_us < start_us or at_us > stop_us
+
+
 @dataclass
 class Clip:
     """Один открытый клип: токен Trassir, окно архива и поток go2rtc."""
 
     token: str
     guid: str
+    # ⚠ ОКНО события — неизменно на всё открытие: его задаёт событие, и шкала
+    # таймлайна стоит именно на нём. Перемотка меняет `start_us`, но НЕ его.
+    window_start_us: int
+    window_stop_us: int
+    # Откуда играем сейчас. При открытии равно началу окна.
     start_us: int
-    stop_us: int
     stream: str
+    # `archive_main` дома, `archive_sub` снаружи (см. `TRASSIR_ARCHIVE_*`).
+    # Хранится в клипе, чтобы перемотка не роняла качество на субпоток.
+    quality: str = TRASSIR_ARCHIVE_MAIN
     session_id: str | None = None
     started: bool = False
-    # Старт по готовности телефона (`ready`): первый кадр тогда и есть начало
-    # окна, и возвращать архив не на что.
-    anchored: bool = False
+    # Когда закончились переговоры: от этого момента отсчитывается пауза перед
+    # командой архива (`TRASSIR_ARCHIVE_SETTLE` — иначе ноль байтов).
+    offered_at: float = 0.0
     # Куда курсор архива встал НА САМОМ ДЕЛЕ: у записи бывают дыры, и «клип
     # начался не с события» — факт регистратора, а не наш промах.
     first_frame: str | None = None
+    # Ближайшая запись оказалась ВНЕ запрошенного окна: кадров не будет вовсе,
+    # и приложение обязано сказать это словами, а не молчать чёрным экраном.
+    out_of_window: bool = False
     ping: Any = field(default=None, repr=False)
     # Старт вслепую, если готовность не пришла (старое приложение её не шлёт):
     # снимать вместе с клипом, иначе команда догонит закрытый просмотр.
     fallback: Any = field(default=None, repr=False)
+    # Сторож открытого, но так и не начатого просмотра: жилец передумал между
+    # «открыть» и переговорами, а токен пингуется и держит соединение.
+    idle: Any = field(default=None, repr=False)
+    # ⚠ Команда архива — одна на соединение, а претендентов на неё двое
+    # (готовность телефона и сторож слепого старта). Без замка они успевали
+    # оба: `started` ставился ПОСЛЕ await, и вторая команда роняла данные.
+    lock: Any = field(default=None, repr=False)
 
 
 class ClipSessions:
@@ -79,11 +134,15 @@ class ClipSessions:
         self._gateway = gateway
         self._clips: dict[str, Clip] = {}
 
-    async def async_open(self, event_id: str) -> dict[str, Any]:
+    async def async_open(self, event_id: str, remote: bool = False) -> dict[str, Any]:
         """Подготовить запись к просмотру и вернуть её id приложению.
 
         Само видео ещё не течёт: токен взят, поток go2rtc назван, а команда
         архива уйдёт, когда телефон подключится (см. заголовок модуля).
+
+        `remote` — жилец пришёл ПЕРЕНОСОМ через менеджер, а не локальной дверью.
+        Решает ровно одно: качество архива (§5а плана). Дома — основной архив,
+        снаружи — суб.
         """
         event = self._gateway.event(event_id)
         if event is None:
@@ -100,24 +159,75 @@ class ClipSessions:
         start = int(event["timestampUs"]) - TRASSIR_CLIP_LEAD * 1_000_000
         stop = int(event["timestampUs"]) + seconds * 1_000_000
 
-        # ⚠ СУБархив: снаружи это 0.45 против 3 Мбит/с (замер на стенде). Разница
-        # «дома/снаружи» не должна быть в наборе функций, а качество клипа
-        # события выбирается один раз и в пользу того, что доедет по мобильному.
-        token = await client.async_get_video(event["guid"], "archive_sub", "rtsp")
+        # ⚠ Субархив — ТОЛЬКО снаружи. Замер стенда 2026-09-09 по прицеленному
+        # окну: основной архив 1.43 Мбит/с и 13.4 к/с, суб — 0.16 Мбит/с и
+        # 10.7 к/с, то есть вдевятеро меньше данных. Дома, где канал ничем не
+        # ограничен, суб выглядит ровно тем, чем является: мелкой картинкой с
+        # выпадающими кадрами рядом с живой камерой в полном качестве.
+        quality = TRASSIR_ARCHIVE_SUB if remote else TRASSIR_ARCHIVE_MAIN
+        token = await client.async_get_video(event["guid"], quality, "rtsp")
         clip = Clip(
             token=token,
             guid=event["guid"],
+            window_start_us=start,
+            window_stop_us=stop,
             start_us=start,
-            stop_us=stop,
             stream=f"trassir_{token}",
+            quality=quality,
         )
-        self._clips[f"{CLIP_PREFIX}{token}"] = clip
-        return {
-            "id": f"{CLIP_PREFIX}{token}",
-            "startUs": start,
-            "stopUs": stop,
-            "cameraName": event.get("cameraName"),
+        clip_id = f"{CLIP_PREFIX}{token}"
+        self._clips[clip_id] = clip
+        self._arm(clip_id, clip)
+        return self._describe(clip_id, clip, camera_name=event.get("cameraName"))
+
+    def _describe(
+        self, clip_id: str, clip: Clip, camera_name: str | None = None
+    ) -> dict[str, Any]:
+        """Ответ приложению об открытом клипе.
+
+        ⚠ `startUs`/`stopUs` — это ОКНО СОБЫТИЯ, а не то, откуда играем: на них
+        стоит шкала таймлайна, и подменять их позицией значит начинать шкалу
+        заново после каждой перемотки.
+        """
+        payload: dict[str, Any] = {
+            "id": clip_id,
+            "startUs": clip.window_start_us,
+            "stopUs": clip.window_stop_us,
+            "positionUs": clip.start_us,
         }
+        if camera_name is not None:
+            payload["cameraName"] = camera_name
+        return payload
+
+    def _arm(self, clip_id: str, clip: Clip) -> None:
+        """Взять токен под охрану СРАЗУ, как он выдан.
+
+        ⚠ Пинг раньше начинался только с переговоров, а токен живёт десять
+        секунд без запросов. Между «открыть» и предложением телефона лежит сбор
+        ICE-кандидатов, а снаружи ещё и дорога через менеджер — то есть токен
+        успевал умереть до того, как go2rtc откроет по нему RTSP, и просмотр
+        уходил в долгое молчание вместо картинки.
+
+        ⚠ Вместе с пингом взводится сторож: клип, который так и не начали
+        смотреть, иначе пингуется вечно и копит соединения к регистратору
+        (`connections_per_ip = -1` на стенде — остановить это будет некому).
+        """
+        hass = self._gateway.hass
+        clip.ping = hass.async_create_background_task(
+            self._async_ping(clip), f"mega_home_trassir_ping_{clip.token}"
+        )
+        clip.idle = hass.async_create_background_task(
+            self._async_idle(clip_id), f"mega_home_trassir_idle_{clip.token}"
+        )
+
+    async def _async_idle(self, clip_id: str) -> None:
+        """Просмотр так и не начался — отпустить токен и поток."""
+        await asyncio.sleep(TRASSIR_CLIP_IDLE_TIMEOUT)
+        clip = self._clips.get(clip_id)
+        if clip is None or clip.session_id:
+            return
+        LOGGER.debug("Запись открыли, но смотреть не стали — убираем за собой")
+        await self._drop(clip_id, clip)
 
     async def async_offer(self, hass: HomeAssistant, clip_id: str, sdp: str) -> dict[str, Any]:
         """Свести телефон с записью: тот же go2rtc, что и у живой камеры."""
@@ -146,13 +256,19 @@ class ClipSessions:
             hass, OWN_URL, clip.stream, source, sdp, "запись события"
         )
         clip.session_id = answer.get("sessionId")
+        # ⚠ Момент, от которого отсчитывается пауза перед командой архива:
+        # go2rtc открывает RTSP ДО того, как отдаст SDP-ответ (иначе ему нечем
+        # объявить кодеки), поэтому «переговоры кончились» — это заведомо
+        # «PLAY уже был», а команда в ту же миллисекунду даёт ноль байтов.
+        clip.offered_at = monotonic()
+        # Смотреть начали — сторож брошенного клипа больше не нужен.
+        if clip.idle:
+            clip.idle.cancel()
+            clip.idle = None
         # ⚠ Команды архива ЗДЕСЬ НЕТ — только прогрев: RTSP открыт, токен
-        # держится пингом, а `play` уйдёт по готовности телефона (`ready`) либо
-        # вслепую по таймауту (старое приложение готовности не шлёт — ему
-        # достаётся прежнее поведение, а не чёрный экран).
-        clip.ping = hass.async_create_background_task(
-            self._async_ping(clip), f"mega_home_trassir_ping_{clip.token}"
-        )
+        # держится пингом (взят под охрану ещё при открытии), а `play` уйдёт по
+        # готовности телефона (`ready`) либо вслепую по таймауту (старое
+        # приложение готовности не шлёт — ему достаётся прежнее поведение).
         clip.fallback = hass.async_create_background_task(
             self._async_fallback(clip_id),
             f"mega_home_trassir_fallback_{clip.token}",
@@ -172,16 +288,25 @@ class ClipSessions:
         clip = self._clips.get(clip_id)
         if clip is None:
             raise OpError("Запись уже закрыта, откройте событие заново", HTTPStatus.NOT_FOUND)
-        if clip.started:
-            return {"ready": False, "positionUs": clip.start_us, "firstFrameTs": clip.first_frame}
-        if clip.fallback:
-            clip.fallback.cancel()
-            clip.fallback = None
-        await self._async_play(clip_id, clip)
-        clip.anchored = True
-        return {"ready": True, "positionUs": clip.start_us, "firstFrameTs": clip.first_frame}
+        started = clip.started
+        if not started:
+            if clip.fallback:
+                clip.fallback.cancel()
+                clip.fallback = None
+            await self._async_play(clip_id, clip)
+        return {
+            "ready": not started,
+            "positionUs": clip.start_us,
+            "firstFrameTs": clip.first_frame,
+            # ⚠ Ближайшая запись вне окна — это «в это время не писали», а не
+            # наша задержка. Молчание здесь и есть тот чёрный прямоугольник, за
+            # которым жилец досиживает до таймаута проигрывателя.
+            "outOfWindow": clip.out_of_window,
+        }
 
-    async def async_seek(self, clip_id: str, position_us: int | None) -> dict[str, Any]:
+    async def async_seek(
+        self, clip_id: str, position_us: int | None, quality: str | None = None
+    ) -> dict[str, Any]:
         """Перемотка ПЕРЕОТКРЫТИЕМ: новый токен, новый поток, новые переговоры.
 
         ⚠ Повтором команды по тому же соединению — НЕЛЬЗЯ (см. заголовок):
@@ -202,22 +327,42 @@ class ClipSessions:
             raise OpError("Позиция — микросекунды числом", HTTPStatus.BAD_REQUEST) from err
         # ⚠ Кламп, а не отказ: палец на таймлайне не обязан попадать в окно
         # микросекунда в микросекунду, а ронять жест из-за края — хамство.
-        position = min(max(position, old.start_us), old.stop_us)
+        # ⚠ Кламп к ОКНУ события, а не к прошлому старту: после перемотки вперёд
+        # прошлый старт стал бы новым дном шкалы, и вернуться назад было бы уже
+        # нечем — жест «к событию» упирался бы в текущее место.
+        position = min(max(position, old.window_start_us), old.window_stop_us)
         client = self._gateway.client
         if client is None:
             raise TrassirError("Видеонаблюдение объекта не настроено")
-        token = await client.async_get_video(old.guid, "archive_sub", "rtsp")
+        # ⚠ Качество по умолчанию берём У СТАРОГО клипа: его выбрала дверь при
+        # открытии, а перемотка дверь не меняет. Захардкоженный суб здесь ронял
+        # домашний просмотр на субпоток после первого же жеста по таймлайну.
+        #
+        # ⚠ Кнопка качества у записи идёт ЭТИМ ЖЕ путём, а не своей операцией:
+        # поток и токен привязаны к качеству, значит смена качества — это то же
+        # переоткрытие, что и перемотка, только позиция остаётся прежней.
+        want = (
+            TRASSIR_ARCHIVE_SUB
+            if quality == "sub"
+            else TRASSIR_ARCHIVE_MAIN
+            if quality == "main"
+            else old.quality
+        )
+        token = await client.async_get_video(old.guid, want, "rtsp")
         await self._drop(clip_id, old)
         clip = Clip(
             token=token,
             guid=old.guid,
+            window_start_us=old.window_start_us,
+            window_stop_us=old.window_stop_us,
             start_us=position,
-            stop_us=old.stop_us,
             stream=f"trassir_{token}",
+            quality=want,
         )
         clip_id = f"{CLIP_PREFIX}{token}"
         self._clips[clip_id] = clip
-        return {"id": clip_id, "startUs": position, "stopUs": old.stop_us}
+        self._arm(clip_id, clip)
+        return self._describe(clip_id, clip)
 
     async def async_close(self, hass: HomeAssistant, clip_id: str, session_id: str) -> dict[str, Any]:
         """Жилец закрыл запись: снять сессию, поток и токен.
@@ -258,27 +403,32 @@ class ClipSessions:
         дальше регистратор прибирает сам по своему таймауту.
         """
         self._clips.pop(clip_id, None)
-        if clip.ping:
-            clip.ping.cancel()
-            clip.ping = None
-        if clip.fallback:
-            clip.fallback.cancel()
-            clip.fallback = None
+        for name in ("ping", "fallback", "idle"):
+            task = getattr(clip, name)
+            if task:
+                task.cancel()
+                setattr(clip, name, None)
         await self._async_drop_stream(clip.stream)
 
-    def live_stream(self, guid: str) -> tuple[str, str]:
+    def live_stream(self, guid: str, quality: str = "main") -> tuple[str, str]:
         """Имя потока go2rtc и источник для ЖИВОЙ камеры регистратора.
 
         ⚠ Токен не нужен вовсе: у live-канала ссылка ПОСТОЯННАЯ
         (`rtsp://host:555/<guid>_m/`), поэтому здесь нет ни сеанса, ни пинга, ни
         уборки — тем и отличается от записи. И идёт она тем же go2rtc и тем же
         WebRTC: камера видеонаблюдения показывается ровно как любая другая.
+
+        ⚠ Дополнительный поток — тот же постоянный адрес с `_s/`. Документация
+        DSSL знает только путь через `get_video` (`docs/docs-trassir/sdk-video.md`),
+        но он выдаёт ТОКЕН — то есть сеанс, пинг и уборку на каждое переключение
+        качества. Суффикс проверен на стенде замером: `_m` — 2.46 Мбит/с, `_s` —
+        0.36 Мбит/с при тех же 22 к/с. Постоянный адрес того стоит: кнопка
+        качества не заводит ни одной новой сущности.
         """
         settings = self._gateway.settings
-        return (
-            f"trassir_live_{guid}",
-            f"rtsp://{settings['host']}:{settings['rtspPort']}/{guid}_m/",
-        )
+        suffix = "_s" if quality == "sub" else "_m"
+        name = f"trassir_live_{guid}" if quality != "sub" else f"trassir_live_sub_{guid}"
+        return (name, f"rtsp://{settings['host']}:{settings['rtspPort']}/{guid}{suffix}/")
 
     def clip_of_session(self, session_id: str) -> str | None:
         """Найти клип по сессии — приложение закрывает просмотр именно ею."""
@@ -288,32 +438,67 @@ class ClipSessions:
         return None
 
     async def _async_play(self, clip_id: str, clip: Clip) -> None:
-        """Единственная команда архива этого соединения — и держать токен живым."""
+        """Единственная команда архива этого соединения.
+
+        ⚠ Замок, а не флаг после await: претендентов на эту команду двое —
+        готовность телефона и сторож слепого старта, — и `started`, ставившийся
+        ПОСЛЕ ответа регистратора, обоих пропускал. Вторая команда по тому же
+        соединению роняет данные (факт стенда), то есть гонка выглядела как
+        «иногда запись просто встаёт».
+        """
         client = self._gateway.client
         if client is None:
             return
-        try:
-            answer = await client.async_archive_command(
-                clip.token,
-                command="play",
-                start=clip.start_us,
-                stop=clip.stop_us,
-                speed=1,
-            )
-        except TrassirError as err:
-            # Не роняем просмотр: поток уже сведён, и жилец увидит хотя бы то,
-            # что отдаёт регистратор по умолчанию. В лог — словами.
-            LOGGER.warning("Запись не встала на событие: %s", err)
-            return
+        if clip.lock is None:
+            clip.lock = asyncio.Lock()
+        async with clip.lock:
+            if clip.started:
+                return
+            clip.started = True
+            await self._async_settle(clip)
+            try:
+                answer = await client.async_archive_command(
+                    clip.token,
+                    command="play",
+                    start=clip.start_us,
+                    stop=clip.window_stop_us,
+                    speed=1,
+                )
+            except TrassirError as err:
+                # Не роняем просмотр: поток уже сведён, и жилец увидит хотя бы
+                # то, что отдаёт регистратор по умолчанию. В лог — словами.
+                LOGGER.warning("Запись не встала на событие: %s", err)
+                return
         if self._clips.get(clip_id) is not clip:
             # Закрыли раньше, чем команда дошла: дальше делать нечего, пинг и
             # так снимут закрытием.
             return
-        clip.started = True
         # `first_frame_ts` — куда курсор встал НА САМОМ ДЕЛЕ. У архива бывают
         # дыры, и «клип начался не с события» это факт регистратора, а не наш
         # промах; отдаём его наружу, чтобы приложение могло сказать правду.
         clip.first_frame = answer.get("first_frame_ts")
+        clip.out_of_window = _outside(clip.first_frame, clip.start_us, clip.window_stop_us)
+        if clip.out_of_window:
+            # ⚠ Проверено на стенде: когда ближайшая запись лежит ПОЗЖЕ конца
+            # окна, регистратор отвечает успехом и не присылает НИ ОДНОГО байта.
+            # Без этой строки симптом неотличим от «медленно грузится».
+            LOGGER.info(
+                "В запрошенном окне записи нет: ближайший кадр %s", clip.first_frame
+            )
+
+    async def _async_settle(self, clip: Clip) -> None:
+        """Выдержать паузу между открытием потока и командой архива.
+
+        ⚠ Не вежливость к регистратору, а условие того, что данные пойдут
+        ВООБЩЕ (`TRASSIR_ARCHIVE_SETTLE`): команда, отданная в ту же
+        миллисекунду, что RTSP PLAY, даёт ноль байтов навсегда. Обычно ждать не
+        приходится — готовность телефона и так приходит позже.
+        """
+        if not clip.offered_at:
+            return
+        left = TRASSIR_ARCHIVE_SETTLE - (monotonic() - clip.offered_at)
+        if left > 0:
+            await asyncio.sleep(left)
 
     async def _async_ping(self, clip: Clip) -> None:
         """Держать токен живым, пока смотрят.

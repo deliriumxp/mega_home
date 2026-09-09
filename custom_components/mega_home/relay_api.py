@@ -140,7 +140,9 @@ async def _dispatch(
         return _json(ops.trassir_events(coordinator, query))
     if path.startswith("api/trassir/events/") and path.endswith("/play") and method == "POST":
         event = unquote(path[len("api/trassir/events/") : -len("/play")])
-        return _json(await ops.trassir_play(coordinator, event))
+        # ⚠ `remote=True`: жилец пришёл переносом, значит канал у него
+        # мобильный — архив отдаём субпотоком (§5а плана).
+        return _json(await ops.trassir_play(coordinator, event, remote=True))
     if path.startswith("api/trassir/clips/") and path.endswith("/seek") and method == "POST":
         # Перемотка переоткрытием — та же дверь, что и открытие: снаружи
         # запись идёт тем же путём, что живой просмотр, без единой новой трубы.
@@ -149,7 +151,12 @@ async def _dispatch(
         if not isinstance(body_json, dict):
             raise ops.OpError("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
         return _json(
-            await ops.trassir_seek(coordinator, clip, body_json.get("positionUs"))
+            await ops.trassir_seek(
+                coordinator,
+                clip,
+                body_json.get("positionUs"),
+                body_json.get("quality"),
+            )
         )
     if path.startswith("api/trassir/clips/") and path.endswith("/ready") and method == "POST":
         # Готовность телефона — команда старта архива. Той же дверью, что

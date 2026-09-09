@@ -234,8 +234,9 @@ def test_камера_регистратора_показывается_домо
     monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
 
     class _Clips:
-        def live_stream(self, guid):
-            return (f"trassir_live_{guid}", f"rtsp://192.168.1.50:555/{guid}_m/")
+        def live_stream(self, guid, quality="main"):
+            suffix = "_s" if quality == "sub" else "_m"
+            return (f"trassir_live_{guid}", f"rtsp://192.168.1.50:555/{guid}{suffix}/")
 
         def clip_of_session(self, session_id):
             return None

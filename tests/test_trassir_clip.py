@@ -125,13 +125,33 @@ def test_окно_клипа_строится_в_шкале_trassir(gateway: Fak
     assert answer["cameraName"] == "Вход"
 
 
-def test_снаружи_берём_субархив(gateway: FakeGateway) -> None:
+def test_дома_основной_архив_снаружи_суб(gateway: FakeGateway) -> None:
+    """⚠ Замер стенда 2026-09-09 по прицеленному окну: основной архив
+    1.43 Мбит/с и 13.4 к/с, суб — 0.16 Мбит/с и 10.7 к/с. Суб ВЕЗДЕ выглядел
+    ровно тем, чем был: мелкой картинкой с выпадающими кадрами при живой
+    камере в полном качестве рядом."""
     asyncio.run(gateway.clips.async_open("e1"))
+    call = next(params for name, params in gateway.client.calls if name == "get_video")
+    assert call["stream"] == "archive_main"
+    assert call["container"] == "rtsp"
+
+    gateway.client.calls.clear()
+    asyncio.run(gateway.clips.async_open("e1", remote=True))
+    call = next(params for name, params in gateway.client.calls if name == "get_video")
+    assert call["stream"] == "archive_sub", "снаружи канал мобильный"
+
+
+def test_перемотка_держит_качество_двери(gateway: FakeGateway) -> None:
+    """⚠ Качество выбирает дверь при открытии, а перемотка дверь не меняет.
+    Захардкоженный суб ронял домашний просмотр на субпоток после первого же
+    жеста по таймлайну."""
+    opened = asyncio.run(gateway.clips.async_open("e1"))
+    gateway.client.calls.clear()
+
+    asyncio.run(gateway.clips.async_seek(opened["id"], EVENT["timestampUs"]))
 
     call = next(params for name, params in gateway.client.calls if name == "get_video")
-    # 0.45 против 3 Мбит/с — замер на стенде; клип события смотрят с телефона.
-    assert call["stream"] == "archive_sub"
-    assert call["container"] == "rtsp"
+    assert call["stream"] == "archive_main"
 
 
 def _offered(
@@ -167,7 +187,12 @@ def test_переговоры_без_команды_греют_тракт(
     hass = _offered(gateway, monkeypatch, clip_id)
 
     assert not [n for n, _ in gateway.client.calls if n == "archive_command"]
-    assert any("ping" in name for name in hass.names), "токен держится"
+    # ⚠ Пинг взводится ПРИ ОТКРЫТИИ, а не здесь: токен живёт десять секунд без
+    # запросов, а между «открыть» и предложением телефона лежит сбор
+    # ICE-кандидатов, снаружи — ещё и дорога через менеджер. Пока пинг ждал
+    # переговоров, токен успевал умереть, и просмотр уходил в долгое молчание.
+    assert any("ping" in name for name in gateway.hass.names), "токен под охраной с выдачи"
+    assert any("fallback" in name for name in hass.names), "сторож слепого старта взведён"
     assert any("fallback" in name for name in hass.names), "сторож взведён"
     asyncio.run(_quiet(hass, gateway))
 
@@ -283,6 +308,10 @@ def test_сторож_стартует_вслепую_без_готовност�
     """Старое приложение готовности не шлёт: ему достаётся прежнее поведение
     (команда после переговоров), а не чёрный экран."""
     monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_READY_TIMEOUT", 0.01)
+    # ⚠ Паузу перед командой архива тоже укорачиваем, а не отменяем: она несущая
+    # (без неё регистратор отдаёт ноль байтов), и спека обязана ходить через
+    # неё, а не мимо.
+    monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_ARCHIVE_SETTLE", 0.02)
 
     async def fake_negotiate(hass, url, identifier, source, sdp, what=""):
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}
@@ -302,7 +331,10 @@ def test_сторож_стартует_вслепую_без_готовност�
                 break
             await asyncio.sleep(0.005)
         clip = gateway.clips._clips[clip_id]  # noqa: SLF001
-        assert not clip.anchored, "вслепую — без якоря готовности"
+        assert clip.started, "сторож стартовал сам"
+        # ⚠ Опоздавшая готовность второй командой НЕ становится: одна команда
+        # на соединение, повтор роняет данные (факт стенда).
+        assert (await gateway.clips.async_ready(clip_id))["ready"] is False
         await _quiet(hass, gateway)
 
     asyncio.run(scenario())
@@ -335,7 +367,8 @@ def test_seek_переоткрывает_а_не_перекомандует(
 
     # Новый клип — новым id: телефон сводит заново, как при открытии.
     assert answer["id"] == f"{CLIP_PREFIX}tok2"
-    assert answer["startUs"] == middle
+    assert answer["positionUs"] == middle
+    assert answer["startUs"] == EVENT["timestampUs"] - 10_000_000, "окно не съезжает"
     assert answer["stopUs"] == EVENT["timestampUs"] + 60_000_000
     # Ни одной команды по старому соединению — только новый токен.
     assert [n for n, _ in gateway.client.calls if n == "archive_command"] == []
@@ -363,8 +396,13 @@ def test_seek_клампит_а_не_отказывает(gateway: FakeGateway) 
     low = asyncio.run(gateway.clips.async_seek(clip_id, 1))
     high = asyncio.run(gateway.clips.async_seek(_opened_clip_id(gateway), 10**18))
 
+    # ⚠ Окно НЕ съезжает: шкала таймлайна стоит на нём, а перемотка двигает
+    # только позицию. Пока окно подменялось позицией, жилец перематывал на
+    # середину и снова оказывался «в начале записи».
     assert low["startUs"] == EVENT["timestampUs"] - 10_000_000
-    assert high["startUs"] == EVENT["timestampUs"] + 60_000_000
+    assert low["stopUs"] == EVENT["timestampUs"] + 60_000_000
+    assert low["positionUs"] == EVENT["timestampUs"] - 10_000_000
+    assert high["positionUs"] == EVENT["timestampUs"] + 60_000_000
 
 
 def test_seek_мусором_объясняется(gateway: FakeGateway) -> None:
@@ -389,7 +427,8 @@ def test_seek_доходит_через_ops(gateway: FakeGateway) -> None:
 
     answer = asyncio.run(ops.trassir_seek(coordinator, clip_id, middle))
 
-    assert answer["startUs"] == middle
+    assert answer["positionUs"] == middle
+    assert answer["startUs"] == EVENT["timestampUs"] - 10_000_000, "окно не съезжает"
 
 
 def test_ready_доходит_через_ops(
@@ -439,3 +478,32 @@ def test_закрытие_до_готовности_не_командует(
     assert not [n for n, _ in gateway.client.calls if n == "archive_command"], (
         "закрытому просмотру команда не уходит"
     )
+
+
+def test_живая_камера_переключает_поток_адресом(gateway: FakeGateway) -> None:
+    """⚠ Кнопка качества у ЖИВОЙ камеры не заводит ни токена, ни сеанса: у
+    канала постоянный адрес, и дополнительный поток — тот же адрес с `_s/`.
+    Замер стенда 2026-09-09: `_m` — 2.46 Мбит/с, `_s` — 0.36 при тех же 22 к/с."""
+    main_name, main_url = gateway.clips.live_stream("cam1")
+    sub_name, sub_url = gateway.clips.live_stream("cam1", "sub")
+
+    assert main_url.endswith("/cam1_m/")
+    assert sub_url.endswith("/cam1_s/")
+    # ⚠ Имена потоков РАЗНЫЕ: одно имя на два источника значит, что go2rtc
+    # оставит первый producer, и переключение качества ничего не поменяет.
+    assert main_name != sub_name
+
+
+def test_смена_качества_записи_переоткрывает_клип(gateway: FakeGateway) -> None:
+    """Поток и токен привязаны к качеству, поэтому смена качества у записи —
+    то же переоткрытие, что перемотка, только позиция остаётся прежней."""
+    opened = asyncio.run(gateway.clips.async_open("e1"))
+    position = EVENT["timestampUs"]
+    gateway.client.calls.clear()
+
+    answer = asyncio.run(gateway.clips.async_seek(opened["id"], position, "sub"))
+
+    call = next(params for name, params in gateway.client.calls if name == "get_video")
+    assert call["stream"] == "archive_sub"
+    assert answer["positionUs"] == position
+    assert answer["startUs"] == EVENT["timestampUs"] - 10_000_000, "окно не съезжает"

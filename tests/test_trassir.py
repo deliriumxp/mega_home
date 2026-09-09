@@ -167,10 +167,54 @@ def test_events_are_deduplicated_across_relogins(tmp_path: Path) -> None:
 
     asyncio.run(scenario())
 
+    # ⚠ В ЛЕНТЕ одна строка, а в хранилище две: «Движение прекратилось» — это
+    # не событие, а конец предыдущего, и сворачивается в его длительность.
+    assert len(gate.raw_events()) == 2, "повторно отданные события не удваивают хранилище"
     rows = gate.events()
-    assert len(rows) == 2, "повторно отданные события не должны удваивать ленту"
-    assert rows[0]["timestampUs"] == 1788960523369911, "новые сверху"
+    assert len(rows) == 1, "конец движения — не отдельная строка ленты"
+    assert rows[0]["timestampUs"] == 1788960515770731, "строка стоит на НАЧАЛЕ движения"
+    assert rows[0]["durationS"] == 7, "конец стал длительностью начала"
     assert rows[0]["cameraName"] == "Вход", "имя камеры подставляется из каналов"
+
+
+def test_конец_без_начала_не_показывается(tmp_path: Path) -> None:
+    """⚠ «Движение прекратилось» без «Движение» — это край нашего окна
+    хранения, а не событие дома: жильцу оно не сообщает ничего."""
+    gate = gateway(tmp_path)
+    client = FakeClient([{"timestamp": "500", "type": "Motion Stop", "origin": "cam1"}])
+
+    async def scenario() -> None:
+        await gate.async_apply(config())
+        gate._client = client  # noqa: SLF001
+        await gate._async_poll_once()  # noqa: SLF001
+
+    asyncio.run(scenario())
+
+    assert gate.events() == []
+    assert len(gate.raw_events()) == 1, "в хранилище факт остаётся"
+
+
+def test_длительность_считается_в_пределах_камеры(tmp_path: Path) -> None:
+    """Движение на входе не закрывает движение на складе."""
+    gate = gateway(tmp_path)
+    client = FakeClient(
+        [
+            {"timestamp": "1000000", "type": "Motion Start", "origin": "cam1"},
+            {"timestamp": "2000000", "type": "Motion Start", "origin": "cam2"},
+            {"timestamp": "6000000", "type": "Motion Stop", "origin": "cam2"},
+        ]
+    )
+
+    async def scenario() -> None:
+        await gate.async_apply(config())
+        gate._client = client  # noqa: SLF001
+        await gate._async_poll_once()  # noqa: SLF001
+
+    asyncio.run(scenario())
+
+    rows = {row["guid"]: row for row in gate.events()}
+    assert rows["cam2"]["durationS"] == 4
+    assert "durationS" not in rows["cam1"], "движение ещё идёт — длительности нет"
 
 
 def test_unknown_camera_keeps_its_guid_as_a_name(tmp_path: Path) -> None:
@@ -226,9 +270,12 @@ def test_events_can_be_filtered_by_camera_and_paged(tmp_path: Path) -> None:
 
     asyncio.run(scenario())
 
-    assert [row["timestampUs"] for row in gate.events(guid="cam1")] == [300, 100]
+    # Конец движения свернулся в длительность начала — в ленте остаются начала.
+    assert [row["timestampUs"] for row in gate.events(guid="cam1")] == [100]
     assert [row["timestampUs"] for row in gate.events(before=300)] == [200, 100]
-    assert gate.event(gate.events()[0]["id"])["timestampUs"] == 300
+    # ⚠ `event()` ищет по ХРАНИЛИЩУ, а не по ленте: по id открывают запись, и
+    # свёрнутая строка обязана оставаться адресуемой.
+    assert gate.event(gate.events()[0]["id"])["timestampUs"] == 200
 
 
 def test_one_page_of_the_feed_is_capped(tmp_path: Path) -> None:

@@ -499,6 +499,8 @@ class MegaHomeTrassirPlayView(_MegaHomeView):
             return error
         assert coordinator is not None
         try:
+            # ⚠ Локальная дверь — жилец ДОМА: архив основной, а не суб.
+            # Замер стенда: 1.43 против 0.16 Мбит/с и 13.4 против 10.7 к/с.
             return self.json(await ops.trassir_play(coordinator, event))
         except ops.OpError as err:
             return self.json_message(err.message, err.status)
@@ -529,7 +531,12 @@ class MegaHomeTrassirClipSeekView(_MegaHomeView):
             return self.json_message("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
         try:
             return self.json(
-                await ops.trassir_seek(coordinator, clip, payload.get("positionUs"))
+                await ops.trassir_seek(
+                    coordinator,
+                    clip,
+                    payload.get("positionUs"),
+                    payload.get("quality"),
+                )
             )
         except ops.OpError as err:
             return self.json_message(err.message, err.status)

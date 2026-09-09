@@ -36,6 +36,7 @@ from .const import (
     TRASSIR_CHANNELS_TTL,
     TRASSIR_CROP_PX,
     TRASSIR_THUMB_CAP,
+    TRASSIR_THUMB_LEAD,
     TRASSIR_THUMB_TTL,
     TRASSIR_THUMB_WIDTH,
     TRASSIR_EVENT_CAP,
@@ -183,10 +184,15 @@ class TrassirGateway:
     ) -> list[dict[str, Any]]:
         """Newest first, optionally one camera, optionally older than `before`."""
         rows = [e for e in self._events if guid is None or e.get("guid") == guid]
+        rows = _fold_endings(rows)
         if before is not None:
             rows = [e for e in rows if int(e.get("timestampUs", 0)) < before]
         rows.sort(key=lambda e: int(e.get("timestampUs", 0)), reverse=True)
         return rows[: max(1, min(limit, 200))]
+
+    def raw_events(self) -> list[dict[str, Any]]:
+        """Лента КАК ЕСТЬ, без склейки — для диагностики и спек."""
+        return list(self._events)
 
     def event(self, event_id: str) -> dict[str, Any] | None:
         """One event by the id this gateway gave it."""
@@ -226,9 +232,16 @@ class TrassirGateway:
         событий, отданный как есть, это десять мегабайт по Wi-Fi жильца — а
         снаружи ещё и через канал менеджера.
 
-        ⚠ Метка события уходит в запрос КАК ЕСТЬ: она в шкале самого Trassir
-        (unix + смещение пояса сервера), и «починка» её нашими часами сдвинула
-        бы кадр на этот самый пояс.
+        ⚠ Метка события уходит в запрос В ШКАЛЕ TRASSIR (unix + смещение пояса
+        сервера) — «починка» её нашими часами сдвинула бы кадр на этот самый
+        пояс. Сдвигаем только на `TRASSIR_THUMB_LEAD`, и это сдвиг внутри той же
+        шкалы, а не смена шкалы.
+
+        ⚠ Кадр берётся ПОЗЖЕ метки на секунду, а не на ней. Детектор срабатывает
+        на первом же изменении картинки, то есть ровно тогда, когда причина
+        события ещё только входит в кадр (а часто — когда виден лишь её край).
+        Через секунду она в кадре целиком, и лента превращается из полосы
+        одинаковых пустых дворов в то, ради чего её открывают.
         """
         event = self.event(event_id)
         if event is None:
@@ -238,7 +251,8 @@ class TrassirGateway:
             return cached[1]
         if not self._client:
             raise TrassirError("Видеонаблюдение объекта не настроено")
-        raw = await self._client.async_screenshot(event["guid"], event["timestampUs"])
+        at = int(event["timestampUs"]) + TRASSIR_THUMB_LEAD * 1_000_000
+        raw = await self._client.async_screenshot(event["guid"], at)
         small = await self._hass.async_add_executor_job(_shrink, raw)
         if len(self._thumbs) >= TRASSIR_THUMB_CAP:
             oldest = min(self._thumbs, key=lambda key: self._thumbs[key][0])
@@ -363,6 +377,47 @@ class TrassirGateway:
         else:
             LOGGER.info("Опрос событий Trassir пошёл")
         self.last_error = error
+
+
+# Пары «началось / кончилось». ⚠ Лента жильца — это «что было», а не журнал
+# охраны: строка «Движение прекратилось» не событие, а конец предыдущего, и
+# рядом с ним она удваивает ленту, ничего не добавляя. Поэтому конец не строка,
+# а ДЛИТЕЛЬНОСТЬ у начала: «Движение · 13:06:36 · 12 с».
+ENDINGS: dict[str, str] = {
+    "Motion Stop": "Motion Start",
+    "Connection Restored": "Connection Lost",
+}
+
+
+def _fold_endings(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Свернуть события-окончания в длительность у их начала.
+
+    ⚠ Конец, начала которого в ленте нет, ПРОПАДАЕТ, а не показывается сам по
+    себе: «Движение прекратилось» без «Движение» — это не событие дома, а край
+    нашего окна хранения, и жильцу оно ничего не сообщает.
+
+    ⚠ Пары ищутся В ПРЕДЕЛАХ КАМЕРЫ: движение на входе не закрывает движение на
+    складе. Ближайшее незакрытое начало ДО конца — по нему и считаем.
+    """
+    by_time = sorted(rows, key=lambda e: int(e.get("timestampUs", 0)))
+    starts: dict[tuple[str, str], dict[str, Any]] = {}
+    folded: list[dict[str, Any]] = []
+    for row in by_time:
+        kind = str(row.get("type") or "")
+        guid = str(row.get("guid") or "")
+        opens = ENDINGS.get(kind)
+        if opens is None:
+            if kind in ENDINGS.values():
+                row = dict(row)
+                starts[(guid, kind)] = row
+            folded.append(row)
+            continue
+        start = starts.pop((guid, opens), None)
+        if start is not None:
+            seconds = (int(row.get("timestampUs", 0)) - int(start.get("timestampUs", 0))) // 1_000_000
+            if seconds > 0:
+                start["durationS"] = seconds
+    return folded
 
 
 def _shrink(raw: bytes) -> bytes:

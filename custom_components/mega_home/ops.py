@@ -207,8 +207,16 @@ async def webrtc_offer(
     if guid:
         # Живая камера регистратора: ссылка постоянная, сеанса и токена нет —
         # но путь тот же самый, что у камеры Home Assistant.
+        #
+        # ⚠ Качество приезжает В ПРЕДЛОЖЕНИИ, а не отдельной операцией: у живой
+        # камеры смена качества — это смена ИСТОЧНИКА, то есть ровно те же
+        # переговоры заново. Своя операция здесь означала бы состояние сеанса
+        # там, где его нет вовсе.
+        quality = payload.get("quality")
         gateway = trassir(coordinator)
-        name, source = gateway.clips.live_stream(guid)
+        name, source = gateway.clips.live_stream(
+            guid, "sub" if quality == "sub" else "main"
+        )
         from .go2rtc_embed import URL as OWN_URL, is_running
 
         if not is_running():
@@ -595,7 +603,7 @@ def trassir_events(
 
 
 async def trassir_play(
-    coordinator: MegaHomeCoordinator, event_id: str
+    coordinator: MegaHomeCoordinator, event_id: str, remote: bool = False
 ) -> dict[str, Any]:
     """Открыть запись события и вернуть её id — дальше обычный просмотр.
 
@@ -603,17 +611,25 @@ async def trassir_play(
     Приложение получает id, который отдаёт в `webrtc` ровно так же, как id
     плитки камеры, — и поэтому снаружи запись работает тем же путём, что живой
     просмотр, без единой новой трубы.
+
+    ⚠ `remote` — единственное, что здесь знают про дверь, и решает оно ровно
+    КАЧЕСТВО архива (§5а плана): дома основной, снаружи суб. Набор функций от
+    двери не зависит и зависеть не должен. Передаёт его сама дверь: `http.py` —
+    локальная, `relay_api.py` — перенос через менеджер.
     """
     from .trassir_client import TrassirError
 
     try:
-        return await trassir(coordinator).clips.async_open(event_id)
+        return await trassir(coordinator).clips.async_open(event_id, remote=remote)
     except TrassirError as err:
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
 
 
 async def trassir_seek(
-    coordinator: MegaHomeCoordinator, clip_id: str, position_us: int | None
+    coordinator: MegaHomeCoordinator,
+    clip_id: str,
+    position_us: int | None,
+    quality: str | None = None,
 ) -> dict[str, Any]:
     """Перемотка ПЕРЕОТКРЫТИЕМ: ответ — новый клип, телефон сводит заново.
 
@@ -621,11 +637,17 @@ async def trassir_seek(
     второй-третьей команды данные встают. Поэтому здесь новый токен, новый
     поток и новые переговоры (`trassir_clip.async_seek`), а не «та же команда
     с новым стартом».
+
+    ⚠ Кнопка качества у записи идёт ЭТОЙ ЖЕ дверью: поток и токен привязаны к
+    качеству, значит смена качества — то же переоткрытие, только позиция
+    остаётся прежней. Своя операция дала бы вторую механику того же самого.
     """
     from .trassir_client import TrassirError
 
     try:
-        return await trassir(coordinator).clips.async_seek(clip_id, position_us)
+        return await trassir(coordinator).clips.async_seek(
+            clip_id, position_us, quality
+        )
     except TrassirError as err:
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
 
