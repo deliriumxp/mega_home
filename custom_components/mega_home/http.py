@@ -111,6 +111,7 @@ async def async_register_http(
         MegaHomeTrassirEventsView,
         MegaHomeTrassirThumbView,
         MegaHomeTrassirPlayView,
+        MegaHomeTrassirClipSeekView,
         MegaHomeWebRtcView,
         MegaHomeWebRtcCloseView,
         MegaHomeRelayView,
@@ -498,6 +499,37 @@ class MegaHomeTrassirPlayView(_MegaHomeView):
         assert coordinator is not None
         try:
             return self.json(await ops.trassir_play(coordinator, event))
+        except ops.OpError as err:
+            return self.json_message(err.message, err.status)
+
+
+class MegaHomeTrassirClipSeekView(_MegaHomeView):
+    """Поставить запись на позицию: начало окна без тела, иначе — метка.
+
+    ⚠ Вызывать один раз на открытие первым кадром (автовозврат на начало) и
+    дальше — жестами по таймлайну. Сеанса своего у просмотра нет (§5а плана),
+    поэтому позиция — это повторная команда архиву, а не своя сущность.
+    """
+
+    url = f"{URL_API}/trassir/clips/{{clip}}/seek"
+    name = "api:mega_home:trassir-seek"
+
+    async def post(self, request: web.Request, clip: str) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        try:
+            payload = await request.json()
+        except ValueError:
+            # Тела нет — значит автовозврат на начало, позиция не нужна.
+            payload = {}
+        if not isinstance(payload, dict):
+            return self.json_message("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
+        try:
+            return self.json(
+                await ops.trassir_seek(coordinator, clip, payload.get("positionUs"))
+            )
         except ops.OpError as err:
             return self.json_message(err.message, err.status)
 

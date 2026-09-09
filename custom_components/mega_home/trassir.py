@@ -34,6 +34,7 @@ from .api import ManagerClient, ManagerError
 from .const import (
     LOGGER,
     TRASSIR_CHANNELS_TTL,
+    TRASSIR_CROP_PX,
     TRASSIR_THUMB_CAP,
     TRASSIR_THUMB_TTL,
     TRASSIR_THUMB_WIDTH,
@@ -365,7 +366,7 @@ class TrassirGateway:
 
 
 def _shrink(raw: bytes) -> bytes:
-    """Ужать кадр до ширины превью. Не вышло — отдаём как есть.
+    """Срезать поля и ужать кадр до ширины превью. Не вышло — отдаём как есть.
 
     ⚠ Отказ уменьшить не должен ронять ленту: без превью событие остаётся
     событием, а без ленты жилец не видит ничего.
@@ -376,13 +377,39 @@ def _shrink(raw: bytes) -> bytes:
 
     try:
         with Image.open(BytesIO(raw)) as image:
-            if image.width <= TRASSIR_THUMB_WIDTH:
+            frame = _crop_margins(image)
+            if frame is image and frame.width <= TRASSIR_THUMB_WIDTH:
                 return raw
-            height = round(image.height * TRASSIR_THUMB_WIDTH / image.width)
-            small = image.convert("RGB").resize((TRASSIR_THUMB_WIDTH, height))
+            if frame.width > TRASSIR_THUMB_WIDTH:
+                height = round(frame.height * TRASSIR_THUMB_WIDTH / frame.width)
+                frame = frame.convert("RGB").resize((TRASSIR_THUMB_WIDTH, height))
+            else:
+                # Обрезанный, но и так маленький: уменьшать нечего, а вернуть
+                # надо уже БЕЗ полей — иначе кроп теряет смысл.
+                frame = frame.convert("RGB")
             buffer = BytesIO()
-            small.save(buffer, format="JPEG", quality=70, optimize=True)
+            frame.save(buffer, format="JPEG", quality=70, optimize=True)
             return buffer.getvalue()
     except Exception as err:  # noqa: BLE001 - битый кадр не стоит ленты
         LOGGER.debug("Превью события не уменьшилось: %s", err)
         return raw
+
+
+def _crop_margins(image):  # noqa: ANN001, ANN202 - тип PIL, его может не быть
+    """Срезать по `TRASSIR_CROP_PX` с каждой стороны — там техническая
+    информация камеры/регистратора (время, имя канала).
+
+    ⚠ Кадр, не сцену: режем ДО уменьшения, пока 50px — это поля, а не десяток
+    пикселей превью. Кадр меньше полей вдвое — не трогаем вовсе: резать там
+    уже нечего, а вернуть пустой прямоугольник вместо камеры — можно.
+    """
+    if image.width <= TRASSIR_CROP_PX * 2 or image.height <= TRASSIR_CROP_PX * 2:
+        return image
+    return image.crop(
+        (
+            TRASSIR_CROP_PX,
+            TRASSIR_CROP_PX,
+            image.width - TRASSIR_CROP_PX,
+            image.height - TRASSIR_CROP_PX,
+        )
+    )

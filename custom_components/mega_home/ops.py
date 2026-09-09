@@ -612,6 +612,24 @@ async def trassir_play(
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
 
 
+async def trassir_seek(
+    coordinator: MegaHomeCoordinator, clip_id: str, position_us: int | None = None
+) -> dict[str, Any]:
+    """Поставить открытую запись на позицию (по умолчанию — начало окна).
+
+    ⚠ Команда та же, что стартует архив (`play` с новым стартом): у сеанса
+    Trassir нет отдельной «перемотки», повторный `play` и есть seek. Поэтому
+    никакой новой команды регистратора здесь не появляется — только повтор уже
+    проверенной.
+    """
+    from .trassir_client import TrassirError
+
+    try:
+        return await trassir(coordinator).clips.async_seek(clip_id, position_us)
+    except TrassirError as err:
+        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
+
+
 async def trassir_thumb(
     coordinator: MegaHomeCoordinator, event_id: str
 ) -> tuple[str, bytes]:

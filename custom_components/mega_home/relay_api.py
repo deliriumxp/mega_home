@@ -141,6 +141,13 @@ async def _dispatch(
     if path.startswith("api/trassir/events/") and path.endswith("/play") and method == "POST":
         event = unquote(path[len("api/trassir/events/") : -len("/play")])
         return _json(await ops.trassir_play(coordinator, event))
+    if path.startswith("api/trassir/clips/") and path.endswith("/seek") and method == "POST":
+        # Позиция записи — та же дверь, что и открытие: снаружи запись идёт
+        # тем же путём, что живой просмотр, без единой новой трубы.
+        clip = unquote(path[len("api/trassir/clips/") : -len("/seek")])
+        return _json(
+            await ops.trassir_seek(coordinator, clip, _json_body(body).get("positionUs"))
+        )
     if path.startswith("api/trassir/events/") and path.endswith("/thumb") and method == "GET":
         event = unquote(path[len("api/trassir/events/") : -len("/thumb")])
         content_type, raw = await ops.trassir_thumb(coordinator, event)

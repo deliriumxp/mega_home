@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from mega_home.api import ManagerError
-from mega_home.trassir import TrassirGateway
+from mega_home.trassir import TrassirGateway, _crop_margins, _shrink
 
 
 class _Config:
@@ -301,3 +301,81 @@ def test_stored_feed_survives_a_restart(tmp_path: Path) -> None:
 
     assert [row["timestampUs"] for row in revived.events()] == [5]
     assert revived._creds.get("sdkPassword") == "sdk-s3cret"  # noqa: SLF001
+
+
+def _кадр(width: int, height: int, центр: tuple[int, int, int], поля: tuple[int, int, int]) -> bytes:
+    """Кадр с «технической информацией» по краям: поля шириной 50px."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    image = Image.new("RGB", (width, height), центр)
+    pixels = image.load()
+    assert pixels is not None
+    for x in range(width):
+        for y in range(height):
+            if x < 50 or y < 50 or x >= width - 50 or y >= height - 50:
+                pixels[x, y] = поля
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=95)
+    return buffer.getvalue()
+
+
+def _угол(raw: bytes) -> tuple[int, int, int]:
+    from io import BytesIO
+
+    from PIL import Image
+
+    with Image.open(BytesIO(raw)) as image:
+        return image.convert("RGB").getpixel((2, 2))
+
+
+def test_превью_режет_поля_до_уменьшения() -> None:
+    """Время и имя канала жгутся по краям кадра: на превью они съедают место и
+    не читаются. Режем 50px исходника с каждой стороны ДО уменьшения."""
+    raw = _кадр(600, 400, (200, 30, 30), (30, 30, 200))
+
+    small = _shrink(raw)
+
+    from io import BytesIO
+
+    from PIL import Image
+
+    with Image.open(BytesIO(small)) as image:
+        # 600 − 100 = 500 → ужато до 480; высота пропорционально.
+        assert image.size == (480, 288)
+    red, _green, blue = _угол(small)
+    assert red > blue, "в углу сцена, а не техническая информация"
+
+
+def test_маленький_кадр_возвращается_без_полей() -> None:
+    """Уменьшать нечего — но поля срезать всё равно надо."""
+    raw = _кадр(200, 120, (30, 200, 30), (200, 200, 30))
+
+    small = _shrink(raw)
+
+    from io import BytesIO
+
+    from PIL import Image
+
+    with Image.open(BytesIO(small)) as image:
+        assert image.size == (100, 20)
+
+
+def test_крошечный_кадр_не_трогаем() -> None:
+    """Кадр меньше полей вдвое: резать там нечего, а пустой прямоугольник
+    вместо камеры вернуть можно."""
+    raw = _кадр(80, 60, (30, 30, 30), (30, 30, 30))
+
+    assert _shrink(raw) == raw
+
+
+def test_битый_кадр_возвращается_как_есть() -> None:
+    assert _shrink(b"not-an-image") == b"not-an-image"
+
+
+def test_кроп_не_трогает_мелочь() -> None:
+    from PIL import Image
+
+    assert _crop_margins(Image.new("RGB", (80, 60))).size == (80, 60)
+    assert _crop_margins(Image.new("RGB", (600, 400))).size == (500, 300)
