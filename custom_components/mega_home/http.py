@@ -112,6 +112,7 @@ async def async_register_http(
         MegaHomeTrassirThumbView,
         MegaHomeTrassirPlayView,
         MegaHomeTrassirClipSeekView,
+        MegaHomeTrassirClipReadyView,
         MegaHomeWebRtcView,
         MegaHomeWebRtcCloseView,
         MegaHomeRelayView,
@@ -504,11 +505,12 @@ class MegaHomeTrassirPlayView(_MegaHomeView):
 
 
 class MegaHomeTrassirClipSeekView(_MegaHomeView):
-    """Поставить запись на позицию: начало окна без тела, иначе — метка.
+    """Перемотка ПЕРЕОТКРЫТИЕМ: ответ — новый id для обычных переговоров.
 
-    ⚠ Вызывать один раз на открытие первым кадром (автовозврат на начало) и
-    дальше — жестами по таймлайну. Сеанса своего у просмотра нет (§5а плана),
-    поэтому позиция — это повторная команда архиву, а не своя сущность.
+    ⚠ Повтором команды по тому же соединению — нельзя (стенд: данные встают),
+    поэтому телефон по этому ответу сводит просмотр заново, как при открытии.
+    Позиция обязательна: «вернуть на начало» без неё — это жест «к событию»,
+    и приложение шлёт его меткой само.
     """
 
     url = f"{URL_API}/trassir/clips/{{clip}}/seek"
@@ -522,7 +524,6 @@ class MegaHomeTrassirClipSeekView(_MegaHomeView):
         try:
             payload = await request.json()
         except ValueError:
-            # Тела нет — значит автовозврат на начало, позиция не нужна.
             payload = {}
         if not isinstance(payload, dict):
             return self.json_message("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
@@ -530,6 +531,29 @@ class MegaHomeTrassirClipSeekView(_MegaHomeView):
             return self.json(
                 await ops.trassir_seek(coordinator, clip, payload.get("positionUs"))
             )
+        except ops.OpError as err:
+            return self.json_message(err.message, err.status)
+
+
+class MegaHomeTrassirClipReadyView(_MegaHomeView):
+    """Телефон собрал тракт: отдать архиву единственную команду старта.
+
+    ⚠ Старт по готовности, а не по переговорам: часы архива идут в реальном
+    времени с команды, и команда, ушедшая раньше готовности, — это пропуск
+    начала (живой факт). Команда же, ушедшая повтором по готовому потоку, —
+    это вставшие данные (факт стенда). Поэтому команда одна и по готовности.
+    """
+
+    url = f"{URL_API}/trassir/clips/{{clip}}/ready"
+    name = "api:mega_home:trassir-ready"
+
+    async def post(self, request: web.Request, clip: str) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        try:
+            return self.json(await ops.trassir_ready(coordinator, clip))
         except ops.OpError as err:
             return self.json_message(err.message, err.status)
 

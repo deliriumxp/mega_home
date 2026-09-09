@@ -613,19 +613,31 @@ async def trassir_play(
 
 
 async def trassir_seek(
-    coordinator: MegaHomeCoordinator, clip_id: str, position_us: int | None = None
+    coordinator: MegaHomeCoordinator, clip_id: str, position_us: int | None
 ) -> dict[str, Any]:
-    """Поставить открытую запись на позицию (по умолчанию — начало окна).
+    """Перемотка ПЕРЕОТКРЫТИЕМ: ответ — новый клип, телефон сводит заново.
 
-    ⚠ Команда та же, что стартует архив (`play` с новым стартом): у сеанса
-    Trassir нет отдельной «перемотки», повторный `play` и есть seek. Поэтому
-    никакой новой команды регистратора здесь не появляется — только повтор уже
-    проверенной.
+    ⚠ Повтором команды по тому же соединению — нельзя: стенд показал, что со
+    второй-третьей команды данные встают. Поэтому здесь новый токен, новый
+    поток и новые переговоры (`trassir_clip.async_seek`), а не «та же команда
+    с новым стартом».
     """
     from .trassir_client import TrassirError
 
     try:
         return await trassir(coordinator).clips.async_seek(clip_id, position_us)
+    except TrassirError as err:
+        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
+
+
+async def trassir_ready(
+    coordinator: MegaHomeCoordinator, clip_id: str
+) -> dict[str, Any]:
+    """Телефон собрал тракт: отдать архиву единственную команду старта."""
+    from .trassir_client import TrassirError
+
+    try:
+        return await trassir(coordinator).clips.async_ready(clip_id)
     except TrassirError as err:
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
 

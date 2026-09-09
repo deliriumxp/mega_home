@@ -10,22 +10,20 @@
 ⚠ Порядок вызовов НЕ переставлять (проверено на живом регистраторе): токен →
 кто-то ОТКРЫЛ поток → `archive_command`. Команда, отданная раньше, отвечает
 `stream is expired` — текст читается как таймаут и им не является. Здесь поток
-открывает go2rtc, когда к нему приходит потребитель, поэтому команда уходит
-ПОСЛЕ ответа на предложение WebRTC.
+открывает go2rtc, когда к нему приходит потребитель.
+
+⚠ Команда — ОДНА на соединение (там же проверено): повторный `play` по одному
+открытому потоку ненадёжен, со второй-третьей команды данные встают. Поэтому
+здесь НЕТ перемотки повтором команды: возврат на начало и жест по таймлайну —
+это ПЕРЕОТКРЫТИЕ (новый токен, новый поток, новые переговоры), а старт архива
+ждёт готовности телефона (`ready`), чтобы первый кадр и был началом окна.
 
 ⚠ Часы архива идут в РЕАЛЬНОМ времени с момента команды `play`, а телефон
-показывает первый кадр на секунды позже: переговоры ICE/DTLS, раскрутка чтения
-архива с диска и ожидание ключевого кадра. Всё, что прошло между командой и
-первым кадром, потеряно навсегда — перемотки назад у живого сеанса нет. Поэтому
-первый показанный кадр — это ещё и сигнал: приложение сообщает `seek`, и дом
-ОТДАЁТ КОМАНДУ ЗАНОВО с началом окна. К этому моменту тракт уже прогрет
-(RTSP открыт, ключевые кадры текут), и повторный старт встаёт почти сразу —
-жилец видит запись с начала окна, а не с середины. Без этого «запись события»
-стабильно начиналась на 3–4 секунды позже метки (живой факт 2026-09-09).
-
-⚠ Та же команда — это и ПЕРЕМОТКА таймлайна: `seek` с позицией ставит архив на
-любой момент окна. Отдельной команды «seek» у сеанса Trassir нет — повторный
-`play` с новым стартом и есть перемотка.
+показывает первый кадр позже: переговоры ICE/DTLS, раскрутка чтения архива с
+диска и ожидание ключевого кадра. Всё, что прошло между командой и первым
+кадром, потеряно навсегда — перемотки назад у живого сеанса нет. Старт по
+готовности убирает и пропуск, и скачок назад: команда уходит, когда тракт уже
+может принять кадры.
 """
 
 from __future__ import annotations
@@ -42,6 +40,7 @@ from .const import (
     TRASSIR_CLIP_LEAD,
     TRASSIR_CLIP_MAX_SECONDS,
     TRASSIR_PING_INTERVAL,
+    TRASSIR_READY_TIMEOUT,
 )
 from .trassir_client import TrassirError
 
@@ -61,10 +60,16 @@ class Clip:
     stream: str
     session_id: str | None = None
     started: bool = False
+    # Старт по готовности телефона (`ready`): первый кадр тогда и есть начало
+    # окна, и возвращать архив не на что.
+    anchored: bool = False
     # Куда курсор архива встал НА САМОМ ДЕЛЕ: у записи бывают дыры, и «клип
     # начался не с события» — факт регистратора, а не наш промах.
     first_frame: str | None = None
     ping: Any = field(default=None, repr=False)
+    # Старт вслепую, если готовность не пришла (старое приложение её не шлёт):
+    # снимать вместе с клипом, иначе команда догонит закрытый просмотр.
+    fallback: Any = field(default=None, repr=False)
 
 
 class ClipSessions:
@@ -141,55 +146,78 @@ class ClipSessions:
             hass, OWN_URL, clip.stream, source, sdp, "запись события"
         )
         clip.session_id = answer.get("sessionId")
-        # ⚠ Команду архива НЕ ждём: её RTT (сессия + команда, сотни мс) лежал на
-        # критическом пути ответа телефону, а архив всё равно переставляется на
-        # начало первым кадром (см. заголовок модуля). Тракт при этом греется
-        # раньше: к приходу телефона RTSP уже течёт и ключевые кадры есть.
-        #
-        # ⚠ Времени «с которого клип реально пошёл» в ответе БОЛЬШЕ НЕТ: команда
-        # ушла фоном, и к моменту ответа её ещё нет. Его отдаёт `seek` — и
-        # приложение подписывает клип уже из него.
-        hass.async_create_background_task(
-            self._async_start(clip_id, clip), f"mega_home_trassir_start_{clip.token}"
+        # ⚠ Команды архива ЗДЕСЬ НЕТ — только прогрев: RTSP открыт, токен
+        # держится пингом, а `play` уйдёт по готовности телефона (`ready`) либо
+        # вслепую по таймауту (старое приложение готовности не шлёт — ему
+        # достаётся прежнее поведение, а не чёрный экран).
+        clip.ping = hass.async_create_background_task(
+            self._async_ping(clip), f"mega_home_trassir_ping_{clip.token}"
+        )
+        clip.fallback = hass.async_create_background_task(
+            self._async_fallback(clip_id),
+            f"mega_home_trassir_fallback_{clip.token}",
         )
         return answer
 
-    async def async_seek(self, clip_id: str, position_us: int | None = None) -> dict[str, Any]:
-        """Поставить архив на позицию: начало окна по умолчанию, иначе — метка.
+    async def async_ready(self, clip_id: str) -> dict[str, Any]:
+        """Телефон готов принимать кадры: отдать архиву ЕДИНСТВЕННУЮ команду.
 
-        Начало окна — это автовозврат по первому кадру телефона (`seek` без
-        позиции). Метка — жест жильца по таймлайну. Команда одна и та же
-        (`play` с новым стартом): у сеанса Trassir нет отдельной перемотки.
-
-        Ошибку НЕ глотаем (в отличие от `_async_start`): там команда была
-        «лучше, чем ничего», а здесь жилец уже смотрит — молчание прочиталось
-        бы как «запись идёт с начала», и приложение обязано узнать, что это
-        не так.
+        Одна команда на соединение — этого требует стенд (см. заголовок):
+        повторный `play` по открытому потоку роняет данные. Поэтому готовность —
+        это и есть старт, а не «ещё одна команда следом». Опоздавшая готовность
+        (сторож уже стартовал вслепую) и повторная — безвредны.
         """
         from .ops import OpError
 
         clip = self._clips.get(clip_id)
         if clip is None:
             raise OpError("Запись уже закрыта, откройте событие заново", HTTPStatus.NOT_FOUND)
+        if clip.started:
+            return {"ready": False, "positionUs": clip.start_us, "firstFrameTs": clip.first_frame}
+        if clip.fallback:
+            clip.fallback.cancel()
+            clip.fallback = None
+        await self._async_play(clip_id, clip)
+        clip.anchored = True
+        return {"ready": True, "positionUs": clip.start_us, "firstFrameTs": clip.first_frame}
+
+    async def async_seek(self, clip_id: str, position_us: int | None) -> dict[str, Any]:
+        """Перемотка ПЕРЕОТКРЫТИЕМ: новый токен, новый поток, новые переговоры.
+
+        ⚠ Повтором команды по тому же соединению — НЕЛЬЗЯ (см. заголовок):
+        со второй-третьей команды данные встают, и это ровно те «скачки»,
+        которые чиним. Поэтому старое соединение разбираем целиком (пинг,
+        сторож, поток go2rtc — токен дальше дохнет сам, его больше не пингуем),
+        а телефон сводит новый просмотр обычным путём: ответ несёт новый id,
+        источник в проигрывателе меняется — и переговоры идут заново.
+        """
+        from .ops import OpError
+
+        old = self._clips.get(clip_id)
+        if old is None:
+            raise OpError("Запись уже закрыта, откройте событие заново", HTTPStatus.NOT_FOUND)
         try:
-            position = clip.start_us if position_us is None else int(position_us)
+            position = int(position_us)  # type: ignore[arg-type]
         except (TypeError, ValueError) as err:
             raise OpError("Позиция — микросекунды числом", HTTPStatus.BAD_REQUEST) from err
         # ⚠ Кламп, а не отказ: палец на таймлайне не обязан попадать в окно
         # микросекунда в микросекунду, а ронять жест из-за края — хамство.
-        position = min(max(position, clip.start_us), clip.stop_us)
+        position = min(max(position, old.start_us), old.stop_us)
         client = self._gateway.client
         if client is None:
             raise TrassirError("Видеонаблюдение объекта не настроено")
-        answer = await client.async_archive_command(
-            clip.token,
-            command="play",
-            start=position,
-            stop=clip.stop_us,
-            speed=1,
+        token = await client.async_get_video(old.guid, "archive_sub", "rtsp")
+        await self._drop(clip_id, old)
+        clip = Clip(
+            token=token,
+            guid=old.guid,
+            start_us=position,
+            stop_us=old.stop_us,
+            stream=f"trassir_{token}",
         )
-        clip.first_frame = answer.get("first_frame_ts") or clip.first_frame
-        return {"positionUs": position, "firstFrameTs": clip.first_frame}
+        clip_id = f"{CLIP_PREFIX}{token}"
+        self._clips[clip_id] = clip
+        return {"id": clip_id, "startUs": position, "stopUs": old.stop_us}
 
     async def async_close(self, hass: HomeAssistant, clip_id: str, session_id: str) -> dict[str, Any]:
         """Жилец закрыл запись: снять сессию, поток и токен.
@@ -202,13 +230,41 @@ class ClipSessions:
         from . import webrtc
 
         webrtc.close_own(hass, session_id)
-        clip = self._clips.pop(clip_id, None)
+        clip = self._clips.get(clip_id)
         if clip is None:
             return {"closed": True}
+        await self._drop(clip_id, clip)
+        return {"closed": True}
+
+    async def _async_fallback(self, clip_id: str) -> None:
+        """Старт вслепую, если готовность не пришла.
+
+        ⚠ Только для старых приложений — новые шлют `ready`, как только тракт
+        собрался. Срок короче прицела проигрывателя (`LIVE_TIMEOUT` у него):
+        вслепую стартовавший архив ещё должен успеть дойти кадрами, иначе
+        жилец получит отказ поверх уже идущего видео.
+        """
+        await asyncio.sleep(TRASSIR_READY_TIMEOUT)
+        clip = self._clips.get(clip_id)
+        if clip is None or clip.started:
+            return
+        LOGGER.debug("Готовность записи не пришла — стартуем вслепую")
+        await self._async_play(clip_id, clip)
+
+    async def _drop(self, clip_id: str, clip: Clip) -> None:
+        """Разобрать соединение целиком: задачи, поток, токен.
+
+        ⚠ Токен отдельно не отпускается — его держит только пинг, а пинг снят:
+        дальше регистратор прибирает сам по своему таймауту.
+        """
+        self._clips.pop(clip_id, None)
         if clip.ping:
             clip.ping.cancel()
+            clip.ping = None
+        if clip.fallback:
+            clip.fallback.cancel()
+            clip.fallback = None
         await self._async_drop_stream(clip.stream)
-        return {"closed": True}
 
     def live_stream(self, guid: str) -> tuple[str, str]:
         """Имя потока go2rtc и источник для ЖИВОЙ камеры регистратора.
@@ -231,13 +287,8 @@ class ClipSessions:
                 return clip_id
         return None
 
-    async def _async_start(self, clip_id: str, clip: Clip) -> None:
-        """Отдать `archive_command` уже открытому потоку и держать токен живым.
-
-        ⚠ Фоновая: зовётся из `async_offer` без ожидания (см. там). Поэтому
-        первая проверка — жив ли клип: шторку могли закрыть раньше, чем команда
-        дошла, и пинг мёртвому токену — это утечка задачи навсегда.
-        """
+    async def _async_play(self, clip_id: str, clip: Clip) -> None:
+        """Единственная команда архива этого соединения — и держать токен живым."""
         client = self._gateway.client
         if client is None:
             return
@@ -255,18 +306,14 @@ class ClipSessions:
             LOGGER.warning("Запись не встала на событие: %s", err)
             return
         if self._clips.get(clip_id) is not clip:
+            # Закрыли раньше, чем команда дошла: дальше делать нечего, пинг и
+            # так снимут закрытием.
             return
         clip.started = True
         # `first_frame_ts` — куда курсор встал НА САМОМ ДЕЛЕ. У архива бывают
         # дыры, и «клип начался не с события» это факт регистратора, а не наш
         # промах; отдаём его наружу, чтобы приложение могло сказать правду.
         clip.first_frame = answer.get("first_frame_ts")
-        # ⚠ Фоновая задача Home Assistant, а не голая `asyncio.create_task`:
-        # неучтённую задачу сборщик мусора вправе выбросить на середине, и
-        # токен перестал бы продлеваться посреди просмотра.
-        clip.ping = self._gateway.hass.async_create_background_task(
-            self._async_ping(clip), f"mega_home_trassir_ping_{clip.token}"
-        )
 
     async def _async_ping(self, clip: Clip) -> None:
         """Держать токен живым, пока смотрят.

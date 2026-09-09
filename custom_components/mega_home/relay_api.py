@@ -142,12 +142,20 @@ async def _dispatch(
         event = unquote(path[len("api/trassir/events/") : -len("/play")])
         return _json(await ops.trassir_play(coordinator, event))
     if path.startswith("api/trassir/clips/") and path.endswith("/seek") and method == "POST":
-        # Позиция записи — та же дверь, что и открытие: снаружи запись идёт
-        # тем же путём, что живой просмотр, без единой новой трубы.
+        # Перемотка переоткрытием — та же дверь, что и открытие: снаружи
+        # запись идёт тем же путём, что живой просмотр, без единой новой трубы.
         clip = unquote(path[len("api/trassir/clips/") : -len("/seek")])
+        body_json = _json_body(body)
+        if not isinstance(body_json, dict):
+            raise ops.OpError("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
         return _json(
-            await ops.trassir_seek(coordinator, clip, _json_body(body).get("positionUs"))
+            await ops.trassir_seek(coordinator, clip, body_json.get("positionUs"))
         )
+    if path.startswith("api/trassir/clips/") and path.endswith("/ready") and method == "POST":
+        # Готовность телефона — команда старта архива. Той же дверью, что
+        # открытие: это команда дому, а не данные для конфига.
+        clip = unquote(path[len("api/trassir/clips/") : -len("/ready")])
+        return _json(await ops.trassir_ready(coordinator, clip))
     if path.startswith("api/trassir/events/") and path.endswith("/thumb") and method == "GET":
         event = unquote(path[len("api/trassir/events/") : -len("/thumb")])
         content_type, raw = await ops.trassir_thumb(coordinator, event)

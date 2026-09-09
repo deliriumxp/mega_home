@@ -1,10 +1,13 @@
 """Просмотр записи события: тем же WebRTC, что и живая камера.
 
-Здесь заперты три вещи, каждая из которых ломает просмотр молча:
+Здесь заперты вещи, каждая из которых ломает просмотр молча:
 
 * **порядок**: токен → потребитель открыл поток → `archive_command`. Команда,
   отданная раньше, получает от регистратора `stream is expired` — текст читается
   как таймаут и им не является;
+* **команда — ОДНА на соединение**: повторный `play` по открытому потоку
+  стенд запретил (со второй-третьей команды данные встают). Поэтому старт ждёт
+  готовность телефона, а перемотка — это переоткрытие, а не повтор команды;
 * **метка события уходит в окно КАК ЕСТЬ**: она в шкале самого Trassir, и
   «починка» её нашими часами сдвинула бы запись на пояс сервера;
 * **уборка**: забытый клип держит соединение с регистратором и поток в go2rtc, а
@@ -33,11 +36,14 @@ EVENT = {
 class FakeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
-        self.token = "tok1"
+        self.tokens = 0
 
     async def async_get_video(self, guid: str, stream: str, container: str) -> str:
         self.calls.append(("get_video", {"guid": guid, "stream": stream, "container": container}))
-        return self.token
+        # ⚠ Каждый клип — свой токен: стенд запретил делить соединение, и спека
+        # обязана видеть то же, что прод.
+        self.tokens += 1
+        return f"tok{self.tokens}"
 
     async def async_archive_command(self, token: str, command: str = "play", **params: Any):
         self.calls.append(("archive_command", {"token": token, "command": command, **params}))
@@ -128,14 +134,12 @@ def test_снаружи_берём_субархив(gateway: FakeGateway) -> Non
     assert call["container"] == "rtsp"
 
 
-def test_команда_архива_уходит_после_переговоров_не_держа_ответ(
-    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    order: list[str] = []
-    opened = asyncio.run(gateway.clips.async_open("e1"))
+def _offered(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch, clip_id: str
+) -> FakeHass:
+    """Переговоры без команды: ответ ушёл, архив молчит."""
 
     async def fake_negotiate(hass, url, identifier, source, sdp, what=""):
-        order.append(f"negotiate:{identifier}:{source}")
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}
 
     from mega_home import webrtc
@@ -143,34 +147,60 @@ def test_команда_архива_уходит_после_переговор�
     monkeypatch.setattr(webrtc, "negotiate_source", fake_negotiate)
     monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
 
-    async def scenario() -> dict[str, Any]:
+    async def scenario() -> FakeHass:
         hass = FakeHass()
-        answer = await gateway.clips.async_offer(hass, opened["id"], "offer-sdp")
-        # ⚠ Команда — фоном: ответ телефону уже ушёл, а архив встаёт следом.
-        # Ждём её здесь, иначе спека проверяет тишину вместо порядка.
-        for _ in range(200):
-            if any(name == "archive_command" for name, _ in gateway.client.calls):
-                break
-            await asyncio.sleep(0.005)
-        order.extend(
-            name for name, _ in gateway.client.calls if name == "archive_command"
-        )
+        await gateway.clips.async_offer(hass, clip_id, "offer-sdp")
+        return hass
+
+    return asyncio.run(scenario())
+
+
+def test_переговоры_без_команды_греют_тракт(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ответ уходит БЕЗ команды архива: RTSP открыт, токен на пинге, а `play`
+    ждёт готовность телефона. Команда раньше готовности — это пропуск начала,
+    повтором по готовому потоку — вставшие данные (факт стенда)."""
+    clip_id = _opened_clip_id(gateway)
+    gateway.client.calls.clear()
+
+    hass = _offered(gateway, monkeypatch, clip_id)
+
+    assert not [n for n, _ in gateway.client.calls if n == "archive_command"]
+    assert any("ping" in name for name in hass.names), "токен держится"
+    assert any("fallback" in name for name in hass.names), "сторож взведён"
+    asyncio.run(_quiet(hass, gateway))
+
+
+def test_команда_одна_и_по_готовности(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Готовность — это и есть старт: одна команда на соединение."""
+    clip_id = _opened_clip_id(gateway)
+    gateway.client.calls.clear()
+    hass = _offered(gateway, monkeypatch, clip_id)
+
+    async def scenario() -> dict[str, Any]:
+        clip = gateway.clips._clips[clip_id]  # noqa: SLF001
+        fallback = clip.fallback
+        answer = await gateway.clips.async_ready(clip_id)
+        # Опоздавшая и повторная готовности — безвредны.
+        again = await gateway.clips.async_ready(clip_id)
+        assert fallback is not None and fallback.cancelled, "сторож снят стартом"
         await _quiet(hass, gateway)
-        return answer
+        return {**answer, "again": again["ready"]}
 
     answer = asyncio.run(scenario())
 
-    assert answer["sessionId"] == "s1"
-    # ⚠ Курсор в ответе offer БОЛЬШЕ НЕ ЕДЕТ: команда ушла фоном, и к моменту
-    # ответа её ещё нет. Где курсор встал — отдаёт `seek` (см. ниже): у архива
-    # бывают дыры, и молчать об этом нельзя.
-    assert "firstFrameTs" not in answer
-    assert order[0].startswith("negotiate:trassir_tok1:rtsp://192.168.1.50:555/tok1")
-    # ⚠ Команда — второй, и только второй: до открытия потока регистратор
-    # отвечает «stream is expired».
-    assert order[1] == "archive_command"
-    command = next(p for n, p in gateway.client.calls if n == "archive_command")
-    assert command["start"] == opened["startUs"], "метка события уходит как есть"
+    assert answer["ready"] is True
+    assert answer["again"] is False
+    # Где курсор встал на самом деле — наружу: у архива бывают дыры.
+    assert answer["firstFrameTs"] == "2026-09-09 14:00:00"
+    commands = [p for n, p in gateway.client.calls if n == "archive_command"]
+    assert len(commands) == 1
+    assert commands[0]["start"] == EVENT["timestampUs"] - 10_000_000, (
+        "метка события уходит как есть"
+    )
 
 
 def test_закрытие_снимает_поток_и_токен(
@@ -247,41 +277,82 @@ def _opened_clip_id(gateway: FakeGateway) -> str:
     return opened["id"]
 
 
-def test_seek_без_позиции_возвращает_на_начало_окна(gateway: FakeGateway) -> None:
-    """Первый кадр показан — архив возвращается на начало окна.
+def test_сторож_стартует_вслепую_без_готовности(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Старое приложение готовности не шлёт: ему достаётся прежнее поведение
+    (команда после переговоров), а не чёрный экран."""
+    monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_READY_TIMEOUT", 0.01)
 
-    Часы архива идут в реальном времени с команды `play`, а телефон показывает
-    первый кадр на секунды позже (ICE/DTLS, раскрутка чтения с диска, ключевой
-    кадр). Без возврата «запись события» стабильно начиналась на 3–4 секунды
-    позже метки.
-    """
+    async def fake_negotiate(hass, url, identifier, source, sdp, what=""):
+        return {"sessionId": "s1", "answer": "sdp", "candidates": []}
+
+    from mega_home import webrtc
+
+    monkeypatch.setattr(webrtc, "negotiate_source", fake_negotiate)
+    monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
     clip_id = _opened_clip_id(gateway)
-    gateway.client.calls.clear()
 
-    answer = asyncio.run(gateway.clips.async_seek(clip_id))
+    async def scenario() -> None:
+        hass = FakeHass()
+        gateway.client.calls.clear()
+        await gateway.clips.async_offer(hass, clip_id, "offer-sdp")
+        for _ in range(200):
+            if any(n == "archive_command" for n, _ in gateway.client.calls):
+                break
+            await asyncio.sleep(0.005)
+        clip = gateway.clips._clips[clip_id]  # noqa: SLF001
+        assert not clip.anchored, "вслепую — без якоря готовности"
+        await _quiet(hass, gateway)
 
-    assert answer["positionUs"] == EVENT["timestampUs"] - 10_000_000
-    assert answer["firstFrameTs"] == "2026-09-09 14:00:00"
+    asyncio.run(scenario())
+
     commands = [p for n, p in gateway.client.calls if n == "archive_command"]
     assert len(commands) == 1
-    assert commands[0]["command"] == "play"
     assert commands[0]["start"] == EVENT["timestampUs"] - 10_000_000
-    assert commands[0]["stop"] == EVENT["timestampUs"] + 60_000_000
 
 
-def test_seek_ставит_на_метку_таймлайна(gateway: FakeGateway) -> None:
-    """Жест по таймлайну — та же команда с другой позицией: отдельной
-    перемотки у сеанса Trassir нет."""
+def test_seek_переоткрывает_а_не_перекомандует(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Жест по таймлайну — новый токен, новый поток, новые переговоры.
+
+    Повторный `play` по одному соединению стенд запретил (данные встают), и
+    «та же команда с новым стартом» — не вариант. Старое соединение разбираем
+    целиком, телефон сводит новый просмотр обычным путём.
+    """
+    dropped: list[str] = []
+    monkeypatch.setattr(
+        ClipSessions,
+        "_async_drop_stream",
+        lambda self, name: _record(dropped, name),
+    )
     clip_id = _opened_clip_id(gateway)
     gateway.client.calls.clear()
     middle = EVENT["timestampUs"] + 20_000_000
 
     answer = asyncio.run(gateway.clips.async_seek(clip_id, middle))
 
-    assert answer["positionUs"] == middle
-    commands = [p for n, p in gateway.client.calls if n == "archive_command"]
-    assert len(commands) == 1
-    assert commands[0]["start"] == middle
+    # Новый клип — новым id: телефон сводит заново, как при открытии.
+    assert answer["id"] == f"{CLIP_PREFIX}tok2"
+    assert answer["startUs"] == middle
+    assert answer["stopUs"] == EVENT["timestampUs"] + 60_000_000
+    # Ни одной команды по старому соединению — только новый токен.
+    assert [n for n, _ in gateway.client.calls if n == "archive_command"] == []
+    tokens = [p for n, p in gateway.client.calls if n == "get_video"]
+    assert len(tokens) == 1
+    # Старый поток снят, старый клип забыт.
+    assert dropped == ["trassir_tok1"]
+    assert gateway.clips._clips.get(clip_id) is None  # noqa: SLF001
+
+
+def test_seek_без_позиции_отказывает(gateway: FakeGateway) -> None:
+    """«Вернуть на начало» без метки — это жест «к событию», и приложение шлёт
+    его меткой само. Пустой позыв — 400, а не угадывание."""
+    with pytest.raises(ops.OpError) as err:
+        asyncio.run(gateway.clips.async_seek(_opened_clip_id(gateway), None))
+
+    assert err.value.status == 400
 
 
 def test_seek_клампит_а_не_отказывает(gateway: FakeGateway) -> None:
@@ -290,10 +361,10 @@ def test_seek_клампит_а_не_отказывает(gateway: FakeGateway) 
     clip_id = _opened_clip_id(gateway)
 
     low = asyncio.run(gateway.clips.async_seek(clip_id, 1))
-    high = asyncio.run(gateway.clips.async_seek(clip_id, 10**18))
+    high = asyncio.run(gateway.clips.async_seek(_opened_clip_id(gateway), 10**18))
 
-    assert low["positionUs"] == EVENT["timestampUs"] - 10_000_000
-    assert high["positionUs"] == EVENT["timestampUs"] + 60_000_000
+    assert low["startUs"] == EVENT["timestampUs"] - 10_000_000
+    assert high["startUs"] == EVENT["timestampUs"] + 60_000_000
 
 
 def test_seek_мусором_объясняется(gateway: FakeGateway) -> None:
@@ -305,7 +376,7 @@ def test_seek_мусором_объясняется(gateway: FakeGateway) -> Non
 
 def test_seek_закрытой_записи_объясняется(gateway: FakeGateway) -> None:
     with pytest.raises(ops.OpError) as err:
-        asyncio.run(gateway.clips.async_seek("trassir:ghost"))
+        asyncio.run(gateway.clips.async_seek("trassir:ghost", 1))
 
     assert "заново" in err.value.message
 
@@ -314,17 +385,36 @@ def test_seek_доходит_через_ops(gateway: FakeGateway) -> None:
     """Обёртка для HTTP-дверей (местной и переноса наружу)."""
     coordinator = type("Coordinator", (), {"trassir": gateway})()
     clip_id = _opened_clip_id(gateway)
+    middle = EVENT["timestampUs"] + 20_000_000
 
-    answer = asyncio.run(ops.trassir_seek(coordinator, clip_id))
+    answer = asyncio.run(ops.trassir_seek(coordinator, clip_id, middle))
 
+    assert answer["startUs"] == middle
+
+
+def test_ready_доходит_через_ops(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Обёртка готовности для HTTP-дверей."""
+    coordinator = type("Coordinator", (), {"trassir": gateway})()
+    clip_id = _opened_clip_id(gateway)
+    hass = _offered(gateway, monkeypatch, clip_id)
+
+    async def scenario() -> dict[str, Any]:
+        answer = await ops.trassir_ready(coordinator, clip_id)
+        await _quiet(hass, gateway)
+        return answer
+
+    answer = asyncio.run(scenario())
+
+    assert answer["ready"] is True
     assert answer["positionUs"] == EVENT["timestampUs"] - 10_000_000
 
 
-def test_закрытие_раньше_команды_не_течёт_пингом(
+def test_закрытие_до_готовности_не_командует(
     gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Шторку закрыли раньше, чем дошла фоновая команда: пинг мёртвому токену
-    не нужен — это утечка задачи навсегда."""
+    """Шторку закрыли раньше готовности: ни команды, ни висящих задач."""
 
     async def fake_negotiate(hass, url, identifier, source, sdp, what=""):
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}
@@ -338,11 +428,14 @@ def test_закрытие_раньше_команды_не_течёт_пинго
         hass = FakeHass()
         opened = await gateway.clips.async_open("e1")
         await gateway.clips.async_offer(hass, opened["id"], "offer")
+        clip = gateway.clips._clips[opened["id"]]  # noqa: SLF001
+        ping, fallback = clip.ping, clip.fallback
         await gateway.clips.async_close(hass, opened["id"], "s1")
+        assert ping.cancelled and fallback.cancelled, "задачи сняты"
         await _quiet(hass, gateway)
 
     asyncio.run(scenario())
 
-    assert not any("ping" in name for name in gateway.hass.names), (
-        "пинг закрытому клипу не заводится"
+    assert not [n for n, _ in gateway.client.calls if n == "archive_command"], (
+        "закрытому просмотру команда не уходит"
     )
