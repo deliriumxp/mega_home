@@ -203,6 +203,22 @@ async def webrtc_offer(
     tile = payload.get("id")
     if isinstance(tile, str) and tile.startswith(CLIP_PREFIX):
         return await trassir(coordinator).clips.async_offer(hass, tile, sdp)
+    guid = _trassir_guid(coordinator, tile)
+    if guid:
+        # Живая камера регистратора: ссылка постоянная, сеанса и токена нет —
+        # но путь тот же самый, что у камеры Home Assistant.
+        gateway = trassir(coordinator)
+        name, source = gateway.clips.live_stream(guid)
+        from .go2rtc_embed import URL as OWN_URL, is_running
+
+        if not is_running():
+            raise OpError(
+                "Дом не может отдать камеру: не поднят его go2rtc",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        return await webrtc.negotiate_source(
+            hass, OWN_URL, name, source, sdp, "с этой камеры"
+        )
     return await webrtc.negotiate(hass, camera_entity(coordinator, payload), sdp)
 
 
@@ -242,6 +258,25 @@ async def camera_frame(
     `relay_api.handle` (одна форма на картинку и на JSON, см. его докстринг),
     а не этого обработчика. Кодирование — забота двери, которой оно нужно.
     """
+    guid = _trassir_guid(coordinator, payload.get("id"))
+    if guid:
+        # ⚠ Кадр берётся у РЕГИСТРАТОРА, а не у Home Assistant: камеры
+        # видеонаблюдения в HA нет вовсе. Живой кадр — это `timestamp=0`.
+        gateway = trassir(coordinator)
+        client = gateway.client
+        if client is None:
+            raise OpError("Видеонаблюдение объекта не настроено", HTTPStatus.NOT_FOUND)
+        from .trassir import _shrink
+        from .trassir_client import TrassirError
+
+        try:
+            raw = await client.async_screenshot(guid)
+        except TrassirError as err:
+            raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
+        # Тот же размер, что у превью события: полный кадр регистратора — это
+        # полмегабайта на каждое открытие шторки.
+        return "image/jpeg", await hass.async_add_executor_job(_shrink, raw)
+
     from . import webrtc
 
     return await webrtc.snapshot(hass, camera_entity(coordinator, payload))
@@ -263,6 +298,11 @@ def camera_entity(
     if tile.get("domain") != "camera":
         raise OpError("Это устройство не камера")
     if not tile.get("entityId"):
+        # ⚠ У камеры ВИДЕОНАБЛЮДЕНИЯ сущности Home Assistant нет и не будет —
+        # это самостоятельная система, её показывает дом сам. Отказ здесь
+        # означал бы «камера не настроена» там, где всё настроено.
+        if tile.get("trassirGuid"):
+            raise OpError("Это камера видеонаблюдения", HTTPStatus.CONFLICT)
         raise OpError(
             "Элемент ещё не отправлен в Home Assistant — смотреть пока нечего",
             HTTPStatus.NOT_FOUND,
@@ -446,12 +486,17 @@ def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
         # и узнать его задним числом неоткуда.
         values["streamType"] = attributes.get("frontend_stream_type")
 
+    # ⚠ Камера видеонаблюдения ДОСТУПНА без сущности Home Assistant: её показывает
+    # сам дом, забирая поток у регистратора. Считать её недоступной значило бы
+    # написать жильцу «Нет данных» поверх работающей камеры.
+    available = bool(tile.get("trassirGuid")) or (state is not None and not unavailable)
+
     return {
         "id": tile["id"],
         "domain": domain,
         "state": values,
         "attributes": _public_attributes(attributes),
-        "available": state is not None and not unavailable,
+        "available": available,
         "updatedAt": int(state.last_updated.timestamp() * 1000) if state else None,
     }
 
@@ -462,6 +507,13 @@ def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
 # локальная (`http.py`) и перенос запроса снаружи (`relay_api.py`). Ровно ради
 # этого перенос и заведён, и заводить под видеонаблюдение свою операцию значило
 # бы строить вторую трубу (docs/trassir-integration-plan.md, §5а у менеджера).
+
+
+def _trassir_guid(coordinator: MegaHomeCoordinator, tile_id: Any) -> str | None:
+    """Канал регистратора у плитки — или None, если это обычная камера."""
+    tile = find((coordinator.data or {}).get("tiles", []), tile_id)
+    guid = tile.get("trassirGuid") if tile else None
+    return guid if isinstance(guid, str) and guid else None
 
 
 def trassir(coordinator: MegaHomeCoordinator) -> Any:

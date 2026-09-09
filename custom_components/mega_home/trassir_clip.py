@@ -153,6 +153,20 @@ class ClipSessions:
         await self._async_drop_stream(clip.stream)
         return {"closed": True}
 
+    def live_stream(self, guid: str) -> tuple[str, str]:
+        """Имя потока go2rtc и источник для ЖИВОЙ камеры регистратора.
+
+        ⚠ Токен не нужен вовсе: у live-канала ссылка ПОСТОЯННАЯ
+        (`rtsp://host:555/<guid>_m/`), поэтому здесь нет ни сеанса, ни пинга, ни
+        уборки — тем и отличается от записи. И идёт она тем же go2rtc и тем же
+        WebRTC: камера видеонаблюдения показывается ровно как любая другая.
+        """
+        settings = self._gateway.settings
+        return (
+            f"trassir_live_{guid}",
+            f"rtsp://{settings['host']}:{settings['rtspPort']}/{guid}_m/",
+        )
+
     def clip_of_session(self, session_id: str) -> str | None:
         """Найти клип по сессии — приложение закрывает просмотр именно ею."""
         for clip_id, clip in self._clips.items():

@@ -212,3 +212,58 @@ def test_плитка_опознаётся_по_адресу_потока(monkey
     found = asyncio.run(ops_module._tiles_by_guid(_Hass(), coordinator))
 
     assert found == {"IAtwTYwK": "t1"}, "чужой адрес плиткой Trassir не становится"
+
+
+def test_камера_регистратора_показывается_домом_без_HA(monkeypatch):
+    """⚠ У камеры видеонаблюдения НЕТ сущности Home Assistant — и это норма.
+
+    Видеонаблюдение — самостоятельная система состава (решение заказчика
+    2026-09-09): менеджер читает камеры прямо у регистратора, в HA они не
+    заводятся вовсе. Значит показывает их дом: живой поток — тем же WebRTC через
+    свой go2rtc, кадр — скриншотом с регистратора.
+    """
+    negotiated: list[tuple[str, str]] = []
+
+    async def fake_negotiate(hass, url, identifier, source, sdp, what=""):
+        negotiated.append((identifier, source))
+        return {"sessionId": "s1", "answer": "sdp", "candidates": []}
+
+    from mega_home import ops as ops_module, webrtc
+
+    monkeypatch.setattr(webrtc, "negotiate_source", fake_negotiate)
+    monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
+
+    class _Clips:
+        def live_stream(self, guid):
+            return (f"trassir_live_{guid}", f"rtsp://192.168.1.50:555/{guid}_m/")
+
+        def clip_of_session(self, session_id):
+            return None
+
+    gateway = FakeGateway()
+    gateway.clips = _Clips()
+    coordinator = _Coordinator(gateway)
+    coordinator.data = {
+        "tiles": [
+            {"id": "t1", "domain": "camera", "entityId": None, "trassirGuid": "IAtwTYwK"}
+        ]
+    }
+
+    answer = asyncio.run(
+        ops_module.run(_Hass(), coordinator, "webrtc", {"id": "t1", "offer": "sdp"})
+    )
+
+    assert answer["sessionId"] == "s1"
+    assert negotiated == [("trassir_live_IAtwTYwK", "rtsp://192.168.1.50:555/IAtwTYwK_m/")]
+
+
+def test_камера_регистратора_доступна_без_состояния():
+    """Иначе жилец прочитал бы «Нет данных» поверх работающей камеры."""
+    from mega_home import ops as ops_module
+
+    view = ops_module.entity_view(
+        {"id": "t1", "domain": "camera", "entityId": None, "trassirGuid": "IAtwTYwK"},
+        None,
+    )
+
+    assert view["available"] is True

@@ -476,3 +476,21 @@ Closing has no route of its own: `webrtc/close` finds the clip by its id prefix
 or by the session, cancels the token ping and drops the temporary go2rtc stream.
 A forgotten clip holds a connection to the recorder, and the object may have no
 connection limit at all.
+
+
+## A recorder camera has no Home Assistant entity (0.2.24)
+
+Video surveillance is a system of its own in the manager: the installer scans the
+recorder there and drags its channels into the structure, and those cameras are
+never created in Home Assistant. So the home has to show them itself — and does,
+through the machinery that was already here: the permanent link
+`rtsp://host:555/<guid>_m/` becomes a source in our go2rtc and is answered by the
+same WebRTC path as any camera, while the tile frame comes from
+`/screenshot/<guid>` on the recorder, shrunk here.
+
+⚠ Such a tile carries `entityId: null` forever, and that is NOT "not pushed to
+Home Assistant yet". Two places had to learn the difference: the refusal in
+`camera_entity` (it used to say "the element has not been sent to Home Assistant"
+— true for a KNX device, nonsense for a camera that will never be there) and
+`available` in `entity_view`, which without this reads "Нет данных" over a camera
+that works perfectly.
