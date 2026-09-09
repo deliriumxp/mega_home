@@ -44,8 +44,6 @@ class FakeClient:
         # заготовок инсталлятора.
         self.rooms: list[dict[str, Any]] = []
         self.tiles: list[dict[str, Any]] = []
-        self.photo_calls: list[str] = []
-        self.tile_photo_calls: list[str] = []
         # Общий канал файлов: что назвал менеджер, за тем дом и сходил.
         self.assets: dict[str, Any] = {}
         self.asset_calls: list[str] = []
@@ -64,23 +62,11 @@ class FakeClient:
             "assets": self.assets,
         }
 
-    async def async_room_photo(self, room_id: str) -> bytes:
-        self.photo_calls.append(room_id)
-        if room_id in self.photo_fails:
-            raise ManagerError("HTTP 404")
-        return b"\xff\xd8\xff" + room_id.encode()
-
     async def async_asset(self, key: str) -> bytes:
         self.asset_calls.append(key)
         if key in self.photo_fails:
             raise ManagerError("HTTP 404")
         return b"asset:" + key.encode()
-
-    async def async_tile_photo(self, tile_id: str) -> bytes:
-        self.tile_photo_calls.append(tile_id)
-        if tile_id in self.photo_fails:
-            raise ManagerError("HTTP 404")
-        return b"\xff\xd8\xff" + tile_id.encode()
 
 
 class FakeBundle:
@@ -195,114 +181,13 @@ def test_опрос_включается_явно_иначе_его_нет_во�
     assert coordinator.listeners == []
 
 
-# --- заготовки фонов инсталлятора ---
+# --- зеркала фонов БОЛЬШЕ НЕТ ---
 #
-# Фон, который инсталлятор загрузил в менеджере, обязан лежать ФАЙЛОМ в доме:
-# приложение раздаёт интеграция, и до менеджера у телефона жильца дороги может
-# не быть вовсе. Проверяем то, что ломается молча: качаем только недостающее,
-# выбрасываем то, что конфиг больше не называет, и одна недоступная картинка не
-# роняет синхронизацию целиком.
-def test_заготовки_качаются_один_раз(tmp_path: Path) -> None:
-    client = FakeClient()
-    client.rooms = [
-        {"id": "r1", "photoVersion": "v1"},
-        {"id": "r2", "photoVersion": "v1"},
-        {"id": "r3"},  # комната без фона — за ней ходить не за чем
-    ]
-    coordinator = _coordinator(tmp_path, client)
-    coordinator.bundle = FakeBundle()
-
-    asyncio.run(coordinator._async_update_data())
-    assert client.photo_calls == ["r1", "r2"]
-    assert coordinator.stock_photos.has("r1", "v1")
-
-    # Второй опрос: те же версии уже лежат на диске — качать нечего.
-    coordinator.data = None
-    asyncio.run(coordinator._async_update_data())
-    assert client.photo_calls == ["r1", "r2"]
-
-
-def test_смена_и_снятие_фона_доезжают_до_дома(tmp_path: Path) -> None:
-    client = FakeClient()
-    client.rooms = [{"id": "r1", "photoVersion": "v1"}, {"id": "r2", "photoVersion": "v1"}]
-    coordinator = _coordinator(tmp_path, client)
-    coordinator.bundle = FakeBundle()
-    asyncio.run(coordinator._async_update_data())
-
-    # Инсталлятор заменил фон первой комнаты и снял фон второй.
-    client.rooms = [{"id": "r1", "photoVersion": "v2"}, {"id": "r2"}]
-    coordinator.data = None
-    asyncio.run(coordinator._async_update_data())
-
-    assert coordinator.stock_photos.has("r1", "v2")
-    assert not coordinator.stock_photos.has("r1", "v1"), "старая версия — мусор на диске"
-    assert not coordinator.stock_photos.has("r2", "v1"), "снятый фон обязан исчезнуть"
-
-
-def test_недоступная_картинка_не_роняет_синхронизацию(tmp_path: Path) -> None:
-    client = FakeClient()
-    client.rooms = [{"id": "r1", "photoVersion": "v1"}, {"id": "r2", "photoVersion": "v1"}]
-    client.photo_fails = {"r1"}
-    coordinator = _coordinator(tmp_path, client)
-    coordinator.bundle = FakeBundle()
-
-    asyncio.run(coordinator._async_update_data())
-
-    # Дом без одного фона работает; следующий опрос попробует снова.
-    assert not coordinator.stock_photos.has("r1", "v1")
-    assert coordinator.stock_photos.has("r2", "v1")
-    assert coordinator.last_error is None
-
-
-# --- фоны ПЛИТОК (0.1.16) ---
-#
-# Фон плитки — снимок самого прибора, который жилец видит вместо иконки. Он
-# принадлежит ОБЪЕКТУ: подбирает его команда в менеджере, а в дом он едет тем же
-# зеркалом, что и заготовка комнаты. Проверяем, что путь именно ОДИН: тот же
-# цикл, то же хранилище, та же чистка — иначе у двух видов фона разъедутся
-# правила «когда качать» и «когда выбрасывать».
-def test_фоны_плиток_едут_в_дом_тем_же_зеркалом(tmp_path: Path) -> None:
-    client = FakeClient()
-    client.rooms = [{"id": "r1", "photoVersion": "v1"}]
-    client.tiles = [
-        {"id": "ha:light.lamp1", "photoVersion": "t1"},
-        {"id": "ha:light.lamp2", "photoVersion": "t2"},
-        {"id": "ha:light.lamp3"},  # плитка без фона — за ней не ходим
-    ]
-    coordinator = _coordinator(tmp_path, client)
-    coordinator.bundle = FakeBundle()
-
-    asyncio.run(coordinator._async_update_data())
-
-    # ⚠ Ключ несёт приставку, id плитки уходит в менеджер без неё.
-    assert client.tile_photo_calls == ["ha:light.lamp1", "ha:light.lamp2"]
-    assert client.photo_calls == ["r1"]
-    assert coordinator.stock_photos.has("tile:ha:light.lamp1", "t1")
-    assert coordinator.stock_photos.has("tile:ha:light.lamp2", "t2")
-    # У каждой плитки СВОЙ файл: пять ламп — пять фонов, а не один на род.
-    assert coordinator.stock_photos.path(
-        "tile:ha:light.lamp1", "t1"
-    ) != coordinator.stock_photos.path("tile:ha:light.lamp2", "t2")
-
-    # Второй опрос: те же версии уже на диске — качать нечего.
-    coordinator.data = None
-    asyncio.run(coordinator._async_update_data())
-    assert client.tile_photo_calls == ["ha:light.lamp1", "ha:light.lamp2"]
-
-
-def test_снятый_в_менеджере_фон_плитки_исчезает_и_в_доме(tmp_path: Path) -> None:
-    client = FakeClient()
-    client.tiles = [{"id": "ha:light.lamp1", "photoVersion": "t1"}]
-    coordinator = _coordinator(tmp_path, client)
-    coordinator.bundle = FakeBundle()
-    asyncio.run(coordinator._async_update_data())
-    assert coordinator.stock_photos.has("tile:ha:light.lamp1", "t1")
-
-    client.tiles = [{"id": "ha:light.lamp1"}]
-    coordinator.data = None
-    asyncio.run(coordinator._async_update_data())
-
-    assert not coordinator.stock_photos.has("tile:ha:light.lamp1", "t1")
+# ⚠ Спеки на «заготовки инсталлятора» сняты вместе с самим зеркалом (0.2.20):
+# фоны комнат и плиток ездят ОБЩИМ каналом файлов, и всё, что они проверяли —
+# качать только недостающее, выбрасывать снятое, переживать недоступный файл —
+# проверяется ниже на нём же. Возвращать второй водопровод не надо: фон плитки
+# он качал ДВАЖДЫ, обоими путями сразу.
 
 
 # --- ОБЩИЙ канал файлов (0.1.17) ---

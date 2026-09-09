@@ -100,7 +100,6 @@ async def async_register_http(
         MegaHomeScenarioView,
         MegaHomePhotosView,
         MegaHomePhotoView,
-        MegaHomeStockPhotoView,
         # ⚠ Общий канал: один маршрут на любой файл и одна розетка на любой
         # запрос-ответ. Оба заведены ради того, чтобы новая функция не стоила
         # выпуска этой интеграции (`assets.py`).
@@ -108,7 +107,6 @@ async def async_register_http(
         MegaHomeCameraFrameView,
         MegaHomeWebRtcView,
         MegaHomeWebRtcCloseView,
-        MegaHomeIceView,
         MegaHomeRelayView,
         # ⚠ РАНЬШЕ каталога: `/mega-home/{path:.*}` накрывает и `sw.js`, а aiohttp
         # отдаёт запрос первому подошедшему ресурсу.
@@ -338,38 +336,6 @@ class MegaHomePhotoView(_MegaHomeView):
         return self.json({"accepted": True})
 
 
-class MegaHomeStockPhotoView(_MegaHomeView):
-    """The INSTALLER's background for one room, mirrored from the manager.
-
-    ⚠ Версию берём ИЗ КОНФИГА, а не из адреса: `?v=` в адресе — метка кэша для
-    браузера, и доверять ей как имени файла значило бы отдавать по чужой ссылке
-    то, чего в конфиге уже нет. Конфиг тут единственный источник правды: какая
-    заготовка у комнаты сейчас, ту дом и показывает.
-    """
-
-    url = f"{URL_API}/stock-photo/{{room}}"
-    name = "api:mega_home:stock-photo"
-
-    async def get(self, request: web.Request, room: str) -> web.StreamResponse:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        version = stock_version(coordinator.data, room)
-        if not version:
-            return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
-        hass: HomeAssistant = request.app["hass"]
-        target = coordinator.stock_photos.path(room, version)
-        if not await hass.async_add_executor_job(target.is_file):
-            # Конфиг заготовку обещает, а файла ещё нет: синхронизация не дошла
-            # (дом только что поднялся, менеджер был недоступен). Это не ошибка
-            # приложения — оно просто нарисует градиент до следующего опроса.
-            return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
-        return web.FileResponse(
-            target, headers={"Cache-Control": "public, max-age=31536000, immutable"}
-        )
-
-
 class MegaHomeAssetView(_MegaHomeView):
     """ONE route for every file the manager hands to this home.
 
@@ -466,35 +432,6 @@ class MegaHomeWebRtcCloseView(_MegaHomeView):
 
     async def post(self, request: web.Request) -> web.Response:
         return await self.run_async(request, "webrtc-close")
-
-
-class MegaHomeIceView(_MegaHomeView):
-    """Чем приложению пробовать соединиться с камерой: STUN и ретранслятор.
-
-    ⚠ Нужен ровно там, где приложение открыто НА ДОМЕНЕ ОБЪЕКТА: тогда его
-    раздаём мы, и менеджера приложение не спрашивает ни о чём — списка ICE ему
-    взять негде. На пути через менеджер список выдаёт он сам, и этот маршрут
-    не участвует.
-
-    ⚠ Список КЭШИРУЕТСЯ (`ICE_CACHE_SECONDS`), и это не экономия запросов:
-    учётка живёт часами, а менеджер бывает недоступен (квартира без интернета —
-    нормальное состояние). Ходить к нему на каждое открытие камеры значило бы
-    поставить локальный просмотр в зависимость от связи с облаком.
-
-    ⚠ Отказ НЕ ошибка: отдаём пустой список, приложение берёт встроенный STUN и
-    работает ровно как до появления ретранслятора. Внутри дома он и не нужен —
-    там LAN.
-    """
-
-    url = f"{URL_API}/ice"
-    name = "api:mega_home:ice"
-
-    async def get(self, request: web.Request) -> web.Response:
-        hass: HomeAssistant = request.app["hass"]
-        coordinator = _coordinator(hass)
-        if coordinator is None:
-            return self.json({"iceServers": []})
-        return self.json({"iceServers": await coordinator.async_ice_servers()})
 
 
 class MegaHomeRelayView(_MegaHomeView):

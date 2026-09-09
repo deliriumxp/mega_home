@@ -13,11 +13,8 @@ from .const import (
     API_ASSET,
     API_APP_MANIFEST,
     API_CONFIG,
-    API_ICE,
     API_ICON,
     API_RELAY,
-    API_ROOM_PHOTO,
-    API_TILE_PHOTO,
     API_VERSION,
     ICON_SIZE,
     RELAY_TIMEOUT,
@@ -69,34 +66,9 @@ class ManagerClient:
             raise ManagerError("manager returned a config without tiles")
         return payload
 
-    async def async_ice_servers(self) -> list[dict[str, Any]]:
-        """Return ICE servers for the app: public STUN and, if the manager has
-        one configured, a relay with fresh short-lived credentials."""
-        payload = await self._get_json(API_ICE)
-        servers = payload.get("iceServers")
-        if not isinstance(servers, list):
-            raise ManagerError("manager returned no ICE servers")
-        return [item for item in servers if isinstance(item, dict)]
-
     async def async_icon(self, icon: str, size: str = ICON_SIZE) -> bytes:
         """Return one scenario icon as PNG bytes."""
         return await self._get_bytes(f"{API_ICON}/{icon}?size={size}")
-
-    async def async_room_photo(self, room_id: str) -> bytes:
-        """Return the installer's background for one room, as JPEG bytes."""
-        return await self._get_bytes(f"{API_ROOM_PHOTO}/{quote(room_id)}")
-
-    async def async_tile_photo(self, tile_id: str) -> bytes:
-        """Return the background of ONE TILE — a photo of the device itself.
-
-        Set in the manager and mirrored here for the same reason as the room
-        backgrounds: the phone looking at the app may have no route to the
-        manager at all.
-
-        ⚠ `safe=""` — идентификатор плитки содержит двоеточие
-        (`ha:light.kitchen`), и оставлять его в адресе как есть нельзя.
-        """
-        return await self._get_bytes(f"{API_TILE_PHOTO}/{quote(tile_id, safe='')}")
 
     async def async_asset(self, key: str) -> bytes:
         """Return ONE file the manager named in the config manifest.

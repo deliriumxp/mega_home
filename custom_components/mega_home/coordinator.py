@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime
-from time import monotonic
 from pathlib import Path
+from shutil import rmtree
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -18,7 +18,6 @@ from .bundle import BundleStore
 from .const import (
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
-    ICE_CACHE_SECONDS,
     ICON_DIR,
     ICON_SIZE,
     LOGGER,
@@ -28,10 +27,9 @@ from .const import (
     ASSET_DIR,
     STORAGE_KEY,
     STORAGE_VERSION,
-    TILE_PHOTO_PREFIX,
 )
 from .assets import AssetStore
-from .photos import PhotoStore, StockPhotoStore
+from .photos import PhotoStore
 
 type MegaHomeConfigEntry = ConfigEntry["MegaHomeCoordinator"]
 
@@ -80,12 +78,6 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.app_error: str | None = None
         self.app_checked_at: datetime | None = None
         self.last_error: str | None = None
-        # Ретранслятор видео: список ICE, выданный менеджером, и когда он выдан.
-        # ⚠ Кэш нужен не ради экономии запросов, а ради НЕЗАВИСИМОСТИ локального
-        # просмотра от связи с облаком: квартира без интернета — нормальное
-        # состояние, и камера в ней обязана открываться.
-        self._ice: list[dict[str, Any]] = []
-        self._ice_at: float = 0.0
         # DataUpdateCoordinator tracks whether the last refresh succeeded but
         # NOT when it last did, so the timestamp the installer actually asks
         # about ("when did this home last hear from the manager?") is ours.
@@ -99,11 +91,15 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ОБЩИЙ канал файлов: что именно в нём лежит, дом не знает и знать не
         # должен — см. `assets.py`.
         self.assets = AssetStore(Path(hass.config.path(STORAGE_DIR, ASSET_DIR)))
-        # Заготовки инсталлятора, наоборот, синхронизируются с менеджером: дом
-        # держит их копию, чтобы фон был виден и без дороги до менеджера.
-        self.stock_photos = StockPhotoStore(
-            Path(hass.config.path(STORAGE_DIR, STOCK_PHOTO_DIR))
-        )
+        # ⚠ Отдельного зеркала «заготовок инсталлятора» здесь БОЛЬШЕ НЕТ
+        # (0.2.20). Оно появилось раньше общего канала и делало то же самое:
+        # фон комнаты качался своим маршрутом, фон плитки — ОБОИМИ сразу, по
+        # два запроса и две копии на диске за одни и те же байты. Теперь фоны
+        # приезжают ключами `photo/room/*` и `photo/tile/*` общего манифеста.
+        # Старый каталог подчищаем один раз: он больше никогда не наполнится.
+        stale = Path(hass.config.path(STORAGE_DIR, STOCK_PHOTO_DIR))
+        if stale.is_dir():
+            rmtree(stale, ignore_errors=True)
 
     @property
     def icons_dir(self) -> Path:
@@ -147,24 +143,6 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         LOGGER.debug("Loaded cached home config %s", cached.get("version"))
         return True
 
-    async def async_ice_servers(self) -> list[dict[str, Any]]:
-        """ICE-серверы для приложения: из кэша, иначе спросить менеджера.
-
-        ⚠ Отказ менеджера — не ошибка: возвращаем пустой список, приложение
-        берёт встроенный STUN и работает ровно как до появления ретранслятора.
-        Внутри дома он и не нужен — там LAN.
-        """
-        now = monotonic()
-        if self._ice and now - self._ice_at < ICE_CACHE_SECONDS:
-            return self._ice
-        try:
-            self._ice = await self.client.async_ice_servers()
-            self._ice_at = now
-        except ManagerError as err:
-            LOGGER.debug("ICE servers unavailable: %s", err)
-            return self._ice
-        return self._ice
-
     async def _async_update_data(self) -> dict[str, Any]:
         try:
             version = await self.client.async_version()
@@ -204,7 +182,6 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         await self._store.async_save(config)
         await self._async_sync_icons(config)
-        await self._async_sync_stock_photos(config)
         await self._async_sync_assets(config)
         await self._async_sync_bundle()
         self._on_success()
@@ -240,63 +217,6 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.last_error = None
         self.last_success_at = dt_util.utcnow()
         self.update_interval = DEFAULT_UPDATE_INTERVAL
-
-    async def _async_sync_stock_photos(self, config: dict[str, Any]) -> None:
-        """Mirror the backgrounds the config names — of rooms AND of tiles.
-
-        A tile background is a photo of the device itself (a lighting group, the
-        TV, the blinds) shown instead of the icon. It belongs to the OBJECT: the
-        team picks it in the manager, and it arrives here exactly like a room
-        background. Its key carries the `tile:` prefix, so both kinds share one
-        store, one download loop and one prune.
-
-        Files, not URLs to the manager — the same reason as the icons: the app
-        is served from inside the home, and the phone looking at it may have no
-        route to the manager at all.
-
-        ⚠ Pruning runs even when nothing is wanted: a background the installer
-        removed has to disappear from the home too, and that case is exactly the
-        one where the download loop below does nothing.
-        """
-        wanted = {
-            room["id"]: room["photoVersion"]
-            for room in config.get("rooms", [])
-            if isinstance(room.get("id"), str)
-            and isinstance(room.get("photoVersion"), str)
-            and room["photoVersion"]
-        }
-        wanted.update(
-            {
-                f"{TILE_PHOTO_PREFIX}{tile['id']}": tile["photoVersion"]
-                for tile in config.get("tiles", [])
-                if isinstance(tile.get("id"), str)
-                and isinstance(tile.get("photoVersion"), str)
-                and tile["photoVersion"]
-            }
-        )
-        for key, version in sorted(wanted.items()):
-            if await self.hass.async_add_executor_job(
-                self.stock_photos.has, key, version
-            ):
-                continue
-            try:
-                payload = await self._async_fetch_stock_photo(key)
-            except ManagerError as err:
-                # Одна картинка не стоит падения синхронизации: дом без фона
-                # работает, а следующий опрос попробует снова.
-                LOGGER.warning("Could not fetch the background of %s: %s", key, err)
-                continue
-            await self.hass.async_add_executor_job(
-                self.stock_photos.save, key, version, payload
-            )
-            LOGGER.debug("Stored the background of %s", key)
-        await self.hass.async_add_executor_job(self.stock_photos.prune, wanted)
-
-    async def _async_fetch_stock_photo(self, key: str) -> bytes:
-        """One background from the manager: комната или плитка — по приставке."""
-        if key.startswith(TILE_PHOTO_PREFIX):
-            return await self.client.async_tile_photo(key[len(TILE_PHOTO_PREFIX) :])
-        return await self.client.async_room_photo(key)
 
     async def _async_sync_assets(self, config: dict[str, Any]) -> None:
         """Mirror every file the manager named in the config manifest.
