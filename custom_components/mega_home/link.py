@@ -61,6 +61,9 @@ class ManagerLink:
         # сокета. Ссылку держим здесь: задача без ссылки может быть собрана
         # сборщиком мусора на полпути.
         self._answers: set[asyncio.Task[None]] = set()
+        # Открытые сессии инженера к устройствам объекта (`stream.py`). Живут
+        # внутри одного подключения к менеджеру и умирают вместе с ним.
+        self._streams: Any = None
 
     @property
     def connected(self) -> bool:
@@ -100,9 +103,24 @@ class ManagerLink:
                     delay = FIRST_RETRY
                     LOGGER.info("Manager link is up")
                     await socket.send_json(await self._hello())
+                    # Сессии инженера живут ровно столько, сколько это
+                    # подключение: оборвался канал — TCP-соединения закрыты, и
+                    # менеджер откроет заново (`stream.py`).
+                    from .stream import Streams
+
+                    self._streams = Streams(socket)
                     async for message in socket:
                         if message.type is aiohttp.WSMsgType.TEXT:
                             await self._handle(message.json(), socket)
+                        elif message.type is aiohttp.WSMsgType.BINARY:
+                            # ⚠ Данные сессии — единственное, что ездит по этому
+                            # каналу бинарно, и разбираются они ПРЯМО ЗДЕСЬ, без
+                            # отдельной задачи: очередь в `stream.py` полна ровно
+                            # тогда, когда устройство не успевает, и притормозить
+                            # чтение канала в этот момент — не беда, а обратное
+                            # давление.
+                            if self._streams is not None:
+                                await self._streams.on_binary(message.data)
                         elif message.type in (
                             aiohttp.WSMsgType.CLOSED,
                             aiohttp.WSMsgType.ERROR,
@@ -121,6 +139,9 @@ class ManagerLink:
                 if self._connected:
                     LOGGER.info("Manager link closed")
                 self._connected = False
+                if self._streams is not None:
+                    await self._streams.close_all()
+                    self._streams = None
             await asyncio.sleep(delay)
             delay = min(delay * 2, MAX_RETRY)
 
@@ -213,6 +234,12 @@ class ManagerLink:
 
     async def _handle(self, payload: dict[str, Any], socket: Any = None) -> None:
         kind = payload.get("t")
+        # Кадры сессии первыми: их больше всех, и они не имеют отношения ни к
+        # запросам жильца, ни к конфигу.
+        if isinstance(kind, str) and kind.startswith("stream."):
+            if self._streams is not None:
+                await self._streams.handle(payload)
+            return
         if kind == "req":
             # ⚠ ОТДЕЛЬНОЙ задачей, а не по месту. Этот метод зовётся из цикла
             # чтения сокета, и пока он не вернётся, ни один следующий кадр не
