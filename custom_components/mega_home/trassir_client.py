@@ -19,6 +19,7 @@ only here: the address is a private one the installer typed in.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any
 
@@ -126,6 +127,22 @@ class TrassirClient:
         """
         return await self._json("archive_command", USER, command=command, token=token, **params)
 
+    async def async_archive_status(self, kind: str = "timeline") -> list[dict[str, Any]]:
+        """Состояние архива ОТКРЫТЫХ потоков этой сессии.
+
+        ⚠ Спрашивается ПОСЛЕ того, как поток открыт и команда отдана: своего
+        параметра «по какому каналу» у запроса нет вовсе — ответ приходит
+        списком по токенам сессии, и нужный ищет вызывающий.
+
+        ⚠ `type=timeline` отдаёт участки записи ЗА СУТКИ `day_start` в СЕКУНДАХ
+        от начала дня. Замер офисного регистратора 2026-09-09: запись ведётся по
+        движению, фрагменты по 6-8 секунд с дырами в минуты — то есть «дыра в
+        записи» это норма объекта, а не поломка, и показать её обязано
+        приложение.
+        """
+        payload = await self._request("archive_status", USER, type=kind)
+        return payload if isinstance(payload, list) else []
+
     async def async_ping(self, token: str) -> None:
         """Keep a video token alive (documented as 10 s without traffic).
 
@@ -197,6 +214,14 @@ class TrassirClient:
                 if attempt == 1:
                     continue
                 raise TrassirAuthError(self._no_session_hint(door, path))
+            # ⚠ И ЛЮБОЙ другой отказ приезжает так же: JSON в теле, статус 200,
+            # а вызывающий ждёт картинку. Замер офисного регистратора
+            # 2026-09-09: событие сервера (вход пользователя в Trassir) даёт
+            # `{"error_code":"channel not found","success":0}` — 46 байт,
+            # которые уезжали жильцу как `image/jpeg` и рисовались битым
+            # значком. Пусть это будет ошибкой, а не «картинкой».
+            if payload[:1] == b"{" and b'"success"' in payload:
+                raise TrassirError(_error_text(payload, path))
             return payload
         raise TrassirError(f"Trassir не ответил на {path}")
 
@@ -273,3 +298,12 @@ class TrassirClient:
                 "(Настройки → Веб-сервер → SDK) — учётка пользователя сюда не подходит"
             )
         return f"Trassir не пустил к {path}: проверьте логин и пароль пользователя"
+
+
+def _error_text(payload: bytes, path: str) -> str:
+    """Отказ регистратора, пришедший телом там, где ждали байты."""
+    try:
+        code = json.loads(payload.decode("utf8", "replace")).get("error_code")
+    except (ValueError, AttributeError):
+        code = None
+    return f"Trassir отказал в {path}: {code}" if code else f"Trassir не отдал {path}"

@@ -75,7 +75,10 @@ class FakeClient:
 
     def __init__(self, events: list[dict[str, Any]] | None = None) -> None:
         self.events_queue = events or []
-        self.channels_data = [{"guid": "cam1", "name": "Вход", "rights": "8975"}]
+        self.channels_data = [
+            {"guid": "cam1", "name": "Вход", "rights": "8975"},
+            {"guid": "cam2", "name": "Склад", "rights": "8975"},
+        ]
         self.channel_calls = 0
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -226,9 +229,21 @@ def test_длительность_считается_в_пределах_кам�
     assert "durationS" not in rows["cam1"], "движение ещё идёт — длительности нет"
 
 
-def test_unknown_camera_keeps_its_guid_as_a_name(tmp_path: Path) -> None:
+def test_события_не_от_камер_в_ленту_не_попадают(tmp_path: Path) -> None:
+    """`/events` отдаёт события ВСЕГО сервера, а лента жильца — про камеры.
+
+    ⚠ Замер офисного регистратора 2026-09-09: в ленте оказался «Login
+    Successful» с origin пользователя. Кадра у такого события нет вовсе
+    (`/screenshot` → `channel not found`), и в ленте оно выглядело битой
+    картинкой без имени камеры.
+    """
     gate = gateway(tmp_path)
-    client = FakeClient([{"timestamp": "1", "type": "Motion Start", "origin": "ghost"}])
+    client = FakeClient(
+        [
+            {"timestamp": "1", "type": "Motion Start", "origin": "cam1"},
+            {"timestamp": "2", "type": "Login Successful, %1 from %2", "origin": "user7"},
+        ]
+    )
 
     async def scenario() -> None:
         await gate.async_apply(config())
@@ -237,7 +252,7 @@ def test_unknown_camera_keeps_its_guid_as_a_name(tmp_path: Path) -> None:
 
     asyncio.run(scenario())
 
-    assert gate.events()[0]["cameraName"] == "ghost"
+    assert [row["guid"] for row in gate.events()] == ["cam1"]
 
 
 def test_feed_is_trimmed_by_age_in_trassir_scale(tmp_path: Path) -> None:

@@ -49,6 +49,26 @@ class FakeClient:
         self.calls.append(("archive_command", {"token": token, "command": command, **params}))
         return {"success": 1, "first_frame_ts": "2026-09-09 14:00:00"}
 
+    async def async_archive_status(self, kind: str = "timeline") -> list[dict[str, Any]]:
+        """Шкала записанных участков за сутки — так отвечает регистратор.
+
+        ⚠ Секунды ОТ НАЧАЛА СУТОК `day_start`, а не метки: перепутать их значит
+        нарисовать жильцу разметку записи в другом веке.
+        """
+        self.calls.append(("archive_status", {"type": kind}))
+        return [
+            {
+                "token": f"tok{self.tokens}",
+                "day_start": "2026-09-09",
+                "timeline": [
+                    # Окно клипа — 13:19:50 + минута (метка события минус лид).
+                    {"begin": "47990", "end": "47997"},  # 13:19:50–13:19:57
+                    {"begin": "48020", "end": "48030"},  # 13:20:20–13:20:30
+                    {"begin": "60000", "end": "60010"},  # вечером — вне окна
+                ],
+            }
+        ]
+
     async def async_ping(self, token: str) -> None:
         self.calls.append(("ping", {"token": token}))
 
@@ -221,6 +241,13 @@ def test_команда_одна_и_по_готовности(
     assert answer["again"] is False
     # Где курсор встал на самом деле — наружу: у архива бывают дыры.
     assert answer["firstFrameTs"] == "2026-09-09 14:00:00"
+    # ⚠ Записанные участки — из шкалы регистратора и ОБРЕЗАННЫЕ окном: запись
+    # на объекте ведётся по движению, дыры внутри окна это норма, и рисует их
+    # приложение. Дальний участок того же дня в окно не попадает.
+    assert answer["segments"] == [
+        {"startUs": 1_788_959_990_000_000, "stopUs": 1_788_959_997_000_000},
+        {"startUs": 1_788_960_020_000_000, "stopUs": 1_788_960_030_000_000},
+    ]
     commands = [p for n, p in gateway.client.calls if n == "archive_command"]
     assert len(commands) == 1
     assert commands[0]["start"] == EVENT["timestampUs"] - 10_000_000, (

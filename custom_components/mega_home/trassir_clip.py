@@ -89,6 +89,49 @@ def _archive_stream(quality: str | None, remote: bool | None) -> str:
     return TRASSIR_ARCHIVE_SUB if remote else TRASSIR_ARCHIVE_MAIN
 
 
+def _segments(
+    rows: Any, token: str, start_us: int, stop_us: int
+) -> list[dict[str, int]]:
+    """Записанные участки архива внутри окна клипа — из `archive_status`.
+
+    ⚠ Зачем это вообще: на объекте запись ведётся ПО ДВИЖЕНИЮ (замер офисного
+    регистратора 2026-09-09: фрагменты по 6-8 секунд, дыры в минуты). Поэтому
+    внутри минутного окна события данные есть лишь местами, и в дыре
+    проигрыватель честно стоит на последнем кадре — а выглядит это как
+    зависшая картинка. Отдать участки наружу дешевле любых догадок: рисует их
+    и толкует ПРИЛОЖЕНИЕ (docs/plan-thin-integration.md).
+
+    ⚠ Шкала: `begin`/`end` — СЕКУНДЫ ОТ НАЧАЛА СУТОК `day_start`, и сутки эти
+    в шкале самого Trassir (unix + пояс сервера). Поэтому день переводим тем же
+    `timegm`, что и `_outside`: местный пояс дома прибавил бы смещение второй
+    раз.
+    """
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, int]] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("token") != token:
+            continue
+        try:
+            day = datetime.strptime(str(row.get("day_start")), "%Y-%m-%d")
+        except ValueError:
+            continue
+        day_us = int(calendar.timegm(day.timetuple())) * 1_000_000
+        for piece in row.get("timeline") or []:
+            try:
+                begin = day_us + int(piece["begin"]) * 1_000_000
+                end = day_us + int(piece["end"]) * 1_000_000
+            except (KeyError, TypeError, ValueError):
+                continue
+            # Обрезаем окном клипа: за его краями рисовать нечего, а лишние
+            # сутки фрагментов — это килобайты по каналу жильца на каждый тап.
+            begin, end = max(begin, start_us), min(end, stop_us)
+            if end > begin:
+                out.append({"startUs": begin, "stopUs": end})
+    out.sort(key=lambda piece: piece["startUs"])
+    return out
+
+
 def _outside(first_frame: str | None, start_us: int, stop_us: int) -> bool:
     """Ближайшая запись лежит вне окна — значит кадров не будет вовсе.
 
@@ -135,6 +178,9 @@ class Clip:
     # Ближайшая запись оказалась ВНЕ запрошенного окна: кадров не будет вовсе,
     # и приложение обязано сказать это словами, а не молчать чёрным экраном.
     out_of_window: bool = False
+    # Записанные участки внутри окна (`_segments`). Пусто — регистратор шкалу
+    # не отдал; это не «записи нет», и приложение обязано их различать.
+    segments: list[dict[str, int]] = field(default_factory=list)
     ping: Any = field(default=None, repr=False)
     # Старт вслепую, если готовность не пришла (старое приложение её не шлёт):
     # снимать вместе с клипом, иначе команда догонит закрытый просмотр.
@@ -331,6 +377,9 @@ class ClipSessions:
             # наша задержка. Молчание здесь и есть тот чёрный прямоугольник, за
             # которым жилец досиживает до таймаута проигрывателя.
             "outOfWindow": clip.out_of_window,
+            # Записанные участки внутри окна: запись на объекте ведётся по
+            # движению, и дыры в окне — норма. Рисует и толкует их приложение.
+            "segments": clip.segments,
         }
 
     async def async_seek(
@@ -571,6 +620,20 @@ class ClipSessions:
         # промах; отдаём его наружу, чтобы приложение могло сказать правду.
         clip.first_frame = answer.get("first_frame_ts")
         clip.out_of_window = _outside(clip.first_frame, clip.start_us, clip.window_stop_us)
+        # ⚠ ПОСЛЕ команды, а не до: своего параметра «по какому каналу» у
+        # `archive_status` нет — он отвечает по токенам ОТКРЫТЫХ потоков, и
+        # раньше старта нашего токена там нет вовсе.
+        try:
+            clip.segments = _segments(
+                await client.async_archive_status("timeline"),
+                clip.token,
+                clip.window_start_us,
+                clip.window_stop_us,
+            )
+        except TrassirError as err:
+            # Не роняем просмотр: без шкалы жилец просто не увидит разметку
+            # записанного, а видео идёт.
+            LOGGER.debug("Шкала архива недоступна: %s", err)
         if clip.out_of_window:
             # ⚠ Проверено на стенде: когда ближайшая запись лежит ПОЗЖЕ конца
             # окна, регистратор отвечает успехом и не присылает НИ ОДНОГО байта.

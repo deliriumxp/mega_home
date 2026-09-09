@@ -312,6 +312,13 @@ class TrassirGateway:
         kind = item.get("type")
         if not isinstance(guid, str) or not isinstance(kind, str):
             return None
+        # ⚠ `/events` отдаёт события ВСЕГО СЕРВЕРА, а не только камер: замер
+        # офисного регистратора 2026-09-09 показал в ленте «Login Successful»
+        # с origin пользователя. У такого события нет ни камеры, ни кадра —
+        # `/screenshot` отвечает `channel not found`, — и в ленте жильца оно
+        # выглядело битой картинкой без имени. Пускаем только каналы.
+        if guid not in names:
+            return None
         return {
             # ⚠ Ключ дедупликации И есть идентификатор события: своего id
             # TRASSIR не даёт, а перелогин повторяет до сотни событий заново.
