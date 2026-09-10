@@ -32,6 +32,7 @@ from .const import (
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
 from .trassir import TrassirGateway
 from .http import async_register_http
+from .agent import AgentRunner
 from .link import ManagerLink
 
 PLATFORMS: list[Platform] = []
@@ -139,6 +140,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # (объект без интернета), и это нормальный режим, а не авария.
     coordinator.link = ManagerLink(hass, entry, coordinator)
     coordinator.link.start()
+
+    # Сторож объекта: правила менеджера, которые дом крутит САМ (`agent.py`).
+    # Поднимается ПОСЛЕ первого опроса, но живёт независимо от него: правила
+    # лежат в своём кэше, и объект, потерявший связь с менеджером, продолжает
+    # сторожить себя — ровно тогда, когда чинить его больше некому.
+    agent = AgentRunner(hass, client)
+    await agent.async_start()
+    coordinator.agent = agent
+    entry.async_on_unload(lambda: hass.async_create_task(agent.async_stop()))
+    await agent.async_sync()
     if PLATFORMS:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True

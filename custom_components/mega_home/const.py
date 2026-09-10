@@ -24,7 +24,7 @@ LOGGER = logging.getLogger(__package__)
 #
 # ⚠ Держится в паре с `manifest.json`, их сверяет `tests/test_version.py`:
 # поднимать ОБА, одним релизом.
-INTEGRATION_VERSION = "0.2.38"
+INTEGRATION_VERSION = "0.2.39"
 
 CONF_MANAGER_URL = "manager_url"
 CONF_TOKEN = "token"
@@ -39,6 +39,10 @@ API_ICON = "/inbound/home-config/icon"
 # (`tile-photo-stores.ts`) и в менеджере — контракт трёх сторон, как и
 # форма состояния плитки. Комнаты лежат под своими id без приставки.
 TILE_PHOTO_PREFIX = "tile:"
+# Дверь СТОРОЖА: правила менеджера, которые дом крутит сам (`agent.py`).
+# Отдельно от конфига намеренно — тело конфига уходит браузеру жильца, а в
+# правиле стоят адрес устройства и команда действия.
+API_AGENT = "/inbound/home-config/agent"
 API_APP_MANIFEST = "/inbound/home-config/app/manifest"
 API_APP_FILE = "/inbound/home-config/app/file"
 

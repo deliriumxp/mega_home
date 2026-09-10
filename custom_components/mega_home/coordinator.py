@@ -66,6 +66,9 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # снаружи, как и канал: координатор его не создаёт, он только приносит
         # ему свежий конфиг — адрес, порты и отпечаток учётки живут там.
         self.trassir: Any = None
+        # Сторож объекта (`agent.py`), если он заведён. Координатор им не
+        # владеет — он только зовёт синхронизацию правил в своём цикле.
+        self.agent: Any = None
         # Бандл интерфейса: качается с менеджера и раздаётся из кэша, поэтому
         # новая версия приложения не требует ни HACS, ни перезапуска.
         #
@@ -166,6 +169,7 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # release, and nothing anywhere said so.
                 await self._async_sync_bundle()
                 await self._async_apply_trassir(self.data)
+                await self._async_sync_agent()
                 self._on_success()
                 return self.data
             config = await self.client.async_config()
@@ -190,9 +194,21 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._async_sync_assets(config)
         await self._async_sync_bundle()
         await self._async_apply_trassir(config)
+        await self._async_sync_agent()
         self._on_success()
         LOGGER.info("Home config updated to %s", config.get("version"))
         return config
+
+    async def _async_sync_agent(self) -> None:
+        """Правила сторожа — в том же цикле, что конфиг и бандл.
+
+        ⚠ Зовётся из ОБЕИХ ветвей опроса, и это не копипаста: ровно так уже
+        терялся бандл — проверка стояла только за ранним возвратом «версия не
+        изменилась», то есть на самом частом пути не выполнялась никогда, и
+        новый интерфейс не доезжал до объекта вовсе.
+        """
+        if self.agent:
+            await self.agent.async_sync()
 
     async def _async_sync_bundle(self) -> None:
         """Check the app bundle in the same cycle as the config.

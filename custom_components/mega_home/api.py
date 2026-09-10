@@ -9,6 +9,7 @@ from urllib.parse import quote
 import aiohttp
 
 from .const import (
+    API_AGENT,
     API_APP_FILE,
     API_ASSET,
     API_APP_MANIFEST,
@@ -93,6 +94,37 @@ class ManagerClient:
             for key, value in payload.items()
             if key in ("username", "password", "sdkPassword") and isinstance(value, str)
         }
+
+    async def async_agent(
+        self, version: str | None, reports: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Отдать отчёты сторожа и забрать его правила ОДНИМ запросом.
+
+        ⚠ Один обход, а не два: дом на узком канале ходит сюда раз в четверть
+        часа, и «правила отдельно, отчёты отдельно» стоило бы второго обхода
+        ради тех же байтов. Совпавшая версия избавляет от тела правил.
+
+        ⚠ Что означают правила, дом не знает и знать не должен (`agent.py`).
+        """
+        payload: dict[str, Any] = {"reports": reports}
+        if version:
+            payload["version"] = version
+        try:
+            async with self._session.post(
+                f"{self._base}{API_AGENT}",
+                headers=self._headers(),
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as response:
+                self._raise_for_status(response.status)
+                answer = await response.json(content_type=None)
+        except aiohttp.ClientError as err:
+            raise ManagerError(str(err)) from err
+        except ValueError as err:
+            raise ManagerError("manager answered with non-JSON content") from err
+        if not isinstance(answer, dict):
+            raise ManagerError("manager answered with an unexpected payload")
+        return answer
 
     async def async_relay(self, payload: dict[str, Any]) -> tuple[int, Any]:
         """Ask the manager something on behalf of the app; return status and answer.

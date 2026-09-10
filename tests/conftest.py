@@ -204,9 +204,18 @@ def _track_state_change_event(hass: object, entity_ids: object, action: object) 
 
 
 _track_state_change_event.calls = []  # type: ignore[attr-defined]
+# Периодический тик: сторож объекта заводит его на запуске. Тесту нужен не
+# таймер, а сама функция тика — её и запоминаем, чтобы дёргать вручную.
+def _track_time_interval(hass: object, action: object, interval: object) -> object:
+    _track_time_interval.calls.append((action, interval))  # type: ignore[attr-defined]
+    return lambda: None
+
+
+_track_time_interval.calls = []  # type: ignore[attr-defined]
 _module(
     "homeassistant.helpers.event",
     async_track_state_change_event=_track_state_change_event,
+    async_track_time_interval=_track_time_interval,
 )
 _module("homeassistant.util")
 

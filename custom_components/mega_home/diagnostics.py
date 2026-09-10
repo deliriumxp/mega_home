@@ -51,6 +51,10 @@ async def async_get_config_entry_diagnostics(
                 else None
             ),
         },
+        # Сторож объекта (`agent.py`): какие правила у дома есть, что он по ним
+        # видел и сколько отчётов не доехало до менеджера. Без этого «контроллер
+        # перезагрузился сам» неотличимо от «его перезагрузил кто-то».
+        "agent": coordinator.agent.summary if coordinator.agent else None,
         "home": {
             "name": config.get("home", {}).get("name"),
             "floors": len(config.get("floors", [])),
@@ -66,11 +70,5 @@ async def async_get_config_entry_diagnostics(
             # this is the only way to tell "this flat has no photos" from "the
             # photos are here and the app is not showing them".
             "room_photos": await hass.async_add_executor_job(coordinator.photos.count),
-            # Заготовки инсталлятора, выкачанные с менеджера. Отдельным числом:
-            # «фонов нет» и «фоны есть, но не выкачались» — разные диагнозы, и
-            # различить их иначе нечем.
-            "stock_photos": await hass.async_add_executor_job(
-                coordinator.stock_photos.count
-            ),
         },
     }
