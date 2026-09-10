@@ -153,7 +153,7 @@ def test_запись_идёт_той_же_операцией_что_и_каме
         def __init__(self) -> None:
             self.offered: list[str] = []
 
-        async def async_offer(self, hass, clip_id, sdp, remote=False):
+        async def async_offer(self, hass, clip_id, sdp, remote=False, trickle=False):
             self.offered.append(clip_id)
             return {"sessionId": "s1", "answer": "sdp", "candidates": []}
 
@@ -225,7 +225,7 @@ def test_камера_регистратора_показывается_домо
     negotiated: list[tuple[str, str]] = []
 
     async def fake_negotiate(
-        hass, url, identifier, source, sdp, what="", remote=False, skip_list=False
+        hass, url, identifier, source, sdp, what="", remote=False, skip_list=False, trickle=False
     ):
         negotiated.append((identifier, source))
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}
@@ -236,7 +236,7 @@ def test_камера_регистратора_показывается_домо
     monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
 
     class _Clips:
-        async def async_live_offer(self, hass, guid, sdp, quality, remote=False):
+        async def async_live_offer(self, hass, guid, sdp, quality, remote=False, trickle=False):
             suffix = "_s" if quality == "sub" else "_m"
             from mega_home import webrtc
 

@@ -114,6 +114,7 @@ async def async_register_http(
         MegaHomeTrassirClipSeekView,
         MegaHomeTrassirClipReadyView,
         MegaHomeWebRtcView,
+        MegaHomeWebRtcCandidatesView,
         MegaHomeWebRtcCloseView,
         MegaHomeRelayView,
         # ⚠ РАНЬШЕ каталога: `/mega-home/{path:.*}` накрывает и `sw.js`, а aiohttp
@@ -588,6 +589,16 @@ class MegaHomeWebRtcView(_MegaHomeView):
 
     async def post(self, request: web.Request) -> web.Response:
         return await self.run_async(request, "webrtc")
+
+
+class MegaHomeWebRtcCandidatesView(_MegaHomeView):
+    """Досыл ICE-кандидатов (trickle) внутри дома — пара к `webrtc`."""
+
+    url = f"{URL_API}/webrtc/candidates"
+    name = "api:mega_home:webrtc_candidates"
+
+    async def post(self, request: web.Request) -> web.Response:
+        return await self.run_async(request, "webrtc-candidates")
 
 
 class MegaHomeWebRtcCloseView(_MegaHomeView):

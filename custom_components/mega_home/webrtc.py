@@ -87,6 +87,14 @@ CANDIDATE_GRACE = 0.4
 # попытка просмотра оставляла бы камеру занятой до перезапуска HA.
 _own_sessions: dict[str, tuple[float, Any]] = {}
 
+# Trickle: session_id → очередь ещё НЕ отданных телефону кандидатов дома.
+#
+# ⚠ Состояние эфемерное и живёт ровно от ответа до закрытия сессии — это цена
+# trickle поверх запрос-ответ, от которой одноразовая схема уходила сознательно.
+# Очередь — ТОТ ЖЕ список, что наполняет ws-подписка `_on_msg`, поэтому досылать
+# кандидатов телефону не требует второй подписки.
+_trickle: dict[str, list[dict[str, Any]]] = {}
+
 # Сколько сессия живёт без закрытия. Телефон, у которого убили приложение,
 # `close` не пришлёт НИКОГДА, а ws держим мы — значит и поток с камеры держим
 # мы, и никакие таймауты go2rtc тут не помогут. Просмотр дольше этого срока —
@@ -100,6 +108,7 @@ def _cannot_stream(what: str) -> str:
 
 async def _drop_own(session_id: str) -> None:
     """Убрать сессию своего go2rtc: закрыть ws и отпустить камеру."""
+    _trickle.pop(session_id, None)
     entry = _own_sessions.pop(session_id, None)
     if entry is None:
         return
@@ -113,6 +122,7 @@ def _expire_own(hass: HomeAssistant) -> None:
     now = monotonic()
     for session_id in [key for key, (when, _) in _own_sessions.items() if now - when > SESSION_TTL]:
         LOGGER.info("Сессия %s просрочена — отпускаем камеру", session_id)
+        _trickle.pop(session_id, None)
         entry = _own_sessions.pop(session_id, None)
         if entry is not None:
             hass.async_create_task(_close_own(entry[1]))
@@ -124,6 +134,7 @@ async def async_shutdown() -> None:
     ⚠ Без этого перезагрузка записи оставляла бы за собой открытые ws к
     go2rtc — то есть занятые камеры, о которых больше некому вспомнить.
     """
+    _trickle.clear()
     for session_id in list(_own_sessions):
         entry = _own_sessions.pop(session_id, None)
         if entry is not None:
@@ -198,7 +209,11 @@ async def _wait_candidates(
 
 
 async def negotiate(
-    hass: HomeAssistant, entity_id: str, offer_sdp: str, remote: bool = False
+    hass: HomeAssistant,
+    entity_id: str,
+    offer_sdp: str,
+    remote: bool = False,
+    trickle: bool = False,
 ) -> dict[str, Any]:
     """Trade the resident's offer for this camera's answer and ICE candidates."""
     # Свой go2rtc :8555 — без зависимости от HA :18555/tcp
@@ -214,7 +229,9 @@ async def negotiate(
         LOGGER.debug("own go2rtc not used: %s", err)
     else:
         if _own_running():
-            return await _negotiate_own(hass, entity_id, offer_sdp, _OWN_URL, remote)
+            return await _negotiate_own(
+                hass, entity_id, offer_sdp, _OWN_URL, remote, trickle
+            )
 
     from homeassistant.components.camera.const import StreamType
     from homeassistant.components.camera.webrtc import (
@@ -294,7 +311,12 @@ async def negotiate(
 
 
 async def _negotiate_own(
-    hass: HomeAssistant, entity_id: str, offer_sdp: str, url: str, remote: bool = False
+    hass: HomeAssistant,
+    entity_id: str,
+    offer_sdp: str,
+    url: str,
+    remote: bool = False,
+    trickle: bool = False,
 ) -> dict[str, Any]:
     """Offer через свой go2rtc :1985 — без HA :18555/tcp."""
     from homeassistant.exceptions import HomeAssistantError
@@ -327,7 +349,7 @@ async def _negotiate_own(
         stream_source = "ffmpeg:" + stream_source
 
     return await negotiate_source(
-        hass, url, identifier, stream_source, offer_sdp, "с этой камеры", remote
+        hass, url, identifier, stream_source, offer_sdp, "с этой камеры", remote, False, trickle
     )
 
 
@@ -340,6 +362,7 @@ async def negotiate_source(
     what: str = "",
     remote: bool = False,
     skip_list: bool = False,
+    trickle: bool = False,
 ) -> dict[str, Any]:
     """Свести предложение телефона с ЛЮБЫМ источником своего go2rtc.
 
@@ -429,8 +452,50 @@ async def negotiate_source(
         LOGGER.warning("own go2rtc offer for %s refused: %s", identifier, failure)
         await _drop_own(session_id)
         raise OpError(failure[0] if failure else "Источник не отдал ответ", HTTPStatus.BAD_GATEWAY)
+    if trickle:
+        # ⚠ Ответ уходит СРАЗУ, окно кандидатов не ждём: телефон доспросит их
+        # операцией `webrtc-candidates` (`ops.webrtc_candidates`). Очередь — ТОТ
+        # ЖЕ список, что наполняет `_on_msg`, поэтому вторая подписка не нужна.
+        _trickle[session_id] = candidates
+        # `candidates: []` кладём намеренно: старый потребитель ответа (бандл,
+        # не знающий trickle) не должен упасть на `undefined` — он получит
+        # пустой список, а сам trickle включает только тот, кто попросил.
+        return {
+            "sessionId": session_id,
+            "answer": answer[0],
+            "candidates": [],
+            "trickle": True,
+        }
     await _wait_candidates(got_candidate, lambda: _has_srflx(answer, candidates), remote)
     return {"sessionId": session_id, "answer": answer[0], "candidates": list(candidates)}
+
+
+async def async_candidates(
+    session_id: str, candidates: list[str] | None
+) -> dict[str, Any]:
+    """Trickle: принять кандидаты ТЕЛЕФОНА и отдать накопленные ДОМОМ.
+
+    ⚠ Симметрично WHEP `PATCH`: туда — свои кандидаты, оттуда — чужие. `done` —
+    соединение go2rtc закрылось (кандидатов больше не будет). Старый дом без
+    этой операции сюда не попадёт: её зовёт только приложение, увидевшее
+    `trickle: true` в ответе на предложение.
+    """
+    queue = _trickle.get(session_id)
+    entry = _own_sessions.get(session_id)
+    if queue is None or entry is None:
+        return {"candidates": [], "done": True}
+    ws = entry[1]
+    # Кандидаты телефона go2rtc принимает тем же ws, что держит поток.
+    from go2rtc_client.ws import WebRTCCandidate as GoCand
+
+    for line in candidates or []:
+        try:
+            await ws.send(GoCand(candidate=str(line)))
+        except Exception as err:  # noqa: BLE001 - путь отвалился, не сессия
+            LOGGER.debug("candidate to own go2rtc failed: %s", err)
+    out = list(queue)
+    queue.clear()
+    return {"candidates": out, "done": not ws.connected}
 
 
 # Предел кадра-постера. Больше — отказ, а не обрезанная картинка: кадр едет
@@ -555,6 +620,7 @@ def close_own(hass: HomeAssistant, session_id: str) -> bool:
     спрашивает. Возвращает False, если сессия не наша, — тогда закрывать её
     штатным путём Home Assistant.
     """
+    _trickle.pop(session_id, None)
     own = _own_sessions.pop(session_id, None)
     if own is None:
         return False

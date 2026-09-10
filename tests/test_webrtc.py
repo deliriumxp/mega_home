@@ -179,6 +179,10 @@ class _Go2RtcWsClient:
     async def close(self) -> None:
         self.closed = True
 
+    @property
+    def connected(self) -> bool:
+        return not self.closed
+
     def receive(self, message) -> None:
         """Доставить сообщение подписчикам — как это делает rx-таска либы."""
         for subscriber in self.subscribers:
@@ -907,3 +911,54 @@ def test_публичный_host_считается_внешним_адресо�
     assert _has_srflx([], [{"candidate": public_host}])
     assert not _has_srflx([private_host], [])
     assert _has_srflx([srflx], [])
+
+
+def test_trickle_отдаёт_ответ_сразу_и_досылает_кандидатов(own_go2rtc) -> None:
+    """⚠ Ответ уходит СРАЗУ, без окна кандидатов, а сами кандидаты текут
+    операцией `webrtc-candidates`: телефонные — в ws go2rtc, домовые — обратно.
+    Именно это убирает и «холодный STUN», и 6-секундное ожидание."""
+    from mega_home import webrtc
+    from mega_home.webrtc import _trickle  # noqa: SLF001
+
+    async def scenario() -> None:
+        task = asyncio.ensure_future(
+            webrtc.negotiate_source(
+                object(),
+                "http://127.0.0.1:1985",
+                "trassir_tok",
+                "rtsp://cam/tok",
+                "v=0 offer",
+                "запись события",
+                True,
+                True,
+                True,
+            )
+        )
+        await asyncio.sleep(0)
+        ws = _Go2RtcWsClient.instances[-1]
+        ws.receive(_GoAnswer("v=0 answer"))
+        answer = await task
+
+        assert answer["trickle"] is True
+        assert answer["candidates"] == [], "ответ не ждёт окно кандидатов"
+
+        # Кандидат дома появился уже ПОСЛЕ ответа — и всё равно доедет.
+        ws.receive(_GoCandidate("candidate:1 1 udp 1 8.8.8.8 8555 typ host"))
+        drained = await webrtc.async_candidates(
+            answer["sessionId"], ["candidate:9 1 udp 1 1.2.3.4 9 typ host"]
+        )
+        assert drained["candidates"] == [
+            {"candidate": "candidate:1 1 udp 1 8.8.8.8 8555 typ host", "sdpMLineIndex": 0}
+        ]
+        assert drained["done"] is False
+        # Кандидат телефона доехал до go2rtc тем же ws.
+        assert any(
+            getattr(message, "candidate", "") == "candidate:9 1 udp 1 1.2.3.4 9 typ host"
+            for message in ws.sent
+        )
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        _trickle.clear()
+        webrtc._own_sessions.clear()  # noqa: SLF001

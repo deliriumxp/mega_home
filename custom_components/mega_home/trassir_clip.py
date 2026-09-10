@@ -303,7 +303,12 @@ class ClipSessions:
         await self._drop(clip_id, clip)
 
     async def async_offer(
-        self, hass: HomeAssistant, clip_id: str, sdp: str, remote: bool = False
+        self,
+        hass: HomeAssistant,
+        clip_id: str,
+        sdp: str,
+        remote: bool = False,
+        trickle: bool = False,
     ) -> dict[str, Any]:
         """Свести телефон с записью: тот же go2rtc, что и у живой камеры."""
         from .ops import OpError
@@ -330,7 +335,7 @@ class ClipSessions:
         # ⚠ `skip_list=True`: имя потока клипа эфемерно (в нём токен), списком
         # его существование не проверяем — это лишний круг на критическом пути.
         answer = await webrtc.negotiate_source(
-            hass, OWN_URL, clip.stream, source, sdp, "запись события", remote, True
+            hass, OWN_URL, clip.stream, source, sdp, "запись события", remote, True, trickle
         )
         clip.session_id = answer.get("sessionId")
         # ⚠ Момент, от которого отсчитывается пауза перед командой архива:
@@ -491,6 +496,7 @@ class ClipSessions:
         sdp: str,
         quality: str,
         remote: bool = False,
+        trickle: bool = False,
     ) -> dict[str, Any]:
         """Свести телефон с ЖИВОЙ камерой регистратора — двумя путями.
 
@@ -512,7 +518,7 @@ class ClipSessions:
             name, source = self.live_stream(guid, quality)
             try:
                 return await webrtc.negotiate_source(
-                    hass, OWN_URL, name, source, sdp, "с этой камеры", remote
+                    hass, OWN_URL, name, source, sdp, "с этой камеры", remote, False, trickle
                 )
             except Exception as err:  # noqa: BLE001 — причин отказа много, путь один
                 LOGGER.info(
@@ -548,7 +554,7 @@ class ClipSessions:
         # ⚠ `skip_list=True`: имя потока запасного пути тоже эфемерно (токен),
         # списком его существование проверять нечего.
         answer = await webrtc.negotiate_source(
-            hass, OWN_URL, clip.stream, source, sdp, "с этой камеры", remote, True
+            hass, OWN_URL, clip.stream, source, sdp, "с этой камеры", remote, True, trickle
         )
         clip.session_id = answer.get("sessionId")
         if clip.idle:

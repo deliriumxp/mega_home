@@ -72,6 +72,11 @@ async def run(
         return await webrtc_offer(hass, coordinator, data, remote)
     if op == "webrtc-close":
         return webrtc_close(hass, coordinator, data)
+    if op == "webrtc-candidates":
+        # ⚠ Именованная операция тут — исключение, а не привычка: сигналинг
+        # WebRTC не ресурс HTTP, через перенос (`http`) он не едет. Trickle —
+        # часть ТОГО ЖЕ обмена, что `webrtc`, поэтому и дверь та же.
+        return await webrtc_candidates(data)
     if op == "http":
         # Перенос ОБЫЧНОГО запроса к API этого дома: жилец снаружи должен уметь
         # ровно то же, что дома, и теми же путями (`relay_api.py`).
@@ -225,6 +230,9 @@ async def webrtc_offer(
     sdp = payload.get("offer")
     if not isinstance(sdp, str) or not sdp:
         raise OpError("Предложение WebRTC не передано")
+    # ⚠ Trickle просит ПРИЛОЖЕНИЕ (новое умеет), а не дом по версии: старый
+    # бандл поля не шлёт и получает прежний одноразовый ответ с кандидатами.
+    trickle = payload.get("trickle") is True
     # ⚠ Запись события идёт ТОЙ ЖЕ операцией, что и живая камера, и это не
     # экономия строк: своя операция под архив означала бы второй сеанс со своими
     # сроками, своим закрытием и своей диагностикой — то есть вторую трубу
@@ -232,7 +240,9 @@ async def webrtc_offer(
     # источник, и решает это приставка id.
     tile = payload.get("id")
     if isinstance(tile, str) and tile.startswith(CLIP_PREFIX):
-        return await trassir(coordinator).clips.async_offer(hass, tile, sdp, remote)
+        return await trassir(coordinator).clips.async_offer(
+            hass, tile, sdp, remote, trickle
+        )
     guid = _trassir_guid(coordinator, tile)
     if guid:
         # Живая камера регистратора: ссылка постоянная, сеанса и токена нет —
@@ -255,9 +265,11 @@ async def webrtc_offer(
         # документированный токен. Решает это сам сеанс, потому что там же живут
         # пинг и уборка, которые запасному пути нужны (`async_live_offer`).
         return await gateway.clips.async_live_offer(
-            hass, guid, sdp, "sub" if quality == "sub" else "main", remote
+            hass, guid, sdp, "sub" if quality == "sub" else "main", remote, trickle
         )
-    return await webrtc.negotiate(hass, camera_entity(coordinator, payload), sdp, remote)
+    return await webrtc.negotiate(
+        hass, camera_entity(coordinator, payload), sdp, remote, trickle
+    )
 
 
 def webrtc_close(
@@ -281,6 +293,27 @@ def webrtc_close(
         hass.async_create_task(gateway.clips.async_close(hass, clip_id, session_id))
         return {"closed": True}
     return webrtc.close(hass, camera_entity(coordinator, payload), session_id)
+
+
+async def webrtc_candidates(payload: dict[str, Any]) -> dict[str, Any]:
+    """Trickle: кандидаты телефона — туда, накопленные домом — оттуда.
+
+    ⚠ Сессию не ищем по камере: кандидаты — часть ТОГО ЖЕ соединения, что уже
+    поднято `webrtc`, и живут по его `sessionId`. Закрылась — ответ `done`, и
+    приложение перестаёт спрашивать.
+    """
+    from . import webrtc
+
+    session_id = payload.get("sessionId")
+    if not isinstance(session_id, str) or not session_id:
+        raise OpError("Сессия не указана")
+    incoming = payload.get("candidates")
+    lines = (
+        [item for item in incoming if isinstance(item, str)]
+        if isinstance(incoming, list)
+        else []
+    )
+    return await webrtc.async_candidates(session_id, lines)
 
 
 async def camera_frame(
