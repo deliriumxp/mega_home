@@ -130,11 +130,43 @@ async def async_shutdown() -> None:
             await _close_own(entry[1])
 
 
+def _external_address(line: str) -> str | None:
+    """Публичный адрес в строке кандидата — или None.
+
+    ⚠ Типа `srflx` МАЛО. go2rtc свои КОНФИГУРНЫЕ кандидаты (`candidates:
+    [stun:8555]`) отдаёт строкой `typ host`, хотя адрес в ней публичный, узнанный
+    у STUN (`CandidateICE` в исходниках go2rtc жёстко печатает `typ host`).
+    Проверка только по `srflx` не видела внешний путь, и дом ждал окно целиком на
+    КАЖДОМ открытии (живой отчёт 2026-09-10: переговоры 6844 мс при готовом
+    внешнем адресе). Смотрим на сам адрес.
+    """
+    from ipaddress import ip_address
+
+    tokens = line.removeprefix("a=").split()
+    try:
+        at = tokens.index("typ")
+    except ValueError:
+        return None
+    kind = tokens[at + 1] if at + 1 < len(tokens) else ""
+    # `srflx`/`relay` — уже «наружу», адрес для вердикта не нужен: строка может
+    # прийти и укороченной (без ip/port), а тип всё сказал.
+    # Порядок: foundation component transport priority ADDRESS port typ type,
+    # то есть адрес — за два токена до `typ`.
+    if kind in ("srflx", "relay"):
+        return tokens[at - 2] if at >= 2 else kind
+    if kind != "host" or at < 2:
+        return None
+    host = tokens[at - 2]
+    try:
+        return host if ip_address(host).is_global else None
+    except ValueError:
+        return None
+
+
 def _has_srflx(answer: list[str], candidates: list[dict[str, Any]]) -> bool:
     """Есть ли в пакете адрес, по которому дом видно снаружи."""
-    if any("typ srflx" in line for line in answer):
-        return True
-    return any("typ srflx" in (item.get("candidate") or "") for item in candidates)
+    lines = list(answer) + [(item.get("candidate") or "") for item in candidates]
+    return any(_external_address(line) for line in lines)
 
 
 async def _wait_candidates(

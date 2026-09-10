@@ -890,3 +890,20 @@ def test_окно_кандидатов_выбирается_дверью() -> No
         assert aio.run(scenario(True)) > 0.2, "снаружи — длинное"
     finally:
         monkey.undo()
+
+
+def test_публичный_host_считается_внешним_адресом() -> None:
+    """⚠ go2rtc свои конфигурные кандидаты помечает `typ host`, хотя адрес в них
+    публичный (найден у STUN). Проверка только по `srflx` не видела внешний путь,
+    и дом ждал окно ЦЕЛИКОМ на каждом открытии: живой отчёт 2026-09-10 —
+    «Кандидаты дома: host 4», «Соединение: connected», а переговоры 6844 мс."""
+    from mega_home.webrtc import _has_srflx  # noqa: SLF001
+
+    public_host = "candidate:1 1 udp 2130706431 8.8.8.8 8555 typ host"
+    private_host = "candidate:2 1 udp 2130706431 192.168.1.10 8555 typ host"
+    srflx = "candidate:3 1 udp 1686 95.1.2.3 8555 typ srflx raddr 192.168.1.10"
+
+    assert _has_srflx([public_host], [])
+    assert _has_srflx([], [{"candidate": public_host}])
+    assert not _has_srflx([private_host], [])
+    assert _has_srflx([srflx], [])
