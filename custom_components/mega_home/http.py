@@ -37,7 +37,6 @@ from .photos import (
     MAX_PHOTO_BYTES,
     photo_key_known,
     photo_keys,
-    stock_version,
 )
 
 # ⚠ Копии интерфейса в релизе НЕТ (2026-09-06): пока бандл не скачан, отдаём эту

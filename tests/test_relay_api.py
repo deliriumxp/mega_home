@@ -20,7 +20,7 @@ import pytest
 from homeassistant.core import State
 
 from mega_home import ops
-from mega_home.photos import PhotoStore, StockPhotoStore
+from mega_home.photos import PhotoStore
 
 JPEG = b"\xff\xd8\xff\xe0" + b"0" * 32
 
@@ -86,10 +86,9 @@ class _Coordinator:
     def __init__(self, tmp: Path) -> None:
         self.data = CONFIG
         self.photos = PhotoStore(tmp / "own")
-        self.stock_photos = StockPhotoStore(tmp / "stock")
         self.assets = _Assets(tmp / "assets")
         self.icons_dir = tmp / "icons"
-        for directory in ("own", "stock", "assets", "icons"):
+        for directory in ("own", "assets", "icons"):
             (tmp / directory).mkdir(parents=True, exist_ok=True)
 
 
@@ -159,10 +158,10 @@ def test_чужой_ключ_и_не_jpeg_отвергаются(coordinator):
     assert err.value.status == HTTPStatus.BAD_REQUEST
 
 
-def test_заготовка_и_файл_общего_канала_отдаются_тем_же_переносом(coordinator):
-    coordinator.stock_photos.save("r1", "v7", JPEG)
-    assert body_of(call(coordinator, "GET", "api/stock-photo/r1")) == JPEG
-
+def test_файл_общего_канала_отдаётся_тем_же_переносом(coordinator):
+    # ⚠ Своего маршрута заготовок (`api/stock-photo/`) БОЛЬШЕ НЕТ (0.2.40): он
+    # появился раньше общего канала и делал ровно то же — фоны едут ключами
+    # `photo/room/*` и `photo/tile/*` манифеста, приложение просит их оттуда.
     coordinator.assets.path("photo/tile/t1", "a1").write_bytes(JPEG)
     answer = call(coordinator, "GET", "api/asset/photo/tile/t1")
     assert answer["contentType"] == "image/jpeg"

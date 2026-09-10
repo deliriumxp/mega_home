@@ -39,7 +39,6 @@ from .photos import (
     MAX_PHOTO_BYTES,
     photo_key_known,
     photo_keys,
-    stock_version,
 )
 
 JSON_TYPE = "application/json"
@@ -108,8 +107,6 @@ async def _dispatch(
         return _json({"photos": versions})
     if path.startswith("api/photo/"):
         return await _photo(hass, coordinator, method, unquote(path[len("api/photo/") :]), body)
-    if path.startswith("api/stock-photo/") and method == "GET":
-        return await _stock(hass, coordinator, unquote(path[len("api/stock-photo/") :]))
     if path.startswith("api/camera-frame/") and method == "GET":
         # Постер камеры: один кадр на открытие просмотра. ⚠ Не поток — кадр на
         # ПЛИТКЕ обновляется по таймеру, и снаружи его нет вовсе
@@ -224,19 +221,6 @@ async def _photo(
             raise ops.OpError("Фото не найдено", HTTPStatus.NOT_FOUND)
         return _json({"accepted": True})
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.METHOD_NOT_ALLOWED)
-
-
-async def _stock(
-    hass: HomeAssistant, coordinator: MegaHomeCoordinator, key: str
-) -> tuple[int, str, bytes, str]:
-    """Фон, пришедший из менеджера. Версию берём ИЗ КОНФИГА, как и локально."""
-    version = stock_version(coordinator.data, key)
-    if not version:
-        raise ops.OpError("Фото не найдено", HTTPStatus.NOT_FOUND)
-    target = coordinator.stock_photos.path(key, version)
-    if not await hass.async_add_executor_job(target.is_file):
-        raise ops.OpError("Фото не найдено", HTTPStatus.NOT_FOUND)
-    return (HTTPStatus.OK, JPEG_TYPE, await _read(hass, target), IMMUTABLE)
 
 
 async def _asset(

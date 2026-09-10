@@ -105,63 +105,6 @@ class PhotoStore:
             return 0
 
 
-class StockPhotoStore:
-    """Backgrounds the INSTALLER set in the manager, mirrored onto this disk.
-
-    Not the same thing as `PhotoStore`, and deliberately a separate directory:
-    the resident's own photo belongs to the home and is never overwritten by a
-    sync, while these are a copy of what the manager holds and are thrown away
-    the moment the manager stops naming them.
-
-    ⚠ The file name carries the VERSION from the config, so "do we already hold
-    this picture?" is `path.exists()` and never a download to compare bytes.
-    A replaced background is a different name — nothing to invalidate.
-    """
-
-    def __init__(self, directory: Path) -> None:
-        self._dir = directory
-
-    def path(self, room_id: str, version: str) -> Path:
-        room = sha1(room_id.encode("utf-8")).hexdigest()
-        return self._dir / f"{room}_{_safe_version(version)}.jpg"
-
-    def has(self, room_id: str, version: str) -> bool:
-        return self.path(room_id, version).is_file()
-
-    def save(self, room_id: str, version: str, payload: bytes) -> None:
-        """Write one background. Written aside and renamed, as with the resident's."""
-        self._dir.mkdir(0o755, parents=True, exist_ok=True)
-        target = self.path(room_id, version)
-        temporary = target.with_suffix(".part")
-        temporary.write_bytes(payload)
-        temporary.replace(target)
-
-    def prune(self, wanted: dict[str, str]) -> None:
-        """Drop every file the config no longer names — old versions included."""
-        keep = {self.path(room, version).name for room, version in wanted.items()}
-        try:
-            stale = [path for path in self._dir.iterdir() if path.name not in keep]
-        except OSError:
-            return
-        for path in stale:
-            try:
-                path.unlink()
-            except OSError:
-                continue
-
-    def count(self) -> int:
-        """How many backgrounds are mirrored — for diagnostics."""
-        try:
-            return len(list(self._dir.glob("*.jpg")))
-        except OSError:
-            return 0
-
-
-def _safe_version(version: str) -> str:
-    """The version comes from the manager and becomes a file name — keep it boring."""
-    return "".join(char if char.isalnum() else "-" for char in version)[:32]
-
-
 # --- ключи фонов в конфиге -------------------------------------------------
 #
 # ⚠ Живут ЗДЕСЬ, в одном месте на оба входа: локальные view (`http.py`) и
@@ -189,22 +132,3 @@ def photo_key_known(config: dict[str, Any], key: str) -> bool:
     return any(room.get("id") == key for room in config.get("rooms", []))
 
 
-def stock_version(config: dict[str, Any], key: str) -> str | None:
-    """Версия заготовки по ключу: комната или `tile:<id>` плитки.
-
-    ⚠ Источник правды — КОНФИГ, а не адрес: `?v=` в адресе это метка кэша для
-    браузера, и доверять ей как имени файла значило бы отдавать по чужой ссылке
-    то, чего в конфиге уже нет.
-    """
-    if key.startswith(TILE_PHOTO_PREFIX):
-        tile_id = key[len(TILE_PHOTO_PREFIX) :]
-        for tile in config.get("tiles", []):
-            if tile.get("id") == tile_id:
-                version = tile.get("photoVersion")
-                return version if isinstance(version, str) and version else None
-        return None
-    for room in config.get("rooms", []):
-        if room.get("id") == key:
-            version = room.get("photoVersion")
-            return version if isinstance(version, str) and version else None
-    return None
