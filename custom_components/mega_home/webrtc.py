@@ -65,7 +65,13 @@ CANDIDATE_WINDOW = 1.5
 # ⚠ Это НЕ «подождём подольше на всякий случай»: дожидаемся мы только там, где
 # иначе гарантированно отдали бы бесполезный ответ. Есть srflx — работает
 # прежнее окно, и ждать нечего.
-CANDIDATE_WINDOW_COLD = 4.0
+#
+# ⚠ 6, а не 4: go2rtc ищет адрес у STUN синхронно и по очереди, с сетевым
+# таймаутом 3 с на каждый сервер (в списке их два — Google и HA). Первый сервер
+# на объекте может молчать, и тогда окно в 4 с истекало ровно на середине
+# второго — дом снова отдавал ответ без srflx. Шесть секунд закрывают худший
+# случай; после первого захода адрес кэширован 5 минут и работает короткое окно.
+CANDIDATE_WINDOW_COLD = 6.0
 # Пауза после появления внешнего адреса, прежде чем отдать пакет.
 #
 # ⚠ Зеркало раннего выхода браузера (`GATHER_GRACE_MS` в `webrtc-stream.ts`
@@ -176,7 +182,7 @@ async def negotiate(
         LOGGER.debug("own go2rtc not used: %s", err)
     else:
         if _own_running():
-            return await _negotiate_own(hass, entity_id, offer_sdp, _OWN_URL)
+            return await _negotiate_own(hass, entity_id, offer_sdp, _OWN_URL, remote)
 
     from homeassistant.components.camera.const import StreamType
     from homeassistant.components.camera.webrtc import (
@@ -256,7 +262,7 @@ async def negotiate(
 
 
 async def _negotiate_own(
-    hass: HomeAssistant, entity_id: str, offer_sdp: str, url: str
+    hass: HomeAssistant, entity_id: str, offer_sdp: str, url: str, remote: bool = False
 ) -> dict[str, Any]:
     """Offer через свой go2rtc :1985 — без HA :18555/tcp."""
     from homeassistant.exceptions import HomeAssistantError
@@ -289,7 +295,7 @@ async def _negotiate_own(
         stream_source = "ffmpeg:" + stream_source
 
     return await negotiate_source(
-        hass, url, identifier, stream_source, offer_sdp, "с этой камеры"
+        hass, url, identifier, stream_source, offer_sdp, "с этой камеры", remote
     )
 
 
@@ -301,6 +307,7 @@ async def negotiate_source(
     offer_sdp: str,
     what: str = "",
     remote: bool = False,
+    skip_list: bool = False,
 ) -> dict[str, Any]:
     """Свести предложение телефона с ЛЮБЫМ источником своего go2rtc.
 
@@ -313,6 +320,11 @@ async def negotiate_source(
     камера Home Assistant. Второй способ показывать видео мы не заводим —
     ровно поэтому здесь нет ни слова про то, чей это источник
     (docs/trassir-integration-plan.md, §5а у менеджера).
+
+    ⚠ `skip_list` — имя потока заведомо НОВОЕ (эфемерный токен клипа или
+    запасной live-путь): `GET /api/streams` на критическом пути тогда ничего не
+    решает, только добавляет круг через менеджер. Вызывающий знает это точно,
+    поэтому и решает он, а не эвристика по имени (переименуют — молча сломается).
     """
     from go2rtc_client import Go2RtcRestClient
     from go2rtc_client.ws import Go2RtcWsClient, WebRTCAnswer as GoAnswer, WebRTCCandidate as GoCand, WsError
@@ -320,11 +332,17 @@ async def negotiate_source(
 
     session = async_get_clientsession(hass)
     rest = Go2RtcRestClient(session, url)
-    # Добавить поток если его нет
+    # Добавить поток, если его нет. ⚠ Для ЗАВЕДОМО нового имени список не
+    # спрашиваем: он ответит «нет такого», и это ровно то, что мы уже знаем.
     try:
-        streams = await rest.streams.list()
-        if identifier not in streams or not any(stream_source == p.url for p in streams[identifier].producers):
+        if skip_list:
             await rest.streams.add(identifier, [stream_source])
+        else:
+            streams = await rest.streams.list()
+            if identifier not in streams or not any(
+                stream_source == p.url for p in streams[identifier].producers
+            ):
+                await rest.streams.add(identifier, [stream_source])
     except Exception as err:  # noqa: BLE001
         LOGGER.debug("own go2rtc add stream failed: %s", err)
         raise OpError(_cannot_stream(what), HTTPStatus.BAD_GATEWAY) from err

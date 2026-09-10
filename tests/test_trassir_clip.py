@@ -179,7 +179,9 @@ def _offered(
 ) -> FakeHass:
     """Переговоры без команды: ответ ушёл, архив молчит."""
 
-    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
+    async def fake_negotiate(
+        hass, url, identifier, source, sdp, what="", remote=False, skip_list=False
+    ):
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}
 
     from mega_home import webrtc
@@ -261,7 +263,9 @@ def test_закрытие_снимает_поток_и_токен(
     dropped: list[str] = []
     closed: list[str] = []
 
-    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
+    async def fake_negotiate(
+        hass, url, identifier, source, sdp, what="", remote=False, skip_list=False
+    ):
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}
 
     from mega_home import webrtc
@@ -298,7 +302,9 @@ def test_клип_закрывается_даже_если_приложение_
 ) -> None:
     """Ключ уборки — сессия: поля `id` в закрытии может не быть."""
 
-    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
+    async def fake_negotiate(
+        hass, url, identifier, source, sdp, what="", remote=False, skip_list=False
+    ):
         return {"sessionId": "s7", "answer": "sdp", "candidates": []}
 
     from mega_home import webrtc
@@ -340,7 +346,9 @@ def test_сторож_стартует_вслепую_без_готовност�
     # неё, а не мимо.
     monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_ARCHIVE_SETTLE", 0.02)
 
-    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
+    async def fake_negotiate(
+        hass, url, identifier, source, sdp, what="", remote=False, skip_list=False
+    ):
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}
 
     from mega_home import webrtc
@@ -482,7 +490,9 @@ def test_закрытие_до_готовности_не_командует(
 ) -> None:
     """Шторку закрыли раньше готовности: ни команды, ни висящих задач."""
 
-    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
+    async def fake_negotiate(
+        hass, url, identifier, source, sdp, what="", remote=False, skip_list=False
+    ):
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}
 
     from mega_home import webrtc
@@ -544,7 +554,9 @@ def test_канал_без_постоянного_адреса_идёт_по_т�
     один, такая камера не открывалась вовсе — «wrong response on DESCRIBE»."""
     sources: list[str] = []
 
-    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
+    async def fake_negotiate(
+        hass, url, identifier, source, sdp, what="", remote=False, skip_list=False
+    ):
         sources.append(source)
         if source.endswith("_m/"):
             raise RuntimeError("webrtc: streams: wrong response on DESCRIBE")
@@ -579,7 +591,9 @@ def test_живой_просмотр_по_токену_ничем_не_кома�
 ) -> None:
     """Запасной путь — это тот же сеанс, что у записи, но БЕЗ команды архива."""
 
-    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
+    async def fake_negotiate(
+        hass, url, identifier, source, sdp, what="", remote=False, skip_list=False
+    ):
         if source.endswith("_m/"):
             raise RuntimeError("404")
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}

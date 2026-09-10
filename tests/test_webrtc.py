@@ -199,9 +199,11 @@ class _StreamsApi:
     def __init__(self) -> None:
         self.streams: dict[str, _Stream] = {}
         self.added: list[tuple[str, list]] = []
+        self.listed = 0
         self.fail = False
 
     async def list(self) -> dict[str, _Stream]:
+        self.listed += 1
         if self.fail:
             raise RuntimeError("go2rtc is down")
         return self.streams
@@ -651,6 +653,38 @@ def test_свой_go2rtc_кандидаты_едут_с_mline(_ha_camera_modules
     # (когда открыта, клиент): срок нужен, чтобы забытая сессия не держала
     # камеру вечно — телефон с убитым приложением `close` не пришлёт никогда.
     assert webrtc._own_sessions[result["sessionId"]][1] is ws
+
+
+def test_эфемерный_поток_не_спрашивает_список(own_go2rtc):
+    """⚠ Имя клипа эфемерно (в нём токен): `GET /api/streams` на критическом пути
+    ничего не решает, только добавляет круг через менеджер. `skip_list` его
+    убирает, а `add` остаётся — без него go2rtc не найдёт поток."""
+    from mega_home import webrtc
+
+    async def scenario():
+        task = asyncio.ensure_future(
+            webrtc.negotiate_source(
+                object(),
+                "http://127.0.0.1:1985",
+                "trassir_tok",
+                "rtsp://cam/tok",
+                "v=0 offer",
+                "запись события",
+                True,
+                True,
+            )
+        )
+        await asyncio.sleep(0)
+        ws = _Go2RtcWsClient.instances[-1]
+        ws.receive(_GoAnswer("v=0 answer"))
+        ws.receive(_GoCandidate("candidate:1 typ srflx"))
+        return await task
+
+    run(scenario())
+
+    rest = _Go2RtcRestClient.instances[-1]
+    assert rest.streams.listed == 0
+    assert rest.streams.added == [("trassir_tok", ["rtsp://cam/tok"])]
 
 
 def test_отказ_своего_go2rtc_не_подменяется_фолбэком(_ha_camera_modules, own_go2rtc, monkeypatch):

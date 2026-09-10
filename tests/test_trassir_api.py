@@ -224,7 +224,9 @@ def test_камера_регистратора_показывается_домо
     """
     negotiated: list[tuple[str, str]] = []
 
-    async def fake_negotiate(hass, url, identifier, source, sdp, what="", remote=False):
+    async def fake_negotiate(
+        hass, url, identifier, source, sdp, what="", remote=False, skip_list=False
+    ):
         negotiated.append((identifier, source))
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}
 

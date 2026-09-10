@@ -157,8 +157,18 @@ class ManagerLink:
         if socket is None or not isinstance(request_id, str):
             return
         try:
+            # ⚠ `remote=True` — дверь линка и ЕСТЬ «снаружи»: по ней приходят
+            # запросы менеджера (жилец не дома / макет инсталлятора). Без этого
+            # признака переговоры WebRTC считались домашними и не ждали внешний
+            # адрес дома (`CANDIDATE_WINDOW_COLD`), а первый, ещё холодный к STUN
+            # go2rtc отдавал одни host-кандидаты — телефон снаружи не достучался
+            # бы ни с первого раза, ни со второго (живой отчёт 2026-09-10).
             payload = await ops.run(
-                self._hass, self._coordinator, frame.get("op") or "", frame.get("payload")
+                self._hass,
+                self._coordinator,
+                frame.get("op") or "",
+                frame.get("payload"),
+                remote=True,
             )
             reply: dict[str, Any] = {"t": "res", "id": request_id, "ok": True, "payload": payload}
         except ops.OpError as err:

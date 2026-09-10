@@ -327,8 +327,10 @@ class ClipSessions:
 
         settings = self._gateway.settings
         source = f"rtsp://{settings['host']}:{settings['rtspPort']}/{clip.token}"
+        # ⚠ `skip_list=True`: имя потока клипа эфемерно (в нём токен), списком
+        # его существование не проверяем — это лишний круг на критическом пути.
         answer = await webrtc.negotiate_source(
-            hass, OWN_URL, clip.stream, source, sdp, "запись события", remote
+            hass, OWN_URL, clip.stream, source, sdp, "запись события", remote, True
         )
         clip.session_id = answer.get("sessionId")
         # ⚠ Момент, от которого отсчитывается пауза перед командой архива:
@@ -543,8 +545,10 @@ class ClipSessions:
         self._clips[clip_id] = clip
         self._arm(clip_id, clip)
         source = f"rtsp://{settings['host']}:{settings['rtspPort']}/{token}"
+        # ⚠ `skip_list=True`: имя потока запасного пути тоже эфемерно (токен),
+        # списком его существование проверять нечего.
         answer = await webrtc.negotiate_source(
-            hass, OWN_URL, clip.stream, source, sdp, "с этой камеры", remote
+            hass, OWN_URL, clip.stream, source, sdp, "с этой камеры", remote, True
         )
         clip.session_id = answer.get("sessionId")
         if clip.idle:

@@ -38,7 +38,7 @@ def link(answer):
     instance._answers = set()
     ops_run = ops.run
 
-    async def patched(hass, coordinator, op, payload):
+    async def patched(hass, coordinator, op, payload, remote=False):
         return answer(op, payload)
 
     ops.run = patched
@@ -80,7 +80,7 @@ def test_ответ_не_держит_чтение_сокета():
     instance._coordinator = object()
     instance._answers = set()
     ops_run = ops.run
-    ops.run = lambda hass, coordinator, op, payload: slow(op, payload)
+    ops.run = lambda hass, coordinator, op, payload, remote=False: slow(op, payload)
     socket = _Socket()
 
     async def run():
@@ -123,6 +123,40 @@ def test_неожиданная_ошибка_тоже_возвращается_�
     # ⚠ Внутренности наружу не уезжают: жильцу нечего делать с текстом
     # исключения, а менеджеру — тем более.
     assert "что-то сломалось" not in sent[0]["error"]
+
+
+def test_дверь_линка_помечает_запрос_снаружи():
+    """⚠ Весь фикс холодного STUN держится на этом признаке: переговоры WebRTC,
+    пришедшие от менеджера, обязаны считаться «снаружи». Без него дом не ждёт
+    внешний адрес (`CANDIDATE_WINDOW_COLD`), первый оффер уезжает с одними
+    host-кандидатами и не открывается — а повтор, уже тёплый, работает. Ровно
+    это и выглядело как «камера открывается со второго раза».
+    """
+    instance = ManagerLink.__new__(ManagerLink)
+    instance._hass = object()
+    instance._coordinator = object()
+    instance._answers = set()
+    seen: list[bool] = []
+    ops_run = ops.run
+
+    async def patched(hass, coordinator, op, payload, remote=False):
+        seen.append(remote)
+        return {}
+
+    ops.run = patched
+    socket = _Socket()
+
+    async def run():
+        await instance._handle({"t": "req", "id": "r1", "op": "webrtc"}, socket)
+        if instance._answers:
+            await asyncio.gather(*instance._answers)
+
+    try:
+        asyncio.run(run())
+    finally:
+        ops.run = ops_run
+
+    assert seen == [True]
 
 
 def test_кадр_без_идентификатора_игнорируется():
