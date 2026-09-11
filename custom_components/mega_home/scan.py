@@ -7,12 +7,10 @@
 обход и рисует результат.
 
 ⚠ Здесь НЕТ толкования «что это за устройство»: только обнаружение хостов,
-перебор веб-портов, снятие заголовка/`<title>` страницы и ПОДТВЕРЖДЕНИЕ
-признаков (RTSP/ONVIF — «это видеонаблюдение»). Смысл (какой порт открывать,
-что считать веб-интерфейсом, как назвать вендора и как подписать видеонаблюдение
-в строке) живёт в менеджере и меняется его деплоем, а не релизом HACS с
-перезапуском Home Assistant на КАЖДОМ объекте (docs/plan-thin-integration.md в
-менеджере).
+перебор веб-портов и снятие заголовка/`<title>` страницы. Смысл (какой порт
+открывать, что считать веб-интерфейсом, как назвать вендора) живёт в менеджере и
+меняется его деплоем, а не релизом HACS с перезапуском Home Assistant на КАЖДОМ
+объекте (docs/plan-thin-integration.md в менеджере).
 
 ⚠ Кто зовёт: ТОЛЬКО менеджер живым каналом, где объект опознан своим токеном.
 Локальной HTTP-двери у этой операции нет и быть не должно — контур дома без
@@ -32,7 +30,6 @@ import asyncio
 import ipaddress
 import re
 import socket
-import ssl
 import time
 from http import HTTPStatus
 from typing import Any
@@ -68,36 +65,6 @@ WEB_PORTS = (
 DISCOVERY_PORTS = (80, 443, 9)
 # Порты, на которых по умолчанию HTTPS: сначала пробуем его, иначе — HTTP.
 TLS_PORTS = frozenset({443, 8443, 9443, 5001})
-# Порты видеопотока (RTSP) — ОТДЕЛЬНО от веб-портов: спрашиваем про них только
-# затем, чтобы отличить видеонаблюдение от всего остального. 554 — стандарт,
-# 8554 — второй по частоте, 322 — RTSP поверх TLS (`rtsps`).
-RTSP_PORTS = ((554, False), (8554, False), (322, True))
-# Запрос `OPTIONS`: единственный метод RTSP, обязанный работать без авторизации
-# (RFC 2326, §10.1) — ответ не зависит от того, есть ли у нас пароль.
-RTSP_OPTIONS = b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: mega-manager\r\n\r\n"
-# Срок диалога по RTSP: камера под нагрузкой отвечает за полсекунды, но обрыв на
-# этом сроке — не приговор устройству, поэтому берём с запасом.
-VIDEO_TIMEOUT_S = 1.5
-# Путь ONVIF-службы устройства: он один и тот же у всех вендоров.
-ONVIF_PATH = "/onvif/device_service"
-# Тело ONVIF-запроса — `GetSystemDateAndTime`: ЕДИНСТВЕННЫЙ запрос ONVIF,
-# который устройство обязано обслужить без авторизации. Спросить что-то
-# осмысленнее — получить `401` от каждой настроенной железки и не отличить
-# ONVIF от обычной страницы за авторизацией.
-ONVIF_BODY = (
-    '<?xml version="1.0" encoding="UTF-8"?>'
-    '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
-    '<s:Body><GetSystemDateAndTime xmlns="http://www.onvif.org/ver10/device/wsdl"/>'
-    "</s:Body></s:Envelope>"
-)
-ONVIF_CONTENT_TYPE = "application/soap+xml; charset=utf-8"
-# Ответ RTSP-сервера: версия протокола и код. `200 OK` — настроенная камера,
-# `401` — та, что требует пароль (и это тоже доказательство: веб-сервис на этом
-# порту так не ответит), `404` — регистратор, не знающий `OPTIONS *`.
-_RTSP_RE = re.compile(r"^RTSP/\d\.\d\s+\d{3}")
-# Конверт SOAP любого вендора: `<s:Envelope>`, `<SOAP-ENV:Envelope>`, `<soapenv:…>`.
-_SOAP_RE = re.compile(r"<(?:[\w.-]+:)?envelope[\s>]|soap-env|soapenv", re.IGNORECASE)
-_ONVIF_RESPONSE_RE = re.compile(r"getsystemdateandtimeresponse", re.IGNORECASE)
 # Снятие страницы: короткий срок и малый потолок — это заголовок, а не файл.
 FINGERPRINT_TIMEOUT_S = 3.0
 FINGERPRINT_CONCURRENCY = 24
@@ -134,7 +101,6 @@ async def run(hass: HomeAssistant, payload: dict[str, Any]) -> dict[str, Any]:
     hosts.sort(key=lambda host: ipaddress.ip_address(host["ip"]))
     await _scan_ports(hosts)
     await _fingerprint(hass, hosts)
-    await _probe_video(hass, hosts)
     await _names(hosts)
 
     LOGGER.info(
@@ -363,121 +329,6 @@ def _title(text: str) -> str:
     if not match:
         return ""
     return re.sub(r"\s+", " ", match.group(1)).strip()[:80]
-
-
-async def _probe_video(hass: HomeAssistant, hosts: list[dict[str, Any]]) -> None:
-    """Опознать видеонаблюдение: RTSP-порты прямо и ONVIF поверх веб-портов.
-
-    ⚠ Предмет — ВИДЕОНАБЛЮДЕНИЕ, а не «камера»: по RTSP и ONVIF одинаково
-    отвечают регистраторы, камеры и вызывные панели домофонии, и по протоколу
-    они неразличимы. Толкование того, как это назвать в интерфейсе, живёт в
-    менеджере (docs/plan-thin-integration.md).
-
-    ⚠ Отметка ставится по СОСТОЯВШЕМУСЯ диалогу, а не по открытому порту: «554
-    открыт» одинаково выглядит у камеры и у чужого сервиса, вставшего на тот же
-    номер. Правила опознания ОБЩИЕ с менеджером
-    (`backend/src/modules/lan-scan/video-probe.ts`) — расходиться им нельзя.
-    """
-    semaphore = asyncio.Semaphore(CONCURRENCY)
-
-    async def rtsp_one(host: dict[str, Any], port: int, use_tls: bool) -> None:
-        async with semaphore:
-            if await _answers_rtsp(host["ip"], port, use_tls):
-                host["ports"].append({"port": port, "tls": use_tls, "video": "rtsp"})
-
-    await asyncio.gather(
-        *(rtsp_one(host, port, tls) for host in hosts for port, tls in RTSP_PORTS)
-    )
-
-    from homeassistant.helpers.aiohttp_client import async_get_clientsession
-
-    session = async_get_clientsession(hass)
-    onvif_semaphore = asyncio.Semaphore(FINGERPRINT_CONCURRENCY)
-
-    async def onvif_one(host: dict[str, Any]) -> None:
-        async with onvif_semaphore:
-            for port in host["ports"]:
-                # По порту без ответа страницы не стучимся: там либо не HTTP,
-                # либо он молчит, и ждать две попытки по три секунды не за что.
-                if port.get("video") or "status" not in port:
-                    continue
-                answer = await _ask_onvif(
-                    session, host["ip"], port["port"], port["tls"]
-                )
-                if answer and _looks_like_onvif(*answer):
-                    port["video"] = "onvif"
-                    return
-
-    await asyncio.gather(*(onvif_one(host) for host in hosts))
-    for host in hosts:
-        host["ports"].sort(key=lambda port: port["port"])
-
-
-async def _answers_rtsp(ip: str, port: int, use_tls: bool) -> bool:
-    """Порт говорит по RTSP: спрашиваем `OPTIONS` и читаем строку статуса."""
-    context: ssl.SSLContext | None = None
-    if use_tls:
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port, ssl=context), CONNECT_TIMEOUT_S
-        )
-    except (asyncio.TimeoutError, OSError, ssl.SSLError):
-        return False
-    try:
-        writer.write(RTSP_OPTIONS)
-        await writer.drain()
-        line = await asyncio.wait_for(reader.readline(), VIDEO_TIMEOUT_S)
-    except (asyncio.TimeoutError, OSError, ssl.SSLError):
-        return False
-    finally:
-        writer.close()
-    return bool(_RTSP_RE.match(line.decode("utf-8", "replace")))
-
-
-async def _ask_onvif(
-    session: aiohttp.ClientSession, ip: str, port: int, tls: bool
-) -> tuple[int, str, dict[str, str]] | None:
-    """Спросить веб-порт про ONVIF. `None` — порт не ответил вовсе."""
-    scheme = "https" if tls else "http"
-    try:
-        async with session.post(
-            f"{scheme}://{ip}:{port}{ONVIF_PATH}",
-            data=ONVIF_BODY,
-            headers={"Content-Type": ONVIF_CONTENT_TYPE},
-            timeout=aiohttp.ClientTimeout(total=FINGERPRINT_TIMEOUT_S),
-            ssl=False,
-            allow_redirects=False,
-        ) as answer:
-            raw = await answer.content.read(MAX_FINGERPRINT_BYTES)
-            return answer.status, raw.decode("utf-8", "replace"), dict(answer.headers)
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError):
-        return None
-
-
-def _looks_like_onvif(status: int, body: str, headers: dict[str, str]) -> bool:
-    """Ответ похож на ONVIF.
-
-    1. тело несёт `GetSystemDateAndTimeResponse` — устройство ОТВЕЧАЕТ на ONVIF;
-    2. тело — конверт SOAP: отказ тоже приходит конвертом, тогда как обычный
-       веб-сервер на этом адресе отвечает `404` и HTML (спрашиваем-то мы
-       ОДИН адрес — ONVIF'овский);
-    3. `401`, где ONVIF назван в теле или в `WWW-Authenticate`.
-
-    ⚠ Просто слово «onvif» в теле НЕ считается: оно встречается в веб-мордах
-    («настройки ONVIF» на обычной странице), и по нему отметка встала бы на
-    устройство, которое об ONVIF только рассказывает.
-    """
-    if _ONVIF_RESPONSE_RE.search(body):
-        return True
-    if _SOAP_RE.search(body):
-        return True
-    if status != 401:
-        return False
-    text = "\n".join([body, *headers.values()]).lower()
-    return "onvif" in text
 
 
 async def _names(hosts: list[dict[str, Any]]) -> None:
