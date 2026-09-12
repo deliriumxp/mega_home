@@ -239,3 +239,25 @@ def test_фон_снятой_из_состава_комнаты_читается
     with pytest.raises(ops.OpError) as err:
         call(coordinator, "POST", "api/photo/r1", JPEG)
     assert err.value.status == HTTPStatus.NOT_FOUND
+
+
+def test_состояние_архива_доезжает_и_снаружи(coordinator, monkeypatch):
+    """⚠ Строка «поиск в архиве…» обязана работать ОБЕИМИ дверями.
+
+    Состояние архива спрашивают инструментом живой сессии (`/command`), а он
+    до этой правки был открыт только дома: снаружи приложение получало бы 404 и
+    молча показывало иглу, бегущую впереди картинки. Разница «дома/снаружи»
+    обязана оставаться только в адресе базы.
+    """
+    asked: list[tuple] = []
+
+    async def session_command(coordinator, clip, fn, params):
+        asked.append((clip, fn, params))
+        return [{"token": "tok1", "state": "4", "time": "2026-09-12 11:56:58"}]
+
+    monkeypatch.setattr(ops, "trassir_session_command", session_command)
+    payload = json.dumps({"fn": "archive_status", "params": {"type": "state"}}).encode()
+    answer = call(coordinator, "POST", "api/trassir/clips/trassir:tok1/command", payload)
+
+    assert asked == [("trassir:tok1", "archive_status", {"type": "state"})]
+    assert json_of(answer)[0]["state"] == "4"

@@ -170,6 +170,22 @@ async def _dispatch(
         # открытие: это команда дому, а не данные для конфига.
         clip = unquote(path[len("api/trassir/clips/") : -len("/ready")])
         return _json(await ops.trassir_ready(coordinator, clip))
+    if path.startswith("api/trassir/clips/") and path.endswith("/command") and method == "POST":
+        # ⚠ Инструмент живой сессии обязан доезжать ОБЕИМИ дверями. Иначе
+        # «дома» и «снаружи» перестают отличаться только адресом базы:
+        # приложение снаружи не узнало бы, что регистратор ищет метку, — и
+        # строка состояния архива работала бы лишь в домашней сети. Словарь
+        # команд остаётся разрешённым (`ops.trassir_session_command`), это не
+        # произвольный прокси на регистратор.
+        clip = unquote(path[len("api/trassir/clips/") : -len("/command")])
+        body_json = _json_body(body)
+        if not isinstance(body_json, dict):
+            raise ops.OpError("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
+        return _json(
+            await ops.trassir_session_command(
+                coordinator, clip, body_json.get("fn"), body_json.get("params")
+            )
+        )
     if path.startswith("api/trassir/events/") and path.endswith("/thumb") and method == "GET":
         event = unquote(path[len("api/trassir/events/") : -len("/thumb")])
         content_type, raw = await ops.trassir_thumb(
