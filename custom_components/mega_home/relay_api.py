@@ -177,9 +177,6 @@ async def _dispatch(
                 window_stop_us=body_json.get("windowStopUs"),
             )
         )
-    if path.startswith("api/trassir/clips/") and path.endswith("/days") and method == "GET":
-        clip = unquote(path[len("api/trassir/clips/") : -len("/days")])
-        return _json(await ops.trassir_archive_days(coordinator, clip))
     if path.startswith("api/trassir/clips/") and path.endswith("/seek") and method == "POST":
         # Перемотка переоткрытием — та же дверь, что и открытие: снаружи
         # запись идёт тем же путём, что живой просмотр, без единой новой трубы.

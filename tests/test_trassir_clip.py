@@ -37,9 +37,6 @@ class FakeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.tokens = 0
-        # ⚠ Календарь дней регистратор отдаёт РОВНО ОДИН РАЗ на открытие потока
-        # (замер стенда 2026-09-12) — флаг и держит эту правду в спеке.
-        self.calendar_given = False
 
     async def async_get_video(self, guid: str, stream: str, container: str) -> str:
         self.calls.append(("get_video", {"guid": guid, "stream": stream, "container": container}))
@@ -70,17 +67,6 @@ class FakeClient:
                     {"begin": "60000", "end": "60010"},  # вечером — вне окна
                 ],
             }
-        ]
-
-    async def async_archive_events(self, token: str) -> list[dict[str, Any]]:
-        """Дни с архивом — событием `CalendarEvent` в открытом потоке."""
-        self.calls.append(("archive_events", {"token": token}))
-        if self.calendar_given:
-            return [{"token": f"tok{self.tokens}", "event_name": "SpeedLimitEvent"}]
-        self.calendar_given = True
-        return [
-            {"event_name": "CalendarEvent", "calendar": ["2026-09-08", "2026-09-09"]},
-            {"event_name": "SpeedLimitEvent"},
         ]
 
     async def async_ping(self, token: str) -> None:
@@ -256,13 +242,11 @@ def test_команда_одна_и_по_готовности(
     assert answer["again"] is False
     # Где курсор встал на самом деле — наружу: у архива бывают дыры.
     assert answer["firstFrameTs"] == "2026-09-09 14:00:00"
-    # ⚠ Записанные участки — из шкалы регистратора и ОБРЕЗАННЫЕ окном: запись
-    # на объекте ведётся по движению, дыры внутри окна это норма, и рисует их
-    # приложение. Дальний участок того же дня в окно не попадает.
-    assert answer["segments"] == [
-        {"startUs": 1_788_959_990_000_000, "stopUs": 1_788_959_997_000_000},
-        {"startUs": 1_788_960_020_000_000, "stopUs": 1_788_960_030_000_000},
-    ]
+    # ⚠ Наружу уходит только ответ РЕГИСТРАТОРА: где он встал и откуда просили.
+    # Участки записи, окно и «писали ли вообще» считает приложение — в доме этих
+    # толкований больше нет (docs/plan-thin-integration.md, «Широкая дверь»).
+    assert "segments" not in answer
+    assert "outOfWindow" not in answer
     commands = [p for n, p in gateway.client.calls if n == "archive_command"]
     assert len(commands) == 1
     assert commands[0]["start"] == EVENT["timestampUs"] - 10_000_000, (
@@ -775,90 +759,46 @@ def test_старый_бандл_получает_умолчание_по_две
 # открывается ПО МЕТКЕ, и окно у него — СУТКИ, а не минуты вокруг события.
 
 
-def test_архив_по_метке_открывается_сутками(gateway: FakeGateway) -> None:
-    """Окно клипа архива — целые сутки метки, и оно поедет за курсором."""
+def test_окно_шкалы_приходит_от_приложения(gateway: FakeGateway) -> None:
+    """⚠ Окно считает ПРИЛОЖЕНИЕ: шкалу рисует оно. Дом хранит присланное и
+    уезжает обратно как есть — считать сутки в доме больше нечему."""
     at = EVENT["timestampUs"]
-    answer = asyncio.run(gateway.clips.async_open_at("cam1", at))
+    window = (at - 3_600_000_000, at + 3_600_000_000)
+    answer = asyncio.run(gateway.clips.async_open_at("cam1", at, None, False, None, *window))
 
-    day = 86_400_000_000
-    assert answer["startUs"] == (at // day) * day, "окно — сутки метки"
-    assert answer["stopUs"] == (at // day) * day + day
+    assert answer["startUs"] == window[0]
+    assert answer["stopUs"] == window[1]
     assert answer["positionUs"] == at, "играем ровно с метки"
 
 
-def test_архив_без_метки_это_последняя_запись(gateway: FakeGateway) -> None:
-    """⚠ Своих часов в шкале Trassir у приложения нет: «последнюю запись»
-    считает ДОМ по своим часам (он на том же объекте и в том же поясе), а
-    регистратор сам встанет на ближайший записанный кадр."""
-    from mega_home import trassir_clip
+def test_без_окна_дом_ничего_не_считает(gateway: FakeGateway) -> None:
+    """Окна нет — и нет: выдумывать сутки в доме запрещено (замок
+    `test_thin_gateway.py`), и шкалу посчитает тот, кто её рисует."""
+    answer = asyncio.run(gateway.clips.async_open_at("cam1", EVENT["timestampUs"]))
 
-    moment = 1_788_960_000_000_000
-    original = trassir_clip.trassir_now_us
-    trassir_clip.trassir_now_us = lambda: moment
-    try:
-        answer = asyncio.run(gateway.clips.async_open_at("cam1"))
-    finally:
-        trassir_clip.trassir_now_us = original
-
-    assert answer["positionUs"] == moment
-    assert answer["stopUs"] - answer["startUs"] == 86_400_000_000
+    assert answer["startUs"] is None and answer["stopUs"] is None
 
 
-def test_дни_архива_читаются_один_раз_и_помнятся(gateway: FakeGateway) -> None:
-    """⚠ `CalendarEvent` приходит РОВНО ОДИН РАЗ на открытие потока: спросить
-    повторно не у кого. Поэтому дом помнит календарь у клипа, а спека считает
-    сами вопросы — второго быть не должно."""
-    opened = asyncio.run(gateway.clips.async_open_at("cam1", EVENT["timestampUs"]))
-    gateway.client.calls.clear()
+def test_без_метки_часы_не_подставляются(gateway: FakeGateway, monkeypatch) -> None:
+    """⚠ Метки нет — «последняя запись», и НИЧЕГО считать не надо: регистратор
+    встанет на ближайшую запись по СВОИМ часам, а куда встал — скажет сам.
 
-    first = asyncio.run(gateway.clips.async_days(opened["id"]))
-    second = asyncio.run(gateway.clips.async_days(opened["id"]))
+    Подставить сюда «сейчас» значило бы завести в доме часы чужой шкалы: она с
+    поясом сервера, и наши часы сдвинули бы запись на этот пояс.
+    """
+    opened = asyncio.run(gateway.clips.async_open_at("cam1"))
+    assert opened["positionUs"] is None
 
-    assert first["days"] == ["2026-09-08", "2026-09-09"]
-    assert second["days"] == ["2026-09-08", "2026-09-09"]
-    assert [n for n, _ in gateway.client.calls if n == "archive_events"] == ["archive_events"]
-
-
-def test_разметка_дня_читается_каждый_раз(gateway: FakeGateway) -> None:
-    """А вот разметку суток — читаем ЗАНОВО: после прыжка на другой день
-    вчерашние участки на новой шкале были бы враньём."""
-    opened = asyncio.run(gateway.clips.async_open_at("cam1", EVENT["timestampUs"]))
-    gateway.client.calls.clear()
-
-    asyncio.run(gateway.clips.async_days(opened["id"]))
-    asyncio.run(gateway.clips.async_days(opened["id"]))
-
-    assert [n for n, _ in gateway.client.calls if n == "archive_status"] == [
-        "archive_status",
-        "archive_status",
-    ]
-
-
-def test_прыжок_на_другой_день_двигает_окно(
-    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """⚠ У архива окно ЕДЕТ за курсором: шкала приложения — сутки, и «покажи
-    9 сентября» это перемотка на другой день, а не выход за окно. Кламп здесь
-    был бы приговором — уехав на день вперёд, жилец не вернулся бы назад."""
-    opened = asyncio.run(gateway.clips.async_open_at("cam1", EVENT["timestampUs"]))
     hass = _offered(gateway, monkeypatch, opened["id"])
 
     async def scenario() -> dict[str, Any]:
         await gateway.clips.async_ready(opened["id"])
-        gateway.client.calls.clear()
-        answer = await gateway.clips.async_seek(opened["id"], other_day, None, 1)
         await _quiet(hass, gateway)
-        return answer
+        return next(p for n, p in gateway.client.calls if n == "archive_command")
 
-    other_day = EVENT["timestampUs"] - 86_400_000_000
-    answer = asyncio.run(scenario())
-
-    assert answer["id"] == opened["id"], "тот же клип — переговоров не будет"
-    day = 86_400_000_000
-    assert answer["startUs"] == (other_day // day) * day
-    command = next(p for n, p in gateway.client.calls if n == "archive_command")
-    assert command["direction"] == 1, "«ближайший кадр ВПЕРЁД»: полночь дня — не запись"
-
+    command = asyncio.run(scenario())
+    assert "start" not in command, "часов в доме нет"
+    assert "stop" not in command
 
 def test_событие_не_двигает_окно(gateway: FakeGateway) -> None:
     """У клипа СОБЫТИЯ окно стоит на месте: его задало событие, и приложение
@@ -872,43 +812,3 @@ def test_событие_не_двигает_окно(gateway: FakeGateway) -> No
     assert answer["stopUs"] == opened["stopUs"]
 
 
-def test_календарь_читается_сразу_после_старта_записи(
-    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """⚠ Поток только что открыт — это ЕДИНСТВЕННЫЙ момент, когда регистратор
-    ещё готов рассказать, за какие дни у него есть архив. Спрашиваем сразу
-    после команды: позже `CalendarEvent` уже не придёт."""
-    opened = asyncio.run(gateway.clips.async_open_at("cam1", EVENT["timestampUs"]))
-    hass = _offered(gateway, monkeypatch, opened["id"])
-
-    async def scenario() -> list[str]:
-        await gateway.clips.async_ready(opened["id"])
-        await _quiet(hass, gateway)
-        # ⚠ Второй раз спрашивать не у кого — календарь уже должен быть у клипа.
-        gateway.client.calls.clear()
-        days = (await gateway.clips.async_days(opened["id"]))["days"]
-        assert not [n for n, _ in gateway.client.calls if n == "archive_events"], (
-            "календарь прочитан стартом, а не при отрисовке"
-        )
-        return days
-
-    assert asyncio.run(scenario()) == ["2026-09-08", "2026-09-09"]
-
-
-def test_эпоха_это_не_день(gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch) -> None:
-    """⚠ Пока архив не позиционирован, регистратор отвечает `1970-01-01` и
-    пустой шкалой — это «не знаю», а не «первое января».
-
-    Без этой проверки приложение рисовало жильцу календарь 1970 года (живой
-    отчёт с объекта 2026-09-12: «архив открывается на 1 января»).
-    """
-
-    async def empty_status(kind: str = "timeline") -> list[dict[str, Any]]:
-        return [{"token": "tok1", "day_start": "1970-01-01", "timeline": []}]
-
-    monkeypatch.setattr(gateway.client, "async_archive_status", empty_status)
-    opened = asyncio.run(gateway.clips.async_open_at("cam1", EVENT["timestampUs"]))
-    days = asyncio.run(gateway.clips.async_days(opened["id"]))
-
-    assert days["dayStartUs"] is None
-    assert days["segments"] == []

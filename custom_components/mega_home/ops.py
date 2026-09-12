@@ -790,22 +790,6 @@ async def trassir_clip_at(
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
 
 
-async def trassir_archive_days(
-    coordinator: MegaHomeCoordinator, clip_id: str
-) -> dict[str, Any]:
-    """Дни с архивом у канала этого клипа и разметка суток, где он стоит.
-
-    ⚠ Разметка читается КАЖДЫЙ раз: после прыжка на другой день вчерашние
-    участки на новой шкале — враньё.
-    """
-    from .trassir_client import TrassirError
-
-    try:
-        return await trassir(coordinator).clips.async_days(clip_id)
-    except TrassirError as err:
-        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
-
-
 async def trassir_seek(
     coordinator: MegaHomeCoordinator,
     clip_id: str,

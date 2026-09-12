@@ -92,156 +92,20 @@ def _archive_stream(quality: str | None, remote: bool | None) -> str:
     return TRASSIR_ARCHIVE_SUB if remote else TRASSIR_ARCHIVE_MAIN
 
 
-# Сутки в шкале Trassir: она идёт целыми сутками, поэтому границы дня — это
-# целочисленное деление (та же арифметика, что у приложения в `eventDay`).
-DAY_US = 86_400_000_000
-
-
-def day_bounds(timestamp_us: int) -> tuple[int, int]:
-    """Сутки шкалы Trassir, в которые попала метка.
-
-    ⚠ Пояс здесь НЕ при чём: шкала Trassir — это unix-время с уже прибавленным
-    поясом сервера, и «полночь» в ней — просто начало суток этого числа.
-    Пересчёт через наши часы сдвинул бы границу на пояс второй раз.
-    """
-    start = (int(timestamp_us) // DAY_US) * DAY_US
-    return start, start + DAY_US
-
-
-def trassir_now_us() -> int:
-    """«Сейчас» в шкале Trassir — по часам ДОМА.
-
-    ⚠ Нужно ровно для одного: открыть архив канала, когда метки взять неоткуда
-    («покажи последнюю запись»). Дом стоит на том же объекте и живёт в том же
-    поясе, что регистратор, поэтому его наивное местное время в `timegm` даёт ту
-    же шкалу, что и метки архива. Пояс, разошедшийся с регистратором, сдвинул бы
-    открытие на часы — то есть ошибка видна сразу, а не молчит.
-    """
-    return calendar.timegm(datetime.now().timetuple()) * 1_000_000
-
-
-def _day_start_of(rows: Any, token: str) -> int | None:
-    """Сутки, на которых стоит архив этого токена, — по ответу регистратора.
-
-    ⚠ Своих расчётов здесь нет намеренно: регистратор один знает, куда встал
-    курсор после перемотки, и `day_start` — его собственный ответ. Наша
-    арифметика совпала бы с ним до первой смены суток посреди просмотра.
-
-    ⚠ Пока архив НЕ ПОЗИЦИОНИРОВАН (поток открыт, команды ещё не было),
-    регистратор отвечает строкой `1970-01-01` и пустой шкалой — это «не знаю»,
-    а не «первое января». Отличить одно от другого без этой проверки нельзя, и
-    приложение рисовало жильцу «1 января 1970» в календаре (живой отчёт
-    2026-09-12). Поэтому: пустая шкала — не день вовсе.
-    """
-    if not isinstance(rows, list):
-        return None
-    for row in rows:
-        if not isinstance(row, dict) or row.get("token") != token:
-            continue
-        if not row.get("timeline"):
-            return None
-        try:
-            day = datetime.strptime(str(row.get("day_start")), "%Y-%m-%d")
-        except ValueError:
-            return None
-        at = int(calendar.timegm(day.timetuple())) * 1_000_000
-        # Эпоха — тот же «не знаю», пришедший другой формой.
-        return at or None
-    return None
-
-
-def _calendar_days(rows: Any) -> list[str] | None:
-    """Дни с архивом из событий открытого потока (`CalendarEvent`).
-
-    ⚠ Приходит ОДИН РАЗ на открытие потока, поэтому вызывающий обязан
-    запомнить список: спросить его второй раз будет не у кого (замер стенда
-    2026-09-12 — в повторных ответах календаря нет).
-    """
-    if not isinstance(rows, list):
-        return None
-    for row in rows:
-        if isinstance(row, dict) and row.get("event_name") == "CalendarEvent":
-            days = row.get("calendar")
-            if isinstance(days, list):
-                return [str(day) for day in days]
-    return None
-
-
-def _segments(
-    rows: Any, token: str, start_us: int, stop_us: int
-) -> list[dict[str, int]]:
-    """Записанные участки архива внутри окна клипа — из `archive_status`.
-
-    ⚠ Зачем это вообще: на объекте запись ведётся ПО ДВИЖЕНИЮ (замер офисного
-    регистратора 2026-09-09: фрагменты по 6-8 секунд, дыры в минуты). Поэтому
-    внутри минутного окна события данные есть лишь местами, и в дыре
-    проигрыватель честно стоит на последнем кадре — а выглядит это как
-    зависшая картинка. Отдать участки наружу дешевле любых догадок: рисует их
-    и толкует ПРИЛОЖЕНИЕ (docs/plan-thin-integration.md).
-
-    ⚠ Шкала: `begin`/`end` — СЕКУНДЫ ОТ НАЧАЛА СУТОК `day_start`, и сутки эти
-    в шкале самого Trassir (unix + пояс сервера). Поэтому день переводим тем же
-    `timegm`, что и `_outside`: местный пояс дома прибавил бы смещение второй
-    раз.
-    """
-    if not isinstance(rows, list):
-        return []
-    out: list[dict[str, int]] = []
-    for row in rows:
-        if not isinstance(row, dict) or row.get("token") != token:
-            continue
-        try:
-            day = datetime.strptime(str(row.get("day_start")), "%Y-%m-%d")
-        except ValueError:
-            continue
-        day_us = int(calendar.timegm(day.timetuple())) * 1_000_000
-        for piece in row.get("timeline") or []:
-            try:
-                begin = day_us + int(piece["begin"]) * 1_000_000
-                end = day_us + int(piece["end"]) * 1_000_000
-            except (KeyError, TypeError, ValueError):
-                continue
-            # Обрезаем окном клипа: за его краями рисовать нечего, а лишние
-            # сутки фрагментов — это килобайты по каналу жильца на каждый тап.
-            begin, end = max(begin, start_us), min(end, stop_us)
-            if end > begin:
-                out.append({"startUs": begin, "stopUs": end})
-    out.sort(key=lambda piece: piece["startUs"])
-    return out
-
-
-def _outside(first_frame: str | None, start_us: int, stop_us: int) -> bool:
-    """Ближайшая запись лежит вне окна — значит кадров не будет вовсе.
-
-    ⚠ Метка разбирается в шкале САМОГО Trassir (UTC-геттеры), той же, в которой
-    считалось окно: «починить» её местным поясом значит прибавить смещение
-    второй раз и объявить дырой каждую нормальную запись.
-    """
-    if not first_frame:
-        return False
-    try:
-        moment = datetime.strptime(first_frame, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        # Регистратор ответил меткой незнакомого вида — молчим, а не врём про
-        # отсутствие записи: пустой экран честнее выдуманного объяснения.
-        return False
-    at_us = int(calendar.timegm(moment.timetuple())) * 1_000_000
-    return at_us < start_us or at_us > stop_us
-
-
 @dataclass
 class Clip:
     """Один открытый клип: токен Trassir, окно архива и поток go2rtc."""
 
     token: str
     guid: str
-    # ⚠ ОКНО события — неизменно на всё открытие: его задаёт событие, и шкала
-    # таймлайна стоит именно на нём. Перемотка меняет `start_us`, но НЕ его.
-    window_start_us: int
-    window_stop_us: int
-    # Откуда играем сейчас. При открытии равно началу окна.
-    start_us: int
     stream: str
+    # Откуда играем. Не знаем — регистратор встанет на ближайшую запись сам.
+    start_us: int | None = None
+    # ⚠ ОКНО ШКАЛЫ присылает ПРИЛОЖЕНИЕ и дом в него не заглядывает: шкалу
+    # рисует оно (`docs/plan-thin-integration.md`, «Широкая дверь»). Здесь оно
+    # только хранится и уезжает обратно как есть — считать в доме нечего.
+    window_start_us: int | None = None
+    window_stop_us: int | None = None
     # `archive_main` дома, `archive_sub` снаружи (см. `TRASSIR_ARCHIVE_*`).
     # Хранится в клипе, чтобы перемотка не роняла качество на субпоток.
     quality: str = TRASSIR_ARCHIVE_MAIN
@@ -253,22 +117,10 @@ class Clip:
     # Куда курсор архива встал НА САМОМ ДЕЛЕ: у записи бывают дыры, и «клип
     # начался не с события» — факт регистратора, а не наш промах.
     first_frame: str | None = None
-    # Ближайшая запись оказалась ВНЕ запрошенного окна: кадров не будет вовсе,
-    # и приложение обязано сказать это словами, а не молчать чёрным экраном.
-    out_of_window: bool = False
-    # Записанные участки внутри окна (`_segments`). Пусто — регистратор шкалу
-    # не отдал; это не «записи нет», и приложение обязано их различать.
-    segments: list[dict[str, int]] = field(default_factory=list)
-    # ⚠ ОКНО ИДЁТ ЗА КУРСОРОМ. У клипа события окно задано событием и стоит на
-    # месте; у архива по дням окно — СУТКИ того места, куда просят, и оно
-    # переезжает вместе с перемоткой. Без этого «покажи 9 сентября» упиралось бы
-    # в кламп минутного окна события, а расширять окно вслепую нельзя: в него
-    # упирается и шкала, которую рисует приложение.
-    day_window: bool = False
-    # Дни с архивом у этого канала (`CalendarEvent`). ⚠ Читается ОДИН РАЗ на
-    # открытие потока, поэтому хранится здесь: второй раз спросить не у кого.
-    # Пусто — не спросили или регистратор не отдал (тогда календаря в UI нет).
-    days: list[str] | None = None
+    # ⚠ Всё остальное оставили приложению: `outOfWindow`, участки записи, дни с
+    # архивом и окно шкалы. Дом их не считает и не разбирает — он держит сессию
+    # и исполняет описанные вызовы (`recorder.py`),
+    # `docs/plan-thin-integration.md` («Широкая дверь»).
     ping: Any = field(default=None, repr=False)
     # Старт вслепую, если готовность не пришла (старое приложение её не шлёт):
     # снимать вместе с клипом, иначе команда догонит закрытый просмотр.
@@ -320,6 +172,8 @@ class ClipSessions:
         # ⚠ Метка события уходит в окно КАК ЕСТЬ — она в шкале самого Trassir
         # (unix + пояс сервера). Пересчёт по нашим часам сдвинул бы запись на
         # часовой пояс регистратора, а выглядело бы это как «показывает не то».
+        # ⚠ Это НЕ толкование календаря: метка события приходит готовой и лишь
+        # раздвигается на лид и длину клипа. Календарных расчётов в доме нет.
         start = int(event["timestampUs"]) - TRASSIR_CLIP_LEAD * 1_000_000
         stop = int(event["timestampUs"]) + seconds * 1_000_000
 
@@ -353,94 +207,34 @@ class ClipSessions:
     ) -> dict[str, Any]:
         """Открыть запись КАНАЛА на метке — классический просмотр архива.
 
-        ⚠ Отличие от `async_open` ровно одно и по существу: окно здесь — СУТКИ
-        метки (`day_window`), а не минуты вокруг события. Так шкала приложения
-        становится суточной, и перемотка едет по дню, а не по минутному окну;
-        «покажи 9 сентября в 21:40» становится обычным `seek`.
+        ⚠ Метки нет — значит «последняя запись», и НИЧЕГО считать не надо:
+        регистратор встанет на ближайший записанный кадр сам, а куда он встал,
+        дом узнает из его же ответа (`first_frame_ts`). Своих часов в шкале
+        Trassir дом не держит и держать не должен — она с поясом сервера.
 
-        ⚠ Метки нет — значит «последняя запись»: считаем её по часам дома
-        (`trassir_now_us`), а регистратор сам встанет на ближайший записанный
-        кадр. Приложения своей метки в шкале Trassir не имеют вовсе — у неё
-        пояс сервера, и любое «сейчас» телефона сдвинуло бы открытие на часы.
+        ⚠ Окно шкалы считает ПРИЛОЖЕНИЕ и присылает готовым: шкалу рисует оно.
+        Дом хранит присланное и уезжает обратно как есть.
         """
         client = self._gateway.client
         if client is None:
             raise TrassirError("Видеонаблюдение объекта не настроено")
 
-        at = int(timestamp_us) if timestamp_us else trassir_now_us()
-        # ⚠ ОКНО СЧИТАЕТ ПРИЛОЖЕНИЕ и присылает готовым: шкала, по которой жилец
-        # видит записи, — его дело, а не дома. Дом хранит присланное и больше в
-        # окно не заглядывает (`docs/plan-thin-integration.md`, «Широкая дверь»).
-        #
-        # ⚠ Считаем сами ТОЛЬКО для сборок, которые окна ещё не шлют: их шкала
-        # стоит на этом окне, и без него она выродилась бы в точку. Долг снимется
-        # вместе с ними.
-        if window_start_us is not None and window_stop_us is not None:
-            start, stop = int(window_start_us), int(window_stop_us)
-        else:
-            start, stop = day_bounds(at)
+        at = int(timestamp_us) if timestamp_us else None
         want = _archive_stream(quality, remote)
         token = await client.async_get_video(guid, want, "rtsp")
         clip = Clip(
             token=token,
             guid=guid,
-            window_start_us=start,
-            window_stop_us=stop,
+            window_start_us=int(window_start_us) if window_start_us else None,
+            window_stop_us=int(window_stop_us) if window_stop_us else None,
             start_us=at,
             stream=f"trassir_{token}",
             quality=want,
-            day_window=True,
         )
         clip_id = f"{CLIP_PREFIX}{token}"
         self._clips[clip_id] = clip
         self._arm(clip_id, clip)
         return self._describe(clip_id, clip, camera_name=camera_name)
-
-    async def async_days(self, clip_id: str) -> dict[str, Any]:
-        """Дни с архивом у канала этого клипа и сутки, на которых он стоит.
-
-        ⚠ Календарь берётся у РЕГИСТРАТОРА одноразово (`_read_days`): событие
-        `CalendarEvent` приходит лишь в первый ответ после открытия потока.
-        Пока его нет — отвечаем пустым списком, а не выдуманным «архива нет».
-
-        ⚠ А вот разметку суток читаем КАЖДЫЙ раз: после перемотки на другой
-        день она описывает уже его, и вчерашние участки на новой шкале были бы
-        враньём. День берём из ответа регистратора (`day_start`), а не из наших
-        расчётов: он один знает, куда встал.
-        """
-        clip = self._clips.get(clip_id)
-        if clip is None:
-            raise TrassirError("Запись уже закрыта, откройте событие заново")
-        if clip.days is None:
-            await self._read_days(clip)
-        client = self._gateway.client
-        rows = await client.async_archive_status("timeline") if client else []
-        clip.segments = _segments(rows, clip.token, clip.window_start_us, clip.window_stop_us)
-        return {
-            "days": clip.days or [],
-            "dayStartUs": _day_start_of(rows, clip.token),
-            "segments": clip.segments,
-        }
-
-    async def _read_days(self, clip: Clip) -> None:
-        """Запомнить дни с архивом — пока регистратор их ещё рассказывает.
-
-        ⚠ Ровно один шанс: `CalendarEvent` приходит в ПЕРВЫЙ ответ
-        `archive_events` после открытия потока, в следующих его уже нет (замер
-        стенда 2026-09-12). Поэтому читаем и в `play` (поток только что открыт),
-        и при каждом `days` — пока список не получен.
-        """
-        client = self._gateway.client
-        if client is None:
-            return
-        try:
-            days = _calendar_days(await client.async_archive_events(clip.token))
-        except TrassirError as err:
-            # Без календаря жилец потеряет только выбор дня; просмотр идёт.
-            LOGGER.debug("Календарь архива недоступен: %s", err)
-            return
-        if days is not None:
-            clip.days = days
 
     def _describe(
         self, clip_id: str, clip: Clip, camera_name: str | None = None
@@ -565,17 +359,14 @@ class ClipSessions:
                 clip.fallback.cancel()
                 clip.fallback = None
             await self._async_play(clip_id, clip)
+        # ⚠ Наружу уходит только то, что ответил РЕГИСТРАТОР: где он встал
+        # (`first_frame_ts`) и откуда просили. Всё остальное — окно, участки,
+        # «записи не было» — считает и толкует приложение: дом в это не лезет
+        # (`docs/plan-thin-integration.md`, «Широкая дверь»).
         return {
             "ready": not started,
             "positionUs": clip.start_us,
             "firstFrameTs": clip.first_frame,
-            # ⚠ Ближайшая запись вне окна — это «в это время не писали», а не
-            # наша задержка. Молчание здесь и есть тот чёрный прямоугольник, за
-            # которым жилец досиживает до таймаута проигрывателя.
-            "outOfWindow": clip.out_of_window,
-            # Записанные участки внутри окна: запись на объекте ведётся по
-            # движению, и дыры в окне — норма. Рисует и толкует их приложение.
-            "segments": clip.segments,
         }
 
     async def async_seek(
@@ -610,16 +401,10 @@ class ClipSessions:
             raise OpError("Позиция — микросекунды числом", HTTPStatus.BAD_REQUEST) from err
         # ⚠ Кламп, а не отказ: палец на таймлайне не обязан попадать в окно
         # микросекунда в микросекунду, а ронять жест из-за края — хамство.
-        # ⚠ Кламп к ОКНУ события, а не к прошлому старту: после перемотки вперёд
-        # прошлый старт стал бы новым дном шкалы, и вернуться назад было бы уже
-        # нечем — жест «к событию» упирался бы в текущее место.
-        if old.day_window:
-            # ⚠ У архива по дням окно ЕДЕТ за курсором: шкала приложения — СУТКИ,
-            # и «покажи 9 сентября» это перемотка на другой день, а не выход за
-            # окно. Кламп здесь был бы приговором: уехав на день вперёд, жилец не
-            # вернулся бы назад.
-            old.window_start_us, old.window_stop_us = day_bounds(position)
-        else:
+        # ⚠ И только когда окно ЕСТЬ: у архива, открытого без метки, его нет
+        # вовсе, и клампить нечем. Окно считает приложение, дом его не двигает:
+        # это была бы арифметика суток в доме.
+        if old.window_start_us is not None and old.window_stop_us is not None:
             position = min(max(position, old.window_start_us), old.window_stop_us)
         client = self._gateway.client
         if client is None:
@@ -655,16 +440,13 @@ class ClipSessions:
         clip = Clip(
             token=token,
             guid=old.guid,
-            window_start_us=old.window_start_us,
-            window_stop_us=old.window_stop_us,
             start_us=position,
             stream=f"trassir_{token}",
-            quality=want,
-            # ⚠ Смена качества при просмотре АРХИВА — это тот же архив: и окно,
-            # и уже вычитанные дни переезжают в новый клип. Иначе переключатель
-            # HD/SD возвращал бы жильца в минутное окно события без календаря.
-            day_window=old.day_window,
-            days=old.days,
+            # ⚠ Смена качества при просмотре АРХИВА — это тот же архив: окно
+            # шкалы переезжает в новый клип, чтобы после переключения HD/SD
+            # шкала не прыгнула.
+            window_start_us=old.window_start_us,
+            window_stop_us=old.window_stop_us,
         )
         clip_id = f"{CLIP_PREFIX}{token}"
         self._clips[clip_id] = clip
@@ -870,11 +652,17 @@ class ClipSessions:
             clip.started = True
             await self._async_settle(clip)
             try:
+                # ⚠ Метки нет — параметров нет вовсе: регистратор встанет на
+                # ближайшую запись по СВОИМ часам. Подставить сюда «сейчас»
+                # значило бы завести в доме часы чужой шкалы.
                 answer = await client.async_archive_command(
                     clip.token,
                     command="play",
-                    start=clip.start_us,
-                    stop=clip.window_stop_us,
+                    **(
+                        {"start": clip.start_us, "stop": clip.window_stop_us}
+                        if clip.start_us is not None
+                        else {}
+                    ),
                     speed=1,
                 )
             except TrassirError as err:
@@ -889,33 +677,10 @@ class ClipSessions:
         # `first_frame_ts` — куда курсор встал НА САМОМ ДЕЛЕ. У архива бывают
         # дыры, и «клип начался не с события» это факт регистратора, а не наш
         # промах; отдаём его наружу, чтобы приложение могло сказать правду.
+        # Куда курсор встал НА САМОМ ДЕЛЕ — ответ регистратора, и он уходит
+        # наружу как есть. Что это значит для шкалы и «писали ли вообще»,
+        # решает приложение: в доме таких толкований больше нет.
         clip.first_frame = answer.get("first_frame_ts")
-        clip.out_of_window = _outside(clip.first_frame, clip.start_us, clip.window_stop_us)
-        # ⚠ ПОСЛЕ команды, а не до: своего параметра «по какому каналу» у
-        # `archive_status` нет — он отвечает по токенам ОТКРЫТЫХ потоков, и
-        # раньше старта нашего токена там нет вовсе.
-        try:
-            clip.segments = _segments(
-                await client.async_archive_status("timeline"),
-                clip.token,
-                clip.window_start_us,
-                clip.window_stop_us,
-            )
-        except TrassirError as err:
-            # Не роняем просмотр: без шкалы жилец просто не увидит разметку
-            # записанного, а видео идёт.
-            LOGGER.debug("Шкала архива недоступна: %s", err)
-        # ⚠ Дни с архивом — ЗДЕСЬ: поток только что открыт, а `CalendarEvent`
-        # регистратор отдаёт лишь в первый ответ после открытия. Спросим позже
-        # — не получим вовсе.
-        await self._read_days(clip)
-        if clip.out_of_window:
-            # ⚠ Проверено на стенде: когда ближайшая запись лежит ПОЗЖЕ конца
-            # окна, регистратор отвечает успехом и не присылает НИ ОДНОГО байта.
-            # Без этой строки симптом неотличим от «медленно грузится».
-            LOGGER.info(
-                "В запрошенном окне записи нет: ближайший кадр %s", clip.first_frame
-            )
 
     async def _async_settle(self, clip: Clip) -> None:
         """Выдержать паузу между открытием потока и командой архива.
