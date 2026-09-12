@@ -20,6 +20,11 @@
   не поднимаемся вовсе и уступаем штатному пути Home Assistant: подменять
   РАБОЧИЙ путь своим, у которого нет слушателя, — это `srflx 0` в диагностике и
   поиск несуществующей проблемы с NAT.
+* **но сначала — СИРОТА (0.2.44).** Отвечающий на НАШЕМ API-порте (1985,
+  только петля) — это наш же процесс прошлого запуска, переживший нечистую
+  остановку HA. Уступить его «чужому аддону» — значит после каждого такого
+  рестарта навсегда остаться с «не поднят go2rtc». Усыновляем: конфиг наш,
+  порты его, переговоры продолжаются без единого разрыва.
 """
 
 from __future__ import annotations
@@ -72,6 +77,19 @@ async def async_start(hass: HomeAssistant) -> bool:
 
     if is_running():
         return True
+    # ⚠ СИРОТА — раньше проверки портов. Свой go2rtc прошлого запуска HA,
+    # переживший нечистую остановку, держит и API, и медиа-порт. Уступить его
+    # «чужому аддону» значило бы навсегда остаться с «не поднят go2rtc»:
+    # живой факт 2026-09-12 — два обновления подряд, и камера мертва до
+    # ребута объекта. Отвечает НАШ API на петле — усыновляем, а не уступаем.
+    if await _api_alive(hass):
+        _ready = True
+        LOGGER.info(
+            "Усыновлён go2rtc прошлого запуска (%s): порты его, конфиг наш — "
+            "переговоры идут через него",
+            URL,
+        )
+        return True
     binary = await hass.async_add_executor_job(shutil.which, "go2rtc")
     if not binary:
         LOGGER.debug("go2rtc binary not found — WebRTC через HA, без нас")
@@ -115,7 +133,12 @@ async def async_start(hass: HomeAssistant) -> bool:
 
 
 async def async_stop() -> None:
-    """Снять процесс и убрать за собой. Зовётся при выгрузке и остановке HA."""
+    """Снять процесс и убрать за собой. Зовётся при выгрузке и остановке HA.
+
+    ⚠ Усыновлённый процесс НЕ снимается — мы его не поднимали и handle на
+    него не имеем. Он переживёт выгрузку, продолжит держать медиа-порт и
+    будет усыновлён следующим стартом: камеры при перезапуске HA не мигают.
+    """
     global _proc, _tmp, _drain, _ready
 
     _ready = False
@@ -148,8 +171,13 @@ def is_running() -> bool:
     продолжает работать, и тогда мы уводили бы переговоры на путь без единого
     кандидата — при живом штатном пути HA. Поэтому здесь и флаг готовности,
     поставленный только после ответа его API.
+
+    ⚠ УСЫНОВЛЁННЫЙ (`_proc is None`) жив по факту ответа API при старте:
+    своего handle у него нет, тихая смерть посреди работы обнаружится только
+    упавшей переговоркой — и лечится перезапуском HA, который усыновит или
+    поднимет заново. Редкий случай: усыновляемый уже пережил часы работы.
     """
-    return _ready and _proc is not None and _proc.returncode is None
+    return _ready and (_proc is None or _proc.returncode is None)
 
 
 def log_tail() -> list[str]:
@@ -225,6 +253,23 @@ async def _await_api(hass: HomeAssistant) -> bool:
             pass
         await asyncio.sleep(0.2)
     return False
+
+
+async def _api_alive(hass: HomeAssistant) -> bool:
+    """Отвечает ли чей-то go2rtc на НАШЕМ API-порте (петля, один запрос).
+
+    ⚠ Порт 1985 выбран среди незанятых и наружу не слушается вовсе, поэтому
+    ответивший на нём — практически наверняка наш же процесс прошлого запуска.
+    Шов для спек: настоящий HTTP здесь не тестируется.
+    """
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+    session = async_get_clientsession(hass)
+    try:
+        async with session.get(f"{URL}/api/streams", timeout=_timeout(1)) as answer:
+            return answer.status < 500
+    except Exception:  # noqa: BLE001 - не отвечает, значит нечего усыновлять
+        return False
 
 
 def _timeout(seconds: float):  # noqa: ANN201

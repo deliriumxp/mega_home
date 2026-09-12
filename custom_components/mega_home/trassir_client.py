@@ -46,6 +46,23 @@ class TrassirAuthError(TrassirError):
     """Credentials were rejected, or the wrong identity was used."""
 
 
+
+def _net_text(err: Exception, prefix: str) -> str:
+    """Сетевой текст для человека — С ЗАПАСНЫМ, а не каким попало.
+
+    ⚠ str(TimeoutError) ПУСТ: подставить его в шаблон — значит отгрузить в
+    журнал «Trassir не отвечает: » с висящим разделителем и без причины.
+    Та же ловушка, что у RouterOS (пустой message у сетевых ошибок): запасной
+    текст обязателен.
+    """
+    detail = str(err).strip()
+    return (
+        f"{prefix}: {detail}"
+        if detail
+        else f"{prefix}: нет ответа за {TRASSIR_TIMEOUT} с"
+    )
+
+
 class TrassirClient:
     """One recorder, two sessions, no interpretation of what comes back."""
 
@@ -156,8 +173,10 @@ class TrassirClient:
                 url, timeout=aiohttp.ClientTimeout(total=TRASSIR_TIMEOUT), ssl=False
             ) as response:
                 await response.read()
-        except aiohttp.ClientError as err:
-            raise TrassirError(f"Trassir не отвечает на продление токена: {err}") from err
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise TrassirError(
+                _net_text(err, "Trassir не отвечает на продление токена")
+            ) from err
 
     # --- transport ------------------------------------------------------
 
@@ -179,8 +198,8 @@ class TrassirClient:
                     ssl=False,
                 ) as response:
                     body = await response.json(content_type=None)
-            except aiohttp.ClientError as err:
-                raise TrassirError(f"Trassir не отвечает: {err}") from err
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                raise TrassirError(_net_text(err, "Trassir не отвечает")) from err
             except ValueError as err:
                 raise TrassirError(f"Trassir ответил не-JSON на {path}") from err
             if self._is_no_session(body):
@@ -206,8 +225,8 @@ class TrassirClient:
                     ssl=False,
                 ) as response:
                     payload = await response.read()
-            except aiohttp.ClientError as err:
-                raise TrassirError(f"Trassir не отвечает: {err}") from err
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                raise TrassirError(_net_text(err, "Trassir не отвечает")) from err
             # An error comes back as JSON even where bytes were asked for.
             if payload[:1] == b"{" and b"no session" in payload:
                 self._sids.pop(door, None)
@@ -261,8 +280,8 @@ class TrassirClient:
                     ssl=False,
                 ) as response:
                     raw = await response.read()
-            except aiohttp.ClientError as err:
-                raise TrassirError(f"Trassir не отвечает на вход: {err}") from err
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                raise TrassirError(_net_text(err, "Trassir не отвечает на вход")) from err
             finally:
                 self._last_login = time.monotonic()
         sid = self._sid_of(raw)

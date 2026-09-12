@@ -275,7 +275,13 @@ class TrassirGateway:
             except TrassirError as err:
                 self._note(str(err))
             except Exception as err:  # noqa: BLE001 — цикл не имеет права умереть
-                self._note(f"неожиданная ошибка опроса Trassir: {err}")
+                # ⚠ str(TimeoutError) пуст — тот же урок, что у RouterOS:
+                # в журнал обязана уехать причина, а не висящее двоеточие.
+                detail = str(err).strip()
+                self._note(
+                    "неожиданная ошибка опроса Trassir "
+                    f"({type(err).__name__}): {detail or 'без текста ошибки'}"
+                )
             await asyncio.sleep(TRASSIR_POLL_INTERVAL)
 
     async def _async_poll_once(self) -> None:

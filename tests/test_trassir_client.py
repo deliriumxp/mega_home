@@ -202,3 +202,19 @@ def test_refusal_carries_the_reason_from_trassir() -> None:
     with pytest.raises(TrassirError) as err:
         asyncio.run(client(session).async_get_video("cam", container="flv"))
     assert "flv is disabled" in str(err.value)
+
+
+def test_timeout_gets_human_text_not_empty() -> None:
+    """Голый asyncio.TimeoutError — с ПУСТЫМ str! — обязан превращаться в
+    человекочитаемый отказ: в журнале объекта 2026-09-12 осталась строка
+    «неожиданная ошибка опроса Trassir:» с висящим двоеточием и без причины.
+    Та же ловушка, что у RouterOS (CLAUDE.md): запасной текст обязателен."""
+
+    class DeadSession:
+        def get(self, url: str, params: dict[str, Any] | None = None, **kwargs: Any):
+            raise asyncio.TimeoutError()
+
+    with pytest.raises(TrassirError) as err:
+        asyncio.run(client(DeadSession()).async_events())  # type: ignore[arg-type]
+
+    assert "нет ответа за" in str(err.value), "причина должна быть словами"

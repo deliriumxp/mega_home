@@ -141,3 +141,22 @@ def _подменить_запуск(monkeypatch, proc: _Proc, *, готов: bo
     monkeypatch.setattr(embed, "_ports_busy", lambda: "")
     monkeypatch.setattr(embed, "_await_api", api)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+
+def test_сирота_усыновляется_а_не_уступает_чужому(monkeypatch):
+    """Свой go2rtc прошлого запуска, переживший нечистую остановку HA, держит
+    порты — и «порт занят» раньше означал «уступи чужому аддону»: объект
+    оставался с «не поднят go2rtc» до ребута (2026-09-12, два обновления
+    подряд). Отвечает НАШ API на петле — усыновляем, переговоры идут."""
+
+    async def alive(hass):  # noqa: ANN001, ANN202
+        return True
+
+    def _не_должны_стартовать(*_args):
+        pytest.fail("усыновление не должно поднимать новый процесс")
+
+    monkeypatch.setattr(embed, "_api_alive", alive)
+    monkeypatch.setattr(embed.shutil, "which", _не_должны_стартовать)
+
+    assert asyncio.run(embed.async_start(_Hass())) is True
+    assert embed.is_running() is True
