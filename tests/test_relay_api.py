@@ -261,3 +261,35 @@ def test_состояние_архива_доезжает_и_снаружи(coor
 
     assert asked == [("trassir:tok1", "archive_status", {"type": "state"})]
     assert json_of(answer)[0]["state"] == "4"
+
+
+def test_архив_по_метке_и_дни_доезжают_снаружи(coordinator, monkeypatch):
+    """⚠ Классический просмотр архива обязан работать ОБЕИМИ дверями.
+
+    Открытие записи по метке и выбор дня — не «домашняя» возможность: снаружи
+    жилец смотрит архив ровно так же, и разница «дома/снаружи» обязана
+    оставаться только в адресе базы.
+    """
+    opened: list[tuple] = []
+
+    async def clip_at(coordinator, guid, timestamp_us, camera_name, quality=None):
+        opened.append((guid, timestamp_us, camera_name, quality))
+        return {"id": "trassir:tok1", "startUs": 0, "stopUs": 86_400_000_000}
+
+    asked: list[str] = []
+
+    async def archive_days(coordinator, clip_id):
+        asked.append(clip_id)
+        return {"days": ["2026-09-08"], "dayStartUs": 0, "segments": []}
+
+    monkeypatch.setattr(ops, "trassir_clip_at", clip_at)
+    monkeypatch.setattr(ops, "trassir_archive_days", archive_days)
+
+    body = json.dumps({"timestampUs": 1788960000000000, "quality": "sub"}).encode()
+    clip = json_of(call(coordinator, "POST", "api/trassir/channels/cam1/clip", body))
+    days = json_of(call(coordinator, "GET", "api/trassir/clips/trassir:tok1/days"))
+
+    assert opened == [("cam1", 1788960000000000, None, "sub")]
+    assert clip["stopUs"] - clip["startUs"] == 86_400_000_000
+    assert asked == ["trassir:tok1"]
+    assert days["days"] == ["2026-09-08"]

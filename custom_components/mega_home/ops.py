@@ -699,11 +699,58 @@ async def trassir_play(
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
 
 
+async def trassir_clip_at(
+    coordinator: MegaHomeCoordinator,
+    guid: str,
+    timestamp_us: int | None = None,
+    camera_name: str | None = None,
+    remote: bool = False,
+    quality: str | None = None,
+) -> dict[str, Any]:
+    """Открыть АРХИВ КАНАЛА на метке — классический просмотр по дню и времени.
+
+    ⚠ Событие здесь не нужно вовсе, и это не мелочь: событие — лишь ОДНА из
+    причин посмотреть запись, а смотреть хотят и «что было вчера в 21:40», где
+    события в нашей летописи может и не быть (она вообще конечной глубины).
+    Запись живёт в архиве регистратора и открывается по метке.
+
+    ⚠ Метки нет — «последняя запись»: дом считает её своими часами, регистратор
+    сам встаёт на ближайший записанный кадр. Приложение своей метки в шкале
+    Trassir не имеет: там пояс сервера, и «сейчас» телефона сдвинуло бы
+    открытие на часы.
+    """
+    from .trassir_client import TrassirError
+
+    try:
+        return await trassir(coordinator).clips.async_open_at(
+            guid, timestamp_us, camera_name=camera_name, remote=remote, quality=quality
+        )
+    except TrassirError as err:
+        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
+
+
+async def trassir_archive_days(
+    coordinator: MegaHomeCoordinator, clip_id: str
+) -> dict[str, Any]:
+    """Дни с архивом у канала этого клипа и разметка суток, где он стоит.
+
+    ⚠ Разметка читается КАЖДЫЙ раз: после прыжка на другой день вчерашние
+    участки на новой шкале — враньё.
+    """
+    from .trassir_client import TrassirError
+
+    try:
+        return await trassir(coordinator).clips.async_days(clip_id)
+    except TrassirError as err:
+        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
+
+
 async def trassir_seek(
     coordinator: MegaHomeCoordinator,
     clip_id: str,
     position_us: int | None,
     quality: str | None = None,
+    direction: int = 0,
 ) -> dict[str, Any]:
     """Перемотка: при неизменном качестве — официальный `command=seek` по
     живому токену, ответ несёт ТОТ ЖЕ id (кадр продолжается без переоткрытия);
@@ -711,12 +758,16 @@ async def trassir_seek(
 
     ⚠ `play` остаётся одним на соединение (факт стенда), seek — отдельная
     документированная команда (`trassir_clip.async_seek`, §13.7 плана).
+
+    ⚠ `direction` присылает приложение: им прыгают на другой ДЕНЬ. «9 сентября»
+    — это полночь, а запись в тот день началась в 01:18, и «ближайший кадр в
+    любую сторону» (0) уехал бы в конец 8-го.
     """
     from .trassir_client import TrassirError
 
     try:
         return await trassir(coordinator).clips.async_seek(
-            clip_id, position_us, quality
+            clip_id, position_us, quality, direction
         )
     except TrassirError as err:
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err

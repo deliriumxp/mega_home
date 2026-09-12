@@ -37,6 +37,9 @@ class FakeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.tokens = 0
+        # ⚠ Календарь дней регистратор отдаёт РОВНО ОДИН РАЗ на открытие потока
+        # (замер стенда 2026-09-12) — флаг и держит эту правду в спеке.
+        self.calendar_given = False
 
     async def async_get_video(self, guid: str, stream: str, container: str) -> str:
         self.calls.append(("get_video", {"guid": guid, "stream": stream, "container": container}))
@@ -67,6 +70,17 @@ class FakeClient:
                     {"begin": "60000", "end": "60010"},  # вечером — вне окна
                 ],
             }
+        ]
+
+    async def async_archive_events(self, token: str) -> list[dict[str, Any]]:
+        """Дни с архивом — событием `CalendarEvent` в открытом потоке."""
+        self.calls.append(("archive_events", {"token": token}))
+        if self.calendar_given:
+            return [{"token": f"tok{self.tokens}", "event_name": "SpeedLimitEvent"}]
+        self.calendar_given = True
+        return [
+            {"event_name": "CalendarEvent", "calendar": ["2026-09-08", "2026-09-09"]},
+            {"event_name": "SpeedLimitEvent"},
         ]
 
     async def async_ping(self, token: str) -> None:
@@ -752,3 +766,130 @@ def test_старый_бандл_получает_умолчание_по_две
     asyncio.run(gateway.clips.async_open("e1", remote=False))
     call = next(p for n, p in gateway.client.calls if n == "get_video")
     assert call["stream"] == "archive_main"
+
+
+# --- классический архив по дням (2026-09-12) --------------------------------
+#
+# ⚠ Событие — лишь ОДНА из причин посмотреть запись. «Что было вчера в 21:40»
+# события не имеет вовсе, а запись у регистратора есть; поэтому архив канала
+# открывается ПО МЕТКЕ, и окно у него — СУТКИ, а не минуты вокруг события.
+
+
+def test_архив_по_метке_открывается_сутками(gateway: FakeGateway) -> None:
+    """Окно клипа архива — целые сутки метки, и оно поедет за курсором."""
+    at = EVENT["timestampUs"]
+    answer = asyncio.run(gateway.clips.async_open_at("cam1", at))
+
+    day = 86_400_000_000
+    assert answer["startUs"] == (at // day) * day, "окно — сутки метки"
+    assert answer["stopUs"] == (at // day) * day + day
+    assert answer["positionUs"] == at, "играем ровно с метки"
+
+
+def test_архив_без_метки_это_последняя_запись(gateway: FakeGateway) -> None:
+    """⚠ Своих часов в шкале Trassir у приложения нет: «последнюю запись»
+    считает ДОМ по своим часам (он на том же объекте и в том же поясе), а
+    регистратор сам встанет на ближайший записанный кадр."""
+    from mega_home import trassir_clip
+
+    moment = 1_788_960_000_000_000
+    original = trassir_clip.trassir_now_us
+    trassir_clip.trassir_now_us = lambda: moment
+    try:
+        answer = asyncio.run(gateway.clips.async_open_at("cam1"))
+    finally:
+        trassir_clip.trassir_now_us = original
+
+    assert answer["positionUs"] == moment
+    assert answer["stopUs"] - answer["startUs"] == 86_400_000_000
+
+
+def test_дни_архива_читаются_один_раз_и_помнятся(gateway: FakeGateway) -> None:
+    """⚠ `CalendarEvent` приходит РОВНО ОДИН РАЗ на открытие потока: спросить
+    повторно не у кого. Поэтому дом помнит календарь у клипа, а спека считает
+    сами вопросы — второго быть не должно."""
+    opened = asyncio.run(gateway.clips.async_open_at("cam1", EVENT["timestampUs"]))
+    gateway.client.calls.clear()
+
+    first = asyncio.run(gateway.clips.async_days(opened["id"]))
+    second = asyncio.run(gateway.clips.async_days(opened["id"]))
+
+    assert first["days"] == ["2026-09-08", "2026-09-09"]
+    assert second["days"] == ["2026-09-08", "2026-09-09"]
+    assert [n for n, _ in gateway.client.calls if n == "archive_events"] == ["archive_events"]
+
+
+def test_разметка_дня_читается_каждый_раз(gateway: FakeGateway) -> None:
+    """А вот разметку суток — читаем ЗАНОВО: после прыжка на другой день
+    вчерашние участки на новой шкале были бы враньём."""
+    opened = asyncio.run(gateway.clips.async_open_at("cam1", EVENT["timestampUs"]))
+    gateway.client.calls.clear()
+
+    asyncio.run(gateway.clips.async_days(opened["id"]))
+    asyncio.run(gateway.clips.async_days(opened["id"]))
+
+    assert [n for n, _ in gateway.client.calls if n == "archive_status"] == [
+        "archive_status",
+        "archive_status",
+    ]
+
+
+def test_прыжок_на_другой_день_двигает_окно(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """⚠ У архива окно ЕДЕТ за курсором: шкала приложения — сутки, и «покажи
+    9 сентября» это перемотка на другой день, а не выход за окно. Кламп здесь
+    был бы приговором — уехав на день вперёд, жилец не вернулся бы назад."""
+    opened = asyncio.run(gateway.clips.async_open_at("cam1", EVENT["timestampUs"]))
+    hass = _offered(gateway, monkeypatch, opened["id"])
+
+    async def scenario() -> dict[str, Any]:
+        await gateway.clips.async_ready(opened["id"])
+        gateway.client.calls.clear()
+        answer = await gateway.clips.async_seek(opened["id"], other_day, None, 1)
+        await _quiet(hass, gateway)
+        return answer
+
+    other_day = EVENT["timestampUs"] - 86_400_000_000
+    answer = asyncio.run(scenario())
+
+    assert answer["id"] == opened["id"], "тот же клип — переговоров не будет"
+    day = 86_400_000_000
+    assert answer["startUs"] == (other_day // day) * day
+    command = next(p for n, p in gateway.client.calls if n == "archive_command")
+    assert command["direction"] == 1, "«ближайший кадр ВПЕРЁД»: полночь дня — не запись"
+
+
+def test_событие_не_двигает_окно(gateway: FakeGateway) -> None:
+    """У клипа СОБЫТИЯ окно стоит на месте: его задало событие, и приложение
+    старых сборок рисует по нему шкалу — сдвинуть его значит сломать шкалу."""
+    opened = asyncio.run(gateway.clips.async_open("e1"))
+    gateway.client.calls.clear()
+
+    answer = asyncio.run(gateway.clips.async_seek(opened["id"], EVENT["timestampUs"] + 5_000_000))
+
+    assert answer["startUs"] == opened["startUs"]
+    assert answer["stopUs"] == opened["stopUs"]
+
+
+def test_календарь_читается_сразу_после_старта_записи(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """⚠ Поток только что открыт — это ЕДИНСТВЕННЫЙ момент, когда регистратор
+    ещё готов рассказать, за какие дни у него есть архив. Спрашиваем сразу
+    после команды: позже `CalendarEvent` уже не придёт."""
+    opened = asyncio.run(gateway.clips.async_open_at("cam1", EVENT["timestampUs"]))
+    hass = _offered(gateway, monkeypatch, opened["id"])
+
+    async def scenario() -> list[str]:
+        await gateway.clips.async_ready(opened["id"])
+        await _quiet(hass, gateway)
+        # ⚠ Второй раз спрашивать не у кого — календарь уже должен быть у клипа.
+        gateway.client.calls.clear()
+        days = (await gateway.clips.async_days(opened["id"]))["days"]
+        assert not [n for n, _ in gateway.client.calls if n == "archive_events"], (
+            "календарь прочитан стартом, а не при отрисовке"
+        )
+        return days
+
+    assert asyncio.run(scenario()) == ["2026-09-08", "2026-09-09"]

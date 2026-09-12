@@ -150,6 +150,25 @@ async def _dispatch(
                 quality=played.get("quality") if isinstance(played, dict) else None,
             )
         )
+    if path.startswith("api/trassir/channels/") and path.endswith("/clip") and method == "POST":
+        # Открытие архива канала по метке — та же дверь, что и всё остальное:
+        # снаружи «что было вчера в 21:40» обязано работать так же, как дома.
+        channel = unquote(path[len("api/trassir/channels/") : -len("/clip")])
+        body_json = _json_body(body)
+        if not isinstance(body_json, dict):
+            raise ops.OpError("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
+        return _json(
+            await ops.trassir_clip_at(
+                coordinator,
+                channel,
+                body_json.get("timestampUs"),
+                body_json.get("cameraName"),
+                quality=body_json.get("quality"),
+            )
+        )
+    if path.startswith("api/trassir/clips/") and path.endswith("/days") and method == "GET":
+        clip = unquote(path[len("api/trassir/clips/") : -len("/days")])
+        return _json(await ops.trassir_archive_days(coordinator, clip))
     if path.startswith("api/trassir/clips/") and path.endswith("/seek") and method == "POST":
         # Перемотка переоткрытием — та же дверь, что и открытие: снаружи
         # запись идёт тем же путём, что живой просмотр, без единой новой трубы.
@@ -163,6 +182,7 @@ async def _dispatch(
                 clip,
                 body_json.get("positionUs"),
                 body_json.get("quality"),
+                body_json.get("direction"),
             )
         )
     if path.startswith("api/trassir/clips/") and path.endswith("/ready") and method == "POST":

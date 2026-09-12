@@ -144,6 +144,21 @@ class TrassirClient:
         """
         return await self._json("archive_command", USER, command=command, token=token, **params)
 
+    async def async_archive_events(self, token: str) -> list[dict[str, Any]]:
+        """События ОТКРЫТОГО архива: календарь дней, шкала суток, движение.
+
+        ⚠ Это не «список событий», а УВЕДОМЛЕНИЯ о состоянии архива, и часть
+        их приходит РОВНО ОДИН РАЗ на открытие потока: замер стенда 2026-09-12 —
+        `CalendarEvent` есть только в первом ответе после открытия, дальше его
+        нет вовсе. Значит читать их должен тот, кто держит поток и ПОМНИТ
+        прочитанное, а не «запросить при отрисовке».
+
+        ⚠ И требует ОТКРЫТОГО потока: без потребителя в ответе один
+        `SpeedLimitEvent` — ни календаря, ни шкалы (проверено тремя прогонами).
+        """
+        payload = await self._request("archive_events", USER, token=token)
+        return payload if isinstance(payload, list) else []
+
     async def async_archive_status(self, kind: str = "timeline") -> list[dict[str, Any]]:
         """Состояние архива ОТКРЫТЫХ потоков этой сессии.
 

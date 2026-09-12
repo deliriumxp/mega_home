@@ -110,6 +110,8 @@ async def async_register_http(
         MegaHomeTrassirEventsView,
         MegaHomeTrassirThumbView,
         MegaHomeTrassirPlayView,
+        MegaHomeTrassirArchiveClipView,
+        MegaHomeTrassirArchiveDaysView,
         MegaHomeTrassirClipSeekView,
         MegaHomeTrassirClipReadyView,
         MegaHomeTrassirClipCommandView,
@@ -548,8 +550,66 @@ class MegaHomeTrassirClipSeekView(_MegaHomeView):
                     clip,
                     payload.get("positionUs"),
                     payload.get("quality"),
+                    payload.get("direction"),
                 )
             )
+        except ops.OpError as err:
+            return self.json_message(err.message, err.status)
+
+
+class MegaHomeTrassirArchiveClipView(_MegaHomeView):
+    """Открыть архив КАНАЛА на метке — классический просмотр по дню и времени.
+
+    ⚠ Отдельно от `events/{event}/play`: запись открывают не только по событию,
+    а «что было вчера в 21:40» события не имеет вовсе. Метки нет — последняя
+    запись (метку в шкале Trassir считает дом: у приложения там нет своих часов).
+    """
+
+    url = f"{URL_API}/trassir/channels/{{channel}}/clip"
+    name = "api:mega_home:trassir-clip-at"
+
+    async def post(self, request: web.Request, channel: str) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            return self.json_message("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
+        try:
+            return self.json(
+                await ops.trassir_clip_at(
+                    coordinator,
+                    channel,
+                    payload.get("timestampUs"),
+                    payload.get("cameraName"),
+                    quality=payload.get("quality"),
+                )
+            )
+        except ops.OpError as err:
+            return self.json_message(err.message, err.status)
+
+
+class MegaHomeTrassirArchiveDaysView(_MegaHomeView):
+    """Дни с архивом у канала открытого клипа + разметка текущих суток.
+
+    ⚠ Календарь регистратор отдаёт ОДИН РАЗ на открытие потока — дом помнит его
+    у клипа и отвечает им; разметку суток читает заново, она едет за перемоткой.
+    """
+
+    url = f"{URL_API}/trassir/clips/{{clip}}/days"
+    name = "api:mega_home:trassir-days"
+
+    async def get(self, request: web.Request, clip: str) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        try:
+            return self.json(await ops.trassir_archive_days(coordinator, clip))
         except ops.OpError as err:
             return self.json_message(err.message, err.status)
 
