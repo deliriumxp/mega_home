@@ -461,6 +461,39 @@ class ClipSessions:
         self._arm(clip_id, clip)
         return self._describe(clip_id, clip)
 
+    async def async_session_command(
+        self, clip_id: str, fn: str | None, params: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Инструмент новых функций: команда ЖИВОЙ сессии без релиза интеграции.
+
+        ⚠ Бандл знает словарь регистратора (`docs/docs-trassir/sdk-archive-command.md`)
+        и составляет команду сам — скорость воспроизведения, покадровый шаг,
+        соседний фрагмент: каждая такая функция раньше стоила бы релиза HACS
+        на каждом объекте (`docs/plan-thin-integration.md`). Драйвер отвечает
+        только за то, что не может уйти из дома: сессию, токен и ГРАНИЦЫ
+        списка — выдача токена (`get_video`) и пинг остаются у драйвера, с
+        ними связаны сторож, уборка и «одна команда на соединение». Это не
+        произвольный прокси на регистратор, а разрешённый словарь открытой
+        сессии.
+        """
+        from .ops import OpError
+
+        clip = self._clips.get(clip_id)
+        if clip is None:
+            raise OpError("Запись уже закрыта, откройте событие заново", HTTPStatus.NOT_FOUND)
+        if fn == "archive_command":
+            call = self._gateway.client.async_archive_command if self._gateway.client else None
+            if call is None:
+                raise TrassirError("Видеонаблюдение объекта не настроено")
+            return await call(clip.token, **(params or {}))
+        if fn == "archive_status":
+            call = self._gateway.client.async_archive_status if self._gateway.client else None
+            if call is None:
+                raise TrassirError("Видеонаблюдение объекта не настроено")
+            kind = params.get("type") if isinstance(params, dict) else None
+            return await call(kind if isinstance(kind, str) else "timeline")
+        raise OpError("Такая команда сессии не разрешена", HTTPStatus.FORBIDDEN)
+
     async def async_close(self, hass: HomeAssistant, clip_id: str, session_id: str) -> dict[str, Any]:
         """Жилец закрыл запись: снять сессию, поток и токен.
 

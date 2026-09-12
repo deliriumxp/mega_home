@@ -464,6 +464,63 @@ def test_смену_качества_seek_переоткрывает(
     assert dropped == ["trassir_tok1"]
 
 
+def test_команда_сессии_едет_в_регистратор_с_токеном_клипа(
+    gateway: FakeGateway,
+) -> None:
+    """Инструмент новых функций: бандл составляет команду словаря регистратора
+    (`sdk-archive-command.md`), драйвер подставляет токен живой сессии. Новая
+    медиа-функция бандла — без релиза интеграции."""
+    clip_id = _opened_clip_id(gateway)
+    gateway.client.calls.clear()
+
+    answer = asyncio.run(
+        gateway.clips.async_session_command(
+            clip_id,
+            "archive_command",
+            {"command": "seek", "timestamp": 123, "direction": 0},
+        )
+    )
+
+    assert answer == {"success": 1, "first_frame_ts": "2026-09-09 14:00:00"}
+    commands = [p for n, p in gateway.client.calls if n == "archive_command"]
+    assert len(commands) == 1
+    assert commands[0]["token"] == "tok1"
+    assert commands[0]["command"] == "seek"
+
+
+def test_команда_сессии_читает_статус_по_типу(gateway: FakeGateway) -> None:
+    clip_id = _opened_clip_id(gateway)
+    gateway.client.calls.clear()
+
+    asyncio.run(
+        gateway.clips.async_session_command(clip_id, "archive_status", {"type": "state"})
+    )
+
+    statuses = [p for n, p in gateway.client.calls if n == "archive_status"]
+    assert statuses == [{"type": "state"}]
+
+
+def test_команда_сессии_за_границами_словаря_запрещена(gateway: FakeGateway) -> None:
+    """Выдача токена и пинг — жизненный цикл сессии: с ними связаны сторож
+    и уборка, бандлу они не отдаются. Инструмент — не прокси на регистратор."""
+    clip_id = _opened_clip_id(gateway)
+
+    for fn in ("get_video", "ping", "login", ""):
+        with pytest.raises(ops.OpError) as err:
+            asyncio.run(gateway.clips.async_session_command(clip_id, fn, {}))
+        assert err.value.status == 403
+
+
+def test_команда_закрытой_сессии_отказывает(gateway: FakeGateway) -> None:
+    with pytest.raises(ops.OpError) as err:
+        asyncio.run(
+            gateway.clips.async_session_command(
+                f"{CLIP_PREFIX}мёртвый", "archive_command", {}
+            )
+        )
+    assert err.value.status == 404
+
+
 def test_seek_без_позиции_отказывает(gateway: FakeGateway) -> None:
     """«Вернуть на начало» без метки — это жест «к событию», и приложение шлёт
     его меткой само. Пустой позыв — 400, а не угадывание."""

@@ -112,6 +112,7 @@ async def async_register_http(
         MegaHomeTrassirPlayView,
         MegaHomeTrassirClipSeekView,
         MegaHomeTrassirClipReadyView,
+        MegaHomeTrassirClipCommandView,
         MegaHomeWebRtcView,
         MegaHomeWebRtcCandidatesView,
         MegaHomeWebRtcCloseView,
@@ -517,10 +518,11 @@ class MegaHomeTrassirPlayView(_MegaHomeView):
 
 
 class MegaHomeTrassirClipSeekView(_MegaHomeView):
-    """Перемотка ПЕРЕОТКРЫТИЕМ: ответ — новый id для обычных переговоров.
+    """Перемотка: тот же клип (`command=seek`) либо переоткрытие при смене
+    качества.
 
-    ⚠ Повтором команды по тому же соединению — нельзя (стенд: данные встают),
-    поэтому телефон по этому ответу сводит просмотр заново, как при открытии.
+    ⚠ Ответ несёт id: тот же — источник в приложении не менялся, картинка
+    продолжается; новый — телефон сводит просмотр заново, как при открытии.
     Позиция обязательна: «вернуть на начало» без неё — это жест «к событию»,
     и приложение шлёт его меткой само.
     """
@@ -571,6 +573,39 @@ class MegaHomeTrassirClipReadyView(_MegaHomeView):
         assert coordinator is not None
         try:
             return self.json(await ops.trassir_ready(coordinator, clip))
+        except ops.OpError as err:
+            return self.json_message(err.message, err.status)
+
+
+class MegaHomeTrassirClipCommandView(_MegaHomeView):
+    """Команда живой сессии из разрешённого словаря — канал новых функций.
+
+    ⚠ Тело `{fn, params}`: бандл составляет команду сам (скорость,
+    покадровый шаг, соседний фрагмент — `sdk-archive-command.md`), драйвер
+    держит границы списка. Выдача токена и пинг через эту дверь не идут —
+    жизненный цикл сессии остаётся у драйвера.
+    """
+
+    url = f"{URL_API}/trassir/clips/{{clip}}/command"
+    name = "api:mega_home:trassir-clip-command"
+
+    async def post(self, request: web.Request, clip: str) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            return self.json_message("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
+        fn = payload.get("fn")
+        params = payload.get("params")
+        try:
+            return self.json(
+                await ops.trassir_session_command(coordinator, clip, fn, params)
+            )
         except ops.OpError as err:
             return self.json_message(err.message, err.status)
 

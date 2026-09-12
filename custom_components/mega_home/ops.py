@@ -705,22 +705,41 @@ async def trassir_seek(
     position_us: int | None,
     quality: str | None = None,
 ) -> dict[str, Any]:
-    """Перемотка ПЕРЕОТКРЫТИЕМ: ответ — новый клип, телефон сводит заново.
+    """Перемотка: при неизменном качестве — официальный `command=seek` по
+    живому токену, ответ несёт ТОТ ЖЕ id (кадр продолжается без переоткрытия);
+    при смене качества — переоткрытие: поток регистратора привязан к качеству.
 
-    ⚠ Повтором команды по тому же соединению — нельзя: стенд показал, что со
-    второй-третьей команды данные встают. Поэтому здесь новый токен, новый
-    поток и новые переговоры (`trassir_clip.async_seek`), а не «та же команда
-    с новым стартом».
-
-    ⚠ Кнопка качества у записи идёт ЭТОЙ ЖЕ дверью: поток и токен привязаны к
-    качеству, значит смена качества — то же переоткрытие, только позиция
-    остаётся прежней. Своя операция дала бы вторую механику того же самого.
+    ⚠ `play` остаётся одним на соединение (факт стенда), seek — отдельная
+    документированная команда (`trassir_clip.async_seek`, §13.7 плана).
     """
     from .trassir_client import TrassirError
 
     try:
         return await trassir(coordinator).clips.async_seek(
             clip_id, position_us, quality
+        )
+    except TrassirError as err:
+        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
+
+
+async def trassir_session_command(
+    coordinator: MegaHomeCoordinator,
+    clip_id: str,
+    fn: str | None,
+    params: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Команда живой сессии из разрешённого словаря — канал новых функций.
+
+    ⚠ Не произвольный прокси: драйвер держит границы (`SESSION_COMMANDS` в
+    `trassir_clip.py`) — выдача токена и пинг не отдаются бандлу, с ними
+    связаны сторож и уборка. Новая медиа-функция бандла едет этим каналом
+    БЕЗ релиза интеграции (`docs/plan-thin-integration.md`).
+    """
+    from .trassir_client import TrassirError
+
+    try:
+        return await trassir(coordinator).clips.async_session_command(
+            clip_id, fn, params
         )
     except TrassirError as err:
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
