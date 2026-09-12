@@ -759,6 +759,8 @@ async def trassir_clip_at(
     camera_name: str | None = None,
     remote: bool = False,
     quality: str | None = None,
+    window_start_us: int | None = None,
+    window_stop_us: int | None = None,
 ) -> dict[str, Any]:
     """Открыть АРХИВ КАНАЛА на метке — классический просмотр по дню и времени.
 
@@ -776,7 +778,13 @@ async def trassir_clip_at(
 
     try:
         return await trassir(coordinator).clips.async_open_at(
-            guid, timestamp_us, camera_name=camera_name, remote=remote, quality=quality
+            guid,
+            timestamp_us,
+            camera_name=camera_name,
+            remote=remote,
+            quality=quality,
+            window_start_us=window_start_us,
+            window_stop_us=window_stop_us,
         )
     except TrassirError as err:
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err

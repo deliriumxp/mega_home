@@ -272,9 +272,13 @@ def test_архив_по_метке_и_дни_доезжают_снаружи(co
     """
     opened: list[tuple] = []
 
-    async def clip_at(coordinator, guid, timestamp_us, camera_name, quality=None):
-        opened.append((guid, timestamp_us, camera_name, quality))
-        return {"id": "trassir:tok1", "startUs": 0, "stopUs": 86_400_000_000}
+    async def clip_at(
+        coordinator, guid, timestamp_us, camera_name, quality=None,
+        window_start_us=None, window_stop_us=None,
+    ):
+        # ⚠ Окно присылает ПРИЛОЖЕНИЕ: шкала — его дело, дом хранит присланное.
+        opened.append((guid, timestamp_us, camera_name, quality, window_start_us, window_stop_us))
+        return {"id": "trassir:tok1", "startUs": window_start_us, "stopUs": window_stop_us}
 
     asked: list[str] = []
 
@@ -285,11 +289,20 @@ def test_архив_по_метке_и_дни_доезжают_снаружи(co
     monkeypatch.setattr(ops, "trassir_clip_at", clip_at)
     monkeypatch.setattr(ops, "trassir_archive_days", archive_days)
 
-    body = json.dumps({"timestampUs": 1788960000000000, "quality": "sub"}).encode()
+    body = json.dumps(
+        {
+            "timestampUs": 1788960000000000,
+            "quality": "sub",
+            "windowStartUs": 1788900000000000,
+            "windowStopUs": 1788986400000000,
+        }
+    ).encode()
     clip = json_of(call(coordinator, "POST", "api/trassir/channels/cam1/clip", body))
     days = json_of(call(coordinator, "GET", "api/trassir/clips/trassir:tok1/days"))
 
-    assert opened == [("cam1", 1788960000000000, None, "sub")]
-    assert clip["stopUs"] - clip["startUs"] == 86_400_000_000
+    assert opened == [
+        ("cam1", 1788960000000000, None, "sub", 1788900000000000, 1788986400000000)
+    ]
+    assert clip["startUs"] == 1788900000000000, "окно уходит дому как есть"
     assert asked == ["trassir:tok1"]
     assert days["days"] == ["2026-09-08"]

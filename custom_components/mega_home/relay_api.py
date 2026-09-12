@@ -173,6 +173,8 @@ async def _dispatch(
                 body_json.get("timestampUs"),
                 body_json.get("cameraName"),
                 quality=body_json.get("quality"),
+                window_start_us=body_json.get("windowStartUs"),
+                window_stop_us=body_json.get("windowStopUs"),
             )
         )
     if path.startswith("api/trassir/clips/") and path.endswith("/days") and method == "GET":

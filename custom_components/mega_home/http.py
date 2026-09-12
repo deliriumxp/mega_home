@@ -590,6 +590,10 @@ class MegaHomeTrassirArchiveClipView(_MegaHomeView):
                     payload.get("timestampUs"),
                     payload.get("cameraName"),
                     quality=payload.get("quality"),
+                    # ⚠ Окно считает приложение и присылает готовым: шкала — его
+                    # дело. Дом хранит присланное.
+                    window_start_us=payload.get("windowStartUs"),
+                    window_stop_us=payload.get("windowStopUs"),
                 )
             )
         except ops.OpError as err:

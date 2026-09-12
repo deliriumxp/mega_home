@@ -348,6 +348,8 @@ class ClipSessions:
         camera_name: str | None = None,
         remote: bool = False,
         quality: str | None = None,
+        window_start_us: int | None = None,
+        window_stop_us: int | None = None,
     ) -> dict[str, Any]:
         """Открыть запись КАНАЛА на метке — классический просмотр архива.
 
@@ -366,7 +368,17 @@ class ClipSessions:
             raise TrassirError("Видеонаблюдение объекта не настроено")
 
         at = int(timestamp_us) if timestamp_us else trassir_now_us()
-        start, stop = day_bounds(at)
+        # ⚠ ОКНО СЧИТАЕТ ПРИЛОЖЕНИЕ и присылает готовым: шкала, по которой жилец
+        # видит записи, — его дело, а не дома. Дом хранит присланное и больше в
+        # окно не заглядывает (`docs/plan-thin-integration.md`, «Широкая дверь»).
+        #
+        # ⚠ Считаем сами ТОЛЬКО для сборок, которые окна ещё не шлют: их шкала
+        # стоит на этом окне, и без него она выродилась бы в точку. Долг снимется
+        # вместе с ними.
+        if window_start_us is not None and window_stop_us is not None:
+            start, stop = int(window_start_us), int(window_stop_us)
+        else:
+            start, stop = day_bounds(at)
         want = _archive_stream(quality, remote)
         token = await client.async_get_video(guid, want, "rtsp")
         clip = Clip(
