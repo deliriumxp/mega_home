@@ -162,16 +162,15 @@ def test_дома_основной_архив_снаружи_суб(gateway: Fak
 
 
 def test_перемотка_держит_качество_двери(gateway: FakeGateway) -> None:
-    """⚠ Качество выбирает дверь при открытии, а перемотка дверь не меняет.
-    Захардкоженный суб ронял домашний просмотр на субпоток после первого же
-    жеста по таймлайну."""
+    """⚠ Качество выбирает дверь при открытии. Официальный seek живой поток
+    не пересоздаёт вовсе: `get_video` на перемотке значил бы смену потока,
+    а это уже не перемотка."""
     opened = asyncio.run(gateway.clips.async_open("e1"))
     gateway.client.calls.clear()
 
     asyncio.run(gateway.clips.async_seek(opened["id"], EVENT["timestampUs"]))
 
-    call = next(params for name, params in gateway.client.calls if name == "get_video")
-    assert call["stream"] == "archive_main"
+    assert [n for n, _ in gateway.client.calls if n == "get_video"] == []
 
 
 def _offered(
@@ -379,15 +378,74 @@ def test_сторож_стартует_вслепую_без_готовност�
     assert commands[0]["start"] == EVENT["timestampUs"] - 10_000_000
 
 
-def test_seek_переоткрывает_а_не_перекомандует(
+def test_seek_позиционирует_живой_поток_тем_же_клипом(
     gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Жест по таймлайну — новый токен, новый поток, новые переговоры.
+    """Перемотка — документированный `command=seek` по живому токену
+    (`sdk-archive-command.md`): тот же токен, тот же поток go2rtc, та же
+    WebRTC-сессия — кадр продолжается с новой метки без переоткрытия и
+    заморозки. Ответ несёт ТОТ ЖЕ id: приложение по нему понимает, что
+    проигрыватель трогать не надо.
 
-    Повторный `play` по одному соединению стенд запретил (данные встают), и
-    «та же команда с новым стартом» — не вариант. Старое соединение разбираем
-    целиком, телефон сводит новый просмотр обычным путём.
+    ⚠ `play` от этого не становится повторным: старт — один на соединение
+    (факт стенда), seek — отдельная документированная команда. Живое поведение
+    проверяет прод; откат — релиз интеграции.
     """
+    clip_id = _opened_clip_id(gateway)
+    monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_ARCHIVE_SETTLE", 0.02)
+    # Архив должен быть ЗАПУЩЕН: seek позиционирует живой поток.
+    _offered(gateway, monkeypatch, clip_id)
+    asyncio.run(gateway.clips.async_ready(clip_id))
+    gateway.client.calls.clear()
+    middle = EVENT["timestampUs"] + 20_000_000
+
+    answer = asyncio.run(gateway.clips.async_seek(clip_id, middle))
+
+    # Клип тот же: источник в приложении не меняется, переговоров нет.
+    assert answer["id"] == clip_id
+    assert answer["positionUs"] == middle
+    assert answer["startUs"] == EVENT["timestampUs"] - 10_000_000, "окно не съезжает"
+    assert answer["stopUs"] == EVENT["timestampUs"] + 60_000_000
+    # Одна команда — сам seek, с документированными параметрами.
+    commands = [p for n, p in gateway.client.calls if n == "archive_command"]
+    assert len(commands) == 1
+    assert commands[0]["command"] == "seek"
+    assert commands[0]["timestamp"] == middle
+    assert commands[0]["direction"] == 0
+    # Ни нового токена, ни разбора потока.
+    assert [n for n, _ in gateway.client.calls if n == "get_video"] == []
+    assert gateway.clips._clips.get(clip_id) is not None  # noqa: SLF001
+
+
+def test_seek_до_старта_не_шлёт_команду(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Архив ещё не стартовал (`play` уйдёт по готовности телефона): seek
+    просто сдвигает старт — команда по неоткрытому потоку получает
+    `stream is expired` (факт стенда). Стартовать надо уже с новой метки."""
+    monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_ARCHIVE_SETTLE", 0.02)
+    clip_id = _opened_clip_id(gateway)
+    gateway.client.calls.clear()
+    middle = EVENT["timestampUs"] + 20_000_000
+
+    answer = asyncio.run(gateway.clips.async_seek(clip_id, middle))
+
+    assert answer["id"] == clip_id
+    assert answer["positionUs"] == middle
+    assert [n for n, _ in gateway.client.calls if n == "archive_command"] == []
+
+    # Стартовавший архив играет уже с новой метки.
+    asyncio.run(gateway.clips.async_ready(clip_id))
+    commands = [p for n, p in gateway.client.calls if n == "archive_command"]
+    assert commands and commands[0]["start"] == middle
+
+
+def test_смену_качества_seek_переоткрывает(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Поток регистратора привязан к качеству: позиционировать нельзя, только
+    новый токен и новый поток. Это единственный оставшийся путь переоткрытия —
+    обычная перемотка им больше не ходит."""
     dropped: list[str] = []
     monkeypatch.setattr(
         ClipSessions,
@@ -398,20 +456,12 @@ def test_seek_переоткрывает_а_не_перекомандует(
     gateway.client.calls.clear()
     middle = EVENT["timestampUs"] + 20_000_000
 
-    answer = asyncio.run(gateway.clips.async_seek(clip_id, middle))
+    answer = asyncio.run(gateway.clips.async_seek(clip_id, middle, "sub"))
 
-    # Новый клип — новым id: телефон сводит заново, как при открытии.
     assert answer["id"] == f"{CLIP_PREFIX}tok2"
-    assert answer["positionUs"] == middle
-    assert answer["startUs"] == EVENT["timestampUs"] - 10_000_000, "окно не съезжает"
-    assert answer["stopUs"] == EVENT["timestampUs"] + 60_000_000
-    # Ни одной команды по старому соединению — только новый токен.
-    assert [n for n, _ in gateway.client.calls if n == "archive_command"] == []
     tokens = [p for n, p in gateway.client.calls if n == "get_video"]
-    assert len(tokens) == 1
-    # Старый поток снят, старый клип забыт.
+    assert tokens and tokens[0]["stream"] == "archive_sub"
     assert dropped == ["trassir_tok1"]
-    assert gateway.clips._clips.get(clip_id) is None  # noqa: SLF001
 
 
 def test_seek_без_позиции_отказывает(gateway: FakeGateway) -> None:
