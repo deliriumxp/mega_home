@@ -718,6 +718,12 @@ async def recorder_call(
     door = getattr(gateway, "recorders", None)
     if door is None:
         raise OpError("У объекта нет регистратора", HTTPStatus.NOT_FOUND)
+    # ⚠ Описания ещё не приехали (конфиг дома постарше) — двери ЭТО НЕТ, и это
+    # 404, а не отказ: бандл по 404 переходит на прежние пути, а по отказу
+    # решил бы, что ему нельзя, и перемотка у жильца упала бы с ошибкой
+    # (живой отчёт 2026-09-12).
+    if door.descriptor(payload.get("recorder")) is None:
+        raise OpError("У объекта нет такого регистратора", HTTPStatus.NOT_FOUND)
 
     session: dict[str, str] = {}
     clip_id = payload.get("clip")

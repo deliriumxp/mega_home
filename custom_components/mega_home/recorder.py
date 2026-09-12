@@ -56,7 +56,12 @@ class RecorderDescriptor:
 
     id: str
     host: str
-    port: int = 80
+    # ⚠ Схема — ДАННЫЕ: у Trassir SDK живёт на HTTPS, у другого регистратора
+    # может быть иначе, и знать это дом не обязан. Замер стенда 2026-09-12: по
+    # http:// регистратор молча рвёт соединение — «Server disconnected», а
+    # жилец видит «Дом не смог выполнить запрос».
+    scheme: str = "https"
+    port: int = 443
     rtsp_port: int = 554
     vendor: str = ""
     # Как войти: путь, параметры (с {user}/{pass}) и поле ответа с сессией.
@@ -96,7 +101,8 @@ def descriptor_of(block: Any) -> RecorderDescriptor | None:
     return RecorderDescriptor(
         id=str(block.get("id") or block.get("vendor") or "recorder"),
         host=host,
-        port=int(block.get("port") or 80),
+        scheme=str(block.get("scheme") or "https"),
+        port=int(block.get("port") or 443),
         rtsp_port=int(block.get("rtspPort") or block.get("rtsp_port") or 554),
         vendor=str(block.get("vendor") or ""),
         login_path=str(block.get("login") or ""),
@@ -192,7 +198,7 @@ class RecorderCall:
             query[descriptor.session_param] = await self._sid(descriptor)
         query.update(session or {})
 
-        url = f"http://{descriptor.host}:{descriptor.port}{path}"
+        url = f"{descriptor.scheme}://{descriptor.host}:{descriptor.port}{path}"
         client = await self._client()
         try:
             async with client.request(
@@ -203,9 +209,7 @@ class RecorderCall:
                     raise RecorderDenied("Ответ регистратора больше потолка двери")
                 return response.status, response.content_type, payload
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-            raise RecorderDenied(
-                "Регистратор не отвечает" if not str(err) else f"Регистратор не отвечает: {err}"
-            ) from err
+            raise RecorderDenied(_reason(err)) from err
 
     async def _sid(self, descriptor: RecorderDescriptor) -> str:
         """Сессия регистратора: живая из памяти либо новый вход."""
@@ -231,11 +235,23 @@ class RecorderCall:
     async def _plain(
         self, descriptor: RecorderDescriptor, path: str, params: dict[str, str]
     ) -> tuple[int, str, bytes]:
-        """Запрос БЕЗ подстановки сессии — им же входим."""
+        """Запрос БЕЗ подстановки сессии — им же входим.
+
+        ⚠ Ошибка связи превращается в ОТКАЗ двери, а не летит наружу: на выходе
+        из дома неожиданное исключение менеджер отдаёт жильцу как «Дом не смог
+        выполнить запрос» — причину, которой он не видит. Живой отчёт
+        2026-09-12: перемотка падала так, потому что дверь стучалась по http://,
+        а регистратор на это молча рвёт соединение.
+        """
         client = await self._client()
-        url = f"http://{descriptor.host}:{descriptor.port}{path}"
-        async with client.get(url, params=params, timeout=aiohttp.ClientTimeout(total=CALL_TIMEOUT)) as response:
-            return response.status, response.content_type, await response.content.read()
+        url = f"{descriptor.scheme}://{descriptor.host}:{descriptor.port}{path}"
+        try:
+            async with client.get(
+                url, params=params, timeout=aiohttp.ClientTimeout(total=CALL_TIMEOUT)
+            ) as response:
+                return response.status, response.content_type, await response.content.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise RecorderDenied(_reason(err)) from err
 
     async def stream_url(self, camera: str, quality: str) -> str:
         """Адрес потока по описанию: дом идёт за токеном сам, шаблон — из данных."""
@@ -277,6 +293,12 @@ class RecorderCall:
             await self._session.close()
         self._session = None
         self._sids.clear()
+
+
+def _reason(err: Exception) -> str:
+    """Причина отказа словами — у сетевых ошибок сообщение часто пустое."""
+    text = str(err).strip()
+    return f"Регистратор не отвечает: {text}" if text else "Регистратор не отвечает"
 
 
 def _field(payload: bytes, name: str) -> str:
