@@ -12,6 +12,8 @@ this on a customer object in this state.
 
 from __future__ import annotations
 
+import base64
+import json
 from http import HTTPStatus
 from typing import Any
 
@@ -115,6 +117,7 @@ async def async_register_http(
         MegaHomeTrassirClipSeekView,
         MegaHomeTrassirClipReadyView,
         MegaHomeTrassirClipCommandView,
+        MegaHomeRecorderCallView,
         MegaHomeWebRtcView,
         MegaHomeWebRtcCandidatesView,
         MegaHomeWebRtcCloseView,
@@ -666,6 +669,44 @@ class MegaHomeTrassirClipCommandView(_MegaHomeView):
             return self.json(
                 await ops.trassir_session_command(coordinator, clip, fn, params)
             )
+        except ops.OpError as err:
+            return self.json_message(err.message, err.status)
+
+
+class MegaHomeRecorderCallView(_MegaHomeView):
+    """Универсальная дверь к регистратору: дом ИСПОЛНЯЕТ описанный вызов.
+
+    ⚠ Ни словаря команд, ни разбора ответов здесь нет и не будет: дом выполняет
+    запрос, описанный в конфиге объекта, и отдаёт ответ КАК ЕСТЬ. Что значат
+    поля, где тут дни и шкала — решает бандл, который обновляется сам
+    (`recorder.py`, `docs/plan-thin-integration.md`).
+
+    ⚠ Поэтому новая функция архива и новый регистратор не стоят релиза: первый
+    — правка бандла, второй — описание в конфиге (его собирает менеджер).
+
+    Ответ: JSON как есть, если регистратор ответил JSON; иначе конверт
+    `{status, contentType, body}` с base64 — так же, как носит файлы реле.
+    """
+
+    url = f"{URL_API}/recorder/call"
+    name = "api:mega_home:recorder-call"
+
+    async def post(self, request: web.Request) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            return self.json_message("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
+        # ⚠ Работа живёт в `ops.py`, а не здесь: тот же код обслуживает жильца,
+        # пришедшего СНАРУЖИ через менеджер (`relay_api.py`). Копия правил двери
+        # на каждый транспорт разъехалась бы.
+        try:
+            return self.json(await ops.recorder_call(coordinator, payload))
         except ops.OpError as err:
             return self.json_message(err.message, err.status)
 

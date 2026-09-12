@@ -1,0 +1,300 @@
+"""Универсальная дверь к регистратору: дом ИСПОЛНЯЕТ описанный вызов.
+
+⚠ Дом не знает ни одного вендора и не разбирает ни одного ответа. Он умеет
+ровно две вещи: выполнить запрос, ОПИСАННЫЙ в конфиге объекта, и отдать ответ
+как есть. Что значат поля, где тут дни, где шкала, где «эпоха вместо дня» —
+решает бандл, который обновляется сам
+(`docs/plan-thin-integration.md`, «Широкая дверь»).
+
+⚠ Почему так, а не «словарь команд». Словарь в доме — это код, который нельзя
+обновить: каждая новая надобность приложения просит релиза HACS и перезапуска
+Home Assistant на КАЖДОМ объекте. Вечер 2026-09-12 показал и обратную сторону:
+в шлюз приехало толкование (`day_bounds`, `trassir_now_us`, «эпоха — не день»)
+и выпустило два релиза подряд ради того, что чинится бандлом.
+
+⚠ Учётки через эту дверь НЕ ходят: их подставляет дом, он же держит сессию
+(`sid`) и подставляет её в запрос. Телефон жильца знает пути, но не пароли.
+
+⚠ Границы широкой двери (политика, а не список команд):
+  * адресат — только регистратор из конфига объекта (никакого «сходи по LAN»);
+  * запрещены вход, настройки и всё, что меняет состояние регистратора (запрос
+    воспроизведения — можно, перенастройку — нет);
+  * потолок размера ответа и срок: дверь не превращается в выкачивание;
+  * метод — GET/HEAD/POST; тело уходит как есть.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from time import monotonic
+from typing import Any
+
+import aiohttp
+
+from .const import LOGGER
+
+# Срок одного вызова: регистратор местный, но искать кадр в архиве может
+# подолгу (замер стенда 2026-09-12: снимок отдаётся за 0,7–1,3 с).
+CALL_TIMEOUT = 30
+# Потолок ответа. Кадр полного размера — ~390 КБ, конфиг регистратора — сотни
+# килобайт; восемь мегабайт ловят ошибку «просим не то», а не ограничивают работу.
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+# Пути, закрытые ВСЕГДА, каким бы ни был вендор: вход, настройки и дерево
+# объектов (через него правится состояние регистратора, а не воспроизведение).
+DENY_ALWAYS = ("/login", "/settings", "/objects", "/users")
+ALLOWED_METHODS = ("GET", "HEAD", "POST")
+
+
+@dataclass
+class RecorderDescriptor:
+    """Описание ОДНОГО регистратора объекта — данные, а не код.
+
+    ⚠ Ничего вендорского в питоне: новый регистратор приезжает этим описанием в
+    конфиге (его собирает менеджер), и релиза интеграции для этого не нужно.
+    """
+
+    id: str
+    host: str
+    port: int = 80
+    rtsp_port: int = 554
+    vendor: str = ""
+    # Как войти: путь, параметры (с {user}/{pass}) и поле ответа с сессией.
+    login_path: str = ""
+    login_params: dict[str, str] = field(default_factory=dict)
+    session_field: str = "sid"
+    # Как зовут сессию в запросе: Trassir — `sid` в строке запроса.
+    session_param: str = "sid"
+    # Как получить поток: путь, параметры, поле с токеном и шаблон адреса.
+    stream_path: str = ""
+    stream_params: dict[str, str] = field(default_factory=dict)
+    stream_field: str = "token"
+    stream_url: str = "rtsp://{host}:{rtspPort}/{token}"
+    # Дополнительные запреты этого регистратора (к общим).
+    deny: tuple[str, ...] = ()
+    # Сколько живёт сессия без запросов (Trassir — 15 минут).
+    session_ttl: float = 600.0
+
+
+def descriptor_of(block: Any) -> RecorderDescriptor | None:
+    """Собрать описание из блока конфига; мусор — «описания нет».
+
+    ⚠ Не бросаем: конфиг дома может быть от менеджера постарше, и падать из-за
+    незнакомого поля нельзя — регистратор просто останется без этой двери.
+    """
+    if not isinstance(block, dict):
+        return None
+    # ⚠ Пробелы — тот же «не задано»: иначе описание с пустым хостом уехало бы
+    # в работу и дверь стучалась бы в никуда (та же проверка у менеджера).
+    host = str(block.get("host") or "").strip()
+    if not host:
+        return None
+    def strings(value: Any) -> dict[str, str]:
+        if not isinstance(value, dict):
+            return {}
+        return {str(key): str(item) for key, item in value.items()}
+    return RecorderDescriptor(
+        id=str(block.get("id") or block.get("vendor") or "recorder"),
+        host=host,
+        port=int(block.get("port") or 80),
+        rtsp_port=int(block.get("rtspPort") or block.get("rtsp_port") or 554),
+        vendor=str(block.get("vendor") or ""),
+        login_path=str(block.get("login") or ""),
+        login_params=strings(block.get("loginParams")),
+        session_field=str(block.get("sessionField") or "sid"),
+        session_param=str(block.get("sessionParam") or "sid"),
+        stream_path=str(block.get("streamPath") or ""),
+        stream_params=strings(block.get("streamParams")),
+        stream_field=str(block.get("streamField") or "token"),
+        stream_url=str(block.get("streamUrl") or "rtsp://{host}:{rtspPort}/{token}"),
+        deny=tuple(str(item) for item in (block.get("deny") or ())),
+        session_ttl=float(block.get("sessionTtl") or 600),
+    )
+
+
+class RecorderDenied(Exception):
+    """Вызов не проходит политику двери — и это НЕ отказ регистратора."""
+
+
+class RecorderCall:
+    """Сессии регистраторов и исполнение описанных вызовов."""
+
+    def __init__(self, credentials: Any = None) -> None:
+        self._descriptors: dict[str, RecorderDescriptor] = {}
+        # Учётка на регистратор: тем же маршрутом менеджера, что и раньше.
+        self._credentials = credentials
+        self._session: aiohttp.ClientSession | None = None
+        self._sids: dict[str, tuple[str, float]] = {}
+
+    # --- описание -------------------------------------------------------
+
+    def apply(self, blocks: Any) -> None:
+        """Принять описания из конфига объекта (список блоков `recorders`)."""
+        self._descriptors = {}
+        self._sids.clear()
+        if not isinstance(blocks, list):
+            return
+        for block in blocks:
+            descriptor = descriptor_of(block)
+            if descriptor is not None:
+                self._descriptors[descriptor.id] = descriptor
+
+    def ids(self) -> list[str]:
+        return list(self._descriptors)
+
+    def descriptor(self, recorder: str | None) -> RecorderDescriptor | None:
+        """Описание по имени; без имени — единственный регистратор объекта."""
+        if recorder:
+            return self._descriptors.get(recorder)
+        if len(self._descriptors) == 1:
+            return next(iter(self._descriptors.values()))
+        return None
+
+    # --- политика -------------------------------------------------------
+
+    @staticmethod
+    def check(descriptor: RecorderDescriptor, method: str, path: str) -> None:
+        """Пропустить вызов или объяснить, почему нет.
+
+        ⚠ Это ГРАНИЦА двери, и она намеренно простая: запрет по префиксам путей
+        и по методу. Список команд не ведём — иначе новая функция приложения
+        снова упрётся в релиз, ради чего дверь и переделывалась.
+        """
+        if method not in ALLOWED_METHODS:
+            raise RecorderDenied(f"Метод {method} через дверь не ходит")
+        if not path.startswith("/"):
+            raise RecorderDenied("Путь начинается с «/»")
+        for prefix in (*DENY_ALWAYS, *descriptor.deny):
+            if path.split("?")[0].startswith(prefix):
+                raise RecorderDenied(f"{prefix}* через дверь не ходит")
+
+    # --- исполнение -----------------------------------------------------
+
+    async def call(
+        self,
+        recorder: str | None,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        body: bytes | None = None,
+        session: dict[str, str] | None = None,
+    ) -> tuple[int, str, bytes]:
+        """Выполнить описанный вызов. Ответ отдаётся КАК ЕСТЬ — без разбора."""
+        descriptor = self.descriptor(recorder)
+        if descriptor is None:
+            raise RecorderDenied("Такого регистратора у объекта нет")
+        method = method.upper()
+        self.check(descriptor, method, path)
+
+        query = {str(key): str(value) for key, value in (params or {}).items()}
+        # ⚠ Сессию подставляет ДОМ: бандл её не видит и не хранит.
+        if descriptor.login_path and path.split("?")[0] != descriptor.login_path:
+            query[descriptor.session_param] = await self._sid(descriptor)
+        query.update(session or {})
+
+        url = f"http://{descriptor.host}:{descriptor.port}{path}"
+        client = await self._client()
+        try:
+            async with client.request(
+                method, url, params=query, data=body, timeout=aiohttp.ClientTimeout(total=CALL_TIMEOUT)
+            ) as response:
+                payload = await response.content.read(MAX_RESPONSE_BYTES + 1)
+                if len(payload) > MAX_RESPONSE_BYTES:
+                    raise RecorderDenied("Ответ регистратора больше потолка двери")
+                return response.status, response.content_type, payload
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise RecorderDenied(
+                "Регистратор не отвечает" if not str(err) else f"Регистратор не отвечает: {err}"
+            ) from err
+
+    async def _sid(self, descriptor: RecorderDescriptor) -> str:
+        """Сессия регистратора: живая из памяти либо новый вход."""
+        cached = self._sids.get(descriptor.id)
+        if cached and cached[1] > monotonic():
+            return cached[0]
+        if not descriptor.login_path:
+            return ""
+        creds = await self._login_credentials()
+        params = {
+            key: value.replace("{user}", creds[0]).replace("{pass}", creds[1])
+            for key, value in descriptor.login_params.items()
+        }
+        status, _, payload = await self._plain(
+            descriptor, descriptor.login_path, params
+        )
+        sid = _field(payload, descriptor.session_field)
+        if status != 200 or not sid:
+            raise RecorderDenied("Регистратор не пустил дом в сессию")
+        self._sids[descriptor.id] = (sid, monotonic() + descriptor.session_ttl)
+        return sid
+
+    async def _plain(
+        self, descriptor: RecorderDescriptor, path: str, params: dict[str, str]
+    ) -> tuple[int, str, bytes]:
+        """Запрос БЕЗ подстановки сессии — им же входим."""
+        client = await self._client()
+        url = f"http://{descriptor.host}:{descriptor.port}{path}"
+        async with client.get(url, params=params, timeout=aiohttp.ClientTimeout(total=CALL_TIMEOUT)) as response:
+            return response.status, response.content_type, await response.content.read()
+
+    async def stream_url(self, camera: str, quality: str) -> str:
+        """Адрес потока по описанию: дом идёт за токеном сам, шаблон — из данных."""
+        descriptor = self.descriptor(None)
+        if descriptor is None or not descriptor.stream_path:
+            raise RecorderDenied("Регистратор объекта не описан")
+        params = {
+            key: value.replace("{camera}", camera).replace("{quality}", quality)
+            for key, value in descriptor.stream_params.items()
+        }
+        status, _, payload = await self._read_with_session(descriptor, descriptor.stream_path, params)
+        token = _field(payload, descriptor.stream_field)
+        if status != 200 or not token:
+            raise RecorderDenied("Регистратор не выдал поток")
+        return descriptor.stream_url.format(
+            host=descriptor.host, rtspPort=descriptor.rtsp_port, token=token
+        )
+
+    async def _read_with_session(
+        self, descriptor: RecorderDescriptor, path: str, params: dict[str, str]
+    ) -> tuple[int, str, bytes]:
+        query = dict(params)
+        if descriptor.login_path:
+            query[descriptor.session_param] = await self._sid(descriptor)
+        return await self._plain(descriptor, path, query)
+
+    async def _login_credentials(self) -> tuple[str, str]:
+        if self._credentials is None:
+            raise RecorderDenied("Учётка регистратора недоступна")
+        return await self._credentials()
+
+    async def _client(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def async_close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
+        self._sids.clear()
+
+
+def _field(payload: bytes, name: str) -> str:
+    """Поле ответа по имени — единственный разбор, который двери позволен.
+
+    ⚠ Это не толкование: имя поля пришло в описании, значение уходит наружу как
+    есть. Всё остальное (даты, шкалы, сутки) разбирает бандл.
+    """
+    if not name or not payload:
+        return ""
+    import json
+
+    try:
+        data = json.loads(payload.decode("utf-8", "ignore"))
+    except ValueError:
+        LOGGER.debug("Регистратор ответил не-JSON на запрос описания")
+        return ""
+    if isinstance(data, dict):
+        value = data.get(name)
+        return str(value) if isinstance(value, (str, int)) else ""
+    return ""

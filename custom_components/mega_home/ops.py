@@ -699,6 +699,59 @@ async def trassir_play(
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
 
 
+async def recorder_call(
+    coordinator: MegaHomeCoordinator, payload: dict[str, Any]
+) -> Any:
+    """Исполнить ОПИСАННЫЙ вызов регистратора — универсальная дверь.
+
+    ⚠ Дом не знает ни одного вендора и не разбирает ни одного ответа: он
+    подставляет сессию (и токен открытой записи), выполняет запрос у
+    регистратора из конфига и отдаёт ответ КАК ЕСТЬ
+    (`recorder.py`, docs/plan-thin-integration.md).
+    """
+    import base64 as _base64
+    import json as _json
+
+    from .recorder import RecorderDenied
+
+    gateway = getattr(coordinator, "trassir", None)
+    door = getattr(gateway, "recorders", None)
+    if door is None:
+        raise OpError("У объекта нет регистратора", HTTPStatus.NOT_FOUND)
+
+    session: dict[str, str] = {}
+    clip_id = payload.get("clip")
+    if clip_id and gateway is not None:
+        clip = getattr(gateway.clips, "_clips", {}).get(str(clip_id))
+        if clip is not None:
+            session["token"] = clip.token
+
+    body = payload.get("body")
+    raw = (
+        _base64.b64decode(body)
+        if isinstance(body, str) and body
+        else (str(body).encode("utf-8") if body else None)
+    )
+    try:
+        status, content_type, answer = await door.call(
+            payload.get("recorder"),
+            str(payload.get("method") or "GET"),
+            str(payload.get("path") or ""),
+            payload.get("params"),
+            raw,
+            session,
+        )
+    except RecorderDenied as err:
+        raise OpError(str(err), HTTPStatus.FORBIDDEN) from err
+    if "json" in (content_type or "") and not payload.get("binary"):
+        return _json.loads(answer.decode("utf-8", "ignore"))
+    return {
+        "status": status,
+        "contentType": content_type or "",
+        "body": _base64.b64encode(answer).decode("ascii"),
+    }
+
+
 async def trassir_clip_at(
     coordinator: MegaHomeCoordinator,
     guid: str,

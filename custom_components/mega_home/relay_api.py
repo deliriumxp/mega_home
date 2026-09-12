@@ -150,6 +150,15 @@ async def _dispatch(
                 quality=played.get("quality") if isinstance(played, dict) else None,
             )
         )
+    if path == "api/recorder/call" and method == "POST":
+        # ⚠ Универсальная дверь — ОБЕИМИ дверями приложения, как и всё
+        # остальное: снаружи новая функция архива обязана работать так же, как
+        # дома. Границы двери (адресат из конфига, запрет входа и настроек,
+        # потолок ответа) — в `recorder.py`, они одни на оба транспорта.
+        payload = _json_body(body)
+        if not isinstance(payload, dict):
+            raise ops.OpError("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
+        return _json(await ops.recorder_call(coordinator, payload))
     if path.startswith("api/trassir/channels/") and path.endswith("/clip") and method == "POST":
         # Открытие архива канала по метке — та же дверь, что и всё остальное:
         # снаружи «что было вчера в 21:40» обязано работать так же, как дома.

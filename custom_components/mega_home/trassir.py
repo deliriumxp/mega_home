@@ -45,6 +45,7 @@ from .const import (
     TRASSIR_STORAGE_KEY,
     STORAGE_VERSION,
 )
+from .recorder import RecorderCall, RecorderDenied
 from .trassir_clip import ClipSessions
 from .trassir_client import TrassirClient, TrassirError
 
@@ -82,6 +83,10 @@ class TrassirGateway:
         # Открытые записи: свой модуль, потому что это ДРУГАЯ тема — сеанс
         # просмотра, а не лента (`trassir_clip.py`).
         self.clips = ClipSessions(self)
+        # Универсальная дверь: исполнение ОПИСАННЫХ вызовов регистратора
+        # (`recorder.py`). Дом при этом не знает ни одного вендора — описание
+        # приезжает конфигом, а ответы уходят наружу как есть.
+        self.recorders = RecorderCall(credentials=self._manager_trassir_credentials)
         # Одна строка в журнал на СМЕНУ состояния, а не на каждую неудачу: опрос
         # идёт каждые пять секунд, и объект без связи с регистратором иначе
         # засыпал бы лог быстрее, чем его читают.
@@ -94,6 +99,18 @@ class TrassirGateway:
 
     # --- жизненный цикл -------------------------------------------------
 
+    async def _manager_trassir_credentials(self) -> tuple[str, str]:
+        """Учётка регистратора для двери — тем же маршрутом менеджера.
+
+        ⚠ Через дверь учётки НЕ ходят: их подставляет дом, а телефон жильца
+        знает пути, но не пароли.
+        """
+        try:
+            creds = await self._manager.async_trassir_credentials()
+        except ManagerError as err:
+            raise RecorderDenied(f"Учётка регистратора недоступна: {err}") from err
+        return str(creds.get("username") or ""), str(creds.get("password") or "")
+
     async def async_load(self) -> None:
         """Restore credentials and the feed from disk."""
         stored = await self._store.async_load() or {}
@@ -104,6 +121,9 @@ class TrassirGateway:
 
     async def async_apply(self, config: dict[str, Any]) -> None:
         """Take the `trassir` block of a freshly synchronised config."""
+        # ⚠ Описания регистраторов принимаются ВСЕГДА, и до блока `trassir`:
+        # дверь работает и там, где драйвер объекта ещё не настроен.
+        self.recorders.apply(config.get("recorders"))
         block = config.get("trassir")
         if not isinstance(block, dict) or not block.get("host"):
             await self.async_stop()
