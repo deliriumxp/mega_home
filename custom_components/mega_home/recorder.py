@@ -285,7 +285,19 @@ class RecorderCall:
 
     async def _client(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            # ⚠ Сертификат регистратора САМОПОДПИСАННЫЙ, и проверять его нечем:
+            # доверие здесь держится на том, что адрес взят ИЗ КОНФИГА объекта, а
+            # не из запроса приложения (решение заказчика 2026-09-12).
+            #
+            # ⚠ Так же поступает драйвер (`trassir_client.py`, `ssl=False` в
+            # трёх местах): дверь и драйвер говорят с ОДНИМ И ТЕМ ЖЕ
+            # регистратором, и разная строгость у них означала бы, что дверь не
+            # подключается там, где драйвер работает (живой отчёт: «Дом не смог
+            # выполнить запрос» — дверь стучалась по http, а по https её
+            # останавливала проверка сертификата).
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=False)
+            )
         return self._session
 
     async def async_close(self) -> None:
