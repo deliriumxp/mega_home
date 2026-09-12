@@ -126,17 +126,27 @@ def _day_start_of(rows: Any, token: str) -> int | None:
     ⚠ Своих расчётов здесь нет намеренно: регистратор один знает, куда встал
     курсор после перемотки, и `day_start` — его собственный ответ. Наша
     арифметика совпала бы с ним до первой смены суток посреди просмотра.
+
+    ⚠ Пока архив НЕ ПОЗИЦИОНИРОВАН (поток открыт, команды ещё не было),
+    регистратор отвечает строкой `1970-01-01` и пустой шкалой — это «не знаю»,
+    а не «первое января». Отличить одно от другого без этой проверки нельзя, и
+    приложение рисовало жильцу «1 января 1970» в календаре (живой отчёт
+    2026-09-12). Поэтому: пустая шкала — не день вовсе.
     """
     if not isinstance(rows, list):
         return None
     for row in rows:
         if not isinstance(row, dict) or row.get("token") != token:
             continue
+        if not row.get("timeline"):
+            return None
         try:
             day = datetime.strptime(str(row.get("day_start")), "%Y-%m-%d")
         except ValueError:
             return None
-        return int(calendar.timegm(day.timetuple())) * 1_000_000
+        at = int(calendar.timegm(day.timetuple())) * 1_000_000
+        # Эпоха — тот же «не знаю», пришедший другой формой.
+        return at or None
     return None
 
 

@@ -893,3 +893,22 @@ def test_календарь_читается_сразу_после_старта_
         return days
 
     assert asyncio.run(scenario()) == ["2026-09-08", "2026-09-09"]
+
+
+def test_эпоха_это_не_день(gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠ Пока архив не позиционирован, регистратор отвечает `1970-01-01` и
+    пустой шкалой — это «не знаю», а не «первое января».
+
+    Без этой проверки приложение рисовало жильцу календарь 1970 года (живой
+    отчёт с объекта 2026-09-12: «архив открывается на 1 января»).
+    """
+
+    async def empty_status(kind: str = "timeline") -> list[dict[str, Any]]:
+        return [{"token": "tok1", "day_start": "1970-01-01", "timeline": []}]
+
+    monkeypatch.setattr(gateway.client, "async_archive_status", empty_status)
+    opened = asyncio.run(gateway.clips.async_open_at("cam1", EVENT["timestampUs"]))
+    days = asyncio.run(gateway.clips.async_days(opened["id"]))
+
+    assert days["dayStartUs"] is None
+    assert days["segments"] == []
