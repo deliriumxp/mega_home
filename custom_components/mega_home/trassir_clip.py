@@ -117,6 +117,8 @@ class Clip:
     # Куда курсор архива встал НА САМОМ ДЕЛЕ: у записи бывают дыры, и «клип
     # начался не с события» — факт регистратора, а не наш промах.
     first_frame: str | None = None
+    # Почему архив не встал: отказ регистратора на команду старта, словами.
+    start_error: str | None = None
     # ⚠ Всё остальное оставили приложению: `outOfWindow`, участки записи, дни с
     # архивом и окно шкалы. Дом их не считает и не разбирает — он держит сессию
     # и исполняет описанные вызовы (`recorder.py`),
@@ -340,7 +342,13 @@ class ClipSessions:
         )
         return answer
 
-    async def async_ready(self, clip_id: str) -> dict[str, Any]:
+    async def async_ready(
+        self,
+        clip_id: str,
+        position_us: int | None = None,
+        window_start_us: int | None = None,
+        window_stop_us: int | None = None,
+    ) -> dict[str, Any]:
         """Телефон готов принимать кадры: отдать архиву ЕДИНСТВЕННУЮ команду.
 
         Одна команда на соединение — этого требует стенд (см. заголовок):
@@ -355,6 +363,17 @@ class ClipSessions:
             raise OpError("Запись уже закрыта, откройте событие заново", HTTPStatus.NOT_FOUND)
         started = clip.started
         if not started:
+            # ⚠ Откуда играть, приложение может узнать ТОЛЬКО когда поток уже
+            # открыт: календарь регистратор отдаёт лишь у потока с потребителем
+            # (замер стенда 2026-09-13 — без него 0 дней и день `1970-01-01`).
+            # Поэтому запись, открытая без метки, получает её здесь. Дом ничего
+            # не толкует: он кладёт присланные числа в команду как есть.
+            if position_us:
+                clip.start_us = int(position_us)
+            if window_start_us:
+                clip.window_start_us = int(window_start_us)
+            if window_stop_us:
+                clip.window_stop_us = int(window_stop_us)
             if clip.fallback:
                 clip.fallback.cancel()
                 clip.fallback = None
@@ -367,6 +386,11 @@ class ClipSessions:
             "ready": not started,
             "positionUs": clip.start_us,
             "firstFrameTs": clip.first_frame,
+            # ⚠ Отказ регистратора уходит НАРУЖУ словами, а не только в журнал
+            # дома: без метки `play` он отвергает («start is empty», замер
+            # стенда 2026-09-13), и жилец видел чёрный кадр до таймаута
+            # проигрывателя — то есть ровно то же, что при потере связи.
+            "error": clip.start_error,
         }
 
     async def async_seek(
@@ -399,13 +423,12 @@ class ClipSessions:
             position = int(position_us)  # type: ignore[arg-type]
         except (TypeError, ValueError) as err:
             raise OpError("Позиция — микросекунды числом", HTTPStatus.BAD_REQUEST) from err
-        # ⚠ Кламп, а не отказ: палец на таймлайне не обязан попадать в окно
-        # микросекунда в микросекунду, а ронять жест из-за края — хамство.
-        # ⚠ И только когда окно ЕСТЬ: у архива, открытого без метки, его нет
-        # вовсе, и клампить нечем. Окно считает приложение, дом его не двигает:
-        # это была бы арифметика суток в доме.
-        if old.window_start_us is not None and old.window_stop_us is not None:
-            position = min(max(position, old.window_start_us), old.window_stop_us)
+        # ⚠ Кламп здесь БЫЛ и снят намеренно. Окно — это шкала, которую рисует
+        # приложение, и дом, поджимавший метку к окну, ОТКРЫТИЯ, отменял прыжок
+        # на другой день: жилец выбирал 9 сентября, а дом возвращал его к краю
+        # тех суток, с которых просмотр начался. Край гасит тот, кто знает
+        # шкалу: приложение (`seekTo`). Заодно это последняя арифметика окна в
+        # доме (`docs/plan-thin-integration.md`, «Широкая дверь»).
         client = self._gateway.client
         if client is None:
             raise TrassirError("Видеонаблюдение объекта не настроено")
@@ -625,6 +648,19 @@ class ClipSessions:
         name = f"trassir_live_{guid}" if quality != "sub" else f"trassir_live_sub_{guid}"
         return (name, f"rtsp://{settings['host']}:{settings['rtspPort']}/{guid}{suffix}/")
 
+    def token_of(self, clip_id: str) -> str:
+        """Токен открытой записи — им регистратор зовёт её поток.
+
+        ⚠ Нужен универсальной двери: бандл токена не носит (он эфемерный, и в
+        телефоне жильца ему делать нечего), а присылает id клипа — подставляет
+        токен дом. Раньше дверь доставала его из ПРИВАТНОГО словаря сеансов
+        (`clips._clips`) через `getattr`: молча пережило бы любое переименование
+        и перестало бы подставлять токен, а выглядело бы это как «регистратор
+        не отдаёт календарь».
+        """
+        clip = self._clips.get(clip_id)
+        return clip.token if clip is not None else ""
+
     def clip_of_session(self, session_id: str) -> str | None:
         """Найти клип по сессии — приложение закрывает просмотр именно ею."""
         for clip_id, clip in self._clips.items():
@@ -651,24 +687,31 @@ class ClipSessions:
                 return
             clip.started = True
             await self._async_settle(clip)
+            # ⚠ Регистратор требует ОБА края окна: `play` без `start` он
+            # отвергает («start is empty»), а `stop`, сериализованный из
+            # пустоты, приезжает строкой "None" и даёт «timestamp format is not
+            # valid» (замеры стенда 2026-09-13). Значит окно присылает
+            # приложение — своих часов в шкале Trassir у дома нет и не будет, —
+            # а дом честно говорит, когда его не прислали, вместо чёрного кадра.
+            if clip.start_us is None or clip.window_stop_us is None:
+                clip.start_error = (
+                    "Архив не запущен: приложение не прислало, с какого места играть"
+                )
+                LOGGER.warning("Запись не встала: нет окна воспроизведения")
+                return
             try:
-                # ⚠ Метки нет — параметров нет вовсе: регистратор встанет на
-                # ближайшую запись по СВОИМ часам. Подставить сюда «сейчас»
-                # значило бы завести в доме часы чужой шкалы.
                 answer = await client.async_archive_command(
                     clip.token,
                     command="play",
-                    **(
-                        {"start": clip.start_us, "stop": clip.window_stop_us}
-                        if clip.start_us is not None
-                        else {}
-                    ),
+                    start=clip.start_us,
+                    stop=clip.window_stop_us,
                     speed=1,
                 )
             except TrassirError as err:
                 # Не роняем просмотр: поток уже сведён, и жилец увидит хотя бы
                 # то, что отдаёт регистратор по умолчанию. В лог — словами.
                 LOGGER.warning("Запись не встала на событие: %s", err)
+                clip.start_error = str(err)
                 return
         if self._clips.get(clip_id) is not clip:
             # Закрыли раньше, чем команда дошла: дальше делать нечего, пинг и

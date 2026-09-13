@@ -528,21 +528,26 @@ def test_seek_без_позиции_отказывает(gateway: FakeGateway) -
     assert err.value.status == 400
 
 
-def test_seek_клампит_а_не_отказывает(gateway: FakeGateway) -> None:
-    """Палец на таймлайне не обязан попадать в окно микросекунда в
-    микросекунду, а ронять жест из-за края — хамство."""
+def test_seek_не_поджимает_метку_к_окну_открытия(gateway: FakeGateway) -> None:
+    """⚠ Дом метку НЕ ТРОГАЕТ — иначе прыжок на другой день отменяется им же.
+
+    Кламп к окну здесь был и снят: окно у клипа — то, с которым его ОТКРЫЛИ, а
+    выбор дня в календаре просит метку заведомо за его краем. Дом поджимал её
+    обратно, и жилец, выбрав 9 сентября, оставался в сутках открытия — при этом
+    шкала приложения уже показывала новый день. Край гасит тот, кто рисует
+    шкалу; в доме это была последняя арифметика окна.
+    """
     clip_id = _opened_clip_id(gateway)
+    far = EVENT["timestampUs"] + 3 * 86_400_000_000
 
-    low = asyncio.run(gateway.clips.async_seek(clip_id, 1))
-    high = asyncio.run(gateway.clips.async_seek(_opened_clip_id(gateway), 10**18))
+    answer = asyncio.run(gateway.clips.async_seek(clip_id, far))
 
+    assert answer["positionUs"] == far, "метка уходит регистратору как есть"
     # ⚠ Окно НЕ съезжает: шкала таймлайна стоит на нём, а перемотка двигает
     # только позицию. Пока окно подменялось позицией, жилец перематывал на
     # середину и снова оказывался «в начале записи».
-    assert low["startUs"] == EVENT["timestampUs"] - 10_000_000
-    assert low["stopUs"] == EVENT["timestampUs"] + 60_000_000
-    assert low["positionUs"] == EVENT["timestampUs"] - 10_000_000
-    assert high["positionUs"] == EVENT["timestampUs"] + 60_000_000
+    assert answer["startUs"] == EVENT["timestampUs"] - 10_000_000
+    assert answer["stopUs"] == EVENT["timestampUs"] + 60_000_000
 
 
 def test_seek_мусором_объясняется(gateway: FakeGateway) -> None:
@@ -779,12 +784,18 @@ def test_без_окна_дом_ничего_не_считает(gateway: FakeGa
     assert answer["startUs"] is None and answer["stopUs"] is None
 
 
-def test_без_метки_часы_не_подставляются(gateway: FakeGateway, monkeypatch) -> None:
-    """⚠ Метки нет — «последняя запись», и НИЧЕГО считать не надо: регистратор
-    встанет на ближайшую запись по СВОИМ часам, а куда встал — скажет сам.
+def test_без_метки_дом_не_шлёт_обречённую_команду(gateway: FakeGateway, monkeypatch) -> None:
+    """⚠ Метки нет — команду старта НЕ ШЛЁМ и говорим об этом словами.
 
-    Подставить сюда «сейчас» значило бы завести в доме часы чужой шкалы: она с
-    поясом сервера, и наши часы сдвинули бы запись на этот пояс.
+    ⚠ Замер стенда 2026-09-13 (`TRASSIR-4.8.2.0`): `play` без `start` регистратор
+    отвергает — `{"error_code":"start is empty","help":"You should specify
+    'start', 'stop' and 'speed' for playing archive"}`, а `stop`, приехавший из
+    пустоты строкой "None", даёт `timestamp format is not valid`. То есть
+    прежнее «метки нет — регистратор встанет на ближайшую запись сам» было
+    догадкой, и стоила она чёрного кадра до таймаута проигрывателя: команда
+    уходила, отказ оставался в журнале дома, а жилец видел то же, что при
+    потере связи. Часов чужой шкалы дом по-прежнему не заводит — окно присылает
+    приложение (оно узнаёт день у календаря открытого потока).
     """
     opened = asyncio.run(gateway.clips.async_open_at("cam1"))
     assert opened["positionUs"] is None
@@ -792,13 +803,37 @@ def test_без_метки_часы_не_подставляются(gateway: Fak
     hass = _offered(gateway, monkeypatch, opened["id"])
 
     async def scenario() -> dict[str, Any]:
-        await gateway.clips.async_ready(opened["id"])
+        answer = await gateway.clips.async_ready(opened["id"])
+        await _quiet(hass, gateway)
+        return answer
+
+    answer = asyncio.run(scenario())
+    assert not [p for n, p in gateway.client.calls if n == "archive_command"], (
+        "команда без окна регистратором отвергается — слать её незачем"
+    )
+    assert answer["error"], "жилец обязан прочитать причину, а не смотреть в чёрный кадр"
+
+
+def test_окно_можно_уточнить_на_готовности(gateway: FakeGateway, monkeypatch) -> None:
+    """⚠ Где играть, приложение узнаёт ТОЛЬКО у открытого потока.
+
+    Календарь регистратор отдаёт лишь потоку с потребителем (замер стенда
+    2026-09-13: без него 0 дней и день `1970-01-01`), а поток открывается на шаг
+    раньше готовности. Поэтому окно приезжает сюда — и уходит в команду как
+    есть, без единого пересчёта в доме.
+    """
+    opened = asyncio.run(gateway.clips.async_open_at("cam1"))
+    hass = _offered(gateway, monkeypatch, opened["id"])
+    day = 1_789_171_200_000_000
+
+    async def scenario() -> dict[str, Any]:
+        await gateway.clips.async_ready(opened["id"], day, day, day + 86_400_000_000)
         await _quiet(hass, gateway)
         return next(p for n, p in gateway.client.calls if n == "archive_command")
 
     command = asyncio.run(scenario())
-    assert "start" not in command, "часов в доме нет"
-    assert "stop" not in command
+    assert command["start"] == day
+    assert command["stop"] == day + 86_400_000_000
 
 def test_событие_не_двигает_окно(gateway: FakeGateway) -> None:
     """У клипа СОБЫТИЯ окно стоит на месте: его задало событие, и приложение

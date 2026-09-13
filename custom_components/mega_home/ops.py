@@ -728,16 +728,20 @@ async def recorder_call(
     session: dict[str, str] = {}
     clip_id = payload.get("clip")
     if clip_id and gateway is not None:
-        clip = getattr(gateway.clips, "_clips", {}).get(str(clip_id))
-        if clip is not None:
-            session["token"] = clip.token
+        token = gateway.clips.token_of(str(clip_id))
+        if token:
+            session["token"] = token
 
     body = payload.get("body")
-    raw = (
-        _base64.b64decode(body)
-        if isinstance(body, str) and body
-        else (str(body).encode("utf-8") if body else None)
-    )
+    # ⚠ Тело строкой — это base64 (им же носит файлы реле); объект — это JSON.
+    # `str(dict)` давал питоновский repr с одинарными кавычками: получатель
+    # такого тела не разберёт, а понять по ответу, что ушло, невозможно.
+    if isinstance(body, str) and body:
+        raw = _base64.b64decode(body)
+    elif isinstance(body, (dict, list)):
+        raw = _json.dumps(body).encode("utf-8")
+    else:
+        raw = None
     try:
         status, content_type, answer = await door.call(
             payload.get("recorder"),
@@ -848,13 +852,34 @@ async def trassir_session_command(
 
 
 async def trassir_ready(
-    coordinator: MegaHomeCoordinator, clip_id: str
+    coordinator: MegaHomeCoordinator,
+    clip_id: str,
+    position_us: Any = None,
+    window_start_us: Any = None,
+    window_stop_us: Any = None,
 ) -> dict[str, Any]:
-    """Телефон собрал тракт: отдать архиву единственную команду старта."""
+    """Телефон собрал тракт: отдать архиву единственную команду старта.
+
+    ⚠ Окно приложение может уточнить ИМЕННО ЗДЕСЬ, и это не прихоть: узнать, с
+    какого места играть, оно способно только у открытого потока (календарь
+    регистратор отдаёт лишь потоку с потребителем), а поток открывается на шаг
+    раньше. Дом присланные числа не толкует — кладёт в команду как есть.
+    """
     from .trassir_client import TrassirError
 
+    def number(value: Any) -> int | None:
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
     try:
-        return await trassir(coordinator).clips.async_ready(clip_id)
+        return await trassir(coordinator).clips.async_ready(
+            clip_id,
+            number(position_us),
+            number(window_start_us),
+            number(window_stop_us),
+        )
     except TrassirError as err:
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
 

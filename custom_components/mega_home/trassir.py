@@ -86,7 +86,13 @@ class TrassirGateway:
         # Универсальная дверь: исполнение ОПИСАННЫХ вызовов регистратора
         # (`recorder.py`). Дом при этом не знает ни одного вендора — описание
         # приезжает конфигом, а ответы уходят наружу как есть.
-        self.recorders = RecorderCall(credentials=self._manager_trassir_credentials)
+        self.recorders = RecorderCall(
+            credentials=self._manager_trassir_credentials,
+            # ⚠ Дверь говорит ЖИВОЙ сессией драйвера, а не своей: поток, открытый
+            # одной сессией, второй не виден вовсе (замер стенда 2026-09-13 —
+            # `archive_status` пустой, `archive_events` без календаря и шкалы).
+            sid_provider=self._driver_sid,
+        )
         # Одна строка в журнал на СМЕНУ состояния, а не на каждую неудачу: опрос
         # идёт каждые пять секунд, и объект без связи с регистратором иначе
         # засыпал бы лог быстрее, чем его читают.
@@ -110,6 +116,13 @@ class TrassirGateway:
         except ManagerError as err:
             raise RecorderDenied(f"Учётка регистратора недоступна: {err}") from err
         return str(creds.get("username") or ""), str(creds.get("password") or "")
+
+    async def _driver_sid(self) -> str:
+        """Сессия драйвера для двери; драйвера нет — пусть дверь входит сама."""
+        client = self._client
+        if client is None:
+            return ""
+        return await client.async_sid()
 
     async def async_load(self) -> None:
         """Restore credentials and the feed from disk."""
@@ -181,6 +194,12 @@ class TrassirGateway:
         if self._task:
             self._task.cancel()
             self._task = None
+        # ⚠ У двери своё соединение с регистратором, и закрыть его больше
+        # некому: без этого перезагрузка записи конфигурации оставляет за собой
+        # открытую сессию aiohttp (Home Assistant пишет об этом в журнал), а на
+        # объекте они копятся — у регистратора предел подключений с адреса
+        # (`sdk-session.md`: не более 99).
+        await self.recorders.async_close()
 
     # --- чтение (этап D спрашивает отсюда) ------------------------------
 

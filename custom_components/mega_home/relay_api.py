@@ -197,7 +197,18 @@ async def _dispatch(
         # Готовность телефона — команда старта архива. Той же дверью, что
         # открытие: это команда дому, а не данные для конфига.
         clip = unquote(path[len("api/trassir/clips/") : -len("/ready")])
-        return _json(await ops.trassir_ready(coordinator, clip))
+        ready_body = _json_body(body)
+        if not isinstance(ready_body, dict):
+            ready_body = {}
+        return _json(
+            await ops.trassir_ready(
+                coordinator,
+                clip,
+                ready_body.get("positionUs"),
+                ready_body.get("windowStartUs"),
+                ready_body.get("windowStopUs"),
+            )
+        )
     if path.startswith("api/trassir/clips/") and path.endswith("/command") and method == "POST":
         # ⚠ Инструмент живой сессии обязан доезжать ОБЕИМИ дверями. Иначе
         # «дома» и «снаружи» перестают отличаться только адресом базы:

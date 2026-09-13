@@ -260,3 +260,114 @@ def test_сертификат_регистратора_не_проверяетс
 
     assert session.connector._ssl is False  # noqa: SLF001 — замок на решение
     asyncio.run(call.async_close())
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/a/../settings/webserver/",
+        "/./settings/webserver/",
+        "/%2e%2e/settings/webserver/",
+        "//settings/webserver/",
+        "/x/y/../../login",
+    ],
+)
+def test_обход_запрета_точками_не_проходит(path: str) -> None:
+    """⚠ Проверять надо ТО, ЧТО УЙДЁТ В СЕТЬ, а не то, что прислали.
+
+    Замер стенда 2026-09-13: `/a/../settings/webserver/` проезжал мимо запрета
+    целиком — префикс `/settings` в нём не первый, а нормализацию делает уже
+    клиент, ПОСЛЕ проверки. Регистратор отвечал 200, и на том же стенде
+    `sdk_settings_write = 1`, то есть той же дырой менялись бы его НАСТРОЙКИ.
+    В локальном контуре дома аутентификации нет вовсе — значит любой в Wi-Fi
+    объекта.
+    """
+    descriptor = door().descriptor(None)
+    assert descriptor is not None
+    with pytest.raises(RecorderDenied):
+        RecorderCall.check(descriptor, "GET", path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/ptz", "/archive_export", "/export_archive", "/jit-export-create-task"],
+)
+def test_действие_на_объекте_дверью_не_ходит(path: str) -> None:
+    """⚠ Политика двери обещает пускать ВОСПРОИЗВЕДЕНИЕ, а не действие.
+
+    PTZ физически крутит камеру, экспорт пишет файл на диск регистратора и
+    занимает его очередь — локальная и удалённая задачи блокируют друг друга
+    (`docs/docs-trassir/sdk-archive-export.md`). Обещание было в заголовке
+    `recorder.py`, а запрета не было.
+    """
+    descriptor = door().descriptor(None)
+    assert descriptor is not None
+    with pytest.raises(RecorderDenied):
+        RecorderCall.check(descriptor, "GET", path)
+
+
+def test_дверь_говорит_сессией_драйвера() -> None:
+    """⚠ ГЛАВНОЕ про дверь: сессия у дома ОДНА.
+
+    Замер стенда 2026-09-13 (`TRASSIR-4.8.2.0`, две сессии одного и того же
+    `Admin`): поток, открытый ПЕРВОЙ сессией, ВТОРАЯ не видит вовсе —
+    `archive_status` при `type=state|timeline|calendar` отдаёт пустой список, а
+    `archive_events` приходит без `CalendarEvent` и `TimelineEvent`. То есть
+    дверь со своей сессией НИКОГДА не получит ни календаря, ни шкалы суток по
+    записи, открытой драйвером, — а выглядит это как «регистратор не отдаёт
+    дни» (живой отчёт 2026-09-13).
+
+    Вторая причина та же по цене: вход чаще раза в 5 секунд Trassir считает по
+    АДРЕСУ и банит его (`docs/docs-trassir/sdk-session.md`), а два независимых
+    входа гоняются именно в этот запрет.
+    """
+    call = RecorderCall(credentials=_creds, sid_provider=_driver_sid)
+    call.apply([TRASSIR])
+    seen: list[dict[str, Any]] = []
+
+    class Body:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+
+        async def read(self, _limit: int = 0) -> bytes:
+            return self._payload
+
+    class Answer:
+        def __init__(self, payload: bytes) -> None:
+            self.status = 200
+            self.content_type = "application/json"
+            self.content = Body(payload)
+
+        async def __aenter__(self) -> "Answer":
+            return self
+
+        async def __aexit__(self, *_: Any) -> bool:
+            return False
+
+    class Client:
+        closed = False
+
+        def request(self, method: str, url: str, **kwargs: Any) -> Answer:
+            seen.append({"метод": method, "params": kwargs.get("params")})
+            return Answer(b"[]")
+
+        def get(self, url: str, **kwargs: Any) -> Answer:
+            seen.append({"вход": url})
+            return Answer('{"sid": "своя"}'.encode("utf-8"))
+
+    call._session = Client()  # noqa: SLF001
+    asyncio.run(call.call(None, "GET", "/archive_status", {"type": "calendar"}))
+
+    assert not [item for item in seen if "вход" in item], (
+        "своего входа у двери быть не должно, пока жива сессия драйвера"
+    )
+    ask = next(item for item in seen if "метод" in item)
+    assert ask["params"]["sid"] == "драйверская"
+
+
+async def _driver_sid() -> str:
+    return "драйверская"
+
+
+async def _creds() -> tuple[str, str]:
+    return "megahome", "s3cret"

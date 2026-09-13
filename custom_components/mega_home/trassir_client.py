@@ -142,7 +142,12 @@ class TrassirClient:
         opens the stream → this command. Called before the stream is open it
         answers `stream is expired`, which reads like a timeout and is not one.
         """
-        return await self._json("archive_command", USER, command=command, token=token, **params)
+        # ⚠ Пустые параметры ОПУСКАЕМ, а не сериализуем: `str(None)` даёт
+        # литерал "None", и регистратор отвечает `timestamp format is not
+        # valid` (замер стенда 2026-09-13 — `play` со `stop=None`). Та же
+        # ловушка, что у RouterOS (`toParams`), и лечится тем же guard'ом.
+        clean = {key: value for key, value in params.items() if value is not None}
+        return await self._json("archive_command", USER, command=command, token=token, **clean)
 
     async def async_archive_events(self, token: str) -> list[dict[str, Any]]:
         """События ОТКРЫТОГО архива: календарь дней, шкала суток, движение.
@@ -174,6 +179,26 @@ class TrassirClient:
         """
         payload = await self._request("archive_status", USER, type=kind)
         return payload if isinstance(payload, list) else []
+
+    async def async_sid(self, door: str = USER) -> str:
+        """Живая сессия этого регистратора — ОДНА на весь дом.
+
+        ⚠ Зачем она наружу: универсальная дверь (`recorder.py`) говорит с ТЕМ ЖЕ
+        регистратором, и своя сессия ей не годится. Замер стенда 2026-09-13
+        (`archive_status?type=state|timeline|calendar`, вторая сессия того же
+        `Admin`): поток, открытый ПЕРВОЙ сессией, ВТОРАЯ не видит вовсе —
+        ответ пустой список, а `archive_events` отдаёт только `StateTransition`
+        и `TimeChanged`, без `CalendarEvent` и `TimelineEvent`. То есть
+        календарь и шкала суток через дверь со своей сессией не работают
+        НИКОГДА, а выглядит это как «регистратор не отдаёт дни».
+
+        ⚠ Команды с явным токеном (`archive_command`) — исключение: они проходят
+        и чужой сессией (тот же замер). Но раз состояние доступно только
+        владельцу потока, сессия у дома должна быть одна: ещё и потому, что
+        вход чаще раза в 5 секунд с одного адреса Trassir банит (`sdk-session.md`),
+        а два независимых входа гоняются друг с другом именно в этот запрет.
+        """
+        return await self._async_sid(door)
 
     async def async_ping(self, token: str) -> None:
         """Keep a video token alive (documented as 10 s without traffic).

@@ -42,7 +42,23 @@ CALL_TIMEOUT = 30
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 # Пути, закрытые ВСЕГДА, каким бы ни был вендор: вход, настройки и дерево
 # объектов (через него правится состояние регистратора, а не воспроизведение).
-DENY_ALWAYS = ("/login", "/settings", "/objects", "/users")
+DENY_ALWAYS = (
+    "/login",
+    "/settings",
+    "/objects",
+    "/users",
+    # ⚠ Ниже — не воспроизведение, а ДЕЙСТВИЕ на объекте, и политика двери
+    # обещает их не пускать: PTZ физически крутит камеру, экспорт пишет файлы
+    # на диск регистратора и занимает его очередь (`sdk-archive-export.md`:
+    # локальная и удалённая задачи блокируют друг друга). Пускать это в
+    # локальный контур дома, где аутентификации нет, нельзя.
+    "/ptz",
+    "/archive_export",
+    "/export_archive",
+    "/export_task",
+    "/export_cancel",
+    "/jit-export",
+)
 ALLOWED_METHODS = ("GET", "HEAD", "POST")
 
 
@@ -125,10 +141,17 @@ class RecorderDenied(Exception):
 class RecorderCall:
     """Сессии регистраторов и исполнение описанных вызовов."""
 
-    def __init__(self, credentials: Any = None) -> None:
+    def __init__(self, credentials: Any = None, sid_provider: Any = None) -> None:
         self._descriptors: dict[str, RecorderDescriptor] = {}
         # Учётка на регистратор: тем же маршрутом менеджера, что и раньше.
         self._credentials = credentials
+        # ⚠ ЖИВАЯ сессия драйвера этого объекта. Дверь обязана говорить ТОЙ ЖЕ
+        # сессией, что открыла поток: замер стенда 2026-09-13 показал, что
+        # вторая сессия того же пользователя не видит чужой поток вовсе —
+        # `archive_status` (state/timeline/calendar) отдаёт пустой список, а
+        # `archive_events` приходит без `CalendarEvent` и `TimelineEvent`.
+        # Со своей сессией дверь молча теряла календарь и шкалу суток.
+        self._sid_provider = sid_provider
         self._session: aiohttp.ClientSession | None = None
         self._sids: dict[str, tuple[str, float]] = {}
 
@@ -159,20 +182,30 @@ class RecorderCall:
     # --- политика -------------------------------------------------------
 
     @staticmethod
-    def check(descriptor: RecorderDescriptor, method: str, path: str) -> None:
-        """Пропустить вызов или объяснить, почему нет.
+    def check(descriptor: RecorderDescriptor, method: str, path: str) -> str:
+        """Пропустить вызов или объяснить, почему нет; вернуть ПРОВЕРЕННЫЙ путь.
 
         ⚠ Это ГРАНИЦА двери, и она намеренно простая: запрет по префиксам путей
         и по методу. Список команд не ведём — иначе новая функция приложения
         снова упрётся в релиз, ради чего дверь и переделывалась.
+
+        ⚠ Проверять НАДО ТО, ЧТО УЙДЁТ В СЕТЬ, а не то, что прислали. Замер
+        стенда 2026-09-13: `/a/../settings/webserver/` мимо запрета проезжал
+        целиком — префикс `/settings` в нём не первый, а yarl приводит путь к
+        `/settings/webserver/` уже после проверки, и регистратор отвечал 200.
+        На стенде при этом `sdk_settings_write = 1`, то есть той же дырой
+        менялись бы НАСТРОЙКИ регистратора, а в локальном контуре дома
+        аутентификации нет вовсе — любой в Wi-Fi объекта.
         """
         if method not in ALLOWED_METHODS:
             raise RecorderDenied(f"Метод {method} через дверь не ходит")
         if not path.startswith("/"):
             raise RecorderDenied("Путь начинается с «/»")
+        clean = _normalized(path)
         for prefix in (*DENY_ALWAYS, *descriptor.deny):
-            if path.split("?")[0].startswith(prefix):
+            if clean.split("?")[0].startswith(prefix):
                 raise RecorderDenied(f"{prefix}* через дверь не ходит")
+        return clean
 
     # --- исполнение -----------------------------------------------------
 
@@ -190,7 +223,9 @@ class RecorderCall:
         if descriptor is None:
             raise RecorderDenied("Такого регистратора у объекта нет")
         method = method.upper()
-        self.check(descriptor, method, path)
+        # ⚠ Дальше идёт ПРОВЕРЕННЫЙ путь, а не присланный: иначе нормализация
+        # в сети вернула бы обратно то, что политика только что отвергла.
+        path = self.check(descriptor, method, path)
 
         query = {str(key): str(value) for key, value in (params or {}).items()}
         # ⚠ Сессию подставляет ДОМ: бандл её не видит и не хранит.
@@ -212,7 +247,19 @@ class RecorderCall:
             raise RecorderDenied(_reason(err)) from err
 
     async def _sid(self, descriptor: RecorderDescriptor) -> str:
-        """Сессия регистратора: живая из памяти либо новый вход."""
+        """Сессия регистратора — ЖИВАЯ ДРАЙВЕРСКАЯ, если она есть.
+
+        ⚠ Свой вход остаётся только там, где драйвера нет вовсе (регистратор
+        описан конфигом, но объектом не настроен). Своя сессия рядом с
+        драйверской — это две беды сразу: состояние чужого потока не читается
+        (замер выше) и два входа гоняются в запрет «не чаще раза в 5 секунд с
+        одного адреса» (`docs/docs-trassir/sdk-session.md`), а он банит АДРЕС,
+        то есть роняет видеонаблюдение целиком, а не один запрос.
+        """
+        if self._sid_provider is not None:
+            sid = await self._sid_provider()
+            if sid:
+                return str(sid)
         cached = self._sids.get(descriptor.id)
         if cached and cached[1] > monotonic():
             return cached[0]
@@ -305,6 +352,33 @@ class RecorderCall:
             await self._session.close()
         self._session = None
         self._sids.clear()
+
+
+def _normalized(path: str) -> str:
+    """Путь таким, каким его увидит регистратор: без «..», «.» и %-обёрток.
+
+    ⚠ Сначала раскрываем проценты, потом убираем точки-сегменты — иначе
+    `/%2e%2e/settings/` проедет мимо (проверено на стенде). Схлопываем и
+    повторные «/»: запрет по префиксу иначе обходится лишним слэшем.
+    """
+    from urllib.parse import unquote
+
+    raw = unquote(path)
+    head, sep, tail = raw.partition("?")
+    out: list[str] = []
+    for part in head.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if out:
+                out.pop()
+            continue
+        out.append(part)
+    # ⚠ Хвостовой «/» СОХРАНЯЕМ: у Trassir это разные адреса (каталог настроек
+    # против значения), и нормализация не имеет права менять смысл запроса —
+    # только убрать обходы запрета.
+    tailing = "/" if head.endswith("/") and out else ""
+    return "/" + "/".join(out) + tailing + (sep + tail if sep else "")
 
 
 def _reason(err: Exception) -> str:

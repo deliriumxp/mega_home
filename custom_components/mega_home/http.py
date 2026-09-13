@@ -616,8 +616,24 @@ class MegaHomeTrassirClipReadyView(_MegaHomeView):
         if error is not None:
             return error
         assert coordinator is not None
+        # ⚠ Тела может не быть вовсе: сборки до этой правки шлют пустой POST, и
+        # отказывать им нельзя — окно у них уже задано при открытии.
         try:
-            return self.json(await ops.trassir_ready(coordinator, clip))
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        try:
+            return self.json(
+                await ops.trassir_ready(
+                    coordinator,
+                    clip,
+                    payload.get("positionUs"),
+                    payload.get("windowStartUs"),
+                    payload.get("windowStopUs"),
+                )
+            )
         except ops.OpError as err:
             return self.json_message(err.message, err.status)
 
