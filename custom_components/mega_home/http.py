@@ -23,6 +23,7 @@ from homeassistant.components.http import HomeAssistantView, StaticPathConfig
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    TRASSIR_TILE_CACHE,
     DOMAIN,
     LOGGER,
     TILE_PHOTO_PREFIX,
@@ -420,7 +421,16 @@ class MegaHomeCameraFrameView(_MegaHomeView):
         return web.Response(
             body=body,
             # Кадр живой: закешированный постер показывал бы вчерашний двор.
-            headers={"Content-Type": content_type, "Cache-Control": "no-store"},
+            headers={
+                "Content-Type": content_type,
+                # ⚠ КЭШИРУЕМ на период обновления плитки. Было `no-store`, и
+                # это значило: каждый переход между комнатами — заново все
+                # кадры, хотя их только что показывали. Теперь браузер держит
+                # кадр ровно столько, сколько плитка живёт до обновления, и
+                # переход в соседнюю комнату не начинает дозагрузок
+                # (решение заказчика 2026-09-13).
+                "Cache-Control": f"private, max-age={TRASSIR_TILE_CACHE}",
+            },
         )
 
 

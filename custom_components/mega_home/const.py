@@ -24,7 +24,7 @@ LOGGER = logging.getLogger(__package__)
 #
 # ⚠ Держится в паре с `manifest.json`, их сверяет `tests/test_version.py`:
 # поднимать ОБА, одним релизом.
-INTEGRATION_VERSION = "0.2.54"
+INTEGRATION_VERSION = "0.2.55"
 
 CONF_MANAGER_URL = "manager_url"
 CONF_TOKEN = "token"
@@ -190,5 +190,9 @@ TRASSIR_PREVIEW_TTL = 8.0
 # Качество кадра превью. ⚠ Работает ТОЛЬКО у `get_video` (у `screenshot` такого
 # параметра нет ни в доке, ни на деле). На субпотоке даёт 9–10 КБ за 0.04–0.31 с.
 TRASSIR_PREVIEW_QUALITY = 20
+# Сколько браузер держит кадр ПЛИТКИ. Ровно период её обновления: меньше — и
+# переход между комнатами снова начнёт дозагрузки, больше — и плитка покажет
+# несвежее дольше, чем обещает. Кадр берётся с субпотока и стоит 9–10 КБ.
+TRASSIR_TILE_CACHE = 30
 
 SERVICE_SYNC = "sync"
