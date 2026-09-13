@@ -424,3 +424,30 @@ async def _driver_sid() -> str:
 
 async def _creds() -> tuple[str, str]:
     return "megahome", "s3cret"
+
+
+def test_падение_драйверской_сессии_это_отказ_двери_а_не_500() -> None:
+    """⚠ РЕГРЕССИЯ 0.2.49, найдена на живом объекте 2026-09-13.
+
+    Дверь стала брать сессию у драйвера, а драйвер падает СВОИМИ исключениями
+    (`TrassirError` при недоступном регистраторе, `TrassirAuthError` при
+    неверной учётке). До провайдера дверь входила сама и отвечала на это
+    отказом; с провайдером исключение полетело МИМО обработчиков
+    `ops.recorder_call` и стало неперехваченным 500. Для жильца это выглядело
+    как «не показывает ни архив, ни календарь» всякий раз, когда регистратор
+    просто медленно отвечает.
+
+    Беда регистратора обязана оставаться вердиктом двери — и именно
+    «недоступен», чтобы приложение назвало причину, а не ушло на прежние пути.
+    """
+
+    async def падает() -> str:
+        raise RuntimeError("Trassir не отвечает: нет ответа за 15 с")
+
+    call = RecorderCall(credentials=_creds, sid_provider=падает)
+    call.apply([TRASSIR])
+
+    with pytest.raises(RecorderUnreachable) as err:
+        asyncio.run(call.call(None, "GET", "/archive_status", {"type": "calendar"}))
+
+    assert "нет ответа" in str(err.value)

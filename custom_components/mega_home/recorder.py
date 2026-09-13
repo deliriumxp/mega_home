@@ -278,7 +278,18 @@ class RecorderCall:
         то есть роняет видеонаблюдение целиком, а не один запрос.
         """
         if self._sid_provider is not None:
-            sid = await self._sid_provider()
+            # ⚠ Провайдер — ЧУЖОЙ код (драйвер), и падает он своими исключениями:
+            # `TrassirError` при недоступном регистраторе, `TrassirAuthError`
+            # при неверной учётке. До 0.2.49 дверь входила сама и отвечала на это
+            # отказом; с провайдером исключение полетело МИМО обработчиков
+            # `ops.recorder_call` и стало неперехваченным 500 — то есть архив и
+            # календарь умирали целиком всякий раз, когда регистратор просто
+            # медленно отвечает (живой отчёт 2026-09-13). Беда регистратора
+            # обязана оставаться вердиктом двери.
+            try:
+                sid = await self._sid_provider()
+            except Exception as err:  # noqa: BLE001 — любое падение драйвера
+                raise RecorderUnreachable(_reason(err)) from err
             if sid:
                 return str(sid)
         cached = self._sids.get(descriptor.id)

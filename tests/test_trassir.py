@@ -517,3 +517,42 @@ def test_разный_сдвиг_разные_кадры_в_кэше(tmp_path: P
         return len([1 for n, _ in client.calls if n == "screenshot"])
 
     assert asyncio.run(scenario()) == 2, "повтор того же сдвига берётся из кэша"
+
+
+def test_events_ждёт_дольше_обычного_запроса() -> None:
+    """⚠ `/events` — ДЛИННЫЙ ОПРОС, и срок ему нужен свой.
+
+    Замер стенда 2026-09-13 (`TRASSIR-4.8.2.0`, 12 камер с движением): сервер
+    держит соединение 19.5, 43.1 и 46.7 секунды подряд и отдаёт в ответе ровно
+    одно событие. С общим сроком в 15 секунд дом обрывал опрос САМ — и это
+    стоило не строки в журнале, а СОБЫТИЙ: замер «рвущаяся сессия против
+    эталонной» за 60 секунд дал 8 событий у эталона и 1 у рвущейся, то есть
+    семь из восьми не дошли вовсе. Отвечать обязан сервер, а не наш таймер.
+    """
+    from mega_home.const import TRASSIR_EVENTS_TIMEOUT, TRASSIR_TIMEOUT
+
+    assert TRASSIR_EVENTS_TIMEOUT > 47, (
+        "срок обязан перекрывать измеренное удержание сервера (46.7 с), "
+        "иначе опрос рвёт сам дом и теряет события"
+    )
+    assert TRASSIR_EVENTS_TIMEOUT > TRASSIR_TIMEOUT
+
+
+def test_ленту_событий_спрашивают_длинным_сроком() -> None:
+    """Срок из константы доезжает до самого запроса, а не остаётся в файле."""
+    import asyncio as _asyncio
+
+    from mega_home.const import TRASSIR_EVENTS_TIMEOUT
+    from mega_home.trassir_client import TrassirClient
+
+    client = TrassirClient.__new__(TrassirClient)
+    сроки: list[float] = []
+
+    async def _request(path: str, door: str, _timeout: float = 0.0, **_: object) -> object:
+        сроки.append(_timeout)
+        return []
+
+    client._request = _request  # type: ignore[method-assign]
+    _asyncio.run(client.async_events())
+
+    assert сроки == [TRASSIR_EVENTS_TIMEOUT]

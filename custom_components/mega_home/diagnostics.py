@@ -13,6 +13,16 @@ from .coordinator import MegaHomeConfigEntry
 TO_REDACT = [CONF_TOKEN]
 
 
+def _go2rtc_state() -> dict[str, Any]:
+    """Состояние своего go2rtc; модуля нет — так и скажем."""
+    try:
+        from .go2rtc_embed import state
+
+        return state()
+    except Exception as err:  # noqa: BLE001 — диагностика не имеет права падать
+        return {"running": False, "why": f"состояние недоступно: {err}"}
+
+
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: MegaHomeConfigEntry
 ) -> dict[str, Any]:
@@ -55,6 +65,12 @@ async def async_get_config_entry_diagnostics(
         # видел и сколько отчётов не доехало до менеджера. Без этого «контроллер
         # перезагрузился сам» неотличимо от «его перезагрузил кто-то».
         "agent": coordinator.agent.summary if coordinator.agent else None,
+        # ⚠ Запись и удалённая камера идут ТОЛЬКО через свой go2rtc, и когда он
+        # не поднялся, у жильца молчат сразу три экрана: живой поток, архив и
+        # календарь (календарь читается у ОТКРЫТОГО потока). Причина при этом
+        # уезжала в журнал Home Assistant уровнем debug — то есть инсталлятору
+        # оставалось слово «не поднят» без продолжения (живой отчёт 2026-09-13).
+        "go2rtc": _go2rtc_state(),
         "home": {
             "name": config.get("home", {}).get("name"),
             "floors": len(config.get("floors", [])),

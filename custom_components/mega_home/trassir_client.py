@@ -27,6 +27,7 @@ import aiohttp
 
 from .const import (
     LOGGER,
+    TRASSIR_EVENTS_TIMEOUT,
     TRASSIR_LOGIN_GAP,
     TRASSIR_SESSION_TTL,
     TRASSIR_TIMEOUT,
@@ -47,7 +48,7 @@ class TrassirAuthError(TrassirError):
 
 
 
-def _net_text(err: Exception, prefix: str) -> str:
+def _net_text(err: Exception, prefix: str, seconds: float = TRASSIR_TIMEOUT) -> str:
     """Сетевой текст для человека — С ЗАПАСНЫМ, а не каким попало.
 
     ⚠ str(TimeoutError) ПУСТ: подставить его в шаблон — значит отгрузить в
@@ -59,7 +60,7 @@ def _net_text(err: Exception, prefix: str) -> str:
     return (
         f"{prefix}: {detail}"
         if detail
-        else f"{prefix}: нет ответа за {TRASSIR_TIMEOUT} с"
+        else f"{prefix}: нет ответа за {seconds:.0f} с"
     )
 
 
@@ -106,8 +107,14 @@ class TrassirClient:
         ⚠ Not "the last N events": the feed is a per-session queue and it is
         drained by reading it. A fresh session receives a backlog capped at 100,
         which is why the caller must deduplicate — a relogin replays them.
+
+        ⚠ И это ДЛИННЫЙ ОПРОС: сервер держит соединение, пока событий нет
+        (замер стенда 2026-09-13 — 19.5, 43.1 и 46.7 с подряд). Свой срок ему
+        нужен отдельный и заведомо больший: оборвав опрос, мы не просто пишем в
+        журнал «Trassir не отвечает» — мы ТЕРЯЕМ события, которые сервер уже
+        счёл отданными (замер: 7 из 8 за минуту).
         """
-        payload = await self._request("events", SDK)
+        payload = await self._request("events", SDK, _timeout=TRASSIR_EVENTS_TIMEOUT)
         return payload if isinstance(payload, list) else []
 
     async def async_screenshot(self, guid: str, timestamp: int | str | None = None) -> bytes:
@@ -226,20 +233,26 @@ class TrassirClient:
             raise TrassirError(f"Trassir ответил неожиданным телом на {path}")
         return payload
 
-    async def _request(self, path: str, door: str, **params: Any) -> Any:
-        """One SDK call, with a single retry after re-authenticating."""
+    async def _request(
+        self, path: str, door: str, _timeout: float = TRASSIR_TIMEOUT, **params: Any
+    ) -> Any:
+        """One SDK call, with a single retry after re-authenticating.
+
+        ⚠ `_timeout` отдельным параметром, а не одним на всех: `/events` —
+        длинный опрос, и общий срок обрывал бы его, теряя события.
+        """
         for attempt in (1, 2):
             sid = await self._async_sid(door)
             try:
                 async with self._session.get(
                     f"{self._base}/{path}",
                     params={**{k: str(v) for k, v in params.items()}, "sid": sid},
-                    timeout=aiohttp.ClientTimeout(total=TRASSIR_TIMEOUT),
+                    timeout=aiohttp.ClientTimeout(total=_timeout),
                     ssl=False,
                 ) as response:
                     body = await response.json(content_type=None)
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-                raise TrassirError(_net_text(err, "Trassir не отвечает")) from err
+                raise TrassirError(_net_text(err, "Trassir не отвечает", _timeout)) from err
             except ValueError as err:
                 raise TrassirError(f"Trassir ответил не-JSON на {path}") from err
             if self._is_no_session(body):

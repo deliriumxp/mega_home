@@ -35,6 +35,7 @@ import socket
 import tempfile
 from collections import deque
 from pathlib import Path
+from typing import Any
 
 from homeassistant.core import HomeAssistant
 
@@ -73,7 +74,7 @@ _log: deque[str] = deque(maxlen=LOG_TAIL)
 
 async def async_start(hass: HomeAssistant) -> bool:
     """Поднять свой go2rtc. False — идём штатным путём Home Assistant."""
-    global _proc, _tmp, _ready
+    global _proc, _tmp, _ready, _why
 
     if is_running():
         return True
@@ -84,6 +85,7 @@ async def async_start(hass: HomeAssistant) -> bool:
     # ребута объекта. Отвечает НАШ API на петле — усыновляем, а не уступаем.
     if await _api_alive(hass):
         _ready = True
+        _why = ""
         LOGGER.info(
             "Усыновлён go2rtc прошлого запуска (%s): порты его, конфиг наш — "
             "переговоры идут через него",
@@ -92,13 +94,15 @@ async def async_start(hass: HomeAssistant) -> bool:
         return True
     binary = await hass.async_add_executor_job(shutil.which, "go2rtc")
     if not binary:
-        LOGGER.debug("go2rtc binary not found — WebRTC через HA, без нас")
+        _why = "в системе нет go2rtc: запись и удалённая камера не заработают"
+        LOGGER.warning("%s", _why)
         return False
     busy = await hass.async_add_executor_job(_ports_busy)
     if busy:
         # ⚠ Не поднимаемся и НЕ жалуемся громко: чужой go2rtc на этом порту —
         # это, как правило, правильно настроенный аддон. Пусть работает он.
-        LOGGER.info("Порт %s уже занят — свой go2rtc не поднимаем (%s)", busy, URL)
+        _why = f"порт {busy} занят чужим go2rtc или аддоном — свой не поднимаем"
+        LOGGER.info("%s (%s)", _why, URL)
         return False
 
     _tmp = await hass.async_add_executor_job(_write_config)
@@ -112,7 +116,8 @@ async def async_start(hass: HomeAssistant) -> bool:
             stderr=asyncio.subprocess.STDOUT,
         )
     except OSError as err:
-        LOGGER.warning("Failed to start go2rtc: %s", err)
+        _why = f"go2rtc не запустился: {err}"
+        LOGGER.warning("%s", _why)
         await async_stop()
         return False
 
@@ -120,14 +125,14 @@ async def async_start(hass: HomeAssistant) -> bool:
     _start_drain()
     _ready = await _await_api(hass)
     if not _ready:
-        LOGGER.warning(
-            "go2rtc не ответил по %s за %.0f с — WebRTC пойдёт штатным путём HA. Лог: %s",
-            URL,
-            READY_TIMEOUT,
-            " | ".join(_log) or "пусто",
+        _why = (
+            f"go2rtc не ответил по {URL} за {READY_TIMEOUT:.0f} с. "
+            f"Его лог: {' | '.join(_log) or 'пусто'}"
         )
+        LOGGER.warning("%s — WebRTC пойдёт штатным путём HA", _why)
         await async_stop()
         return False
+    _why = ""
     LOGGER.info("mega_home go2rtc готов: %s, медиа :%s", URL, WEBRTC_PORT)
     return True
 
@@ -183,6 +188,28 @@ def is_running() -> bool:
 def log_tail() -> list[str]:
     """Последние строки go2rtc — для диагностики интеграции."""
     return list(_log)
+
+
+# Почему свой go2rtc не поднялся. ⚠ Причин ЧЕТЫРЕ, и лечатся они по-разному:
+# нет бинарника (ставить), порт занят чужим аддоном (так и задумано), не
+# ответил за срок (смотреть его лог), упал при запуске (смотреть ошибку ОС).
+# Наружу же торчало одно слово «не поднят», а сами строки уезжали в журнал Home
+# Assistant уровнем debug — то есть инсталлятор не видел ничего (живой отчёт
+# 2026-09-13: «go2rtc не поднялся», и дальше некуда идти).
+_why: str = "не запускался"
+
+
+def state() -> dict[str, Any]:
+    """Состояние своего go2rtc для диагностики записи объекта."""
+    return {
+        "running": is_running(),
+        # `adopted` — процесс прошлого запуска Home Assistant, взятый под себя.
+        "adopted": _ready and _proc is None,
+        "why": "" if is_running() else _why,
+        "api": URL,
+        "media_port": WEBRTC_PORT,
+        "log": log_tail(),
+    }
 
 
 def _ports_busy() -> str:
