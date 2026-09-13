@@ -460,6 +460,46 @@ class MegaHomeTrassirEventsView(_MegaHomeView):
             return self.json_message(err.message, err.status)
 
 
+class MegaHomeTrassirPreviewView(_MegaHomeView):
+    """Кадр архива канала НА МЕТКЕ — превью под пальцем при перемотке.
+
+    ⚠ Почему это маршрут дома, а не описанный вызов через дверь. За кадром
+    стоят ТРИ шага: выдача токена субпотока, позиционирование и чтение с
+    МЕДИАПОРТА. Медиапорт двери недоступен вовсе (она знает только SDK-порт), а
+    токен — это жизнь сессии, и она домашняя по тому же правилу, что у клипа.
+    Снаружи это ещё и разница между одним походом через менеджер и тремя.
+
+    ⚠ Почему субпоток и `jpeg` с качеством: замер стенда 2026-09-13 —
+    `screenshot?timestamp=` это 0.4–1.0 с и 375–400 КБ (и субпоток он
+    игнорирует), а `archive_sub` + `container=jpeg&quality=20` — 0.04–0.31 с и
+    9–10 КБ. Превью, отстающее на секунду, заказчик отклонил справедливо.
+    """
+
+    url = f"{URL_API}/trassir/channels/{{channel}}/preview"
+    name = "api:mega_home:trassir-preview"
+
+    async def get(self, request: web.Request, channel: str) -> web.StreamResponse:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        try:
+            content_type, body = await ops.trassir_preview(
+                coordinator, channel, request.query.get("at")
+            )
+        except ops.OpError as err:
+            return web.Response(status=err.status, text=err.message)
+        return web.Response(
+            body=body,
+            headers={
+                # Кадр прошедшей секунды не изменится никогда — пусть телефон
+                # держит его у себя: на драге к одной метке возвращаются.
+                "Cache-Control": "private, max-age=600",
+            },
+            content_type=content_type,
+        )
+
+
 class MegaHomeTrassirThumbView(_MegaHomeView):
     """Кадр архива на секунду события — уже ужатый (`trassir.py`)."""
 

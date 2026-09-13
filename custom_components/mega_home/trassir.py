@@ -183,6 +183,8 @@ class TrassirGateway:
                 self._creds.get("username", ""),
                 self._creds.get("password", ""),
                 self._creds.get("sdkPassword", ""),
+                # ⚠ Медиапорт — другой порт, и кадры превью живут на нём.
+                int(settings.get("rtspPort") or 555),
             )
             self._channels = []
             self._channels_at = 0.0
@@ -268,6 +270,18 @@ class TrassirGateway:
             for channel in await self._async_channels()
             if channel.get("guid")
         ]
+
+    async def async_preview(self, guid: str, timestamp_us: int) -> bytes:
+        """Кадр архива на метке — превью под пальцем при перемотке.
+
+        ⚠ Одним вызовом ДОМА, а не тремя из телефона: за кадром стоят выдача
+        токена, позиционирование и чтение с медиапорта — то есть жизнь сессии,
+        и она домашняя. Снаружи это ещё и разница между одним походом через
+        менеджер и тремя.
+        """
+        if not self._client:
+            raise TrassirError("Видеонаблюдение объекта не настроено")
+        return await self._client.async_preview(guid, int(timestamp_us))
 
     async def async_thumb(self, event_id: str, lead_s: int | None = None) -> bytes:
         """Превью одного события — кадр архива на его секунду.

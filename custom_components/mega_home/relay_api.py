@@ -159,6 +159,11 @@ async def _dispatch(
         if not isinstance(payload, dict):
             raise ops.OpError("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
         return _json(await ops.recorder_call(coordinator, payload))
+    if path.startswith("api/trassir/channels/") and path.endswith("/preview") and method == "GET":
+        # Превью под пальцем — снаружи тем же одним запросом, что и дома.
+        channel = unquote(path[len("api/trassir/channels/") : -len("/preview")])
+        kind, frame = await ops.trassir_preview(coordinator, channel, query.get("at"))
+        return {"status": 200, "contentType": kind, "body": frame}
     if path.startswith("api/trassir/channels/") and path.endswith("/clip") and method == "POST":
         # Открытие архива канала по метке — та же дверь, что и всё остальное:
         # снаружи «что было вчера в 21:40» обязано работать так же, как дома.

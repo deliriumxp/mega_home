@@ -24,7 +24,7 @@ LOGGER = logging.getLogger(__package__)
 #
 # ⚠ Держится в паре с `manifest.json`, их сверяет `tests/test_version.py`:
 # поднимать ОБА, одним релизом.
-INTEGRATION_VERSION = "0.2.52"
+INTEGRATION_VERSION = "0.2.53"
 
 CONF_MANAGER_URL = "manager_url"
 CONF_TOKEN = "token"
@@ -190,5 +190,12 @@ TRASSIR_ARCHIVE_SETTLE = 1.5
 # кадрами, при живой камере в полном качестве рядом.
 TRASSIR_ARCHIVE_MAIN = "archive_main"
 TRASSIR_ARCHIVE_SUB = "archive_sub"
+# Сколько держим токен превью. Короче десяти секунд, которые даёт регистратор
+# токену без запросов: на драге кадры просят чаще, а между жестами он протухнет
+# сам — и мы возьмём новый.
+TRASSIR_PREVIEW_TTL = 8.0
+# Качество кадра превью. ⚠ Работает ТОЛЬКО у `get_video` (у `screenshot` такого
+# параметра нет ни в доке, ни на деле). На субпотоке даёт 9–10 КБ за 0.04–0.31 с.
+TRASSIR_PREVIEW_QUALITY = 20
 
 SERVICE_SYNC = "sync"

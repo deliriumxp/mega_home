@@ -27,8 +27,11 @@ import aiohttp
 
 from .const import (
     LOGGER,
+    TRASSIR_ARCHIVE_SUB,
     TRASSIR_EVENTS_TIMEOUT,
     TRASSIR_LOGIN_GAP,
+    TRASSIR_PREVIEW_QUALITY,
+    TRASSIR_PREVIEW_TTL,
     TRASSIR_SESSION_TTL,
     TRASSIR_TIMEOUT,
 )
@@ -75,13 +78,18 @@ class TrassirClient:
         username: str,
         password: str,
         sdk_password: str,
+        media_port: int = 555,
     ) -> None:
         self._session = session
         self._base = f"https://{host}:{port}"
+        # ⚠ Медиапорт — ДРУГОЙ: кадры и потоки живут на нём, а не на SDK-порту.
+        self._media = f"http://{host}:{media_port}"
         self._username = username
         self._password = password
         self._sdk_password = sdk_password
         self._sids: dict[str, tuple[str, float]] = {}
+        # Токены превью по каналам: живут короче срока токена у регистратора.
+        self._previews: dict[str, tuple[str, float]] = {}
         self._locks = {USER: asyncio.Lock(), SDK: asyncio.Lock()}
         # ⚠ ONE gate for both doors: TRASSIR bans the IP for logging in more
         # often than once every five seconds, and it counts the address, not the
@@ -131,10 +139,20 @@ class TrassirClient:
         return await self._bytes(f"screenshot/{guid}", USER, **params)
 
     async def async_get_video(
-        self, guid: str, stream: str = "archive_main", container: str = "rtsp"
+        self,
+        guid: str,
+        stream: str = "archive_main",
+        container: str = "rtsp",
+        **extra: Any,
     ) -> str:
-        """Open a video session and return its EPHEMERAL token."""
-        payload = await self._json("get_video", USER, channel=guid, stream=stream, container=container)
+        """Open a video session and return its EPHEMERAL token.
+
+        ⚠ `extra` — для `quality` у `container=jpeg|mjpeg`: дока разрешает его
+        ТОЛЬКО здесь, и на субпотоке он даёт кадр в 9 КБ вместо 400.
+        """
+        payload = await self._json(
+            "get_video", USER, channel=guid, stream=stream, container=container, **extra
+        )
         token = payload.get("token")
         if not isinstance(token, str) or not token:
             raise TrassirError("Trassir не выдал токен видеопотока")
@@ -209,6 +227,75 @@ class TrassirClient:
             # Прежнюю регистратор уже отверг — выкидываем её, а не отдаём снова.
             self._sids.pop(door, None)
         return await self._async_sid(door)
+
+    async def async_preview(self, guid: str, timestamp_us: int) -> bytes:
+        """Маленький кадр архива на метке — превью под пальцем при перемотке.
+
+        ⚠ СУБПОТОК и `container=jpeg` с качеством. Замер стенда 2026-09-13
+        показал, что это единственный быстрый путь, и разница огромна:
+
+        | путь | время | размер |
+        |---|---|---|
+        | `screenshot?timestamp=` | 0.4–1.0 с | 375–400 КБ |
+        | `archive_main` jpeg q=20 | 0.24–0.89 с | 37 КБ |
+        | `archive_sub` jpeg q=20 | **0.04–0.31 с** | **9–10 КБ** |
+
+        ⚠ У `screenshot` субпотока НЕТ: `stream=sub` и `substream=1` он молча
+        игнорирует — тот же байт-в-байт ответ на 398 КБ (проверено по md5). А
+        `quality` документирован и работает только у `get_video`
+        (`docs/docs-trassir/sdk-video.md`). Поэтому путь именно такой, а не
+        «скриншот с параметрами».
+
+        ⚠ Токен ПЕРЕИСПОЛЬЗУЕТСЯ: он живёт десять секунд без запросов, а на
+        драге кадры просят чаще. Выдавать новый на каждый кадр — это лишний
+        запрос к регистратору на каждое движение пальца.
+        """
+        token = await self._async_preview_token(guid)
+        try:
+            return await self._async_preview_frame(token, timestamp_us)
+        except TrassirError:
+            # Токен протух между жестами — берём новый и пробуем ещё раз.
+            self._previews.pop(guid, None)
+            token = await self._async_preview_token(guid)
+            return await self._async_preview_frame(token, timestamp_us)
+
+    async def _async_preview_token(self, guid: str) -> str:
+        cached = self._previews.get(guid)
+        if cached and cached[1] > time.monotonic():
+            return cached[0]
+        token = await self.async_get_video(
+            guid, TRASSIR_ARCHIVE_SUB, "jpeg", quality=TRASSIR_PREVIEW_QUALITY
+        )
+        # ⚠ ПОТОК НАДО ОТКРЫТЬ, и только потом им командовать — это ровно тот
+        # порядок, что записан в доке («токен → поток → команда»,
+        # `docs/docs-trassir/sdk-archive-command.md`). У контейнера `jpeg` поток
+        # открывает первое ЧТЕНИЕ кадра; без него `seek` отвечает `stream is
+        # expired`, и текст этот читается как таймаут, которым он не является.
+        await self._async_read_frame(token)
+        self._previews[guid] = (token, time.monotonic() + TRASSIR_PREVIEW_TTL)
+        return token
+
+    async def _async_preview_frame(self, token: str, timestamp_us: int) -> bytes:
+        await self.async_archive_command(
+            token, command="seek", timestamp=timestamp_us, direction=0
+        )
+        return await self._async_read_frame(token)
+
+    async def _async_read_frame(self, token: str) -> bytes:
+        """Один кадр с МЕДИАПОРТА. Он же открывает поток у контейнера `jpeg`."""
+        url = self._media.rstrip("/") + f"/{token}"
+        try:
+            async with self._session.get(
+                url, timeout=aiohttp.ClientTimeout(total=TRASSIR_TIMEOUT), ssl=False
+            ) as response:
+                frame = await response.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise TrassirError(_net_text(err, "Trassir не отдал кадр архива")) from err
+        # ⚠ Отказ приезжает телом JSON при статусе 200 — та же ловушка, что у
+        # скриншота: иначе битый значок уехал бы жильцу как картинка.
+        if frame[:1] == b"{":
+            raise TrassirError(_error_text(frame, "кадр архива"))
+        return frame
 
     async def async_ping(self, token: str) -> None:
         """Keep a video token alive (documented as 10 s without traffic).

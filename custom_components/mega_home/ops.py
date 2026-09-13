@@ -891,6 +891,22 @@ async def trassir_ready(
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
 
 
+async def trassir_preview(
+    coordinator: MegaHomeCoordinator, channel: str, timestamp_us: Any
+) -> tuple[str, bytes]:
+    """Маленький кадр архива канала на метке — превью при перемотке."""
+    from .trassir_client import TrassirError
+
+    try:
+        at = int(timestamp_us)
+    except (TypeError, ValueError) as err:
+        raise OpError("Метка — микросекунды числом", HTTPStatus.BAD_REQUEST) from err
+    try:
+        return "image/jpeg", await trassir(coordinator).async_preview(channel, at)
+    except TrassirError as err:
+        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
+
+
 async def trassir_thumb(
     coordinator: MegaHomeCoordinator, event_id: str, lead_s: int | None = None
 ) -> tuple[str, bytes]:
