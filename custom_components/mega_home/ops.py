@@ -581,9 +581,20 @@ def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
 
 
 def _trassir_guid(coordinator: MegaHomeCoordinator, tile_id: Any) -> str | None:
-    """Канал регистратора у плитки — или None, если это обычная камера."""
+    """Камера РЕГИСТРАТОРА у плитки — или None, если она не за регистратором.
+
+    ⚠ Поле называется `videoId`, а не именем вендора. Плитке всё равно, что за
+    ней стоит: это просто картинка, которую надо иногда обновлять, — и следующий
+    регистратор не должен требовать правок ни в плитке, ни в приложении
+    (решение заказчика 2026-09-13: «универсальное решение всегда и никак иначе»).
+
+    ⚠ Старое имя читаем ТОЖЕ и ещё какое-то время: менеджер обновляется сам, а
+    дом — нет, и снимать замену вместе с заменяемым здесь нельзя.
+    """
     tile = find((coordinator.data or {}).get("tiles", []), tile_id)
-    guid = tile.get("trassirGuid") if tile else None
+    if not tile:
+        return None
+    guid = tile.get("videoId") or tile.get("trassirGuid")
     return guid if isinstance(guid, str) and guid else None
 
 
