@@ -275,9 +275,7 @@ class RecorderCall:
                 async with client.request(
                     method, url, params=query, data=body, timeout=aiohttp.ClientTimeout(total=CALL_TIMEOUT)
                 ) as response:
-                    payload = await response.content.read(MAX_RESPONSE_BYTES + 1)
-                    if len(payload) > MAX_RESPONSE_BYTES:
-                        raise RecorderDenied("Ответ регистратора больше потолка двери")
+                    payload = await _read_all(response)
                     status, kind = response.status, response.content_type
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
                 raise RecorderUnreachable(_reason(err)) from err
@@ -413,6 +411,30 @@ class RecorderCall:
             await self._session.close()
         self._session = None
         self._sids.clear()
+
+
+async def _read_all(response: Any) -> bytes:
+    """Тело ЦЕЛИКОМ, но не больше потолка.
+
+    ⚠ `content.read(N)` НЕ читает N байт — он отдаёт то, что уже лежит в буфере,
+    и на потоковом ответе это ПЕРВЫЙ КУСОК. Живой прогон настоящего кода против
+    настоящего регистратора 2026-09-13: `/archive_status?type=calendar` вернулся
+    двумя байтами — `[\n`. Дальше бандл честно разбирал этот огрызок, не находил
+    своего токена и показывал пустой календарь и пустую шкалу. Беда
+    ПЛАВАЮЩАЯ: короткий ответ успевает прийти одним куском и тогда всё работает,
+    а длинный (124 дня календаря, сотни участков шкалы) — нет.
+
+    ⚠ Поэтому читаем кусками до конца и проверяем потолок ПО ХОДУ: иначе
+    «потолок» защищал бы от большого ответа тем, что молча портил любой.
+    """
+    куски: list[bytes] = []
+    всего = 0
+    async for кусок in response.content.iter_chunked(64 * 1024):
+        всего += len(кусок)
+        if всего > MAX_RESPONSE_BYTES:
+            raise RecorderDenied("Ответ регистратора больше потолка двери")
+        куски.append(кусок)
+    return b"".join(куски)
 
 
 def _normalized(path: str) -> str:

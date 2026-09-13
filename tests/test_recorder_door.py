@@ -118,12 +118,22 @@ def test_сессия_подставляется_домом(monkeypatch: pytest.
     seen: list[dict[str, Any]] = []
 
     class Body:
-        """Тело ответа aiohttp: читается с потолком, как в двери."""
+        """Тело ответа aiohttp — КУСКАМИ, как в жизни.
+
+        ⚠ Заглушка отдавала всё одним `read()`, и ровно поэтому юнит-тесты
+        пропустили беду, которую нашёл живой прогон: настоящий поток отдаёт
+        первый кусок, а не тело целиком.
+        """
 
         def __init__(self, payload: bytes) -> None:
             self._payload = payload
 
-        async def read(self, _limit: int = 0) -> bytes:
+        async def iter_chunked(self, _size: int) -> Any:
+            for at in range(0, len(self._payload), 8):
+                yield self._payload[at : at + 8]
+
+        async def read(self) -> bytes:
+            # ⚠ Без аргумента — это «до конца», и так его зовёт только вход.
             return self._payload
 
     class Answer:
@@ -382,7 +392,12 @@ def test_дверь_говорит_сессией_драйвера() -> None:
         def __init__(self, payload: bytes) -> None:
             self._payload = payload
 
-        async def read(self, _limit: int = 0) -> bytes:
+        async def iter_chunked(self, _size: int) -> Any:
+            for at in range(0, len(self._payload), 8):
+                yield self._payload[at : at + 8]
+
+        async def read(self) -> bytes:
+            # ⚠ Без аргумента — это «до конца», и так его зовёт только вход.
             return self._payload
 
     class Answer:
@@ -477,7 +492,12 @@ def test_протухшая_сессия_перевходит_а_не_уезжа
         def __init__(self, payload: bytes) -> None:
             self._payload = payload
 
-        async def read(self, _limit: int = 0) -> bytes:
+        async def iter_chunked(self, _size: int) -> Any:
+            for at in range(0, len(self._payload), 8):
+                yield self._payload[at : at + 8]
+
+        async def read(self) -> bytes:
+            # ⚠ Без аргумента — это «до конца», и так его зовёт только вход.
             return self._payload
 
     class Answer:
@@ -523,8 +543,12 @@ def test_без_маркера_повтора_нет() -> None:
     заходы: list[int] = []
 
     class Body:
-        async def read(self, _limit: int = 0) -> bytes:
-            return b'{"error_code":"no session","success":0}'
+        async def iter_chunked(self, _size: int) -> Any:
+            yield b'{"error_code":"no session"'
+            yield b',"success":0}'
+
+        async def read(self) -> bytes:
+            return '{"sid":"живая"}'.encode("utf-8")
 
     class Answer:
         status = 200
@@ -548,3 +572,97 @@ def test_без_маркера_повтора_нет() -> None:
     asyncio.run(call.call(None, "GET", "/archive_status", {"type": "calendar"}))
 
     assert len(заходы) == 1
+
+
+def test_ответ_читается_ЦЕЛИКОМ_а_не_первым_куском() -> None:
+    """⚠ ГЛАВНАЯ беда двери, найденная живым прогоном 2026-09-13.
+
+    `content.read(N)` НЕ читает N байт — он отдаёт то, что уже лежит в буфере, а
+    на потоковом ответе это ПЕРВЫЙ КУСОК. Настоящий код против настоящего
+    регистратора вернул на `/archive_status?type=calendar` ровно два байта —
+    `[\\n`. Дальше бандл честно разбирал этот огрызок, не находил своего токена и
+    показывал жильцу пустой календарь и пустую шкалу.
+
+    ⚠ Беда ПЛАВАЮЩАЯ, и потому её так долго не видели: короткий ответ успевает
+    прийти одним куском, и тогда всё работает; длинный (124 дня календаря, полсотни
+    участков шкалы) — нет. Отсюда же «то показывает, то нет».
+    """
+    call = door()
+    целое = b'[{"token":"t","calendar":["2026-09-12","2026-09-13"]}]'
+
+    class Body:
+        """Поток, отдающий тело КУСКАМИ, — как настоящий aiohttp."""
+
+        async def read(self) -> bytes:
+            # Вход читается до конца — это другой путь, не предмет спеки.
+            return b'{"sid":"door"}'
+
+        async def iter_chunked(self, _size: int) -> Any:
+            for at in range(0, len(целое), 8):
+                yield целое[at : at + 8]
+
+    class Answer:
+        status = 200
+        content_type = "application/json"
+        content = Body()
+
+        async def __aenter__(self) -> "Answer":
+            return self
+
+        async def __aexit__(self, *_: Any) -> bool:
+            return False
+
+    class Client:
+        closed = False
+
+        def request(self, *_: Any, **__: Any) -> Answer:
+            return Answer()
+
+        def get(self, *_: Any, **__: Any) -> Answer:
+            return Answer()
+
+    call._session = Client()  # noqa: SLF001
+    _, _, payload = asyncio.run(call.call(None, "GET", "/archive_status", {"type": "calendar"}))
+
+    assert payload == целое, "тело обязано приехать целиком, а не первым куском"
+
+
+def test_потолок_ответа_считается_ПО_ХОДУ() -> None:
+    """Потолок остаётся потолком — но не ценой порчи всех остальных ответов."""
+    from mega_home.recorder import MAX_RESPONSE_BYTES
+
+    call = door()
+
+    class Body:
+        async def read(self) -> bytes:
+            return b'{"sid":"door"}'
+
+        async def iter_chunked(self, _size: int) -> Any:
+            послано = 0
+            while послано <= MAX_RESPONSE_BYTES + 1024:
+                послано += 65536
+                yield b"x" * 65536
+
+    class Answer:
+        status = 200
+        content_type = "application/octet-stream"
+        content = Body()
+
+        async def __aenter__(self) -> "Answer":
+            return self
+
+        async def __aexit__(self, *_: Any) -> bool:
+            return False
+
+    class Client:
+        closed = False
+
+        def request(self, *_: Any, **__: Any) -> Answer:
+            return Answer()
+
+        def get(self, *_: Any, **__: Any) -> Answer:
+            return Answer()
+
+    call._session = Client()  # noqa: SLF001
+    with pytest.raises(RecorderDenied):
+        asyncio.run(call.call(None, "GET", "/screenshot/cam"))
