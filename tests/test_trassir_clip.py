@@ -385,9 +385,18 @@ def test_seek_позиционирует_живой_поток_тем_же_кл�
     заморозки. Ответ несёт ТОТ ЖЕ id: приложение по нему понимает, что
     проигрыватель трогать не надо.
 
-    ⚠ `play` от этого не становится повторным: старт — один на соединение
-    (факт стенда), seek — отдельная документированная команда. Живое поведение
-    проверяет прод; откат — релиз интеграции.
+    ⚠⚠ ЗА `seek` ОБЯЗАН ИДТИ `play` — и это замок, а не украшение. Замер на
+    объекте 2026-09-13 своим RTSP-читателем по живому регистратору (канал
+    IAtwTYwK): `play` даёт ровный поток ~200 КБ/с, курсор 14:34:32 → 14:34:38,
+    `state_desc: "P"`. Следом `seek` на 17:54:44 отвечает `success: 1`, курсор
+    честно уезжает — а ДАННЫЕ ПРЕКРАЩАЮТСЯ НАВСЕГДА, `state_desc` из "P"
+    становится ПУСТЫМ. Тот же опыт с `play` следом: данные сразу (899 → 2886
+    КБ), курсор 17:54:44 → 17:55:09, "P" держится. Это и была причина жалобы
+    «любая перемотка — и видео не доходит», которую чинили кругами.
+
+    ⚠ «Одна команда на соединение» этому НЕ противоречит: тот факт — про
+    ВТОРОЙ `play` по УЖЕ ИГРАЮЩЕМУ потоку. После seek поток СТОИТ, и его
+    останавливает сам регистратор.
     """
     clip_id = _opened_clip_id(gateway)
     monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_ARCHIVE_SETTLE", 0.02)
@@ -404,12 +413,16 @@ def test_seek_позиционирует_живой_поток_тем_же_кл�
     assert answer["positionUs"] == middle
     assert answer["startUs"] == EVENT["timestampUs"] - 10_000_000, "окно не съезжает"
     assert answer["stopUs"] == EVENT["timestampUs"] + 60_000_000
-    # Одна команда — сам seek, с документированными параметрами.
+    # Две команды: seek ставит курсор, play поднимает ВСТАВШИЙ поток.
     commands = [p for n, p in gateway.client.calls if n == "archive_command"]
-    assert len(commands) == 1
+    assert len(commands) == 2
     assert commands[0]["command"] == "seek"
     assert commands[0]["timestamp"] == middle
     assert commands[0]["direction"] == 0
+    assert commands[1]["command"] == "play"
+    assert commands[1]["start"] == middle
+    assert commands[1]["stop"] == EVENT["timestampUs"] + 60_000_000
+    assert commands[1]["speed"] == 1
     # Ни нового токена, ни разбора потока.
     assert [n for n, _ in gateway.client.calls if n == "get_video"] == []
     assert gateway.clips._clips.get(clip_id) is not None  # noqa: SLF001
