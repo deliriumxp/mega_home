@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from mega_home.api import ManagerError
-from mega_home.trassir import TrassirGateway, _crop_margins, _shrink
+from mega_home.trassir import TrassirGateway
 
 
 class _Config:
@@ -82,9 +82,18 @@ class FakeClient:
         self.channel_calls = 0
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
+    async def async_preview(self, guid: str, timestamp_us: int) -> bytes:
+        """⚠ Превью — СУБПОТОКОМ: регистратор сам отдаёт 704×576 и 10 КБ, и
+        уменьшать за него Pillow'ом больше не нужно (замер 2026-09-13)."""
+        self.calls.append(("preview", {"guid": guid, "timestamp": timestamp_us}))
+        return f"кадр:{guid}@{timestamp_us}".encode("utf-8")
+
+    async def async_live_frame(self, guid: str) -> bytes:
+        self.calls.append(("live_frame", {"guid": guid}))
+        return f"живой:{guid}".encode("utf-8")
+
     async def async_screenshot(self, guid: str, timestamp: Any = None) -> bytes:
         self.calls.append(("screenshot", {"guid": guid, "timestamp": timestamp}))
-        # Не картинка: `_shrink` без Pillow отдаёт байты как есть.
         return b"jpeg"
 
     async def async_events(self) -> list[dict[str, Any]]:
@@ -183,50 +192,20 @@ def test_events_are_deduplicated_across_relogins(tmp_path: Path) -> None:
     # не событие, а конец предыдущего, и сворачивается в его длительность.
     assert len(gate.raw_events()) == 2, "повторно отданные события не удваивают хранилище"
     rows = gate.events()
-    assert len(rows) == 1, "конец движения — не отдельная строка ленты"
-    assert rows[0]["timestampUs"] == 1788960515770731, "строка стоит на НАЧАЛЕ движения"
-    assert rows[0]["durationS"] == 7, "конец стал длительностью начала"
+    # ⚠ Дом отдаёт ОБЕ строки и ничего не сворачивает: пару «началось/кончилось»
+    # превращает в длительность БАНДЛ (`foldEndings`). Это чистое толкование
+    # данных, и держать его в Python значит платить релизом HACS на каждом
+    # объекте за правку, которая в бандле доезжает сама.
+    assert len(rows) == 2, "дом отдаёт события как есть, сворачивает бандл"
+    # ⚠ Новые события ПЕРВЫМИ, и обе строки на месте: какую из них показать
+    # жильцу и как назвать, решает бандл.
+    assert rows[0]["timestampUs"] == 1788960523369911, "лента идёт новыми вперёд"
+    assert rows[1]["timestampUs"] == 1788960515770731
+    # ⚠ Длительности здесь НЕТ: её считает бандл из пары «началось/кончилось».
+    assert "durationS" not in rows[0], "толкование пары — работа бандла, не дома"
     assert rows[0]["cameraName"] == "Вход", "имя камеры подставляется из каналов"
 
 
-def test_конец_без_начала_не_показывается(tmp_path: Path) -> None:
-    """⚠ «Движение прекратилось» без «Движение» — это край нашего окна
-    хранения, а не событие дома: жильцу оно не сообщает ничего."""
-    gate = gateway(tmp_path)
-    client = FakeClient([{"timestamp": "500", "type": "Motion Stop", "origin": "cam1"}])
-
-    async def scenario() -> None:
-        await gate.async_apply(config())
-        gate._client = client  # noqa: SLF001
-        await gate._async_poll_once()  # noqa: SLF001
-
-    asyncio.run(scenario())
-
-    assert gate.events() == []
-    assert len(gate.raw_events()) == 1, "в хранилище факт остаётся"
-
-
-def test_длительность_считается_в_пределах_камеры(tmp_path: Path) -> None:
-    """Движение на входе не закрывает движение на складе."""
-    gate = gateway(tmp_path)
-    client = FakeClient(
-        [
-            {"timestamp": "1000000", "type": "Motion Start", "origin": "cam1"},
-            {"timestamp": "2000000", "type": "Motion Start", "origin": "cam2"},
-            {"timestamp": "6000000", "type": "Motion Stop", "origin": "cam2"},
-        ]
-    )
-
-    async def scenario() -> None:
-        await gate.async_apply(config())
-        gate._client = client  # noqa: SLF001
-        await gate._async_poll_once()  # noqa: SLF001
-
-    asyncio.run(scenario())
-
-    rows = {row["guid"]: row for row in gate.events()}
-    assert rows["cam2"]["durationS"] == 4
-    assert "durationS" not in rows["cam1"], "движение ещё идёт — длительности нет"
 
 
 def test_события_не_от_камер_в_ленту_не_попадают(tmp_path: Path) -> None:
@@ -318,11 +297,13 @@ def test_events_can_be_filtered_by_camera_and_paged(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
     # Конец движения свернулся в длительность начала — в ленте остаются начала.
-    assert [row["timestampUs"] for row in gate.events(guid="cam1")] == [100]
+    # ⚠ Обе строки камеры, новые первыми: свёртку делает бандл.
+    assert [row["timestampUs"] for row in gate.events(guid="cam1")] == [300, 100]
     assert [row["timestampUs"] for row in gate.events(before=300)] == [200, 100]
     # ⚠ `event()` ищет по ХРАНИЛИЩУ, а не по ленте: по id открывают запись, и
     # свёрнутая строка обязана оставаться адресуемой.
-    assert gate.event(gate.events()[0]["id"])["timestampUs"] == 200
+    # ⚠ Свежайшее событие камеры — конец движения: дом отдаёт обе строки.
+    assert gate.event(gate.events()[0]["id"])["timestampUs"] == 300
 
 
 def test_one_page_of_the_feed_is_capped(tmp_path: Path) -> None:
@@ -424,55 +405,8 @@ def _угол(raw: bytes) -> tuple[int, int, int]:
         return image.convert("RGB").getpixel((2, 2))
 
 
-def test_превью_режет_поля_до_уменьшения() -> None:
-    """Время и имя канала жгутся по краям кадра: на превью они съедают место и
-    не читаются. Режем 50px исходника с каждой стороны ДО уменьшения."""
-    raw = _кадр(600, 400, (200, 30, 30), (30, 30, 200))
-
-    small = _shrink(raw)
-
-    from io import BytesIO
-
-    from PIL import Image
-
-    with Image.open(BytesIO(small)) as image:
-        # 600 − 100 = 500 → ужато до 480; высота пропорционально.
-        assert image.size == (480, 288)
-    red, _green, blue = _угол(small)
-    assert red > blue, "в углу сцена, а не техническая информация"
 
 
-def test_маленький_кадр_возвращается_без_полей() -> None:
-    """Уменьшать нечего — но поля срезать всё равно надо."""
-    raw = _кадр(200, 120, (30, 200, 30), (200, 200, 30))
-
-    small = _shrink(raw)
-
-    from io import BytesIO
-
-    from PIL import Image
-
-    with Image.open(BytesIO(small)) as image:
-        assert image.size == (100, 20)
-
-
-def test_крошечный_кадр_не_трогаем() -> None:
-    """Кадр меньше полей вдвое: резать там нечего, а пустой прямоугольник
-    вместо камеры вернуть можно."""
-    raw = _кадр(80, 60, (30, 30, 30), (30, 30, 30))
-
-    assert _shrink(raw) == raw
-
-
-def test_битый_кадр_возвращается_как_есть() -> None:
-    assert _shrink(b"not-an-image") == b"not-an-image"
-
-
-def test_кроп_не_трогает_мелочь() -> None:
-    from PIL import Image
-
-    assert _crop_margins(Image.new("RGB", (80, 60))).size == (80, 60)
-    assert _crop_margins(Image.new("RGB", (600, 400))).size == (500, 300)
 
 
 def test_сдвиг_превью_присылает_приложение(tmp_path: Path) -> None:
@@ -491,7 +425,7 @@ def test_сдвиг_превью_присылает_приложение(tmp_pat
         await gate.async_thumb(event_id, 0)
         # Умолчание для старого бандла, который сдвига не шлёт.
         await gate.async_thumb(event_id)
-        return [p for n, p in client.calls if n == "screenshot"]
+        return [p for n, p in client.calls if n == "preview"]
 
     shots = asyncio.run(scenario())
 
@@ -514,7 +448,7 @@ def test_разный_сдвиг_разные_кадры_в_кэше(tmp_path: P
         await gate.async_thumb(event_id, 1)
         await gate.async_thumb(event_id, 9)
         await gate.async_thumb(event_id, 1)
-        return len([1 for n, _ in client.calls if n == "screenshot"])
+        return len([1 for n, _ in client.calls if n == "preview"])
 
     assert asyncio.run(scenario()) == 2, "повтор того же сдвига берётся из кэша"
 

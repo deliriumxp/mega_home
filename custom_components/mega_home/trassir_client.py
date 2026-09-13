@@ -125,18 +125,6 @@ class TrassirClient:
         payload = await self._request("events", SDK, _timeout=TRASSIR_EVENTS_TIMEOUT)
         return payload if isinstance(payload, list) else []
 
-    async def async_screenshot(self, guid: str, timestamp: int | str | None = None) -> bytes:
-        """One JPEG frame: from the archive with a timestamp, live without one.
-
-        ⚠ A timestamp in the FUTURE silently returns the live frame instead of
-        an error, so "the archive does not go back that far" looks exactly like
-        success. And the frame is the full-size one (~530 KB on the stand):
-        whoever shows a list of these has to shrink them first.
-        """
-        params: dict[str, Any] = {}
-        if timestamp is not None:
-            params["timestamp"] = timestamp
-        return await self._bytes(f"screenshot/{guid}", USER, **params)
 
     async def async_get_video(
         self,
@@ -259,6 +247,22 @@ class TrassirClient:
             token = await self._async_preview_token(guid)
             return await self._async_preview_frame(token, timestamp_us)
 
+    async def async_live_frame(self, guid: str) -> bytes:
+        """Живой кадр камеры — тоже СУБПОТОКОМ, а не полным скриншотом.
+
+        ⚠ Тот же замер, что у превью архива: `screenshot` это 1920×1128 и 398 КБ,
+        субпоток с `container=jpeg&quality=20` — 704×576 и 10 КБ. Полный кадр на
+        каждое открытие шторки и на каждую плитку был полумегабайтом там, где
+        достаточно десяти килобайт, — и мы ещё и уменьшали его САМИ, Pillow'ом,
+        то есть делали работу за регистратор, который умеет отдать маленький.
+
+        ⚠ Позиционировать нечего: живой поток уже «сейчас», `seek` ему не нужен.
+        """
+        token = await self.async_get_video(
+            guid, "sub", "jpeg", quality=TRASSIR_PREVIEW_QUALITY
+        )
+        return await self._async_read_frame(token)
+
     async def _async_preview_token(self, guid: str) -> str:
         cached = self._previews.get(guid)
         if cached and cached[1] > time.monotonic():
@@ -357,35 +361,6 @@ class TrassirClient:
             return body
         raise TrassirError(f"Trassir не ответил на {path}")
 
-    async def _bytes(self, path: str, door: str, **params: Any) -> bytes:
-        for attempt in (1, 2):
-            sid = await self._async_sid(door)
-            try:
-                async with self._session.get(
-                    f"{self._base}/{path}",
-                    params={**{k: str(v) for k, v in params.items()}, "sid": sid},
-                    timeout=aiohttp.ClientTimeout(total=TRASSIR_TIMEOUT),
-                    ssl=False,
-                ) as response:
-                    payload = await response.read()
-            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-                raise TrassirError(_net_text(err, "Trassir не отвечает")) from err
-            # An error comes back as JSON even where bytes were asked for.
-            if payload[:1] == b"{" and b"no session" in payload:
-                self._sids.pop(door, None)
-                if attempt == 1:
-                    continue
-                raise TrassirAuthError(self._no_session_hint(door, path))
-            # ⚠ И ЛЮБОЙ другой отказ приезжает так же: JSON в теле, статус 200,
-            # а вызывающий ждёт картинку. Замер офисного регистратора
-            # 2026-09-09: событие сервера (вход пользователя в Trassir) даёт
-            # `{"error_code":"channel not found","success":0}` — 46 байт,
-            # которые уезжали жильцу как `image/jpeg` и рисовались битым
-            # значком. Пусть это будет ошибкой, а не «картинкой».
-            if payload[:1] == b"{" and b'"success"' in payload:
-                raise TrassirError(_error_text(payload, path))
-            return payload
-        raise TrassirError(f"Trassir не ответил на {path}")
 
     async def _async_sid(self, door: str) -> str:
         cached = self._sids.get(door)

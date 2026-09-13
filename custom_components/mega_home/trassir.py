@@ -34,11 +34,9 @@ from .api import ManagerClient, ManagerError
 from .const import (
     LOGGER,
     TRASSIR_CHANNELS_TTL,
-    TRASSIR_CROP_PX,
     TRASSIR_THUMB_CAP,
     TRASSIR_THUMB_LEAD,
     TRASSIR_THUMB_TTL,
-    TRASSIR_THUMB_WIDTH,
     TRASSIR_EVENT_CAP,
     TRASSIR_EVENT_RETENTION,
     TRASSIR_POLL_INTERVAL,
@@ -231,7 +229,11 @@ class TrassirGateway:
     ) -> list[dict[str, Any]]:
         """Newest first, optionally one camera, optionally older than `before`."""
         rows = [e for e in self._events if guid is None or e.get("guid") == guid]
-        rows = _fold_endings(rows)
+        # ⚠ Свёртку пар «началось/кончилось» делает БАНДЛ (`foldEndings`), и
+        # двойник в доме снят: это чистое толкование данных, то есть ровно тот
+        # класс, который план тонкой интеграции запрещает держать в Python —
+        # там он стоит релиза HACS на каждом объекте, в бандле обновляется сам.
+        # Убрать его следовало сразу, как бандл научился (план это и предписывал).
         if before is not None:
             rows = [e for e in rows if int(e.get("timestampUs", 0)) < before]
         rows.sort(key=lambda e: int(e.get("timestampUs", 0)), reverse=True)
@@ -286,10 +288,16 @@ class TrassirGateway:
     async def async_thumb(self, event_id: str, lead_s: int | None = None) -> bytes:
         """Превью одного события — кадр архива на его секунду.
 
-        ⚠ Кадр УМЕНЬШАЕТСЯ здесь. Trassir отдаёт полноразмерный JPEG (~530 КБ
-        на стенде) и параметров размера не понимает вовсе: экран из двадцати
-        событий, отданный как есть, это десять мегабайт по Wi-Fi жильца — а
-        снаружи ещё и через канал менеджера.
+        ⚠ Кадр берётся с СУБПОТОКА и больше НЕ уменьшается нами. Замер стенда
+        2026-09-13: `screenshot` отдаёт 1920×1128 и 398 КБ, а субпоток с
+        `container=jpeg&quality=20` — 704×576 и 10 КБ за 0.08–0.10 с. То есть
+        регистратор умеет отдать маленький кадр сам, и вся прежняя машинерия
+        (Pillow, уменьшение, обрезка технических полей) была работой вместо
+        него.
+
+        ⚠ Обрезка полей тоже не нужна: лишние 48 строк (1128 против 1080) —
+        это полоса, которую РИСУЕТ сам `screenshot`; на субпотоке её нет вовсе,
+        кадр там 704×576 — честное D1.
 
         ⚠ Метка события уходит в запрос В ШКАЛЕ TRASSIR (unix + смещение пояса
         сервера) — «починка» её нашими часами сдвинула бы кадр на этот самый
@@ -315,8 +323,9 @@ class TrassirGateway:
         if not self._client:
             raise TrassirError("Видеонаблюдение объекта не настроено")
         at = int(event["timestampUs"]) + lead * 1_000_000
-        raw = await self._client.async_screenshot(event["guid"], at)
-        small = await self._hass.async_add_executor_job(_shrink, raw)
+        # ⚠ СУБПОТОК, а не полный кадр с последующей обрезкой: регистратор сам
+        # отдаёт 704×576 и 10 КБ за доли секунды.
+        small = await self._client.async_preview(event["guid"], at)
         if len(self._thumbs) >= TRASSIR_THUMB_CAP:
             oldest = min(self._thumbs, key=lambda key: self._thumbs[key][0])
             self._thumbs.pop(oldest, None)
@@ -462,92 +471,4 @@ class TrassirGateway:
         self.last_error = error
 
 
-# Пары «началось / кончилось». ⚠ Лента жильца — это «что было», а не журнал
-# охраны: строка «Движение прекратилось» не событие, а конец предыдущего, и
-# рядом с ним она удваивает ленту, ничего не добавляя. Поэтому конец не строка,
-# а ДЛИТЕЛЬНОСТЬ у начала: «Движение · 13:06:36 · 12 с».
-ENDINGS: dict[str, str] = {
-    "Motion Stop": "Motion Start",
-    "Connection Restored": "Connection Lost",
-}
 
-
-def _fold_endings(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Свернуть события-окончания в длительность у их начала.
-
-    ⚠ Конец, начала которого в ленте нет, ПРОПАДАЕТ, а не показывается сам по
-    себе: «Движение прекратилось» без «Движение» — это не событие дома, а край
-    нашего окна хранения, и жильцу оно ничего не сообщает.
-
-    ⚠ Пары ищутся В ПРЕДЕЛАХ КАМЕРЫ: движение на входе не закрывает движение на
-    складе. Ближайшее незакрытое начало ДО конца — по нему и считаем.
-    """
-    by_time = sorted(rows, key=lambda e: int(e.get("timestampUs", 0)))
-    starts: dict[tuple[str, str], dict[str, Any]] = {}
-    folded: list[dict[str, Any]] = []
-    for row in by_time:
-        kind = str(row.get("type") or "")
-        guid = str(row.get("guid") or "")
-        opens = ENDINGS.get(kind)
-        if opens is None:
-            if kind in ENDINGS.values():
-                row = dict(row)
-                starts[(guid, kind)] = row
-            folded.append(row)
-            continue
-        start = starts.pop((guid, opens), None)
-        if start is not None:
-            seconds = (int(row.get("timestampUs", 0)) - int(start.get("timestampUs", 0))) // 1_000_000
-            if seconds > 0:
-                start["durationS"] = seconds
-    return folded
-
-
-def _shrink(raw: bytes) -> bytes:
-    """Срезать поля и ужать кадр до ширины превью. Не вышло — отдаём как есть.
-
-    ⚠ Отказ уменьшить не должен ронять ленту: без превью событие остаётся
-    событием, а без ленты жилец не видит ничего.
-    """
-    if Image is None:
-        return raw
-    from io import BytesIO
-
-    try:
-        with Image.open(BytesIO(raw)) as image:
-            frame = _crop_margins(image)
-            if frame is image and frame.width <= TRASSIR_THUMB_WIDTH:
-                return raw
-            if frame.width > TRASSIR_THUMB_WIDTH:
-                height = round(frame.height * TRASSIR_THUMB_WIDTH / frame.width)
-                frame = frame.convert("RGB").resize((TRASSIR_THUMB_WIDTH, height))
-            else:
-                # Обрезанный, но и так маленький: уменьшать нечего, а вернуть
-                # надо уже БЕЗ полей — иначе кроп теряет смысл.
-                frame = frame.convert("RGB")
-            buffer = BytesIO()
-            frame.save(buffer, format="JPEG", quality=70, optimize=True)
-            return buffer.getvalue()
-    except Exception as err:  # noqa: BLE001 - битый кадр не стоит ленты
-        LOGGER.debug("Превью события не уменьшилось: %s", err)
-        return raw
-
-
-def _crop_margins(image):  # noqa: ANN001, ANN202 - тип PIL, его может не быть
-    """Срезать по `TRASSIR_CROP_PX` с каждой стороны — там техническая
-    информация камеры/регистратора (время, имя канала).
-
-    ⚠ Кадр, не сцену: режем ДО уменьшения, пока 50px — это поля, а не десяток
-    пикселей превью. Кадр меньше полей вдвое — не трогаем вовсе: резать там
-    уже нечего, а вернуть пустой прямоугольник вместо камеры — можно.
-    """
-    if image.width <= TRASSIR_CROP_PX * 2 or image.height <= TRASSIR_CROP_PX * 2:
-        return image
-    return image.crop(
-        (
-            TRASSIR_CROP_PX,
-            TRASSIR_CROP_PX,
-            image.width - TRASSIR_CROP_PX,
-            image.height - TRASSIR_CROP_PX,
-        )
-    )

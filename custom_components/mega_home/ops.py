@@ -337,16 +337,16 @@ async def camera_frame(
         client = gateway.client
         if client is None:
             raise OpError("Видеонаблюдение объекта не настроено", HTTPStatus.NOT_FOUND)
-        from .trassir import _shrink
         from .trassir_client import TrassirError
 
         try:
-            raw = await client.async_screenshot(guid)
+            # ⚠ СУБПОТОК: регистратор сам отдаёт 704×576 и 10 КБ. Прежде брали
+            # полный кадр (1920×1128, 398 КБ) и уменьшали его Pillow'ом — то
+            # есть делали за регистратор работу, которую он делает лучше и
+            # быстрее.
+            return "image/jpeg", await client.async_live_frame(guid)
         except TrassirError as err:
             raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
-        # Тот же размер, что у превью события: полный кадр регистратора — это
-        # полмегабайта на каждое открытие шторки.
-        return "image/jpeg", await hass.async_add_executor_job(_shrink, raw)
 
     from . import webrtc
 
