@@ -847,3 +847,31 @@ def test_событие_не_двигает_окно(gateway: FakeGateway) -> No
     assert answer["stopUs"] == opened["stopUs"]
 
 
+
+
+def test_сторож_не_съедает_попытку_старта_без_окна(gateway: FakeGateway, monkeypatch) -> None:
+    """⚠ Команда архива на соединение ОДНА, и претендентов на неё двое.
+
+    Запись, открытая без метки, окна ещё не имеет: приложение в этот момент идёт
+    за днём к календарю регистратора (раньше его не спросить — он отдаётся только
+    у потока с потребителем). Сторож слепого старта просыпается первым и окна не
+    видит. Если он при этом пометит клип начатым, пришедшая следом готовность с
+    окном не сделает НИЧЕГО, и просмотр останется мёртвым навсегда.
+    """
+    opened = asyncio.run(gateway.clips.async_open_at("cam1"))
+    hass = _offered(gateway, monkeypatch, opened["id"])
+    day = 1_789_171_200_000_000
+
+    async def scenario() -> dict[str, Any]:
+        # Сторож сработал раньше приложения — окна ещё нет.
+        await gateway.clips._async_play(opened["id"], gateway.clips._clips[opened["id"]])
+        assert not [n for n, _ in gateway.client.calls if n == "archive_command"]
+        # …а теперь приложение принесло день, и старт обязан состояться.
+        answer = await gateway.clips.async_ready(opened["id"], day, day, day + 86_400_000_000)
+        await _quiet(hass, gateway)
+        return answer
+
+    answer = asyncio.run(scenario())
+    command = next(p for n, p in gateway.client.calls if n == "archive_command")
+    assert command["start"] == day
+    assert not answer["error"], "состоявшийся старт не жалуется на прошлый отказ"

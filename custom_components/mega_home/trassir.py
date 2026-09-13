@@ -117,12 +117,18 @@ class TrassirGateway:
             raise RecorderDenied(f"Учётка регистратора недоступна: {err}") from err
         return str(creds.get("username") or ""), str(creds.get("password") or "")
 
-    async def _driver_sid(self) -> str:
-        """Сессия драйвера для двери; драйвера нет — пусть дверь входит сама."""
+    async def _driver_sid(self, fresh: bool = False) -> str:
+        """Сессия драйвера для двери; драйвера нет — пусть дверь входит сама.
+
+        ⚠ `fresh` — регистратор не признал прежнюю. Сессия одна на дом, поэтому
+        перевходит именно драйвер: иначе дверь получила бы свою вторую, а поток
+        драйвера ей был бы не виден (замер стенда — состояние архива доступно
+        только той сессии, что его открыла).
+        """
         client = self._client
         if client is None:
             return ""
-        return await client.async_sid()
+        return await client.async_sid(fresh=fresh)
 
     async def async_load(self) -> None:
         """Restore credentials and the feed from disk."""

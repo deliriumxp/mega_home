@@ -685,20 +685,27 @@ class ClipSessions:
         async with clip.lock:
             if clip.started:
                 return
-            clip.started = True
-            await self._async_settle(clip)
             # ⚠ Регистратор требует ОБА края окна: `play` без `start` он
             # отвергает («start is empty»), а `stop`, сериализованный из
             # пустоты, приезжает строкой "None" и даёт «timestamp format is not
             # valid» (замеры стенда 2026-09-13). Значит окно присылает
             # приложение — своих часов в шкале Trassir у дома нет и не будет, —
             # а дом честно говорит, когда его не прислали, вместо чёрного кадра.
+            #
+            # ⚠ ПРОВЕРКА ДО `started`, и это не мелочь: команда на соединение
+            # одна, и претендентов на неё двое. Сторож слепого старта просыпается
+            # через TRASSIR_READY_TIMEOUT и у записи, открытой БЕЗ метки, окна
+            # ещё не видит — приложение как раз идёт за днём к календарю. Съев
+            # единственную попытку, сторож оставлял бы просмотр мёртвым: пришедшая
+            # следом готовность с окном видела бы `started` и не делала ничего.
             if clip.start_us is None or clip.window_stop_us is None:
                 clip.start_error = (
                     "Архив не запущен: приложение не прислало, с какого места играть"
                 )
                 LOGGER.warning("Запись не встала: нет окна воспроизведения")
                 return
+            clip.started = True
+            await self._async_settle(clip)
             try:
                 answer = await client.async_archive_command(
                     clip.token,
@@ -724,6 +731,8 @@ class ClipSessions:
         # наружу как есть. Что это значит для шкалы и «писали ли вообще»,
         # решает приложение: в доме таких толкований больше нет.
         clip.first_frame = answer.get("first_frame_ts")
+        # Старт состоялся — прежняя жалоба больше не про этот просмотр.
+        clip.start_error = None
 
     async def _async_settle(self, clip: Clip) -> None:
         """Выдержать паузу между открытием потока и командой архива.

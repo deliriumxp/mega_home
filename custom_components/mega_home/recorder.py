@@ -60,6 +60,9 @@ DENY_ALWAYS = (
     "/jit-export",
 )
 ALLOWED_METHODS = ("GET", "HEAD", "POST")
+# Сколько байт ответа смотрим на маркер протухшей сессии: отказ у регистратора
+# короткий, а искать строку в восьмимегабайтном кадре незачем.
+MAX_MARKER_BYTES = 4096
 
 
 @dataclass
@@ -95,6 +98,13 @@ class RecorderDescriptor:
     deny: tuple[str, ...] = ()
     # Сколько живёт сессия без запросов (Trassir — 15 минут).
     session_ttl: float = 600.0
+    # ⚠ По чему видно, что сессия УМЕРЛА. Регистратор отвечает на это
+    # ОБЫЧНЫМ 200 и телом `{"error_code":"no session","success":0}` (замер
+    # стенда 2026-09-13) — то есть по коду ответа беду не отличить, а дверь
+    # отдавала такое тело наружу как есть, и бандл видел пустой календарь и
+    # пустую шкалу, ничего не сообщая. Строка — ДАННЫЕ из конфига: другой
+    # вендор скажет то же другими словами. Пусто — повторять не по чему.
+    session_expired: str = ""
 
 
 def descriptor_of(block: Any) -> RecorderDescriptor | None:
@@ -131,6 +141,7 @@ def descriptor_of(block: Any) -> RecorderDescriptor | None:
         stream_url=str(block.get("streamUrl") or "rtsp://{host}:{rtspPort}/{token}"),
         deny=tuple(str(item) for item in (block.get("deny") or ())),
         session_ttl=float(block.get("sessionTtl") or 600),
+        session_expired=str(block.get("sessionExpired") or ""),
     )
 
 
@@ -248,26 +259,42 @@ class RecorderCall:
         # в сети вернула бы обратно то, что политика только что отвергла.
         path = self.check(descriptor, method, path)
 
-        query = {str(key): str(value) for key, value in (params or {}).items()}
-        # ⚠ Сессию подставляет ДОМ: бандл её не видит и не хранит.
-        if descriptor.login_path and path.split("?")[0] != descriptor.login_path:
-            query[descriptor.session_param] = await self._sid(descriptor)
-        query.update(session or {})
-
         url = f"{descriptor.scheme}://{descriptor.host}:{descriptor.port}{path}"
         client = await self._client()
-        try:
-            async with client.request(
-                method, url, params=query, data=body, timeout=aiohttp.ClientTimeout(total=CALL_TIMEOUT)
-            ) as response:
-                payload = await response.content.read(MAX_RESPONSE_BYTES + 1)
-                if len(payload) > MAX_RESPONSE_BYTES:
-                    raise RecorderDenied("Ответ регистратора больше потолка двери")
-                return response.status, response.content_type, payload
-        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-            raise RecorderUnreachable(_reason(err)) from err
+        # ⚠ Два захода: первый обычный, второй — со СВЕЖЕЙ сессией, если
+        # регистратор сказал, что прежняя умерла. Без повтора такой ответ уезжал
+        # бандлу как есть — обычным 200 с телом «no session», — и у жильца молча
+        # пустели календарь и шкала, пока не истечёт наш кэш сессии.
+        for attempt in (1, 2):
+            query = {str(key): str(value) for key, value in (params or {}).items()}
+            # ⚠ Сессию подставляет ДОМ: бандл её не видит и не хранит.
+            if descriptor.login_path and path.split("?")[0] != descriptor.login_path:
+                query[descriptor.session_param] = await self._sid(descriptor, attempt == 2)
+            query.update(session or {})
+            try:
+                async with client.request(
+                    method, url, params=query, data=body, timeout=aiohttp.ClientTimeout(total=CALL_TIMEOUT)
+                ) as response:
+                    payload = await response.content.read(MAX_RESPONSE_BYTES + 1)
+                    if len(payload) > MAX_RESPONSE_BYTES:
+                        raise RecorderDenied("Ответ регистратора больше потолка двери")
+                    status, kind = response.status, response.content_type
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                raise RecorderUnreachable(_reason(err)) from err
+            if attempt == 1 and self._expired(descriptor, payload):
+                LOGGER.debug("Регистратор не признал сессию — входим заново")
+                continue
+            return status, kind, payload
+        raise RecorderUnreachable("Регистратор не признал сессию дважды подряд")
 
-    async def _sid(self, descriptor: RecorderDescriptor) -> str:
+    @staticmethod
+    def _expired(descriptor: RecorderDescriptor, payload: bytes) -> bool:
+        """Сказал ли регистратор, что сессия умерла. Маркер — из описания."""
+        if not descriptor.session_expired:
+            return False
+        return descriptor.session_expired.encode("utf-8") in payload[:MAX_MARKER_BYTES]
+
+    async def _sid(self, descriptor: RecorderDescriptor, fresh: bool = False) -> str:
         """Сессия регистратора — ЖИВАЯ ДРАЙВЕРСКАЯ, если она есть.
 
         ⚠ Свой вход остаётся только там, где драйвера нет вовсе (регистратор
@@ -287,13 +314,13 @@ class RecorderCall:
             # медленно отвечает (живой отчёт 2026-09-13). Беда регистратора
             # обязана оставаться вердиктом двери.
             try:
-                sid = await self._sid_provider()
+                sid = await self._sid_provider(fresh)
             except Exception as err:  # noqa: BLE001 — любое падение драйвера
                 raise RecorderUnreachable(_reason(err)) from err
             if sid:
                 return str(sid)
         cached = self._sids.get(descriptor.id)
-        if cached and cached[1] > monotonic():
+        if cached and cached[1] > monotonic() and not fresh:
             return cached[0]
         if not descriptor.login_path:
             return ""

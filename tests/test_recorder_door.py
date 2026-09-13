@@ -418,7 +418,7 @@ def test_дверь_говорит_сессией_драйвера() -> None:
     assert ask["params"]["sid"] == "драйверская"
 
 
-async def _driver_sid() -> str:
+async def _driver_sid(fresh: bool = False) -> str:
     return "драйверская"
 
 
@@ -441,7 +441,7 @@ def test_падение_драйверской_сессии_это_отказ_д
     «недоступен», чтобы приложение назвало причину, а не ушло на прежние пути.
     """
 
-    async def падает() -> str:
+    async def падает(fresh: bool = False) -> str:
         raise RuntimeError("Trassir не отвечает: нет ответа за 15 с")
 
     call = RecorderCall(credentials=_creds, sid_provider=падает)
@@ -451,3 +451,100 @@ def test_падение_драйверской_сессии_это_отказ_д
         asyncio.run(call.call(None, "GET", "/archive_status", {"type": "calendar"}))
 
     assert "нет ответа" in str(err.value)
+
+
+def test_протухшая_сессия_перевходит_а_не_уезжает_пустотой() -> None:
+    """⚠ Регистратор отвечает на мёртвую сессию ОБЫЧНЫМ 200.
+
+    Замер стенда 2026-09-13: `archive_status?sid=<чужой>` — HTTP 200,
+    `content-type: application/json`, тело `{"error_code":"no session",
+    "success":0}`. По коду ответа беду не отличить, и дверь отдавала это тело
+    наружу как есть: бандл не находил своего токена и показывал ПУСТОЙ календарь
+    и пустую шкалу, ничего не сообщая. Теперь дом перевходит и повторяет вызов —
+    ровно один раз, по маркеру ИЗ ОПИСАНИЯ (у другого вендора слова другие).
+    """
+    свежесть: list[bool] = []
+
+    async def sid(fresh: bool = False) -> str:
+        свежесть.append(fresh)
+        return "мёртвая" if not fresh else "живая"
+
+    call = RecorderCall(credentials=_creds, sid_provider=sid)
+    call.apply([{**TRASSIR, "sessionExpired": "no session"}])
+    ответы: list[dict[str, Any]] = []
+
+    class Body:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+
+        async def read(self, _limit: int = 0) -> bytes:
+            return self._payload
+
+    class Answer:
+        def __init__(self, payload: bytes) -> None:
+            self.status = 200
+            self.content_type = "application/json"
+            self.content = Body(payload)
+
+        async def __aenter__(self) -> "Answer":
+            return self
+
+        async def __aexit__(self, *_: Any) -> bool:
+            return False
+
+    class Client:
+        closed = False
+
+        def request(self, method: str, url: str, **kwargs: Any) -> Answer:
+            sid_used = kwargs.get("params", {}).get("sid")
+            ответы.append({"sid": sid_used})
+            if sid_used == "мёртвая":
+                return Answer(b'{"error_code":"no session","success":0}')
+            return Answer(b'[{"token":"t","calendar":["2026-09-13"]}]')
+
+    call._session = Client()  # noqa: SLF001
+    status, _, payload = asyncio.run(
+        call.call(None, "GET", "/archive_status", {"type": "calendar"})
+    )
+
+    assert свежесть == [False, True], "второй заход обязан просить СВЕЖУЮ сессию"
+    assert [item["sid"] for item in ответы] == ["мёртвая", "живая"]
+    assert b"calendar" in payload, "наружу уходит ответ живой сессии, а не отказ"
+
+
+def test_без_маркера_повтора_нет() -> None:
+    """Маркер — данные конфига. Не прислали — дверь не выдумывает вендорских слов."""
+
+    async def sid(fresh: bool = False) -> str:
+        return "любая"
+
+    call = RecorderCall(credentials=_creds, sid_provider=sid)
+    call.apply([TRASSIR])  # без `sessionExpired`
+    заходы: list[int] = []
+
+    class Body:
+        async def read(self, _limit: int = 0) -> bytes:
+            return b'{"error_code":"no session","success":0}'
+
+    class Answer:
+        status = 200
+        content_type = "application/json"
+        content = Body()
+
+        async def __aenter__(self) -> "Answer":
+            return self
+
+        async def __aexit__(self, *_: Any) -> bool:
+            return False
+
+    class Client:
+        closed = False
+
+        def request(self, *_: Any, **__: Any) -> Answer:
+            заходы.append(1)
+            return Answer()
+
+    call._session = Client()  # noqa: SLF001
+    asyncio.run(call.call(None, "GET", "/archive_status", {"type": "calendar"}))
+
+    assert len(заходы) == 1

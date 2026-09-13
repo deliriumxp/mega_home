@@ -187,7 +187,7 @@ class TrassirClient:
         payload = await self._request("archive_status", USER, type=kind)
         return payload if isinstance(payload, list) else []
 
-    async def async_sid(self, door: str = USER) -> str:
+    async def async_sid(self, door: str = USER, fresh: bool = False) -> str:
         """Живая сессия этого регистратора — ОДНА на весь дом.
 
         ⚠ Зачем она наружу: универсальная дверь (`recorder.py`) говорит с ТЕМ ЖЕ
@@ -205,6 +205,9 @@ class TrassirClient:
         вход чаще раза в 5 секунд с одного адреса Trassir банит (`sdk-session.md`),
         а два независимых входа гоняются друг с другом именно в этот запрет.
         """
+        if fresh:
+            # Прежнюю регистратор уже отверг — выкидываем её, а не отдаём снова.
+            self._sids.pop(door, None)
         return await self._async_sid(door)
 
     async def async_ping(self, token: str) -> None:
