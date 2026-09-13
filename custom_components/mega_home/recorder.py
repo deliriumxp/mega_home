@@ -134,8 +134,29 @@ def descriptor_of(block: Any) -> RecorderDescriptor | None:
     )
 
 
-class RecorderDenied(Exception):
-    """Вызов не проходит политику двери — и это НЕ отказ регистратора."""
+class RecorderError(Exception):
+    """Дверь не выполнила вызов. Дальше важно ПОЧЕМУ — см. наследников."""
+
+
+class RecorderDenied(RecorderError):
+    """Вызов не проходит ПОЛИТИКУ двери — регистратор тут вообще ни при чём.
+
+    ⚠ Это про НАС: бандл попросил путь или метод, которых дверь не пускает.
+    Лечится правкой бандла, и молча уходить с этим на прежние пути нельзя —
+    иначе запрет виден только в журнале дома.
+    """
+
+
+class RecorderUnreachable(RecorderError):
+    """Регистратор не ответил, отказал во входе или порвал соединение.
+
+    ⚠ Разделено с отказом политики намеренно (2026-09-13). Пока обе беды
+    приезжали одним 403, приложение считало ЛЮБУЮ из них за «двери нет» и
+    уходило на прежние именованные пути — то есть к ТОМУ ЖЕ недоступному
+    регистратору, только другой дорогой. Жилец читал «Дом не смог выполнить
+    запрос» вместо «Регистратор не отвечает», а инсталлятор шёл искать поломку
+    в доме вместо регистратора.
+    """
 
 
 class RecorderCall:
@@ -244,7 +265,7 @@ class RecorderCall:
                     raise RecorderDenied("Ответ регистратора больше потолка двери")
                 return response.status, response.content_type, payload
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-            raise RecorderDenied(_reason(err)) from err
+            raise RecorderUnreachable(_reason(err)) from err
 
     async def _sid(self, descriptor: RecorderDescriptor) -> str:
         """Сессия регистратора — ЖИВАЯ ДРАЙВЕРСКАЯ, если она есть.
@@ -275,7 +296,9 @@ class RecorderCall:
         )
         sid = _field(payload, descriptor.session_field)
         if status != 200 or not sid:
-            raise RecorderDenied("Регистратор не пустил дом в сессию")
+            # ⚠ Отказ ВХОДА — беда регистратора (или учётки объекта), а не
+            # политики двери: прежние пути упрутся в него точно так же.
+            raise RecorderUnreachable("Регистратор не пустил дом в сессию")
         self._sids[descriptor.id] = (sid, monotonic() + descriptor.session_ttl)
         return sid
 
@@ -298,7 +321,7 @@ class RecorderCall:
             ) as response:
                 return response.status, response.content_type, await response.content.read()
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-            raise RecorderDenied(_reason(err)) from err
+            raise RecorderUnreachable(_reason(err)) from err
 
     async def stream_url(self, camera: str, quality: str) -> str:
         """Адрес потока по описанию: дом идёт за токеном сам, шаблон — из данных."""
@@ -312,7 +335,7 @@ class RecorderCall:
         status, _, payload = await self._read_with_session(descriptor, descriptor.stream_path, params)
         token = _field(payload, descriptor.stream_field)
         if status != 200 or not token:
-            raise RecorderDenied("Регистратор не выдал поток")
+            raise RecorderUnreachable("Регистратор не выдал поток")
         return descriptor.stream_url.format(
             host=descriptor.host, rtspPort=descriptor.rtsp_port, token=token
         )

@@ -712,7 +712,7 @@ async def recorder_call(
     import base64 as _base64
     import json as _json
 
-    from .recorder import RecorderDenied
+    from .recorder import RecorderDenied, RecorderUnreachable
 
     gateway = getattr(coordinator, "trassir", None)
     door = getattr(gateway, "recorders", None)
@@ -751,6 +751,13 @@ async def recorder_call(
             raw,
             session,
         )
+    except RecorderUnreachable as err:
+        # ⚠ 502, а НЕ 403. Разница не косметическая: по отказу политики бандл
+        # уходит на прежние именованные пути, а по недоступности регистратора
+        # идти туда некуда — там тот же регистратор, только другой дорогой.
+        # Пока обе беды приезжали одним кодом, жилец читал «Дом не смог
+        # выполнить запрос» и поломку шли искать в доме (ревизия 2026-09-13).
+        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
     except RecorderDenied as err:
         raise OpError(str(err), HTTPStatus.FORBIDDEN) from err
     if "json" in (content_type or "") and not payload.get("binary"):

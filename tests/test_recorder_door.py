@@ -16,6 +16,7 @@ import pytest
 from mega_home.recorder import (
     RecorderCall,
     RecorderDenied,
+    RecorderUnreachable,
     descriptor_of,
 )
 
@@ -220,11 +221,18 @@ def test_дверь_без_описания_это_404_а_не_отказ() -> N
     assert err.value.status == HTTPStatus.NOT_FOUND
 
 
-def test_ошибка_связи_это_отказ_а_не_исключение() -> None:
+def test_ошибка_связи_это_НЕДОСТУПНОСТЬ_а_не_отказ_политики() -> None:
     """⚠ Живой отчёт 2026-09-12: перемотка падала с «Дом не смог выполнить
     запрос». Причина — здесь: обрыв соединения вылетал из двери наружу, а
     менеджер отдаёт неожиданное исключение жильцу именно этой фразой. Отказ
-    должен быть ВНЯТНЫМ, иначе его не видно ни в интерфейсе, ни в журнале."""
+    должен быть ВНЯТНЫМ, иначе его не видно ни в интерфейсе, ни в журнале.
+
+    ⚠ И это НЕ отказ политики (ревизия 2026-09-13). Разница видна снаружи: по
+    отказу политики бандл уходит на прежние именованные пути, а при
+    недоступности регистратора идти туда некуда — там тот же регистратор,
+    только другой дорогой. Пока обе беды были одним исключением и одним кодом,
+    жилец читал «Дом не смог выполнить запрос», и поломку шли искать в доме.
+    """
     import aiohttp
 
     call = door()
@@ -236,10 +244,55 @@ def test_ошибка_связи_это_отказ_а_не_исключение(
             raise aiohttp.ClientConnectionError("Server disconnected")
 
     call._session = Broken()  # noqa: SLF001 — шов тот же, что у клиента драйвера
-    with pytest.raises(RecorderDenied) as err:
+    with pytest.raises(RecorderUnreachable) as err:
         asyncio.run(call.call(None, "GET", "/channels"))
 
     assert "Server disconnected" in str(err.value)
+    # ⚠ Наследник общей беды, а не политики: `except RecorderDenied` его НЕ
+    # ловит — иначе разделение осталось бы только в названии.
+    assert not isinstance(err.value, RecorderDenied)
+
+
+def test_недоступность_регистратора_отдаётся_502_а_не_403() -> None:
+    """⚠ Код ответа — это и есть диагноз, который читает бандл.
+
+    403 значит «дверь не пустила» и разрешает уйти на прежние пути; 502 значит
+    «регистратор не ответил», и уходить некуда. Пока всё было 403, приложение
+    считало недоступный регистратор за «двери нет».
+    """
+    import aiohttp
+
+    from mega_home import ops
+
+    call = door()
+
+    class Broken:
+        closed = False
+
+        def get(self, *_: Any, **__: Any) -> Any:
+            raise aiohttp.ClientConnectionError("Server disconnected")
+
+        def request(self, *_: Any, **__: Any) -> Any:
+            raise aiohttp.ClientConnectionError("Server disconnected")
+
+    call._session = Broken()  # noqa: SLF001
+
+    class _Clips:
+        @staticmethod
+        def token_of(_clip: str) -> str:
+            return ""
+
+    class _Gateway:
+        recorders = call
+        clips = _Clips()
+
+    class _Coordinator:
+        trassir = _Gateway()
+
+    with pytest.raises(ops.OpError) as err:
+        asyncio.run(ops.recorder_call(_Coordinator(), {"method": "GET", "path": "/channels"}))
+
+    assert err.value.status == 502
 
 
 def test_сертификат_регистратора_не_проверяется() -> None:
