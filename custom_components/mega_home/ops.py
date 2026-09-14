@@ -115,8 +115,37 @@ async def run(
 
 
 def config(coordinator: MegaHomeCoordinator) -> dict[str, Any]:
-    """The cached home config: floors, rooms, tiles, scenarios."""
-    return coordinator.data
+    """Состав дома из кэша — плюс ПАСПОРТ САМОГО ДОМА.
+
+    ⚠ `integration` — ответ на вопрос «что этот дом умеет», и завести его
+    стоило полутора суток разбора. Раньше сказать это снаружи было НЕЧЕМ:
+    версия уходила только менеджеру (`link.py`), а с любой другой стороны
+    оставалось гадать по маршрутам — и гадание врало. Дверь превью была
+    ОБЪЯВЛЕНА с 0.2.53 и не зарегистрирована до 0.2.60; её `404` побайтово
+    совпадал с ответом на выдуманный путь, и «маршрута нет» читалось как «дом
+    старой версии» на объекте, обновлённом и перезапущенном не раз.
+
+    ⚠ НОВОГО МАРШРУТА ДЛЯ ЭТОГО НЕ ЗАВОДИТСЯ, и это принципиально: правило
+    требует сперва обойтись общим каналом, а «что такое этот дом» — ровно то,
+    за чем приложение и так приходит первым запросом (`CLAUDE.md`, «Новый
+    маршрут в шлюзе»). Ответ на `config` и без того читают все двери.
+
+    ⚠ `routes` — список ПОДНЯТЫХ путей, а не объявленных классов: мёртвую дверь
+    он показывает отсутствием, и повторить историю превью станет нечем.
+    Заодно это единственный честный способ спросить дом «а ты это умеешь?» — по
+    версии судить нельзя, версия говорит лишь о намерении.
+    """
+    from .const import INTEGRATION_VERSION
+    from .http import VIEWS
+
+    return {
+        **(coordinator.data or {}),
+        "integration": {
+            "version": INTEGRATION_VERSION,
+            "appVersion": coordinator.bundle.version if coordinator.bundle else None,
+            "routes": sorted(getattr(view, "url", "") for view in VIEWS),
+        },
+    }
 
 
 def states(hass: HomeAssistant, coordinator: MegaHomeCoordinator) -> dict[str, Any]:
