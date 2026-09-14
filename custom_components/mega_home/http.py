@@ -94,40 +94,7 @@ async def async_register_http(
     #
     # Поэтому же API-маршруты регистрируются ПЕРВЫМИ: `/mega-home/{path:.*}`
     # накрывает и их тоже, а aiohttp отдаёт запрос первому подошедшему ресурсу.
-    for view in (
-        MegaHomeConfigView,
-        MegaHomeStatesView,
-        MegaHomeEventsView,
-        MegaHomeCommandView,
-        MegaHomeScenarioView,
-        MegaHomePhotosView,
-        MegaHomePhotoView,
-        # ⚠ Общий канал: один маршрут на любой файл и одна розетка на любой
-        # запрос-ответ. Оба заведены ради того, чтобы новая функция не стоила
-        # выпуска этой интеграции (`assets.py`).
-        MegaHomeAssetView,
-        MegaHomeCameraFrameView,
-        # Видеонаблюдение объекта: лента событий и превью к ней. Просмотр записи
-        # идёт тем же WebRTC, что и живая камера, — своей двери у него нет.
-        MegaHomeTrassirCamerasView,
-        MegaHomeTrassirEventsView,
-        MegaHomeTrassirThumbView,
-        MegaHomeTrassirPlayView,
-        MegaHomeTrassirArchiveClipView,
-        MegaHomeTrassirClipSeekView,
-        MegaHomeTrassirClipReadyView,
-        MegaHomeTrassirClipCommandView,
-        MegaHomeRecorderCallView,
-        MegaHomeWebRtcView,
-        MegaHomeWebRtcCandidatesView,
-        MegaHomeWebRtcCloseView,
-        MegaHomeRelayView,
-        # ⚠ РАНЬШЕ каталога: `/mega-home/{path:.*}` накрывает и `sw.js`, а aiohttp
-        # отдаёт запрос первому подошедшему ресурсу.
-        MegaHomeServiceWorkerView,
-        MegaHomeAppRootView,
-        MegaHomeAppView,
-    ):
+    for view in VIEWS:
         hass.http.register_view(view())
     hass.data[DOMAIN]["http_registered"] = True
 
@@ -995,3 +962,36 @@ def _serve(request: web.Request, relative: str) -> web.StreamResponse:
     return web.FileResponse(target, headers=headers)
 
 
+# ⚠ СПИСОК РЕГИСТРИРУЕМЫХ ДВЕРЕЙ — модульной константой, а не выражением внутри
+# функции, и это не стиль. Класс, ОПРЕДЕЛЁННЫЙ, но не попавший сюда, живёт в
+# коде, проходит замок маршрутов и отвечает жильцу обычным 404: ровно так
+# `MegaHomeTrassirPreviewView` пролежал мёртвым с 0.2.53 по 0.2.59, и превью
+# при перемотке «не работало» на всех объектах. Теперь список читает и замок.
+VIEWS: tuple[type[HomeAssistantView], ...] = (
+    MegaHomeConfigView,
+    MegaHomeStatesView,
+    MegaHomeEventsView,
+    MegaHomeCommandView,
+    MegaHomeScenarioView,
+    MegaHomePhotosView,
+    MegaHomePhotoView,
+    MegaHomeAssetView,
+    MegaHomeCameraFrameView,
+    MegaHomeTrassirCamerasView,
+    MegaHomeTrassirEventsView,
+    MegaHomeTrassirThumbView,
+    MegaHomeTrassirPreviewView,
+    MegaHomeTrassirPlayView,
+    MegaHomeTrassirArchiveClipView,
+    MegaHomeTrassirClipSeekView,
+    MegaHomeTrassirClipReadyView,
+    MegaHomeTrassirClipCommandView,
+    MegaHomeRecorderCallView,
+    MegaHomeWebRtcView,
+    MegaHomeWebRtcCandidatesView,
+    MegaHomeWebRtcCloseView,
+    MegaHomeRelayView,
+    MegaHomeServiceWorkerView,
+    MegaHomeAppRootView,
+    MegaHomeAppView,
+)
