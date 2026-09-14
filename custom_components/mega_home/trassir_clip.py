@@ -49,6 +49,7 @@ PLAY та же команда с тем же окном отдаёт первы�
 from __future__ import annotations
 
 import asyncio
+import re
 import calendar
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -88,6 +89,47 @@ def _stamp(us: int | None) -> str | None:
     from datetime import datetime, timezone
 
     return datetime.fromtimestamp(us / 1_000_000, timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+async def _play_where_told(client: Any, token: str, start_us: int, stop_us: int) -> dict[str, Any]:
+    """`play` с меткой — и ПОВТОР с той, которую назвал сам регистратор.
+
+    ⚠⚠ Запрошенная точка почти всегда попадает в ДЫРУ: архив пишется по
+    движению, и суток из двух сотен фрагментов по восемь секунд хватает, чтобы
+    промахнуться мимо записи почти всегда. На такой метке регистратор отвечает
+    `success: 1`, честно называет ближайший кадр в `first_frame_ts` — И НЕ
+    ОТДАЁТ ДАННЫЕ.
+
+    Замер объекта 2026-09-14 (вчерашний день, `play` от полуночи):
+      · от полуночи            →  298 КБ, курсор ЗАМЕР на 00:22:42;
+      · повтор с 00:22:42      → 2118 КБ, курсор идёт 00:22:42 → 00:22:50.
+
+    ⚠ Ровно ОДИН повтор и только при расхождении: второй круг значил бы, что мы
+    спорим с регистратором о его же ответе.
+    """
+    answer = await client.async_archive_command(
+        token, command="play", start=_stamp(start_us), stop=_stamp(stop_us), speed=1
+    )
+    назвал = answer.get("first_frame_ts") if isinstance(answer, dict) else None
+    метка = _stamp_of_text(назвал)
+    if метка and метка != _stamp(start_us):
+        await client.async_archive_command(
+            token, command="play", start=метка, stop=_stamp(stop_us), speed=1
+        )
+    return answer if isinstance(answer, dict) else {}
+
+
+def _stamp_of_text(text: str | None) -> str | None:
+    """`2026-09-13 00:22:42` → `20260913T002242`; мусор → None.
+
+    ⚠ ПЕРЕСТАНОВКА СИМВОЛОВ, а не разбор даты, и это принципиально: дом НЕ
+    толкует ответы регистратора (`docs/plan-thin-integration.md`, «Широкая
+    дверь»), а здесь метка регистратора лишь переписывается в его же второй
+    формат, чтобы вернуть ему. Ни календаря, ни пояса, ни арифметики суток.
+    """
+    if not isinstance(text, str):
+        return None
+    сжато = text.strip().replace("-", "").replace(":", "").replace(" ", "T")
+    return сжато if re.fullmatch(r"\d{8}T\d{6}", сжато) else None
 
 def _archive_stream(quality: str | None, remote: bool | None) -> str:
     """Какой поток архива просить у регистратора.
@@ -488,25 +530,8 @@ class ClipSessions:
                 # СТОИТ — регистратор сам его остановил, — и `play` его
                 # поднимает. Стоп архива после `seek` — состояние регистратора,
                 # а не наша выдумка: его видно в `archive_status?type=state`.
-                answer = await client.async_archive_command(
-                    old.token,
-                    command="play",
-                    # ⚠⚠ МЕТКОЙ РЕГИСТРАТОРА, а не микросекундами. Дока говорит
-                    # `start=[дата и время]` (`sdk-archive-command.md`), и замер
-                    # объекта 2026-09-14 показывает цену отступления: при ОДНОЙ
-                    # И ТОЙ ЖЕ посадке строкой приходит 1798 КБ и курсор идёт
-                    # секунда в секунду, числом — 167 КБ и курсор улетает на
-                    # четыре минуты за шесть секунд. Числом регистратор
-                    # отвечает `success: 1` и встаёт куда просили: врёт
-                    # убедительно. Формат `stop` при этом не влияет.
-                    #
-                    # ⚠ Ловушка, из-за которой это жило долго: ПЕРВЫЙ `play` на
-                    # свежем потоке работает В ОБОИХ форматах (1458 КБ против
-                    # 1401 КБ). Ломается только `play`, идущий ЗА `seek`, — то
-                    # есть ровно перемотка.
-                    start=_stamp(position),
-                    stop=_stamp(old.window_stop_us),
-                    speed=1,
+                answer = await _play_where_told(
+                    client, old.token, position, old.window_stop_us
                 )
                 # ⚠ Куда курсор встал НА САМОМ ДЕЛЕ — говорит регистратор, и
                 # только он: у архива дыры, и запрошенная метка внутри дыры
@@ -770,12 +795,8 @@ class ClipSessions:
             clip.started = True
             await self._async_settle(clip)
             try:
-                answer = await client.async_archive_command(
-                    clip.token,
-                    command="play",
-                    start=clip.start_us,
-                    stop=clip.window_stop_us,
-                    speed=1,
+                answer = await _play_where_told(
+                    client, clip.token, clip.start_us, clip.window_stop_us
                 )
             except TrassirError as err:
                 # Не роняем просмотр: поток уже сведён, и жилец увидит хотя бы

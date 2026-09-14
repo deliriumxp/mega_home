@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+
+from mega_home.trassir_clip import _stamp
 from typing import Any
 
 import pytest
@@ -249,10 +251,18 @@ def test_команда_одна_и_по_готовности(
     assert "segments" not in answer
     assert "outOfWindow" not in answer
     commands = [p for n, p in gateway.client.calls if n == "archive_command"]
-    assert len(commands) == 1
-    assert commands[0]["start"] == EVENT["timestampUs"] - 10_000_000, (
-        "метка события уходит как есть"
+    # ⚠⚠ Команд ДВЕ, и вторая не лишняя: `play` с запрошенной метки, затем
+    # ПОВТОР с той, которую назвал сам регистратор (`first_frame_ts`).
+    # Запрошенная точка почти всегда попадает в ДЫРУ — архив пишется по
+    # движению, — и на такой метке регистратор отвечает `success: 1`, честно
+    # называет ближайший кадр и НЕ ОТДАЁТ ДАННЫЕ. Замер объекта 2026-09-14: от
+    # полуночи 298 КБ и замерший курсор против 2118 КБ и идущего курсора после
+    # повтора с названной метки.
+    assert len(commands) == 2
+    assert commands[0]["start"] == _stamp(EVENT["timestampUs"] - 10_000_000), (
+        "метка события уходит меткой регистратора"
     )
+    assert commands[1]["start"] == "20260909T140000", "повтор с названной метки"
 
 
 def test_закрытие_снимает_поток_и_токен(
@@ -373,8 +383,10 @@ def test_сторож_стартует_вслепую_без_готовност�
     asyncio.run(scenario())
 
     commands = [p for n, p in gateway.client.calls if n == "archive_command"]
-    assert len(commands) == 1
-    assert commands[0]["start"] == EVENT["timestampUs"] - 10_000_000
+    # ⚠ Две: `play` с запрошенной метки и повтор с той, что назвал регистратор
+    # (запрошенная почти всегда попадает в дыру — см. `_play_where_told`).
+    assert len(commands) == 2
+    assert commands[0]["start"] == _stamp(EVENT["timestampUs"] - 10_000_000)
 
 
 def test_seek_позиционирует_живой_поток_тем_же_клипом(
@@ -414,9 +426,16 @@ def test_seek_позиционирует_живой_поток_тем_же_кл�
     assert answer["positionUs"] == middle
     assert answer["startUs"] == EVENT["timestampUs"] - 10_000_000, "окно не съезжает"
     assert answer["stopUs"] == EVENT["timestampUs"] + 60_000_000
-    # Две команды: seek ставит курсор, play поднимает ВСТАВШИЙ поток.
+    # ⚠ ТРИ команды: `seek` ставит курсор, `play` поднимает вставший поток, и
+    # ПОВТОР `play` — с метки, которую назвал сам регистратор. Запрошенная точка
+    # почти всегда попадает в дыру (архив пишется по движению), и на ней
+    # регистратор отвечает `success: 1`, честно называет ближайший кадр и НЕ
+    # ОТДАЁТ ДАННЫЕ: замер объекта 2026-09-14 — 298 КБ и замерший курсор против
+    # 2118 КБ и идущего после повтора.
     commands = [p for n, p in gateway.client.calls if n == "archive_command"]
-    assert len(commands) == 2
+    assert len(commands) == 3
+    assert commands[2]["command"] == "play"
+    assert commands[2]["start"] == "20260909T140000", "повтор с названной метки"
     assert commands[0]["command"] == "seek"
     assert commands[0]["timestamp"] == middle
     assert commands[0]["direction"] == 0
@@ -427,8 +446,6 @@ def test_seek_позиционирует_живой_поток_тем_же_кл�
     # курсор идёт секунда в секунду, числом 167 КБ и курсор улетает на четыре
     # минуты за шесть секунд. Числом регистратор отвечает `success: 1` и
     # встаёт куда просили: врёт убедительно.
-    from mega_home.trassir_clip import _stamp
-
     assert commands[1]["start"] == _stamp(middle)
     assert commands[1]["stop"] == _stamp(EVENT["timestampUs"] + 60_000_000)
     assert re.fullmatch(r"\d{8}T\d{6}", commands[1]["start"])
@@ -463,7 +480,7 @@ def test_seek_до_старта_не_шлёт_команду(
     # Стартовавший архив играет уже с новой метки.
     asyncio.run(gateway.clips.async_ready(clip_id))
     commands = [p for n, p in gateway.client.calls if n == "archive_command"]
-    assert commands and commands[0]["start"] == middle
+    assert commands and commands[0]["start"] == _stamp(middle)
 
 
 def test_смену_качества_seek_переоткрывает(
@@ -860,8 +877,10 @@ def test_окно_можно_уточнить_на_готовности(gateway:
         return next(p for n, p in gateway.client.calls if n == "archive_command")
 
     command = asyncio.run(scenario())
-    assert command["start"] == day
-    assert command["stop"] == day + 86_400_000_000
+    # ⚠ Метка регистратора, а не микросекунды: числом `play` встаёт куда просили
+    # и НЕ отдаёт данные (замер объекта 2026-09-14 — 167 КБ против 1798 КБ).
+    assert command["start"] == _stamp(day)
+    assert command["stop"] == _stamp(day + 86_400_000_000)
 
 def test_событие_не_двигает_окно(gateway: FakeGateway) -> None:
     """У клипа СОБЫТИЯ окно стоит на месте: его задало событие, и приложение
@@ -901,7 +920,7 @@ def test_сторож_не_съедает_попытку_старта_без_о�
 
     answer = asyncio.run(scenario())
     command = next(p for n, p in gateway.client.calls if n == "archive_command")
-    assert command["start"] == day
+    assert command["start"] == _stamp(day)
     assert not answer["error"], "состоявшийся старт не жалуется на прошлый отказ"
 
 
@@ -925,3 +944,30 @@ def test_метка_регистратора_симметрична_чтению
     # Пусто остаётся пустым: параметр без значения дверь опускает, а строка
     # "None" даёт «timestamp format is not valid» (замер стенда 2026-09-13).
     assert _stamp(None) is None
+
+
+def test_повтор_play_идёт_с_метки_НАЗВАННОЙ_регистратором() -> None:
+    """⚠⚠ Замок на вторую беду того же рода, что и формат метки.
+
+    Запрошенная точка почти всегда попадает в ДЫРУ: архив пишется по движению,
+    и суток из двух сотен фрагментов по восемь секунд хватает, чтобы
+    промахнуться мимо записи почти всегда. На такой метке регистратор отвечает
+    `success: 1`, честно называет ближайший кадр в `first_frame_ts` — И НЕ
+    ОТДАЁТ ДАННЫЕ.
+
+    Замер объекта 2026-09-14 (вчерашний день, `play` от полуночи):
+      · от полуночи       →  298 КБ, курсор ЗАМЕР на 00:22:42;
+      · повтор с 00:22:42 → 2118 КБ, курсор идёт 00:22:42 → 00:22:50.
+
+    ⚠ Повтор РОВНО ОДИН и только при расхождении: второй круг значил бы, что мы
+    спорим с регистратором о его же ответе.
+    """
+    from mega_home.trassir_clip import _stamp_of_text
+
+    # Перестановка символов, а не разбор даты: дом не толкует ответы.
+    assert _stamp_of_text("2026-09-13 00:22:42") == "20260913T002242"
+    assert _stamp_of_text("") is None
+    assert _stamp_of_text(None) is None
+    assert _stamp_of_text("совсем не метка") is None
+    # ⚠ Полуразобранное тоже не метка: лучше не слать команду, чем слать кривую.
+    assert _stamp_of_text("2026-09-13") is None
