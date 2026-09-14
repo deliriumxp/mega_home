@@ -666,3 +666,29 @@ def test_потолок_ответа_считается_ПО_ХОДУ() -> None:
     call._session = Client()  # noqa: SLF001
     with pytest.raises(RecorderDenied):
         asyncio.run(call.call(None, "GET", "/screenshot/cam"))
+
+
+def test_длинный_опрос_держится_дольше_обычного_вызова() -> None:
+    """⚠ Замок на срок подписки.
+
+    `archive_events` регистратор держит, ПОКА ЕМУ НЕЧЕГО СКАЗАТЬ: замер объекта
+    2026-09-14 — стоящий архив держал соединение 60.2 с и только потом ответил
+    пустотой. Оборвав его обычными тридцатью, дверь теряет ровно то, что
+    регистратор собирался прислать, и документированная ПОДПИСКА вырождается в
+    частый опрос. Тот же урок уже стоил ленты событий (`/events`: 7 потерянных
+    событий из 8 за минуту).
+    """
+    from mega_home.recorder import CALL_TIMEOUT, LONG_POLL_TIMEOUT, _call_timeout
+
+    assert _call_timeout("/archive_events") == LONG_POLL_TIMEOUT
+    assert _call_timeout("/events") == LONG_POLL_TIMEOUT
+    # ⚠ С запасом к измеренным 60 с: срок держит РЕГИСТРАТОР, и его потолок
+    # нам не обещан.
+    assert LONG_POLL_TIMEOUT >= 120
+
+    # Обычный вызов длинным сроком не становится: повисший снимок держал бы
+    # жест жильца без ответа.
+    assert _call_timeout("/archive_status") == CALL_TIMEOUT
+    assert _call_timeout("/get_video") == CALL_TIMEOUT
+    # Запрос с параметрами разбирается по пути, а не по строке целиком.
+    assert _call_timeout("/archive_events?token=abc") == LONG_POLL_TIMEOUT

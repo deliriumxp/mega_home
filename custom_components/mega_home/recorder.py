@@ -37,8 +37,24 @@ from .const import LOGGER
 # Срок одного вызова: регистратор местный, но искать кадр в архиве может
 # подолгу (замер стенда 2026-09-12: снимок отдаётся за 0,7–1,3 с).
 CALL_TIMEOUT = 30
+# ⚠ ДЛИННЫЕ ОПРОСЫ — отдельным сроком, и это не перестраховка. Подписка на
+# события архива (`archive_events`) держится регистратором, ПОКА ЕМУ НЕЧЕГО
+# СКАЗАТЬ: замер объекта 2026-09-14 — стоящий архив держал соединение 60.2 с и
+# только потом ответил пустотой. Оборвав его своими тридцатью, дверь теряет
+# ровно то, что регистратор собирался прислать, — и подписка вырождается в
+# частый опрос. Тот же урок уже стоил ленты событий (`/events`, потеря 7
+# событий из 8 за минуту).
+LONG_POLL_TIMEOUT = 180
+# Пути, которые ДЕРЖАТ соединение: срок им нужен длинный.
+LONG_POLL_PATHS = ("/archive_events", "/events")
 # Потолок ответа. Кадр полного размера — ~390 КБ, конфиг регистратора — сотни
 # килобайт; восемь мегабайт ловят ошибку «просим не то», а не ограничивают работу.
+
+def _call_timeout(path: str) -> int:
+    """Сколько ждать ответа: длинный опрос держат, обычный вызов — нет."""
+    начало = path.split("?", 1)[0].rstrip("/")
+    return LONG_POLL_TIMEOUT if начало in LONG_POLL_PATHS else CALL_TIMEOUT
+
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 # Пути, закрытые ВСЕГДА, каким бы ни был вендор: вход, настройки и дерево
 # объектов (через него правится состояние регистратора, а не воспроизведение).
@@ -273,7 +289,11 @@ class RecorderCall:
             query.update(session or {})
             try:
                 async with client.request(
-                    method, url, params=query, data=body, timeout=aiohttp.ClientTimeout(total=CALL_TIMEOUT)
+                    method,
+                    url,
+                    params=query,
+                    data=body,
+                    timeout=aiohttp.ClientTimeout(total=_call_timeout(path)),
                 ) as response:
                     payload = await _read_all(response)
                     status, kind = response.status, response.content_type
