@@ -138,12 +138,26 @@ def config(coordinator: MegaHomeCoordinator) -> dict[str, Any]:
     from .const import INTEGRATION_VERSION
     from .http import VIEWS
 
+    # ⚠ И ПОЧЕМУ дом чего-то не может — тоже сюда. Причина у него была всегда
+    # (`go2rtc_embed._why`), но лежала в диагностике Home Assistant, за
+    # токеном: снаружи — ни из приложения, ни из скрипта — её было не достать,
+    # и «Дом не может отдать запись: не поднят его go2rtc» оставалось без
+    # продолжения. Паспорт для того и заведён: он говорит не только «что умею»,
+    # но и «чего не могу и по какой причине».
+    try:
+        from .go2rtc_embed import state as go2rtc_state
+
+        media = go2rtc_state()
+    except Exception as err:  # noqa: BLE001 — паспорт важнее одной строки в нём
+        media = {"running": False, "why": f"состояние go2rtc не прочиталось: {err}"}
+
     return {
         **(coordinator.data or {}),
         "integration": {
             "version": INTEGRATION_VERSION,
             "appVersion": coordinator.bundle.version if coordinator.bundle else None,
             "routes": sorted(getattr(view, "url", "") for view in VIEWS),
+            "go2rtc": media,
         },
     }
 

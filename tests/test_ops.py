@@ -542,3 +542,7 @@ def test_дом_говорит_о_себе_в_общем_канале_а_не_с
     assert len(паспорт["routes"]) == len(VIEWS)
     assert "/mega-home/api/trassir/channels/{channel}/preview" in паспорт["routes"]
     assert паспорт["routes"] == sorted(паспорт["routes"]), "список нестабилен между ответами"
+    # ⚠ И ПРИЧИНА отказа: «не поднят его go2rtc» без продолжения — это тупик.
+    # Причина у дома была всегда, но лежала в диагностике HA за токеном.
+    assert "go2rtc" in паспорт
+    assert "running" in паспорт["go2rtc"] and "why" in паспорт["go2rtc"]
