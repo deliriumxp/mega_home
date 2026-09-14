@@ -187,7 +187,7 @@ def test_сценарий_запускает_скрипт():
 # и камера покажет кадр на одном транспорте и пустоту на другом.
 
 
-def _камера(attributes: dict) -> dict:
+def _camera(attributes: dict) -> dict:
     return ops.entity_view(
         {"id": "cam1", "domain": "camera", "entityId": "camera.gate", "name": "Калитка"},
         State("idle", attributes),
@@ -195,7 +195,7 @@ def _камера(attributes: dict) -> dict:
 
 
 def test_кадр_и_поток_строятся_по_entity_id_и_подписанному_токену():
-    view = _камера({"access_token": "tok en", "frontend_stream_type": "hls"})
+    view = _camera({"access_token": "tok en", "frontend_stream_type": "hls"})
 
     assert view["state"]["picture"] == "/api/camera_proxy/camera.gate?token=tok%20en"
     assert view["state"]["stream"] == "/api/camera_proxy_stream/camera.gate?token=tok%20en"
@@ -206,7 +206,7 @@ def test_кадр_и_поток_строятся_по_entity_id_и_подпис�
 def test_без_токена_адресов_не_обещаем():
     # Токен ротируется; адрес без него отдаст 401, а битая картинка на плитке
     # читается как сломанная камера.
-    view = _камера({})
+    view = _camera({})
 
     assert view["state"]["picture"] == ""
     assert view["state"]["stream"] == ""
@@ -215,7 +215,7 @@ def test_без_токена_адресов_не_обещаем():
 def test_у_камеры_нет_вкл_выкл():
     # Состояние камеры в HA — idle/recording/streaming. Выдуманный `power`
     # сделал бы плитку выключателем, которым нечего выключать.
-    assert "power" not in _камера({"access_token": "t"})["state"]
+    assert "power" not in _camera({"access_token": "t"})["state"]
 
 
 def test_элемент_без_сущности_адресов_не_получает():
@@ -232,7 +232,7 @@ def test_элемент_без_сущности_адресов_не_получа
 # (`ha-entity.spec.ts`). Здесь остаётся проверка, что дом ничего не выдумывает.
 
 
-def _плеер(state: str, attributes: dict) -> dict:
+def _player(state: str, attributes: dict) -> dict:
     return ops.entity_view(
         {
             "id": "tv1",
@@ -245,7 +245,7 @@ def _плеер(state: str, attributes: dict) -> dict:
 
 
 def test_состояние_плеера_уходит_сырым():
-    view = _плеер("paused", {"media_title": "Сюита №3", "supported_features": 1})
+    view = _player("paused", {"media_title": "Сюита №3", "supported_features": 1})
 
     assert view["state"] == {"value": "paused"}
     assert view["attributes"]["media_title"] == "Сюита №3"
@@ -282,7 +282,7 @@ def test_токен_доступа_наружу_не_уходит():
     # Не «фильтр полезного», а секрет: из него уже собраны адреса кадра и
     # потока, и отдать его отдельным полем значит отдать право собрать любой
     # другой адрес того же Home Assistant.
-    view = _камера({"access_token": "секрет", "friendly_name": "Калитка"})
+    view = _camera({"access_token": "секрет", "friendly_name": "Калитка"})
 
     assert "access_token" not in view["attributes"]
     assert view["attributes"]["friendly_name"] == "Калитка"
@@ -393,7 +393,7 @@ def test_плитка_без_карты_команд_не_исполняется
     # приносит конфиг. Важно, чтобы отказ был ЯВНЫМ: угадать службу по домену
     # значит завести здесь вторую карту команд, расходящуюся с менеджерской.
     hass = _Hass()
-    без_команд = {
+    no_commands = {
         **_CONFIG,
         "tiles": [
             {
@@ -410,7 +410,7 @@ def test_плитка_без_карты_команд_не_исполняется
     with pytest.raises(ops.OpError) as err:
         run(
             hass,
-            _Coordinator(data=без_команд),
+            _Coordinator(data=no_commands),
             "command",
             {"id": "t1", "command": "set_brightness", "value": 40},
         )
@@ -438,9 +438,9 @@ def test_своя_сессия_закрывается_РАНЬШЕ_чем_спр
     """
     from mega_home import webrtc
 
-    закрыто: list[str] = []
+    closed: list[str] = []
     monkeypatch.setattr(
-        webrtc, "close_own", lambda hass, sid: (закрыто.append(sid), True)[1]
+        webrtc, "close_own", lambda hass, sid: (closed.append(sid), True)[1]
     )
     # Если до сущности дойдёт — тест это увидит: такой камеры в доме нет.
     monkeypatch.setattr(
@@ -455,7 +455,7 @@ def test_своя_сессия_закрывается_РАНЬШЕ_чем_спр
     )
 
     assert answer == {"closed": True}
-    assert закрыто == ["sess-1"], "закрыли не ту сессию или не закрыли вовсе"
+    assert closed == ["sess-1"], "закрыли не ту сессию или не закрыли вовсе"
 
 
 def test_чужая_сессия_по_прежнему_идёт_к_сущности_камеры(
@@ -467,11 +467,11 @@ def test_чужая_сессия_по_прежнему_идёт_к_сущнос�
     from mega_home import webrtc
 
     monkeypatch.setattr(webrtc, "close_own", lambda hass, sid: False)
-    спросили: list[str] = []
+    asked: list[str] = []
     monkeypatch.setattr(
         webrtc,
         "close",
-        lambda hass, entity_id, sid: (спросили.append(entity_id), {"closed": True})[1],
+        lambda hass, entity_id, sid: (asked.append(entity_id), {"closed": True})[1],
     )
     tile = {"id": "cam3", "roomId": "r1", "name": "Калитка", "domain": "camera",
             "entityId": "camera.gate"}
@@ -482,7 +482,7 @@ def test_чужая_сессия_по_прежнему_идёт_к_сущнос�
     )
 
     assert answer == {"closed": True}
-    assert спросили == ["camera.gate"]
+    assert asked == ["camera.gate"]
 
 
 def test_имя_камеры_видеонаблюдения_читает_РОВНО_одна_функция() -> None:
@@ -504,22 +504,22 @@ def test_имя_камеры_видеонаблюдения_читает_РОВ�
     # по классам устройств (`ops_video`, `ops_camera`, `ops_webrtc`), и замок,
     # читающий только фасад, после деления показывал бы ноль читателей —
     # то есть молча перестал бы стеречь.
-    слой = sorted(pathlib.Path(ops.__file__).parent.glob("ops*.py"))
-    строки = [
-        (f"{файл.name}:{n}", s)
-        for файл in слой
-        for n, s in enumerate(файл.read_text(encoding="utf-8").splitlines(), 1)
+    layer = sorted(pathlib.Path(ops.__file__).parent.glob("ops*.py"))
+    lines = [
+        (f"{path.name}:{n}", s)
+        for path in layer
+        for n, s in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
     ]
 
-    def читают(имя: str) -> list[tuple[str, str]]:
-        кавычки = (f'"{имя}"', f"'{имя}'")
-        return [(n, s) for n, s in строки if any(k in s for k in кавычки)]
+    def read_by(name: str) -> list[tuple[str, str]]:
+        quotes = (f'"{name}"', f"'{name}'")
+        return [(n, s) for n, s in lines if any(k in s for k in quotes)]
 
-    вендорское = читают("trassirGuid")
-    assert not вендорское, f"вендорское имя ещё читают: {вендорское}"
+    vendor_named = read_by("trassirGuid")
+    assert not vendor_named, f"вендорское имя ещё читают: {vendor_named}"
 
-    читатели = читают("videoId")
-    assert len(читатели) == 1, f"имя читают в {len(читатели)} местах: {читатели}"
+    readers = read_by("videoId")
+    assert len(readers) == 1, f"имя читают в {len(readers)} местах: {readers}"
 
 
 def test_камера_видеонаблюдения_доступна_БЕЗ_сущности_под_новым_именем() -> None:
@@ -548,22 +548,22 @@ def test_дом_говорит_о_себе_в_общем_канале_а_не_с
     from mega_home.http import VIEWS
 
     answer = ops.config(_Coordinator())
-    паспорт = answer["integration"]
+    passport = answer["integration"]
 
-    assert паспорт["version"] == INTEGRATION_VERSION
+    assert passport["version"] == INTEGRATION_VERSION
     # Состав дома при этом никуда не делся.
     assert answer["rooms"] == _CONFIG["rooms"]
     # Пути — ПОДНЯТЫЕ, поэтому мёртвая дверь видна отсутствием.
-    assert len(паспорт["routes"]) == len(VIEWS)
-    assert "/mega-home/api/video/channels/{channel}/preview" in паспорт["routes"]
+    assert len(passport["routes"]) == len(VIEWS)
+    assert "/mega-home/api/video/channels/{channel}/preview" in passport["routes"]
     # ⚠ И ни одного вендорского пути: маршрут заводится для КЛАССА устройств.
-    assert not [p for p in паспорт["routes"] if "trassir" in p]
-    assert паспорт["routes"] == sorted(паспорт["routes"]), "список нестабилен между ответами"
+    assert not [p for p in passport["routes"] if "trassir" in p]
+    assert passport["routes"] == sorted(passport["routes"]), "список нестабилен между ответами"
     # ⚠ И ПРИЧИНА отказа: «не поднят его go2rtc» без продолжения — это тупик.
     # Причина у дома была всегда, но лежала в диагностике HA за токеном.
-    assert "go2rtc" in паспорт
-    assert "running" in паспорт["go2rtc"] and "why" in паспорт["go2rtc"]
+    assert "go2rtc" in passport
+    assert "running" in passport["go2rtc"] and "why" in passport["go2rtc"]
     # ⚠ И ЧТО дом умеет достать снаружи: без этого бандл гадает по версии, а
     # версия говорит лишь о намерении. Двери у голого координатора нет вовсе —
     # это пустой список, а не отсутствие поля: «доступов нет» тоже ответ.
-    assert паспорт["accesses"] == []
+    assert passport["accesses"] == []

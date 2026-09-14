@@ -107,11 +107,11 @@ async def _play_where_told(client: Any, token: str, start_us: int, stop_us: int)
     answer = await client.async_archive_command(
         token, command="play", start=_stamp(start_us), stop=_stamp(stop_us), speed=1
     )
-    назвал = answer.get("first_frame_ts") if isinstance(answer, dict) else None
-    метка = _stamp_of_text(назвал)
-    if метка and метка != _stamp(start_us):
+    named = answer.get("first_frame_ts") if isinstance(answer, dict) else None
+    stamp = _stamp_of_text(named)
+    if stamp and stamp != _stamp(start_us):
         await client.async_archive_command(
-            token, command="play", start=метка, stop=_stamp(stop_us), speed=1
+            token, command="play", start=stamp, stop=_stamp(stop_us), speed=1
         )
     return answer if isinstance(answer, dict) else {}
 
@@ -126,8 +126,8 @@ def _stamp_of_text(text: str | None) -> str | None:
     """
     if not isinstance(text, str):
         return None
-    сжато = text.strip().replace("-", "").replace(":", "").replace(" ", "T")
-    return сжато if re.fullmatch(r"\d{8}T\d{6}", сжато) else None
+    packed = text.strip().replace("-", "").replace(":", "").replace(" ", "T")
+    return packed if re.fullmatch(r"\d{8}T\d{6}", packed) else None
 
 def _archive_stream(quality: str | None, remote: bool | None) -> str:
     """Какой поток архива просить у регистратора.

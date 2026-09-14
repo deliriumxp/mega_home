@@ -663,8 +663,8 @@ def test_метка_регистратора_симметрична_чтению
 
     assert _stamp(us) == "20260914T094351"
     # Двузначность обязательна: регистратор ждёт ровно 8+1+6 знаков.
-    полночь = int(datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc).timestamp()) * 1_000_000
-    assert _stamp(полночь) == "20260102T030405"
+    midnight = int(datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc).timestamp()) * 1_000_000
+    assert _stamp(midnight) == "20260102T030405"
     # Пусто остаётся пустым: параметр без значения дверь опускает, а строка
     # "None" даёт «timestamp format is not valid» (замер стенда 2026-09-13).
     assert _stamp(None) is None

@@ -378,25 +378,25 @@ def test_stored_feed_survives_a_restart(tmp_path: Path) -> None:
     assert revived._creds.get("sdkPassword") == "sdk-s3cret"  # noqa: SLF001
 
 
-def _кадр(width: int, height: int, центр: tuple[int, int, int], поля: tuple[int, int, int]) -> bytes:
+def _frame(width: int, height: int, center: tuple[int, int, int], fields: tuple[int, int, int]) -> bytes:
     """Кадр с «технической информацией» по краям: поля шириной 50px."""
     from io import BytesIO
 
     from PIL import Image
 
-    image = Image.new("RGB", (width, height), центр)
+    image = Image.new("RGB", (width, height), center)
     pixels = image.load()
     assert pixels is not None
     for x in range(width):
         for y in range(height):
             if x < 50 or y < 50 or x >= width - 50 or y >= height - 50:
-                pixels[x, y] = поля
+                pixels[x, y] = fields
     buffer = BytesIO()
     image.save(buffer, format="JPEG", quality=95)
     return buffer.getvalue()
 
 
-def _угол(raw: bytes) -> tuple[int, int, int]:
+def _corner(raw: bytes) -> tuple[int, int, int]:
     from io import BytesIO
 
     from PIL import Image
@@ -480,13 +480,13 @@ def test_ленту_событий_спрашивают_длинным_срок�
     from mega_home.trassir_client import TrassirClient
 
     client = TrassirClient.__new__(TrassirClient)
-    сроки: list[float] = []
+    deadlines: list[float] = []
 
     async def _request(path: str, door: str, _timeout: float = 0.0, **_: object) -> object:
-        сроки.append(_timeout)
+        deadlines.append(_timeout)
         return []
 
     client._request = _request  # type: ignore[method-assign]
     _asyncio.run(client.async_events())
 
-    assert сроки == [TRASSIR_EVENTS_TIMEOUT]
+    assert deadlines == [TRASSIR_EVENTS_TIMEOUT]

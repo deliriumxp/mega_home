@@ -64,8 +64,8 @@ LONG_POLL_PATHS = ("/archive_events", "/events")
 
 def _call_timeout(path: str) -> int:
     """Сколько ждать ответа: длинный опрос держат, обычный вызов — нет."""
-    начало = path.split("?", 1)[0].rstrip("/")
-    return LONG_POLL_TIMEOUT if начало in LONG_POLL_PATHS else CALL_TIMEOUT
+    start = path.split("?", 1)[0].rstrip("/")
+    return LONG_POLL_TIMEOUT if start in LONG_POLL_PATHS else CALL_TIMEOUT
 
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 # Пути, закрытые ВСЕГДА, каким бы ни был вендор: вход, настройки и дерево
@@ -477,14 +477,14 @@ async def _read_all(response: Any) -> bytes:
     ⚠ Поэтому читаем кусками до конца и проверяем потолок ПО ХОДУ: иначе
     «потолок» защищал бы от большого ответа тем, что молча портил любой.
     """
-    куски: list[bytes] = []
-    всего = 0
-    async for кусок in response.content.iter_chunked(64 * 1024):
-        всего += len(кусок)
-        if всего > MAX_RESPONSE_BYTES:
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.content.iter_chunked(64 * 1024):
+        total += len(chunk)
+        if total > MAX_RESPONSE_BYTES:
             raise AccessDenied("Ответ регистратора больше потолка двери")
-        куски.append(кусок)
-    return b"".join(куски)
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _normalized(path: str) -> str:

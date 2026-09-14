@@ -126,7 +126,7 @@ def _routes() -> set[str]:
     return {getattr(view, "url") for view in mega_http.VIEWS}
 
 
-def _объявленные() -> dict[str, str]:
+def _declared() -> dict[str, str]:
     """Все классы дверей в модуле — объявленные, независимо от регистрации."""
     return {
         name: getattr(view, "url")
@@ -147,13 +147,13 @@ def test_объявленная_дверь_обязана_быть_ЗАРЕГИ�
 
     Поэтому: объявил дверь — зарегистрируй, либо удали класс.
     """
-    зарегистрированы = _routes()
-    мёртвые = {
-        name: url for name, url in _объявленные().items() if url not in зарегистрированы
+    registered = _routes()
+    dead = {
+        name: url for name, url in _declared().items() if url not in registered
     }
 
-    assert not мёртвые, (
-        f"дверь объявлена, но не поднимается: {sorted(мёртвые)}. "
+    assert not dead, (
+        f"дверь объявлена, но не поднимается: {sorted(dead)}. "
         "Впиши класс в `http.VIEWS` или удали его — мёртвый маршрут отвечает "
         "жильцу обычным 404, неотличимым от несуществующего пути"
     )

@@ -462,10 +462,10 @@ def test_падение_драйверской_сессии_это_отказ_д
     «недоступен», чтобы приложение назвало причину, а не ушло на прежние пути.
     """
 
-    async def падает(fresh: bool = False) -> str:
+    async def raises(fresh: bool = False) -> str:
         raise RuntimeError("Trassir не отвечает: нет ответа за 15 с")
 
-    call = AccessGateway(credentials=_creds, sid_provider=падает)
+    call = AccessGateway(credentials=_creds, sid_provider=raises)
     call.apply([TRASSIR])
 
     with pytest.raises(AccessUnreachable) as err:
@@ -484,15 +484,15 @@ def test_протухшая_сессия_перевходит_а_не_уезжа
     и пустую шкалу, ничего не сообщая. Теперь дом перевходит и повторяет вызов —
     ровно один раз, по маркеру ИЗ ОПИСАНИЯ (у другого вендора слова другие).
     """
-    свежесть: list[bool] = []
+    freshness: list[bool] = []
 
     async def sid(fresh: bool = False) -> str:
-        свежесть.append(fresh)
+        freshness.append(fresh)
         return "мёртвая" if not fresh else "живая"
 
     call = AccessGateway(credentials=_creds, sid_provider=sid)
     call.apply([{**TRASSIR, "sessionExpired": "no session"}])
-    ответы: list[dict[str, Any]] = []
+    answers: list[dict[str, Any]] = []
 
     class Body:
         def __init__(self, payload: bytes) -> None:
@@ -523,7 +523,7 @@ def test_протухшая_сессия_перевходит_а_не_уезжа
 
         def request(self, method: str, url: str, **kwargs: Any) -> Answer:
             sid_used = kwargs.get("params", {}).get("sid")
-            ответы.append({"sid": sid_used})
+            answers.append({"sid": sid_used})
             if sid_used == "мёртвая":
                 return Answer(b'{"error_code":"no session","success":0}')
             return Answer(b'[{"token":"t","calendar":["2026-09-13"]}]')
@@ -533,8 +533,8 @@ def test_протухшая_сессия_перевходит_а_не_уезжа
         call.call(None, "GET", "/archive_status", {"type": "calendar"})
     )
 
-    assert свежесть == [False, True], "второй заход обязан просить СВЕЖУЮ сессию"
-    assert [item["sid"] for item in ответы] == ["мёртвая", "живая"]
+    assert freshness == [False, True], "второй заход обязан просить СВЕЖУЮ сессию"
+    assert [item["sid"] for item in answers] == ["мёртвая", "живая"]
     assert b"calendar" in payload, "наружу уходит ответ живой сессии, а не отказ"
 
 
@@ -546,7 +546,7 @@ def test_без_маркера_повтора_нет() -> None:
 
     call = AccessGateway(credentials=_creds, sid_provider=sid)
     call.apply([TRASSIR])  # без `sessionExpired`
-    заходы: list[int] = []
+    rounds: list[int] = []
 
     class Body:
         async def iter_chunked(self, _size: int) -> Any:
@@ -571,13 +571,13 @@ def test_без_маркера_повтора_нет() -> None:
         closed = False
 
         def request(self, *_: Any, **__: Any) -> Answer:
-            заходы.append(1)
+            rounds.append(1)
             return Answer()
 
     call._session = Client()  # noqa: SLF001
     asyncio.run(call.call(None, "GET", "/archive_status", {"type": "calendar"}))
 
-    assert len(заходы) == 1
+    assert len(rounds) == 1
 
 
 def test_ответ_читается_ЦЕЛИКОМ_а_не_первым_куском() -> None:
@@ -594,7 +594,7 @@ def test_ответ_читается_ЦЕЛИКОМ_а_не_первым_кус�
     участков шкалы) — нет. Отсюда же «то показывает, то нет».
     """
     call = door()
-    целое = b'[{"token":"t","calendar":["2026-09-12","2026-09-13"]}]'
+    whole = b'[{"token":"t","calendar":["2026-09-12","2026-09-13"]}]'
 
     class Body:
         """Поток, отдающий тело КУСКАМИ, — как настоящий aiohttp."""
@@ -604,8 +604,8 @@ def test_ответ_читается_ЦЕЛИКОМ_а_не_первым_кус�
             return b'{"sid":"door"}'
 
         async def iter_chunked(self, _size: int) -> Any:
-            for at in range(0, len(целое), 8):
-                yield целое[at : at + 8]
+            for at in range(0, len(whole), 8):
+                yield whole[at : at + 8]
 
     class Answer:
         status = 200
@@ -630,7 +630,7 @@ def test_ответ_читается_ЦЕЛИКОМ_а_не_первым_кус�
     call._session = Client()  # noqa: SLF001
     _, _, payload = asyncio.run(call.call(None, "GET", "/archive_status", {"type": "calendar"}))
 
-    assert payload == целое, "тело обязано приехать целиком, а не первым куском"
+    assert payload == whole, "тело обязано приехать целиком, а не первым куском"
 
 
 def test_потолок_ответа_считается_ПО_ХОДУ() -> None:
@@ -644,9 +644,9 @@ def test_потолок_ответа_считается_ПО_ХОДУ() -> None:
             return b'{"sid":"door"}'
 
         async def iter_chunked(self, _size: int) -> Any:
-            послано = 0
-            while послано <= MAX_RESPONSE_BYTES + 1024:
-                послано += 65536
+            sent = 0
+            while sent <= MAX_RESPONSE_BYTES + 1024:
+                sent += 65536
                 yield b"x" * 65536
 
     class Answer:
@@ -744,11 +744,11 @@ def test_паспорт_называет_доступы_их_вид_и_венд�
         "C", (), {"data": {"rooms": []}, "bundle": None, "accesses": call}
     )()
 
-    доступы = ops.config(coordinator)["integration"]["accesses"]
+    accesses = ops.config(coordinator)["integration"]["accesses"]
 
-    assert доступы == [{"id": "trassir", "kind": "http", "vendor": "trassir"}]
-    сказано = set().union(*(d.keys() for d in доступы))
-    assert not sorted(сказано & {"host", "port", "login", "loginParams"}), (
+    assert accesses == [{"id": "trassir", "kind": "http", "vendor": "trassir"}]
+    said = set().union(*(d.keys() for d in accesses))
+    assert not sorted(said & {"host", "port", "login", "loginParams"}), (
         "паспорт отвечает «что есть», а не «как туда ходить»"
     )
 
