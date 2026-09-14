@@ -417,3 +417,102 @@ def test_плитка_без_карты_команд_не_исполняется
 
     assert err.value.status == HTTPStatus.NOT_FOUND
     assert hass.services.calls == []
+
+
+# Закрытие просмотра. ⚠ Живая камера видеонаблюдения открывается БЫСТРЫМ путём
+# (постоянный адрес канала), и сеанса ей не заводится вовсе: закрывать по клипу
+# нечего, а сущности Home Assistant у неё нет и не будет.
+
+
+def test_своя_сессия_закрывается_РАНЬШЕ_чем_спрашивают_сущность_камеры(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠ Замок на ПОРЯДОК, а не на факт закрытия.
+
+    `webrtc.close` пробует `close_own` первой строкой — но пока сущность камеры
+    вычислялась как АРГУМЕНТ вызова, до этой попытки дело не доходило: плитка
+    видеонаблюдения отвечала `409 «Это камера видеонаблюдения»` и поток к
+    регистратору оставался висеть (замер объекта 2026-09-13: переход на вкладку
+    «Архив» ронял закрытие живого просмотра). У регистратора соединения на IP
+    считаны, течь им нельзя.
+    """
+    from mega_home import webrtc
+
+    закрыто: list[str] = []
+    monkeypatch.setattr(
+        webrtc, "close_own", lambda hass, sid: (закрыто.append(sid), True)[1]
+    )
+    # Если до сущности дойдёт — тест это увидит: такой камеры в доме нет.
+    monkeypatch.setattr(
+        webrtc, "close", lambda *a, **k: pytest.fail("спросили сущность камеры")
+    )
+    tile = {"id": "cam2", "roomId": "r1", "name": "Вход", "domain": "camera",
+            "entityId": None, "videoId": "IAtwTYwK"}
+    coordinator = _Coordinator({**_CONFIG, "tiles": [*_CONFIG["tiles"], tile]})
+
+    answer = ops.webrtc_close(
+        _Hass(), coordinator, {"id": "cam2", "sessionId": "sess-1"}
+    )
+
+    assert answer == {"closed": True}
+    assert закрыто == ["sess-1"], "закрыли не ту сессию или не закрыли вовсе"
+
+
+def test_чужая_сессия_по_прежнему_идёт_к_сущности_камеры(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`close_own` отвечает False на сессию, которая не наша, — и тогда её
+    обязан закрыть штатный путь Home Assistant. Иначе камеры HA перестали бы
+    закрываться вовсе."""
+    from mega_home import webrtc
+
+    monkeypatch.setattr(webrtc, "close_own", lambda hass, sid: False)
+    спросили: list[str] = []
+    monkeypatch.setattr(
+        webrtc,
+        "close",
+        lambda hass, entity_id, sid: (спросили.append(entity_id), {"closed": True})[1],
+    )
+    tile = {"id": "cam3", "roomId": "r1", "name": "Калитка", "domain": "camera",
+            "entityId": "camera.gate"}
+    coordinator = _Coordinator({**_CONFIG, "tiles": [*_CONFIG["tiles"], tile]})
+
+    answer = ops.webrtc_close(
+        _Hass(), coordinator, {"id": "cam3", "sessionId": "sess-2"}
+    )
+
+    assert answer == {"closed": True}
+    assert спросили == ["camera.gate"]
+
+
+def test_имя_камеры_видеонаблюдения_читает_РОВНО_одна_функция() -> None:
+    """⚠ Замок на ЕДИНСТВЕННОГО читателя `videoId`/`trassirGuid`.
+
+    Читателей было три, и два остались на старом вендорском имени: доступность
+    плитки и объяснение «это камера видеонаблюдения». Пока менеджер шлёт оба
+    имени, расхождение невидимо; как только старое уйдёт — камера
+    видеонаблюдения станет «недоступной» и жилец получит «Нет данных» поверх
+    работающей картинки. Поэтому поле читает только `ops.video_id`.
+    """
+    import pathlib
+
+    источник = pathlib.Path(ops.__file__).read_text(encoding="utf-8")
+    строки = [
+        (n, s)
+        for n, s in enumerate(источник.splitlines(), 1)
+        if "trassirGuid" in s and not s.lstrip().startswith("#")
+    ]
+
+    assert len(строки) == 1, f"вендорское имя читают в {len(строки)} местах: {строки}"
+    assert "videoId" in строки[0][1], "старое имя без нового — читатель не тот"
+
+
+def test_камера_видеонаблюдения_доступна_БЕЗ_сущности_под_новым_именем() -> None:
+    """Считать её недоступной значит написать «Нет данных» поверх работающей
+    камеры: её показывает сам дом, забирая поток у регистратора."""
+    view = ops.entity_view(
+        {"id": "cam4", "domain": "camera", "entityId": None, "videoId": "IAtwTYwK"},
+        None,
+    )
+
+    assert view["available"] is True

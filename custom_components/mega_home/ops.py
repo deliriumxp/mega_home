@@ -292,6 +292,18 @@ def webrtc_close(
     if clip_id is not None and gateway is not None:
         hass.async_create_task(gateway.clips.async_close(hass, clip_id, session_id))
         return {"closed": True}
+    # ⚠ СНАЧАЛА своя сессия, и только потом сущность камеры. `webrtc.close`
+    # пробует `close_own` первой строкой — но `camera_entity(...)` вычислялся
+    # РАНЬШЕ, как аргумент вызова, и до этой попытки дело не доходило.
+    #
+    # Живой камере регистратора, открытой БЫСТРЫМ путём (постоянный адрес
+    # канала), сеанс не заводится вовсе — закрывать по клипу нечего, а сущности
+    # Home Assistant у неё нет и не будет. Замер объекта 2026-09-13: переход на
+    # вкладку «Архив» слал `webrtc/close`, получал `409 «Это камера
+    # видеонаблюдения»`, и поток к регистратору оставался висеть до своих
+    # таймаутов. У регистратора соединения на IP считаны, и течь им нельзя.
+    if webrtc.close_own(hass, session_id):
+        return {"closed": True}
     return webrtc.close(hass, camera_entity(coordinator, payload), session_id)
 
 
@@ -372,7 +384,12 @@ def camera_entity(
         # ⚠ У камеры ВИДЕОНАБЛЮДЕНИЯ сущности Home Assistant нет и не будет —
         # это самостоятельная система, её показывает дом сам. Отказ здесь
         # означал бы «камера не настроена» там, где всё настроено.
-        if tile.get("trassirGuid"):
+        # ⚠ Через `_trassir_guid`, а не по полю на месте: имя поля сменилось
+        # (`trassirGuid` → `videoId`), и ЗДЕСЬ оно осталось старым. Менеджер с
+        # 0.2.56 шлёт новое, поэтому камера видеонаблюдения объясняла себя
+        # чужими словами — «Элемент ещё не отправлен в Home Assistant» вместо
+        # «Это камера видеонаблюдения». Читатель имени в доме должен быть ОДИН.
+        if video_id(tile):
             raise OpError("Это камера видеонаблюдения", HTTPStatus.CONFLICT)
         raise OpError(
             "Элемент ещё не отправлен в Home Assistant — смотреть пока нечего",
@@ -560,7 +577,7 @@ def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
     # ⚠ Камера видеонаблюдения ДОСТУПНА без сущности Home Assistant: её показывает
     # сам дом, забирая поток у регистратора. Считать её недоступной значило бы
     # написать жильцу «Нет данных» поверх работающей камеры.
-    available = bool(tile.get("trassirGuid")) or (state is not None and not unavailable)
+    available = bool(video_id(tile)) or (state is not None and not unavailable)
 
     return {
         "id": tile["id"],
@@ -580,22 +597,33 @@ def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
 # бы строить вторую трубу (docs/trassir-integration-plan.md, §5а у менеджера).
 
 
-def _trassir_guid(coordinator: MegaHomeCoordinator, tile_id: Any) -> str | None:
-    """Камера РЕГИСТРАТОРА у плитки — или None, если она не за регистратором.
+def video_id(tile: dict[str, Any] | None) -> str | None:
+    """Камера ВИДЕОНАБЛЮДЕНИЯ у плитки — или None, если она не за ним.
 
-    ⚠ Поле называется `videoId`, а не именем вендора. Плитке всё равно, что за
-    ней стоит: это просто картинка, которую надо иногда обновлять, — и следующий
+    ⚠ ЕДИНСТВЕННЫЙ читатель этого имени в доме, и это не педантизм. Поле
+    называется `videoId`, а не именем вендора: плитке всё равно, что за ней
+    стоит — это просто картинка, которую надо иногда обновлять, — и следующий
     регистратор не должен требовать правок ни в плитке, ни в приложении
     (решение заказчика 2026-09-13: «универсальное решение всегда и никак иначе»).
+
+    ⚠ Читателей было ТРИ, и два из них остались на старом имени: доступность
+    плитки (`entity_view`) и объяснение «это камера видеонаблюдения»
+    (`camera_entity`). Пока менеджер шлёт оба имени, это незаметно; как только
+    старое уйдёт — камера видеонаблюдения станет «недоступной» с надписью «Нет
+    данных» поверх работающей картинки. Отсюда правило: имя читает ОДНА функция.
 
     ⚠ Старое имя читаем ТОЖЕ и ещё какое-то время: менеджер обновляется сам, а
     дом — нет, и снимать замену вместе с заменяемым здесь нельзя.
     """
-    tile = find((coordinator.data or {}).get("tiles", []), tile_id)
     if not tile:
         return None
     guid = tile.get("videoId") or tile.get("trassirGuid")
     return guid if isinstance(guid, str) and guid else None
+
+
+def _trassir_guid(coordinator: MegaHomeCoordinator, tile_id: Any) -> str | None:
+    """То же самое, но по id плитки: искать её в составе дома нужно почти всем."""
+    return video_id(find((coordinator.data or {}).get("tiles", []), tile_id))
 
 
 def trassir(coordinator: MegaHomeCoordinator) -> Any:

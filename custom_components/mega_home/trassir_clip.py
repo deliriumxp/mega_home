@@ -252,6 +252,11 @@ class ClipSessions:
             "startUs": clip.window_start_us,
             "stopUs": clip.window_stop_us,
             "positionUs": clip.start_us,
+            # ⚠ Где регистратор встал НА САМОМ ДЕЛЕ. У открытия его ещё нет
+            # (`play` уйдёт по готовности) — тогда `null`, и приложению нечего
+            # показывать, кроме запрошенного. После перемотки он есть всегда:
+            # это ответ на `play`, которым перемотка и заканчивается.
+            "firstFrameTs": clip.first_frame,
         }
         if camera_name is not None:
             payload["cameraName"] = camera_name
@@ -470,13 +475,21 @@ class ClipSessions:
                 # СТОИТ — регистратор сам его остановил, — и `play` его
                 # поднимает. Стоп архива после `seek` — состояние регистратора,
                 # а не наша выдумка: его видно в `archive_status?type=state`.
-                await client.async_archive_command(
+                answer = await client.async_archive_command(
                     old.token,
                     command="play",
                     start=position,
                     stop=old.window_stop_us,
                     speed=1,
                 )
+                # ⚠ Куда курсор встал НА САМОМ ДЕЛЕ — говорит регистратор, и
+                # только он: у архива дыры, и запрошенная метка внутри дыры
+                # отдаётся как первый кадр СЛЕДУЮЩЕЙ записи. Без этого подпись
+                # под шкалой после перемотки оставалась на месте открытия
+                # (замер объекта 2026-09-13: игла уехала на 16:01, а подпись
+                # сорок секунд показывала 23:20:38 — два разных времени на
+                # одном экране). Что это значит для шкалы, решает приложение.
+                old.first_frame = answer.get("first_frame_ts")
             old.start_us = position
             return self._describe(clip_id, old)
 

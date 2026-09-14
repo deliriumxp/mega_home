@@ -423,6 +423,11 @@ def test_seek_позиционирует_живой_поток_тем_же_кл�
     assert commands[1]["start"] == middle
     assert commands[1]["stop"] == EVENT["timestampUs"] + 60_000_000
     assert commands[1]["speed"] == 1
+    # ⚠ Куда регистратор встал НА САМОМ ДЕЛЕ — уходит наружу. Без этого подпись
+    # под шкалой после перемотки оставалась на месте ОТКРЫТИЯ: замер объекта
+    # 2026-09-13 — игла уехала на 16:01, а подпись сорок секунд показывала
+    # 23:20:38, два разных времени на одном экране.
+    assert answer["firstFrameTs"], "перемотка не сказала, куда встал регистратор"
     # Ни нового токена, ни разбора потока.
     assert [n for n, _ in gateway.client.calls if n == "get_video"] == []
     assert gateway.clips._clips.get(clip_id) is not None  # noqa: SLF001
