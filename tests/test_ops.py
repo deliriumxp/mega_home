@@ -500,11 +500,18 @@ def test_имя_камеры_видеонаблюдения_читает_РОВ�
     """
     import pathlib
 
-    строки = list(
-        enumerate(pathlib.Path(ops.__file__).read_text(encoding="utf-8").splitlines(), 1)
-    )
+    # ⚠ Смотрим ВЕСЬ слой операций, а не один файл: 2026-09-14 `ops.py` разрезан
+    # по классам устройств (`ops_video`, `ops_camera`, `ops_webrtc`), и замок,
+    # читающий только фасад, после деления показывал бы ноль читателей —
+    # то есть молча перестал бы стеречь.
+    слой = sorted(pathlib.Path(ops.__file__).parent.glob("ops*.py"))
+    строки = [
+        (f"{файл.name}:{n}", s)
+        for файл in слой
+        for n, s in enumerate(файл.read_text(encoding="utf-8").splitlines(), 1)
+    ]
 
-    def читают(имя: str) -> list[tuple[int, str]]:
+    def читают(имя: str) -> list[tuple[str, str]]:
         кавычки = (f'"{имя}"', f"'{имя}'")
         return [(n, s) for n, s in строки if any(k in s for k in кавычки)]
 

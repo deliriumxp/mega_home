@@ -31,15 +31,55 @@ from homeassistant.exceptions import ServiceNotFound
 from .const import LOGGER
 from .coordinator import MegaHomeCoordinator
 
+from .ops_base import OpError, _int, find, number
+from .ops_camera import _camera_urls, _warm_cameras, camera_entity, camera_frame
+from .ops_video import (
+    _guid_of,
+    _tiles_by_guid,
+    _trassir_guid,
+    gateway_call,
+    lead_of,
+    trassir,
+    trassir_cameras,
+    trassir_clip_at,
+    trassir_events,
+    trassir_preview,
+    trassir_ready,
+    trassir_thumb,
+    video_id,
+)
+from .ops_webrtc import webrtc_candidates, webrtc_close, webrtc_offer
 
-class OpError(Exception):
-    """A refusal the resident should read, with the status that fits it."""
-
-    def __init__(self, message: str, status: int = HTTPStatus.BAD_REQUEST) -> None:
-        super().__init__(message)
-        self.message = message
-        self.status = int(status)
-
+# ⚠ Имена выше ИМПОРТИРУЮТСЯ РАДИ ЧУЖИХ ВЫЗОВОВ: и двери (`http.py`), и линк
+# (`link.py`), и тесты зовут их как `ops.<имя>`. Это фасад модуля — тот же
+# приём, что у `trassir.ts` в бандле: части читаются порознь, а точка входа
+# остаётся одна.
+__all__ = [
+    "OpError",
+    "camera_entity",
+    "camera_frame",
+    "command",
+    "config",
+    "entity_view",
+    "find",
+    "gateway_call",
+    "lead_of",
+    "number",
+    "run",
+    "scenario",
+    "states",
+    "trassir",
+    "trassir_cameras",
+    "trassir_clip_at",
+    "trassir_events",
+    "trassir_preview",
+    "trassir_ready",
+    "trassir_thumb",
+    "video_id",
+    "webrtc_candidates",
+    "webrtc_close",
+    "webrtc_offer",
+]
 
 async def run(
     hass: HomeAssistant,
@@ -113,7 +153,6 @@ async def run(
         return await run_scan(hass, data)
     raise OpError("Неизвестная операция", HTTPStatus.NOT_FOUND)
 
-
 def config(coordinator: MegaHomeCoordinator) -> dict[str, Any]:
     """Состав дома из кэша — плюс ПАСПОРТ САМОГО ДОМА.
 
@@ -171,7 +210,6 @@ def config(coordinator: MegaHomeCoordinator) -> dict[str, Any]:
         },
     }
 
-
 def _accesses(coordinator: MegaHomeCoordinator) -> list[dict[str, str]]:
     """Доступы, которые дом ПРИНЯЛ: имя, вид, вендор. Двери нет — пустой список."""
     door = getattr(coordinator, "accesses", None)
@@ -186,7 +224,6 @@ def _accesses(coordinator: MegaHomeCoordinator) -> list[dict[str, str]]:
             {"id": descriptor.id, "kind": descriptor.kind, "vendor": descriptor.vendor}
         )
     return out
-
 
 def states(hass: HomeAssistant, coordinator: MegaHomeCoordinator) -> dict[str, Any]:
     """Current states of every tile, read straight from this Home Assistant."""
@@ -208,25 +245,6 @@ def states(hass: HomeAssistant, coordinator: MegaHomeCoordinator) -> dict[str, A
         "appVersion": coordinator.bundle.version if coordinator.bundle else None,
         "entities": entities,
     }
-
-
-def _warm_cameras(hass: HomeAssistant, coordinator: MegaHomeCoordinator) -> None:
-    """Держать наготове кадр каждой камеры, пока приложение открыто.
-
-    ⚠ Опрос состояний — единственный признак «приложение открыто», который у
-    дома есть, и он же лучший момент для подготовки: камеру открывают из сетки
-    плиток, то есть через секунду-другую после этого запроса. Сам снимок стоит
-    секунду с лишним (ffmpeg у камеры без снапшот-адреса), и добывать его в
-    момент открытия — значит показывать пустой прямоугольник ровно столько,
-    сколько идут переговоры (жалоба 2026-09-08). Частоту ограничивает сам
-    `webrtc.warm`, здесь только перечень камер.
-    """
-    from . import webrtc
-
-    for tile in coordinator.data.get("tiles", []):
-        if tile.get("domain") == "camera" and tile.get("entityId"):
-            webrtc.warm(hass, tile["entityId"])
-
 
 async def command(
     hass: HomeAssistant, coordinator: MegaHomeCoordinator, payload: dict[str, Any]
@@ -265,7 +283,6 @@ async def command(
         "entity": entity_view(tile, hass.states.get(tile["entityId"])),
     }
 
-
 async def scenario(
     hass: HomeAssistant, coordinator: MegaHomeCoordinator, payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -276,196 +293,6 @@ async def scenario(
     if not item.get("entityId"):
         raise OpError("Сценарий не создан в Home Assistant", HTTPStatus.NOT_FOUND)
     return await call(hass, "script", "turn_on", {"entity_id": item["entityId"]})
-
-
-async def webrtc_offer(
-    hass: HomeAssistant,
-    coordinator: MegaHomeCoordinator,
-    payload: dict[str, Any],
-    remote: bool = False,
-) -> dict[str, Any]:
-    """Свести телефон жильца, который СНАРУЖИ, с камерой этого дома напрямую.
-
-    Через менеджер проходит только этот обмен (килобайты SDP), видео идёт мимо
-    него — ради этого всё и затевалось (remote-access.md у менеджера).
-
-    ⚠ Импорт локальный: `webrtc.py` берёт отсюда `OpError`, и разорвать
-    кольцо иначе нечем. Заодно модуль камеры Home Assistant не грузится в домах,
-    где камер нет вовсе.
-    """
-    from . import webrtc
-    from .trassir_clip import CLIP_PREFIX
-
-    sdp = payload.get("offer")
-    if not isinstance(sdp, str) or not sdp:
-        raise OpError("Предложение WebRTC не передано")
-    # ⚠ Trickle просит ПРИЛОЖЕНИЕ (новое умеет), а не дом по версии: старый
-    # бандл поля не шлёт и получает прежний одноразовый ответ с кандидатами.
-    trickle = payload.get("trickle") is True
-    # ⚠ Запись события идёт ТОЙ ЖЕ операцией, что и живая камера, и это не
-    # экономия строк: своя операция под архив означала бы второй сеанс со своими
-    # сроками, своим закрытием и своей диагностикой — то есть вторую трубу
-    # (docs/trassir-integration-plan.md, §5а у менеджера). Отличается только
-    # источник, и решает это приставка id.
-    tile = payload.get("id")
-    if isinstance(tile, str) and tile.startswith(CLIP_PREFIX):
-        return await trassir(coordinator).clips.async_offer(
-            hass, tile, sdp, remote, trickle
-        )
-    guid = _trassir_guid(coordinator, tile)
-    if guid:
-        # Живая камера регистратора: ссылка постоянная, сеанса и токена нет —
-        # но путь тот же самый, что у камеры Home Assistant.
-        #
-        # ⚠ Качество приезжает В ПРЕДЛОЖЕНИИ, а не отдельной операцией: у живой
-        # камеры смена качества — это смена ИСТОЧНИКА, то есть ровно те же
-        # переговоры заново. Своя операция здесь означала бы состояние сеанса
-        # там, где его нет вовсе.
-        quality = payload.get("quality")
-        gateway = trassir(coordinator)
-        from .go2rtc_embed import is_running
-
-        if not is_running():
-            raise OpError(
-                "Дом не может отдать камеру: не поднят его go2rtc",
-                HTTPStatus.SERVICE_UNAVAILABLE,
-            )
-        # ⚠ Два пути внутри: постоянный адрес канала и — если его у канала нет —
-        # документированный токен. Решает это сам сеанс, потому что там же живут
-        # пинг и уборка, которые запасному пути нужны (`async_live_offer`).
-        return await gateway.clips.async_live_offer(
-            hass, guid, sdp, "sub" if quality == "sub" else "main", remote, trickle
-        )
-    return await webrtc.negotiate(
-        hass, camera_entity(coordinator, payload), sdp, remote, trickle
-    )
-
-
-def webrtc_close(
-    hass: HomeAssistant, coordinator: MegaHomeCoordinator, payload: dict[str, Any]
-) -> dict[str, Any]:
-    """Жилец закрыл просмотр — отпустить камеру, не дожидаясь развала связи."""
-    from . import webrtc
-    from .trassir_clip import CLIP_PREFIX
-
-    session_id = payload.get("sessionId")
-    if not isinstance(session_id, str) or not session_id:
-        raise OpError("Сессия не указана")
-    tile = payload.get("id")
-    gateway = getattr(coordinator, "trassir", None)
-    clip_id = tile if isinstance(tile, str) and tile.startswith(CLIP_PREFIX) else None
-    if clip_id is None and gateway is not None:
-        # Приложение могло закрыть просмотр, не назвав клип: сессия — тот же
-        # ключ, и потерять уборку из-за отсутствующего поля нельзя.
-        clip_id = gateway.clips.clip_of_session(session_id)
-    if clip_id is not None and gateway is not None:
-        hass.async_create_task(gateway.clips.async_close(hass, clip_id, session_id))
-        return {"closed": True}
-    # ⚠ СНАЧАЛА своя сессия, и только потом сущность камеры. `webrtc.close`
-    # пробует `close_own` первой строкой — но `camera_entity(...)` вычислялся
-    # РАНЬШЕ, как аргумент вызова, и до этой попытки дело не доходило.
-    #
-    # Живой камере регистратора, открытой БЫСТРЫМ путём (постоянный адрес
-    # канала), сеанс не заводится вовсе — закрывать по клипу нечего, а сущности
-    # Home Assistant у неё нет и не будет. Замер объекта 2026-09-13: переход на
-    # вкладку «Архив» слал `webrtc/close`, получал `409 «Это камера
-    # видеонаблюдения»`, и поток к регистратору оставался висеть до своих
-    # таймаутов. У регистратора соединения на IP считаны, и течь им нельзя.
-    if webrtc.close_own(hass, session_id):
-        return {"closed": True}
-    return webrtc.close(hass, camera_entity(coordinator, payload), session_id)
-
-
-async def webrtc_candidates(payload: dict[str, Any]) -> dict[str, Any]:
-    """Trickle: кандидаты телефона — туда, накопленные домом — оттуда.
-
-    ⚠ Сессию не ищем по камере: кандидаты — часть ТОГО ЖЕ соединения, что уже
-    поднято `webrtc`, и живут по его `sessionId`. Закрылась — ответ `done`, и
-    приложение перестаёт спрашивать.
-    """
-    from . import webrtc
-
-    session_id = payload.get("sessionId")
-    if not isinstance(session_id, str) or not session_id:
-        raise OpError("Сессия не указана")
-    incoming = payload.get("candidates")
-    lines = (
-        [item for item in incoming if isinstance(item, str)]
-        if isinstance(incoming, list)
-        else []
-    )
-    return await webrtc.async_candidates(session_id, lines)
-
-
-async def camera_frame(
-    hass: HomeAssistant, coordinator: MegaHomeCoordinator, payload: dict[str, Any]
-) -> tuple[str, bytes]:
-    """Один кадр камеры — постер, пока идут переговоры (`webrtc.snapshot`).
-
-    ⚠ Не операция канала, а обработчик ПУТИ: зовётся и локальной дверью
-    (`http.py`), и переносом (`relay_api.py`). Новых именованных операций мы не
-    заводим — ровно для этого перенос и сделан.
-
-    ⚠ Отдаёт `(contentType, bytes)`, а не base64: base64 — форма ответа
-    `relay_api.handle` (одна форма на картинку и на JSON, см. его докстринг),
-    а не этого обработчика. Кодирование — забота двери, которой оно нужно.
-    """
-    guid = _trassir_guid(coordinator, payload.get("id"))
-    if guid:
-        # ⚠ Кадр берётся у РЕГИСТРАТОРА, а не у Home Assistant: камеры
-        # видеонаблюдения в HA нет вовсе. Живой кадр — это `timestamp=0`.
-        gateway = trassir(coordinator)
-        client = gateway.client
-        if client is None:
-            raise OpError("Видеонаблюдение объекта не настроено", HTTPStatus.NOT_FOUND)
-        from .trassir_client import TrassirError
-
-        try:
-            # ⚠ СУБПОТОК: регистратор сам отдаёт 704×576 и 10 КБ. Прежде брали
-            # полный кадр (1920×1128, 398 КБ) и уменьшали его Pillow'ом — то
-            # есть делали за регистратор работу, которую он делает лучше и
-            # быстрее.
-            return "image/jpeg", await client.async_live_frame(guid)
-        except TrassirError as err:
-            raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
-
-    from . import webrtc
-
-    return await webrtc.snapshot(hass, camera_entity(coordinator, payload))
-
-
-def camera_entity(
-    coordinator: MegaHomeCoordinator, payload: dict[str, Any]
-) -> str:
-    """Плитка-камера из конфига → сущность Home Assistant.
-
-    ⚠ Это и есть вся защита от «покажи мне чужую камеру»: сущность берётся не из
-    запроса, а из СОСТАВА ЭТОГО дома по id плитки. Пустить сюда `entity_id` из
-    запроса значило бы открыть жильцу любую камеру Home Assistant — включая те,
-    которых нет в его приложении.
-    """
-    tile = find(coordinator.data.get("tiles", []), payload.get("id"))
-    if tile is None:
-        raise OpError("Устройство не найдено", HTTPStatus.NOT_FOUND)
-    if tile.get("domain") != "camera":
-        raise OpError("Это устройство не камера")
-    if not tile.get("entityId"):
-        # ⚠ У камеры ВИДЕОНАБЛЮДЕНИЯ сущности Home Assistant нет и не будет —
-        # это самостоятельная система, её показывает дом сам. Отказ здесь
-        # означал бы «камера не настроена» там, где всё настроено.
-        # ⚠ Через `video_id`, а не по полю на месте. Имя поля однажды сменилось
-        # (`trassirGuid` → `videoId`), и ЗДЕСЬ оно осталось старым: камера
-        # видеонаблюдения объясняла себя чужими словами — «Элемент ещё не
-        # отправлен в Home Assistant» вместо «Это камера видеонаблюдения».
-        # Читатель имени в доме должен быть ОДИН.
-        if video_id(tile):
-            raise OpError("Это камера видеонаблюдения", HTTPStatus.CONFLICT)
-        raise OpError(
-            "Элемент ещё не отправлен в Home Assistant — смотреть пока нечего",
-            HTTPStatus.NOT_FOUND,
-        )
-    return tile["entityId"]
-
 
 async def call(
     hass: HomeAssistant, domain: str, service: str, data: dict[str, Any]
@@ -492,13 +319,6 @@ async def call(
         LOGGER.warning("Service %s.%s rejected the payload: %s", domain, service, err)
         raise OpError("Home Assistant отклонил команду") from err
     return {"accepted": True}
-
-
-def find(items: list[dict[str, Any]], item_id: Any) -> dict[str, Any] | None:
-    if not isinstance(item_id, str):
-        return None
-    return next((item for item in items if item.get("id") == item_id), None)
-
 
 def command_spec(tile: dict[str, Any], name: Any) -> dict[str, Any] | None:
     """Чем исполнять команду: службой ИЗ КОНФИГА — другого источника больше нет.
@@ -529,7 +349,6 @@ def command_spec(tile: dict[str, Any], name: Any) -> dict[str, Any] | None:
         "max": described.get("max"),
     }
 
-
 def service_data(spec: dict[str, Any], value: Any) -> dict[str, Any]:
     """Единственный аргумент команды, проверенный по описанным границам.
 
@@ -545,43 +364,6 @@ def service_data(spec: dict[str, Any], value: Any) -> dict[str, Any]:
         return {arg: str(value or "")}
     return {arg: number(value, low, high)}
 
-
-def number(value: Any, low: int, high: int) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as err:
-        raise ValueError(f"Значение должно быть от {low} до {high}") from err
-    if not low <= parsed <= high:
-        raise ValueError(f"Значение должно быть от {low} до {high}")
-    return parsed
-
-
-def _camera_urls(entity_id: Any, attributes: Any) -> dict[str, str]:
-    """Still frame and MJPEG stream - the very paths the HA frontend uses.
-
-    Relative, and signed with the entity's rotating `access_token`. Absolute
-    would be wrong twice over: outside the home they are unreachable anyway, and
-    inside it the app is served by this integration and shares an origin with
-    Home Assistant, so a relative path is exactly right.
-
-    Both are built EXPLICITLY rather than by patching `entity_picture`. The
-    manager builds the same shape in smart-home-view.util.ts, and "replace
-    camera_proxy with camera_proxy_stream" would drift between the two
-    implementations at the first change in Home Assistant.
-    """
-    token = (attributes or {}).get("access_token")
-    if not entity_id or not isinstance(token, str) or not token:
-        # A frame without a token will not open, so we do not promise one: a
-        # broken image on the tile reads as a broken camera.
-        return {"picture": "", "stream": ""}
-    query = f"?token={quote(token, safe='')}"
-    ident = quote(str(entity_id), safe="")
-    return {
-        "picture": f"/api/camera_proxy/{ident}{query}",
-        "stream": f"/api/camera_proxy_stream/{ident}{query}",
-    }
-
-
 # Что из атрибутов наружу НЕ уходит.
 #
 # ⚠ Список короткий намеренно. Это не «фильтр полезного» — атрибуты уходят
@@ -593,14 +375,12 @@ def _camera_urls(entity_id: Any, attributes: Any) -> dict[str, str]:
 # полем значит отдать право собрать любой другой адрес того же HA.
 HIDDEN_ATTRIBUTES = frozenset({"access_token"})
 
-
 def _public_attributes(attributes: Any) -> dict[str, Any]:
     return {
         key: value
         for key, value in (attributes or {}).items()
         if key not in HIDDEN_ATTRIBUTES
     }
-
 
 def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
     """Что дом отвечает о приборе: сырое состояние Home Assistant и атрибуты.
@@ -656,321 +436,3 @@ def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
         "available": available,
         "updatedAt": int(state.last_updated.timestamp() * 1000) if state else None,
     }
-
-
-# --- TRASSIR: лента событий объекта ---
-#
-# ⚠ Обработчики ПУТЕЙ, а не именованные операции канала: их зовут обе двери —
-# локальная (`http.py`) и перенос запроса снаружи (`relay_api.py`). Ровно ради
-# этого перенос и заведён, и заводить под видеонаблюдение свою операцию значило
-# бы строить вторую трубу (docs/trassir-integration-plan.md, §5а у менеджера).
-
-
-def video_id(tile: dict[str, Any] | None) -> str | None:
-    """Камера ВИДЕОНАБЛЮДЕНИЯ у плитки — или None, если она не за ним.
-
-    ⚠ ЕДИНСТВЕННЫЙ читатель этого имени в доме, и это не педантизм. Поле
-    называется `videoId`, а не именем вендора: плитке всё равно, что за ней
-    стоит — это просто картинка, которую надо иногда обновлять, — и следующий
-    регистратор не должен требовать правок ни в плитке, ни в приложении
-    (решение заказчика 2026-09-13: «универсальное решение всегда и никак иначе»).
-
-    ⚠ Читателей было ТРИ, и два из них остались на старом имени: доступность
-    плитки (`entity_view`) и объяснение «это камера видеонаблюдения»
-    (`camera_entity`). Пока менеджер шлёт оба имени, это незаметно; как только
-    старое уйдёт — камера видеонаблюдения станет «недоступной» с надписью «Нет
-    данных» поверх работающей картинки. Отсюда правило: имя читает ОДНА функция.
-
-    ⚠ Старое имя (`trassirGuid`) СНЯТО 2026-09-14, вместе со сломом маршрутов:
-    менеджер шлёт нейтральное с 0.2.56, а окно слома совместимости открыто
-    одно, и тащить замену рядом с заменяемым дальше незачем
-    (`docs/plan-video-rework.md`, этап 1).
-    """
-    if not tile:
-        return None
-    guid = tile.get("videoId")
-    return guid if isinstance(guid, str) and guid else None
-
-
-def _trassir_guid(coordinator: MegaHomeCoordinator, tile_id: Any) -> str | None:
-    """То же самое, но по id плитки: искать её в составе дома нужно почти всем."""
-    return video_id(find((coordinator.data or {}).get("tiles", []), tile_id))
-
-
-def trassir(coordinator: MegaHomeCoordinator) -> Any:
-    """Шлюз к регистратору объекта — или понятный отказ, если его нет."""
-    gateway = getattr(coordinator, "trassir", None)
-    if gateway is None or not gateway.configured:
-        raise OpError(
-            "У этого объекта не настроено видеонаблюдение", HTTPStatus.NOT_FOUND
-        )
-    return gateway
-
-
-async def trassir_cameras(
-    hass: HomeAssistant, coordinator: MegaHomeCoordinator
-) -> dict[str, Any]:
-    """Камеры регистратора: id, имя, кодек, архив и ПЛИТКА дома, если она есть."""
-    return {"cameras": await trassir(coordinator).async_cameras(await _tiles_by_guid(hass, coordinator))}
-
-
-async def _tiles_by_guid(
-    hass: HomeAssistant, coordinator: MegaHomeCoordinator
-) -> dict[str, str]:
-    """Плитки-камеры дома, разложенные по guid канала Trassir.
-
-    ⚠ Опознаём по АДРЕСУ ПОТОКА камеры, а не по имени: постоянная ссылка
-    Trassir несёт guid прямо в пути (`rtsp://host:555/<guid>_m/`). Имена правят
-    с обеих сторон, и совпадение по ним однажды подсунуло бы жильцу записи
-    ЧУЖОЙ камеры — это хуже, чем отсутствие связи вовсе.
-
-    Ошибка одной камеры не роняет список: у дома их несколько, и молчать обо
-    всех из-за одной нельзя.
-    """
-    found: dict[str, str] = {}
-    for tile in (coordinator.data or {}).get("tiles", []):
-        if tile.get("domain") != "camera" or not tile.get("entityId"):
-            continue
-        try:
-            from . import webrtc
-
-            camera = webrtc._camera(hass, tile["entityId"])  # noqa: SLF001
-            source = await camera.stream_source()
-        except Exception as err:  # noqa: BLE001
-            LOGGER.debug("Адрес потока камеры %s не прочитан: %s", tile.get("id"), err)
-            continue
-        guid = _guid_of(source)
-        if guid:
-            found[guid] = str(tile.get("id"))
-    return found
-
-
-def _guid_of(source: str | None) -> str | None:
-    """`rtsp://host:555/<guid>_m/` → guid. Не наш адрес — None."""
-    if not source:
-        return None
-    import re
-
-    match = re.search(r"/([A-Za-z0-9]{6,})_(?:m|s)/?$", source.split("?")[0])
-    return match.group(1) if match else None
-
-
-def trassir_events(
-    coordinator: MegaHomeCoordinator, query: dict[str, Any]
-) -> dict[str, Any]:
-    """Лента событий, новые сверху; можно по одной камере и постранично.
-
-    ⚠ `timestampUs` уходит наружу КАК ЕСТЬ — в шкале самого Trassir. Приложение
-    показывает время из него же и возвращает его обратно, открывая запись; наши
-    часы в этой цепочке не участвуют вовсе, и это единственный способ не
-    промахнуться на часовой пояс сервера.
-    """
-    gateway = trassir(coordinator)
-    return {
-        "events": gateway.events(
-            guid=query.get("guid") or None,
-            limit=_int(query.get("limit"), 50),
-            before=_int(query.get("before"), 0) or None,
-        )
-    }
-
-
-async def gateway_call(
-    coordinator: MegaHomeCoordinator, payload: dict[str, Any]
-) -> Any:
-    """Исполнить ОПИСАННЫЙ вызов — универсальная дверь наружу.
-
-    ⚠ Дом не знает ни одного вендора и не разбирает ни одного ответа: он
-    подставляет сессию (и токен открытой записи), выполняет вызов у доступа из
-    конфига объекта и отдаёт ответ КАК ЕСТЬ
-    (`gateway.py`, docs/plan-thin-integration.md).
-
-    ⚠ Дверь берётся у КООРДИНАТОРА, а не у драйвера видеонаблюдения: она несёт
-    вызовы к любой описанной системе, и объект без регистратора обязан ею
-    пользоваться так же (`docs/plan-video-rework.md`, «Сквозной принцип»).
-    """
-    import base64 as _base64
-    import json as _json
-
-    from .gateway import AccessDenied, AccessUnreachable
-
-    door = getattr(coordinator, "accesses", None)
-    if door is None:
-        raise OpError("У объекта нет ни одного доступа", HTTPStatus.NOT_FOUND)
-    # ⚠ Описания ещё не приехали (конфиг дома постарше) — доступа ЭТОГО НЕТ, и
-    # это 404, а не отказ: по отказу бандл решил бы, что ему нельзя, и вызов у
-    # жильца упал бы с ошибкой (живой отчёт 2026-09-12).
-    if door.descriptor(payload.get("access")) is None:
-        raise OpError("У объекта нет такого доступа", HTTPStatus.NOT_FOUND)
-
-    session: dict[str, str] = {}
-    clip_id = payload.get("clip")
-    gateway = getattr(coordinator, "trassir", None)
-    if clip_id and gateway is not None:
-        token = gateway.clips.token_of(str(clip_id))
-        if token:
-            session["token"] = token
-
-    body = payload.get("body")
-    # ⚠ Тело строкой — это base64 (им же носит файлы реле); объект — это JSON.
-    # `str(dict)` давал питоновский repr с одинарными кавычками: получатель
-    # такого тела не разберёт, а понять по ответу, что ушло, невозможно.
-    if isinstance(body, str) and body:
-        raw = _base64.b64decode(body)
-    elif isinstance(body, (dict, list)):
-        raw = _json.dumps(body).encode("utf-8")
-    else:
-        raw = None
-    try:
-        status, content_type, answer = await door.call(
-            payload.get("access"),
-            str(payload.get("method") or "GET"),
-            str(payload.get("path") or ""),
-            payload.get("params"),
-            raw,
-            session,
-        )
-    except AccessUnreachable as err:
-        # ⚠ 502, а НЕ 403. Разница не косметическая: отказ политики — это наша
-        # ошибка в описании вызова, а недоступность той системы — беда объекта,
-        # и жилец обязан прочитать её словами. Пока обе беды приезжали одним
-        # кодом, жилец читал «Дом не смог выполнить запрос» и поломку шли
-        # искать в доме (ревизия 2026-09-13).
-        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
-    except AccessDenied as err:
-        raise OpError(str(err), HTTPStatus.FORBIDDEN) from err
-    if "json" in (content_type or "") and not payload.get("binary"):
-        return _json.loads(answer.decode("utf-8", "ignore"))
-    return {
-        "status": status,
-        "contentType": content_type or "",
-        "body": _base64.b64encode(answer).decode("ascii"),
-    }
-
-
-async def trassir_clip_at(
-    coordinator: MegaHomeCoordinator,
-    guid: str,
-    timestamp_us: int | None = None,
-    camera_name: str | None = None,
-    remote: bool = False,
-    quality: str | None = None,
-    window_start_us: int | None = None,
-    window_stop_us: int | None = None,
-) -> dict[str, Any]:
-    """Открыть АРХИВ КАНАЛА на метке — классический просмотр по дню и времени.
-
-    ⚠ Событие здесь не нужно вовсе, и это не мелочь: событие — лишь ОДНА из
-    причин посмотреть запись, а смотреть хотят и «что было вчера в 21:40», где
-    события в нашей летописи может и не быть (она вообще конечной глубины).
-    Запись живёт в архиве регистратора и открывается по метке.
-
-    ⚠ Метки нет — «последняя запись»: дом считает её своими часами, регистратор
-    сам встаёт на ближайший записанный кадр. Приложение своей метки в шкале
-    Trassir не имеет: там пояс сервера, и «сейчас» телефона сдвинуло бы
-    открытие на часы.
-    """
-    from .trassir_client import TrassirError
-
-    try:
-        return await trassir(coordinator).clips.async_open_at(
-            guid,
-            timestamp_us,
-            camera_name=camera_name,
-            remote=remote,
-            quality=quality,
-            window_start_us=window_start_us,
-            window_stop_us=window_stop_us,
-        )
-    except TrassirError as err:
-        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
-
-
-async def trassir_ready(
-    coordinator: MegaHomeCoordinator,
-    clip_id: str,
-    position_us: Any = None,
-    window_start_us: Any = None,
-    window_stop_us: Any = None,
-) -> dict[str, Any]:
-    """Телефон собрал тракт: отдать архиву единственную команду старта.
-
-    ⚠ Окно приложение может уточнить ИМЕННО ЗДЕСЬ, и это не прихоть: узнать, с
-    какого места играть, оно способно только у открытого потока (календарь
-    регистратор отдаёт лишь потоку с потребителем), а поток открывается на шаг
-    раньше. Дом присланные числа не толкует — кладёт в команду как есть.
-    """
-    from .trassir_client import TrassirError
-
-    def number(value: Any) -> int | None:
-        try:
-            return int(value) if value is not None else None
-        except (TypeError, ValueError):
-            return None
-
-    try:
-        return await trassir(coordinator).clips.async_ready(
-            clip_id,
-            number(position_us),
-            number(window_start_us),
-            number(window_stop_us),
-        )
-    except TrassirError as err:
-        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
-
-
-async def trassir_preview(
-    coordinator: MegaHomeCoordinator, channel: str, timestamp_us: Any
-) -> tuple[str, bytes]:
-    """Маленький кадр архива канала на метке — превью при перемотке."""
-    from .trassir_client import TrassirError
-
-    try:
-        at = int(timestamp_us)
-    except (TypeError, ValueError) as err:
-        raise OpError("Метка — микросекунды числом", HTTPStatus.BAD_REQUEST) from err
-    try:
-        return "image/jpeg", await trassir(coordinator).async_preview(channel, at)
-    except TrassirError as err:
-        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
-
-
-async def trassir_thumb(
-    coordinator: MegaHomeCoordinator, event_id: str, lead_s: int | None = None
-) -> tuple[str, bytes]:
-    """Превью события — кадр архива, уже уменьшенный домом.
-
-    ⚠ `lead_s` — на сколько секунд ПОЗЖЕ метки взять кадр, и присылает его
-    приложение. Это решение о том, что показать человеку, а не свойство
-    регистратора: детектор срабатывает, когда причина ещё только входит в кадр.
-    Держать такое в Python значит платить за него релизом HACS на каждом
-    объекте (docs/plan-thin-integration.md).
-    """
-    from .trassir_client import TrassirError
-
-    try:
-        return "image/jpeg", await trassir(coordinator).async_thumb(event_id, lead_s)
-    except TrassirError as err:
-        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
-
-
-def lead_of(value: Any) -> int | None:
-    """Сдвиг превью из запроса приложения: секунды числом или «не прислали».
-
-    ⚠ Не `_int` с умолчанием: «не прислали» и «прислали ноль» — РАЗНЫЕ вещи.
-    Ноль означает «кадр ровно на метке», а отсутствие — «реши сам» (старый
-    бандл), и склеивать их значит молча отобрать у приложения выбор.
-    """
-    if value is None or value == "":
-        return None
-    try:
-        return int(str(value))
-    except (TypeError, ValueError):
-        return None
-
-
-def _int(value: Any, default: int) -> int:
-    try:
-        return int(str(value))
-    except (TypeError, ValueError):
-        return default
