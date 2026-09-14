@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 import pytest
@@ -420,8 +421,17 @@ def test_seek_позиционирует_живой_поток_тем_же_кл�
     assert commands[0]["timestamp"] == middle
     assert commands[0]["direction"] == 0
     assert commands[1]["command"] == "play"
-    assert commands[1]["start"] == middle
-    assert commands[1]["stop"] == EVENT["timestampUs"] + 60_000_000
+    # ⚠⚠ МЕТКОЙ РЕГИСТРАТОРА, а не микросекундами: дока говорит
+    # `start=[дата и время]`, и замер объекта 2026-09-14 показывает цену
+    # отступления — при одной и той же посадке строкой приходит 1798 КБ и
+    # курсор идёт секунда в секунду, числом 167 КБ и курсор улетает на четыре
+    # минуты за шесть секунд. Числом регистратор отвечает `success: 1` и
+    # встаёт куда просили: врёт убедительно.
+    from mega_home.trassir_clip import _stamp
+
+    assert commands[1]["start"] == _stamp(middle)
+    assert commands[1]["stop"] == _stamp(EVENT["timestampUs"] + 60_000_000)
+    assert re.fullmatch(r"\d{8}T\d{6}", commands[1]["start"])
     assert commands[1]["speed"] == 1
     # ⚠ Куда регистратор встал НА САМОМ ДЕЛЕ — уходит наружу. Без этого подпись
     # под шкалой после перемотки оставалась на месте ОТКРЫТИЯ: замер объекта
@@ -893,3 +903,25 @@ def test_сторож_не_съедает_попытку_старта_без_о�
     command = next(p for n, p in gateway.client.calls if n == "archive_command")
     assert command["start"] == day
     assert not answer["error"], "состоявшийся старт не жалуется на прошлый отказ"
+
+
+def test_метка_регистратора_симметрична_чтению_приложения() -> None:
+    """⚠ Перевод «микросекунды → метка» обязан быть обратным тому, как
+    приложение ЧИТАЕТ метки регистратора (`trassirTimeUs` разбирает их как
+    UTC). Иначе пояс расходится молча: команда уйдёт с виду правильной, а
+    регистратор встанет в другом часе — и это выглядит как «перемотка мимо».
+    """
+    from datetime import datetime, timezone
+
+    from mega_home.trassir_clip import _stamp
+
+    # 2026-09-14 09:43:51 UTC
+    us = int(datetime(2026, 9, 14, 9, 43, 51, tzinfo=timezone.utc).timestamp()) * 1_000_000
+
+    assert _stamp(us) == "20260914T094351"
+    # Двузначность обязательна: регистратор ждёт ровно 8+1+6 знаков.
+    полночь = int(datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc).timestamp()) * 1_000_000
+    assert _stamp(полночь) == "20260102T030405"
+    # Пусто остаётся пустым: параметр без значения дверь опускает, а строка
+    # "None" даёт «timestamp format is not valid» (замер стенда 2026-09-13).
+    assert _stamp(None) is None

@@ -76,6 +76,19 @@ from .trassir_client import TrassirError
 CLIP_PREFIX = "trassir:"
 
 
+def _stamp(us: int | None) -> str | None:
+    """Микросекунды приложения → метка регистратора `20260914T094351`.
+
+    ⚠ СИММЕТРИЧНО тому, как приложение читает метки регистратора: оно разбирает
+    их как UTC (`trassirTimeUs`), значит и обратно — UTC. Пояс регистратора в
+    расчёте не участвует, гадать про него не нужно: туда и обратно одно число.
+    """
+    if us is None:
+        return None
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(us / 1_000_000, timezone.utc).strftime("%Y%m%dT%H%M%S")
+
 def _archive_stream(quality: str | None, remote: bool | None) -> str:
     """Какой поток архива просить у регистратора.
 
@@ -478,8 +491,21 @@ class ClipSessions:
                 answer = await client.async_archive_command(
                     old.token,
                     command="play",
-                    start=position,
-                    stop=old.window_stop_us,
+                    # ⚠⚠ МЕТКОЙ РЕГИСТРАТОРА, а не микросекундами. Дока говорит
+                    # `start=[дата и время]` (`sdk-archive-command.md`), и замер
+                    # объекта 2026-09-14 показывает цену отступления: при ОДНОЙ
+                    # И ТОЙ ЖЕ посадке строкой приходит 1798 КБ и курсор идёт
+                    # секунда в секунду, числом — 167 КБ и курсор улетает на
+                    # четыре минуты за шесть секунд. Числом регистратор
+                    # отвечает `success: 1` и встаёт куда просили: врёт
+                    # убедительно. Формат `stop` при этом не влияет.
+                    #
+                    # ⚠ Ловушка, из-за которой это жило долго: ПЕРВЫЙ `play` на
+                    # свежем потоке работает В ОБОИХ форматах (1458 КБ против
+                    # 1401 КБ). Ломается только `play`, идущий ЗА `seek`, — то
+                    # есть ровно перемотка.
+                    start=_stamp(position),
+                    stop=_stamp(old.window_stop_us),
                     speed=1,
                 )
                 # ⚠ Куда курсор встал НА САМОМ ДЕЛЕ — говорит регистратор, и
