@@ -94,13 +94,13 @@ def coordinator(gateway: FakeGateway) -> _Coordinator:
 
 
 def test_лента_едет_переносом(coordinator):
-    rows = json_of(call(coordinator, "GET", "api/trassir/events"))["events"]
+    rows = json_of(call(coordinator, "GET", "api/video/events"))["events"]
 
     assert [row["id"] for row in rows] == ["e1", "e2"]
 
 
 def test_фильтр_камеры_переживает_перенос(coordinator, gateway):
-    rows = json_of(call(coordinator, "GET", "api/trassir/events?guid=cam2&limit=10"))["events"]
+    rows = json_of(call(coordinator, "GET", "api/video/events?guid=cam2&limit=10"))["events"]
 
     assert [row["id"] for row in rows] == ["e2"]
     # ⚠ Именно это и терялось: параметры должны доехать до шлюза, а не осесть
@@ -109,20 +109,20 @@ def test_фильтр_камеры_переживает_перенос(coordinat
 
 
 def test_страница_постарше_тоже_переживает(coordinator, gateway):
-    json_of(call(coordinator, "GET", "api/trassir/events?before=300"))
+    json_of(call(coordinator, "GET", "api/video/events?before=300"))
 
     assert gateway.asked[-1]["before"] == 300
 
 
 def test_камеры_едут_переносом(coordinator):
-    cameras = json_of(call(coordinator, "GET", "api/trassir/cameras"))["cameras"]
+    cameras = json_of(call(coordinator, "GET", "api/video/cameras"))["cameras"]
 
     assert cameras[0]["guid"] == "cam1"
     assert cameras[0]["codec"] == "h264", "кодек нужен приложению: h265 WebRTC не отдаст"
 
 
 def test_превью_едет_байтами_и_кэшируется_навсегда(coordinator, gateway):
-    answer = call(coordinator, "GET", "api/trassir/events/e1/thumb")
+    answer = call(coordinator, "GET", "api/video/events/e1/thumb")
 
     assert base64.b64decode(answer["body"]) == JPEG
     assert answer["contentType"] == "image/jpeg"
@@ -135,7 +135,7 @@ def test_объект_без_видеонаблюдения_отвечает_п�
     coordinator = _Coordinator(None)
 
     with pytest.raises(ops.OpError) as err:
-        call(coordinator, "GET", "api/trassir/events")
+        call(coordinator, "GET", "api/video/events")
 
     assert err.value.status == HTTPStatus.NOT_FOUND
     assert "видеонаблюдение" in err.value.message
@@ -258,7 +258,7 @@ def test_камера_регистратора_показывается_домо
     coordinator = _Coordinator(gateway)
     coordinator.data = {
         "tiles": [
-            {"id": "t1", "domain": "camera", "entityId": None, "trassirGuid": "IAtwTYwK"}
+            {"id": "t1", "domain": "camera", "entityId": None, "videoId": "IAtwTYwK"}
         ]
     }
 
@@ -275,7 +275,7 @@ def test_камера_регистратора_доступна_без_сост�
     from mega_home import ops as ops_module
 
     view = ops_module.entity_view(
-        {"id": "t1", "domain": "camera", "entityId": None, "trassirGuid": "IAtwTYwK"},
+        {"id": "t1", "domain": "camera", "entityId": None, "videoId": "IAtwTYwK"},
         None,
     )
 

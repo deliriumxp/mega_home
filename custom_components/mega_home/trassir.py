@@ -43,7 +43,7 @@ from .const import (
     TRASSIR_STORAGE_KEY,
     STORAGE_VERSION,
 )
-from .recorder import RecorderCall, RecorderDenied
+from .gateway import AccessDenied, AccessGateway
 from .trassir_clip import ClipSessions
 from .trassir_client import TrassirClient, TrassirError
 
@@ -81,10 +81,15 @@ class TrassirGateway:
         # Открытые записи: свой модуль, потому что это ДРУГАЯ тема — сеанс
         # просмотра, а не лента (`trassir_clip.py`).
         self.clips = ClipSessions(self)
-        # Универсальная дверь: исполнение ОПИСАННЫХ вызовов регистратора
-        # (`recorder.py`). Дом при этом не знает ни одного вендора — описание
+        # Универсальная дверь наружу: исполнение ОПИСАННЫХ вызовов
+        # (`gateway.py`). Дом при этом не знает ни одного вендора — описание
         # приезжает конфигом, а ответы уходят наружу как есть.
-        self.recorders = RecorderCall(
+        #
+        # ⚠ Живёт ЗДЕСЬ только потому, что учётку и живую сессию держит этот
+        # драйвер. Читают её НЕ отсюда: `coordinator.accesses` — дверь не
+        # принадлежит видеонаблюдению и обязана работать у объекта, где его нет
+        # вовсе (`docs/plan-video-rework.md`, «Сквозной принцип»).
+        self.accesses = AccessGateway(
             credentials=self._manager_trassir_credentials,
             # ⚠ Дверь говорит ЖИВОЙ сессией драйвера, а не своей: поток, открытый
             # одной сессией, второй не виден вовсе (замер стенда 2026-09-13 —
@@ -112,7 +117,7 @@ class TrassirGateway:
         try:
             creds = await self._manager.async_trassir_credentials()
         except ManagerError as err:
-            raise RecorderDenied(f"Учётка регистратора недоступна: {err}") from err
+            raise AccessDenied(f"Учётка регистратора недоступна: {err}") from err
         return str(creds.get("username") or ""), str(creds.get("password") or "")
 
     async def _driver_sid(self, fresh: bool = False) -> str:
@@ -138,9 +143,9 @@ class TrassirGateway:
 
     async def async_apply(self, config: dict[str, Any]) -> None:
         """Take the `trassir` block of a freshly synchronised config."""
-        # ⚠ Описания регистраторов принимаются ВСЕГДА, и до блока `trassir`:
-        # дверь работает и там, где драйвер объекта ещё не настроен.
-        self.recorders.apply(config.get("recorders"))
+        # ⚠ Описания доступов принимаются ВСЕГДА, и до блока `trassir`: дверь
+        # работает и там, где драйвер объекта ещё не настроен.
+        self.accesses.apply(config.get("accesses"))
         block = config.get("trassir")
         if not isinstance(block, dict) or not block.get("host"):
             await self.async_stop()
@@ -205,7 +210,7 @@ class TrassirGateway:
         # открытую сессию aiohttp (Home Assistant пишет об этом в журнал), а на
         # объекте они копятся — у регистратора предел подключений с адреса
         # (`sdk-session.md`: не более 99).
-        await self.recorders.async_close()
+        await self.accesses.async_close()
 
     # --- чтение (этап D спрашивает отсюда) ------------------------------
 

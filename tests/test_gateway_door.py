@@ -1,4 +1,4 @@
-"""Универсальная дверь к регистратору (`recorder.py`).
+"""Универсальная дверь наружу (`gateway.py`).
 
 ⚠ Предмет: дом НЕ знает ни одного вендора и не разбирает ни одного ответа. Он
 исполняет запрос, описанный в конфиге объекта, подставляет сессию и отдаёт ответ
@@ -13,10 +13,10 @@ from typing import Any
 
 import pytest
 
-from mega_home.recorder import (
-    RecorderCall,
-    RecorderDenied,
-    RecorderUnreachable,
+from mega_home.gateway import (
+    AccessGateway,
+    AccessDenied,
+    AccessUnreachable,
     descriptor_of,
 )
 
@@ -39,8 +39,8 @@ TRASSIR = {
 }
 
 
-def door(**patch: Any) -> RecorderCall:
-    call = RecorderCall(credentials=lambda: _creds())
+def door(**patch: Any) -> AccessGateway:
+    call = AccessGateway(credentials=lambda: _creds())
     blocks = [{**TRASSIR, **patch}]
     call.apply(blocks)
     return call
@@ -92,8 +92,8 @@ def test_границы_двери(method: str, path: str) -> None:
     """Вход, настройки, дерево объектов и запись — через дверь не ходят."""
     descriptor = door().descriptor(None)
     assert descriptor is not None
-    with pytest.raises(RecorderDenied):
-        RecorderCall.check(descriptor, method, path)
+    with pytest.raises(AccessDenied):
+        AccessGateway.check(descriptor, method, path)
 
 
 def test_воспроизведение_проходит() -> None:
@@ -101,14 +101,14 @@ def test_воспроизведение_проходит() -> None:
     descriptor = door().descriptor(None)
     assert descriptor is not None
     for path in ("/archive_status", "/archive_events", "/screenshot/IAtwTYwK", "/get_video"):
-        RecorderCall.check(descriptor, "GET", path)
+        AccessGateway.check(descriptor, "GET", path)
 
 
 def test_чужой_регистратор_это_отказ() -> None:
     """Адресат — только из конфига объекта: «сходи по LAN» дверью не выражается."""
     call = door()
     assert call.descriptor("соседний") is None
-    with pytest.raises(RecorderDenied):
+    with pytest.raises(AccessDenied):
         asyncio.run(call.call("соседний", "GET", "/channels"))
 
 
@@ -172,12 +172,12 @@ def test_сессия_подставляется_домом(monkeypatch: pytest.
 
 
 def test_дверь_через_ops_выполняет_описанный_вызов(monkeypatch: pytest.MonkeyPatch) -> None:
-    """⚠ Дверь живёт в `ops.recorder_call`, и её зовут ОБА транспорта (домашний
+    """⚠ Дверь живёт в `ops.gateway_call`, и её зовут ОБА транспорта (домашний
     вид и перенос через менеджера). Здесь ловим Wiring: неожиданное исключение
     на этом пути менеджер отдаёт жильцу как «Дом не смог выполнить запрос» —
     то есть живой отчёт 2026-09-12 про перемотку начинается ровно отсюда."""
     from mega_home import ops
-    from mega_home.recorder import RecorderCall
+    from mega_home.gateway import AccessGateway
 
     class Clips:
         _clips: dict[str, Any] = {}
@@ -185,22 +185,26 @@ def test_дверь_через_ops_выполняет_описанный_выз�
     class Gateway:
         def __init__(self) -> None:
             self.clips = Clips()
-            self.recorders = RecorderCall(credentials=lambda: _creds())
+            self.accesses = AccessGateway(credentials=lambda: _creds())
 
     class Coordinator:
         def __init__(self) -> None:
-            self.trassir = Gateway()
+            gateway = Gateway()
+            self.trassir = gateway
+            # ⚠ Дверь читается ОТСЮДА, а не из драйвера видеонаблюдения: она
+            # несёт вызовы к любому описанному доступу.
+            self.accesses = gateway.accesses
 
     coordinator = Coordinator()
-    coordinator.trassir.recorders.apply([TRASSIR])
+    coordinator.accesses.apply([TRASSIR])
 
     async def fake_call(*args: Any, **kwargs: Any) -> tuple[int, str, bytes]:
         return 200, "application/json", b'{"success": 1, "num": 3}'
 
-    monkeypatch.setattr(coordinator.trassir.recorders, "call", fake_call)
+    monkeypatch.setattr(coordinator.accesses, "call", fake_call)
 
     answer = asyncio.run(
-        ops.recorder_call(
+        ops.gateway_call(
             coordinator,
             {"method": "GET", "path": "/archive_command", "params": {"command": "seek"}},
         )
@@ -219,15 +223,16 @@ def test_дверь_без_описания_это_404_а_не_отказ() -> N
 
     class Gateway:
         def __init__(self) -> None:
-            from mega_home.recorder import RecorderCall
+            from mega_home.gateway import AccessGateway
 
             self.clips = type("Clips", (), {"_clips": {}})()
-            self.recorders = RecorderCall()  # описаний нет вовсе
+            self.accesses = AccessGateway()  # описаний нет вовсе
 
-    coordinator = type("C", (), {"trassir": Gateway()})()
+    _gateway = Gateway()
+    coordinator = type("C", (), {"trassir": _gateway, "accesses": _gateway.accesses})()
 
     with pytest.raises(ops.OpError) as err:
-        asyncio.run(ops.recorder_call(coordinator, {"method": "GET", "path": "/channels"}))
+        asyncio.run(ops.gateway_call(coordinator, {"method": "GET", "path": "/channels"}))
     assert err.value.status == HTTPStatus.NOT_FOUND
 
 
@@ -254,13 +259,13 @@ def test_ошибка_связи_это_НЕДОСТУПНОСТЬ_а_не_от�
             raise aiohttp.ClientConnectionError("Server disconnected")
 
     call._session = Broken()  # noqa: SLF001 — шов тот же, что у клиента драйвера
-    with pytest.raises(RecorderUnreachable) as err:
+    with pytest.raises(AccessUnreachable) as err:
         asyncio.run(call.call(None, "GET", "/channels"))
 
     assert "Server disconnected" in str(err.value)
-    # ⚠ Наследник общей беды, а не политики: `except RecorderDenied` его НЕ
+    # ⚠ Наследник общей беды, а не политики: `except AccessDenied` его НЕ
     # ловит — иначе разделение осталось бы только в названии.
-    assert not isinstance(err.value, RecorderDenied)
+    assert not isinstance(err.value, AccessDenied)
 
 
 def test_недоступность_регистратора_отдаётся_502_а_не_403() -> None:
@@ -293,14 +298,15 @@ def test_недоступность_регистратора_отдаётся_50
             return ""
 
     class _Gateway:
-        recorders = call
+        accesses = call
         clips = _Clips()
 
     class _Coordinator:
         trassir = _Gateway()
+        accesses = call
 
     with pytest.raises(ops.OpError) as err:
-        asyncio.run(ops.recorder_call(_Coordinator(), {"method": "GET", "path": "/channels"}))
+        asyncio.run(ops.gateway_call(_Coordinator(), {"method": "GET", "path": "/channels"}))
 
     assert err.value.status == 502
 
@@ -347,8 +353,8 @@ def test_обход_запрета_точками_не_проходит(path: st
     """
     descriptor = door().descriptor(None)
     assert descriptor is not None
-    with pytest.raises(RecorderDenied):
-        RecorderCall.check(descriptor, "GET", path)
+    with pytest.raises(AccessDenied):
+        AccessGateway.check(descriptor, "GET", path)
 
 
 @pytest.mark.parametrize(
@@ -361,12 +367,12 @@ def test_действие_на_объекте_дверью_не_ходит(path:
     PTZ физически крутит камеру, экспорт пишет файл на диск регистратора и
     занимает его очередь — локальная и удалённая задачи блокируют друг друга
     (`docs/docs-trassir/sdk-archive-export.md`). Обещание было в заголовке
-    `recorder.py`, а запрета не было.
+    `gateway.py`, а запрета не было.
     """
     descriptor = door().descriptor(None)
     assert descriptor is not None
-    with pytest.raises(RecorderDenied):
-        RecorderCall.check(descriptor, "GET", path)
+    with pytest.raises(AccessDenied):
+        AccessGateway.check(descriptor, "GET", path)
 
 
 def test_дверь_говорит_сессией_драйвера() -> None:
@@ -384,7 +390,7 @@ def test_дверь_говорит_сессией_драйвера() -> None:
     АДРЕСУ и банит его (`docs/docs-trassir/sdk-session.md`), а два независимых
     входа гоняются именно в этот запрет.
     """
-    call = RecorderCall(credentials=_creds, sid_provider=_driver_sid)
+    call = AccessGateway(credentials=_creds, sid_provider=_driver_sid)
     call.apply([TRASSIR])
     seen: list[dict[str, Any]] = []
 
@@ -448,7 +454,7 @@ def test_падение_драйверской_сессии_это_отказ_д
     (`TrassirError` при недоступном регистраторе, `TrassirAuthError` при
     неверной учётке). До провайдера дверь входила сама и отвечала на это
     отказом; с провайдером исключение полетело МИМО обработчиков
-    `ops.recorder_call` и стало неперехваченным 500. Для жильца это выглядело
+    `ops.gateway_call` и стало неперехваченным 500. Для жильца это выглядело
     как «не показывает ни архив, ни календарь» всякий раз, когда регистратор
     просто медленно отвечает.
 
@@ -459,10 +465,10 @@ def test_падение_драйверской_сессии_это_отказ_д
     async def падает(fresh: bool = False) -> str:
         raise RuntimeError("Trassir не отвечает: нет ответа за 15 с")
 
-    call = RecorderCall(credentials=_creds, sid_provider=падает)
+    call = AccessGateway(credentials=_creds, sid_provider=падает)
     call.apply([TRASSIR])
 
-    with pytest.raises(RecorderUnreachable) as err:
+    with pytest.raises(AccessUnreachable) as err:
         asyncio.run(call.call(None, "GET", "/archive_status", {"type": "calendar"}))
 
     assert "нет ответа" in str(err.value)
@@ -484,7 +490,7 @@ def test_протухшая_сессия_перевходит_а_не_уезжа
         свежесть.append(fresh)
         return "мёртвая" if not fresh else "живая"
 
-    call = RecorderCall(credentials=_creds, sid_provider=sid)
+    call = AccessGateway(credentials=_creds, sid_provider=sid)
     call.apply([{**TRASSIR, "sessionExpired": "no session"}])
     ответы: list[dict[str, Any]] = []
 
@@ -538,7 +544,7 @@ def test_без_маркера_повтора_нет() -> None:
     async def sid(fresh: bool = False) -> str:
         return "любая"
 
-    call = RecorderCall(credentials=_creds, sid_provider=sid)
+    call = AccessGateway(credentials=_creds, sid_provider=sid)
     call.apply([TRASSIR])  # без `sessionExpired`
     заходы: list[int] = []
 
@@ -629,7 +635,7 @@ def test_ответ_читается_ЦЕЛИКОМ_а_не_первым_кус�
 
 def test_потолок_ответа_считается_ПО_ХОДУ() -> None:
     """Потолок остаётся потолком — но не ценой порчи всех остальных ответов."""
-    from mega_home.recorder import MAX_RESPONSE_BYTES
+    from mega_home.gateway import MAX_RESPONSE_BYTES
 
     call = door()
 
@@ -664,7 +670,7 @@ def test_потолок_ответа_считается_ПО_ХОДУ() -> None:
             return Answer()
 
     call._session = Client()  # noqa: SLF001
-    with pytest.raises(RecorderDenied):
+    with pytest.raises(AccessDenied):
         asyncio.run(call.call(None, "GET", "/screenshot/cam"))
 
 
@@ -678,7 +684,7 @@ def test_длинный_опрос_держится_дольше_обычног�
     частый опрос. Тот же урок уже стоил ленты событий (`/events`: 7 потерянных
     событий из 8 за минуту).
     """
-    from mega_home.recorder import CALL_TIMEOUT, LONG_POLL_TIMEOUT, _call_timeout
+    from mega_home.gateway import CALL_TIMEOUT, LONG_POLL_TIMEOUT, _call_timeout
 
     assert _call_timeout("/archive_events") == LONG_POLL_TIMEOUT
     assert _call_timeout("/events") == LONG_POLL_TIMEOUT
@@ -692,3 +698,73 @@ def test_длинный_опрос_держится_дольше_обычног�
     assert _call_timeout("/get_video") == CALL_TIMEOUT
     # Запрос с параметрами разбирается по пути, а не по строке целиком.
     assert _call_timeout("/archive_events?token=abc") == LONG_POLL_TIMEOUT
+
+
+# --- вид доступа и паспорт (2026-09-14) -------------------------------------
+#
+# ⚠ Дверь перестала быть «дверью к регистратору»: она несёт вызов к ЛЮБОЙ
+# описанной системе, и вид доступа — данные конфига, а не ветка в коде
+# вызывающего (`docs/plan-video-rework.md`, «Сквозной принцип»).
+
+
+def test_вид_доступа_приезжает_данными_а_умолчание_это_http() -> None:
+    """Описания парка вида не несут — и обязаны работать как прежде."""
+    assert descriptor_of(TRASSIR).kind == "http", "старое описание — это http"
+    assert descriptor_of({**TRASSIR, "kind": "mqtt"}).kind == "mqtt"
+
+
+def test_незнакомый_вид_это_ОТКАЗ_СЛОВАМИ_а_не_падение() -> None:
+    """⚠ Конфиг приезжает от менеджера, а тот обновляется САМ: описание вида,
+    которого дом ещё не умеет, — нормальное состояние парка, а не поломка.
+
+    Молча делать вид, что доступа нет, нельзя: бандл прочитал бы это как «двери
+    нет» и ушёл бы искать несуществующий запасной путь. Отказ обязан называть
+    ВИД — иначе причина видна только в журнале дома.
+    """
+    call = door(kind="mqtt")
+
+    with pytest.raises(AccessDenied) as err:
+        asyncio.run(call.call("trassir", "GET", "/channels"))
+
+    assert "mqtt" in str(err.value)
+
+
+def test_паспорт_называет_доступы_их_вид_и_вендора() -> None:
+    """⚠ Без этого бандл вынужден гадать по ВЕРСИИ, а версия говорит лишь о
+    намерении: дверь превью была объявлена с 0.2.53 и не зарегистрирована до
+    0.2.60, и полтора суток разбора ушли ровно на это.
+
+    ⚠ Адресов, портов и учёток здесь нет и быть не может: тело `config` уходит
+    браузеру жильца КАК ЕСТЬ.
+    """
+    from mega_home import ops
+
+    call = door()
+    coordinator = type(
+        "C", (), {"data": {"rooms": []}, "bundle": None, "accesses": call}
+    )()
+
+    доступы = ops.config(coordinator)["integration"]["accesses"]
+
+    assert доступы == [{"id": "trassir", "kind": "http", "vendor": "trassir"}]
+    сказано = set().union(*(d.keys() for d in доступы))
+    assert not sorted(сказано & {"host", "port", "login", "loginParams"}), (
+        "паспорт отвечает «что есть», а не «как туда ходить»"
+    )
+
+
+def test_описание_с_пустым_хостом_в_паспорт_НЕ_попадает() -> None:
+    """Дом такое описание молча отбрасывает — и увидеть это можно только здесь.
+
+    Иначе бандл считает доступ живым, шлёт в него вызовы и получает отказы, а
+    инсталлятор ищет поломку в регистраторе вместо пустого поля в карточке.
+    """
+    from mega_home import ops
+
+    call = AccessGateway()
+    call.apply([{**TRASSIR, "host": "   "}])
+    coordinator = type(
+        "C", (), {"data": {"rooms": []}, "bundle": None, "accesses": call}
+    )()
+
+    assert ops.config(coordinator)["integration"]["accesses"] == []

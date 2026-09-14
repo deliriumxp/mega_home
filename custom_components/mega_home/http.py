@@ -401,11 +401,11 @@ class MegaHomeCameraFrameView(_MegaHomeView):
         )
 
 
-class MegaHomeTrassirCamerasView(_MegaHomeView):
+class MegaHomeVideoCamerasView(_MegaHomeView):
     """Камеры регистратора — чтобы плитку дома можно было связать с событиями."""
 
-    url = f"{URL_API}/trassir/cameras"
-    name = "api:mega_home:trassir-cameras"
+    url = f"{URL_API}/video/cameras"
+    name = "api:mega_home:video-cameras"
 
     async def get(self, request: web.Request) -> web.Response:
         coordinator, error = self.coordinator_or_error(request)
@@ -420,11 +420,11 @@ class MegaHomeTrassirCamerasView(_MegaHomeView):
             return self.json_message(err.message, err.status)
 
 
-class MegaHomeTrassirEventsView(_MegaHomeView):
+class MegaHomeVideoEventsView(_MegaHomeView):
     """Лента событий: `?guid=` — одна камера, `?before=` — страница постарше."""
 
-    url = f"{URL_API}/trassir/events"
-    name = "api:mega_home:trassir-events"
+    url = f"{URL_API}/video/events"
+    name = "api:mega_home:video-events"
 
     async def get(self, request: web.Request) -> web.Response:
         coordinator, error = self.coordinator_or_error(request)
@@ -437,7 +437,7 @@ class MegaHomeTrassirEventsView(_MegaHomeView):
             return self.json_message(err.message, err.status)
 
 
-class MegaHomeTrassirPreviewView(_MegaHomeView):
+class MegaHomeVideoPreviewView(_MegaHomeView):
     """Кадр архива канала НА МЕТКЕ — превью под пальцем при перемотке.
 
     ⚠ Почему это маршрут дома, а не описанный вызов через дверь. За кадром
@@ -452,8 +452,8 @@ class MegaHomeTrassirPreviewView(_MegaHomeView):
     9–10 КБ. Превью, отстающее на секунду, заказчик отклонил справедливо.
     """
 
-    url = f"{URL_API}/trassir/channels/{{channel}}/preview"
-    name = "api:mega_home:trassir-preview"
+    url = f"{URL_API}/video/channels/{{channel}}/preview"
+    name = "api:mega_home:video-preview"
 
     async def get(self, request: web.Request, channel: str) -> web.StreamResponse:
         coordinator, error = self.coordinator_or_error(request)
@@ -477,11 +477,11 @@ class MegaHomeTrassirPreviewView(_MegaHomeView):
         )
 
 
-class MegaHomeTrassirThumbView(_MegaHomeView):
+class MegaHomeVideoThumbView(_MegaHomeView):
     """Кадр архива на секунду события — уже ужатый (`trassir.py`)."""
 
-    url = f"{URL_API}/trassir/events/{{event}}/thumb"
-    name = "api:mega_home:trassir-thumb"
+    url = f"{URL_API}/video/events/{{event}}/thumb"
+    name = "api:mega_home:video-thumb"
 
     async def get(self, request: web.Request, event: str) -> web.StreamResponse:
         coordinator, error = self.coordinator_or_error(request)
@@ -506,77 +506,7 @@ class MegaHomeTrassirThumbView(_MegaHomeView):
         )
 
 
-class MegaHomeTrassirPlayView(_MegaHomeView):
-    """Открыть запись события: ответ — id для обычного просмотра WebRTC.
-
-    ⚠ Маршрут ровно один, и закрытия среди них нет: просмотр закрывается тем же
-    `webrtc/close`, что и живая камера (`ops.webrtc_close` узнаёт клип по
-    приставке id или по сессии). Отдельная дверь «закрыть запись» означала бы
-    две уборки, расходящиеся при первой правке.
-    """
-
-    url = f"{URL_API}/trassir/events/{{event}}/play"
-    name = "api:mega_home:trassir-play"
-
-    async def post(self, request: web.Request, event: str) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        # ⚠ Качество присылает ПРИЛОЖЕНИЕ телом запроса; тела нет — значит бандл
-        # старый, и умолчание берётся по двери (локальная = дома = основной).
-        try:
-            payload = await request.json()
-        except ValueError:
-            payload = {}
-        quality = payload.get("quality") if isinstance(payload, dict) else None
-        try:
-            return self.json(
-                await ops.trassir_play(coordinator, event, quality=quality)
-            )
-        except ops.OpError as err:
-            return self.json_message(err.message, err.status)
-
-
-class MegaHomeTrassirClipSeekView(_MegaHomeView):
-    """Перемотка: тот же клип (`command=seek`) либо переоткрытие при смене
-    качества.
-
-    ⚠ Ответ несёт id: тот же — источник в приложении не менялся, картинка
-    продолжается; новый — телефон сводит просмотр заново, как при открытии.
-    Позиция обязательна: «вернуть на начало» без неё — это жест «к событию»,
-    и приложение шлёт его меткой само.
-    """
-
-    url = f"{URL_API}/trassir/clips/{{clip}}/seek"
-    name = "api:mega_home:trassir-seek"
-
-    async def post(self, request: web.Request, clip: str) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        try:
-            payload = await request.json()
-        except ValueError:
-            payload = {}
-        if not isinstance(payload, dict):
-            return self.json_message("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
-        try:
-            return self.json(
-                await ops.trassir_seek(
-                    coordinator,
-                    clip,
-                    payload.get("positionUs"),
-                    payload.get("quality"),
-                    payload.get("direction"),
-                )
-            )
-        except ops.OpError as err:
-            return self.json_message(err.message, err.status)
-
-
-class MegaHomeTrassirArchiveClipView(_MegaHomeView):
+class MegaHomeVideoClipView(_MegaHomeView):
     """Открыть архив КАНАЛА на метке — классический просмотр по дню и времени.
 
     ⚠ Отдельно от `events/{event}/play`: запись открывают не только по событию,
@@ -584,8 +514,8 @@ class MegaHomeTrassirArchiveClipView(_MegaHomeView):
     запись (метку в шкале Trassir считает дом: у приложения там нет своих часов).
     """
 
-    url = f"{URL_API}/trassir/channels/{{channel}}/clip"
-    name = "api:mega_home:trassir-clip-at"
+    url = f"{URL_API}/video/channels/{{channel}}/clip"
+    name = "api:mega_home:video-clip"
 
     async def post(self, request: web.Request, channel: str) -> web.Response:
         coordinator, error = self.coordinator_or_error(request)
@@ -616,7 +546,7 @@ class MegaHomeTrassirArchiveClipView(_MegaHomeView):
             return self.json_message(err.message, err.status)
 
 
-class MegaHomeTrassirClipReadyView(_MegaHomeView):
+class MegaHomeVideoClipReadyView(_MegaHomeView):
     """Телефон собрал тракт: отдать архиву единственную команду старта.
 
     ⚠ Старт по готовности, а не по переговорам: часы архива идут в реальном
@@ -625,8 +555,8 @@ class MegaHomeTrassirClipReadyView(_MegaHomeView):
     это вставшие данные (факт стенда). Поэтому команда одна и по готовности.
     """
 
-    url = f"{URL_API}/trassir/clips/{{clip}}/ready"
-    name = "api:mega_home:trassir-ready"
+    url = f"{URL_API}/video/clips/{{clip}}/ready"
+    name = "api:mega_home:video-ready"
 
     async def post(self, request: web.Request, clip: str) -> web.Response:
         coordinator, error = self.coordinator_or_error(request)
@@ -655,56 +585,27 @@ class MegaHomeTrassirClipReadyView(_MegaHomeView):
             return self.json_message(err.message, err.status)
 
 
-class MegaHomeTrassirClipCommandView(_MegaHomeView):
-    """Команда живой сессии из разрешённого словаря — канал новых функций.
-
-    ⚠ Тело `{fn, params}`: бандл составляет команду сам (скорость,
-    покадровый шаг, соседний фрагмент — `sdk-archive-command.md`), драйвер
-    держит границы списка. Выдача токена и пинг через эту дверь не идут —
-    жизненный цикл сессии остаётся у драйвера.
-    """
-
-    url = f"{URL_API}/trassir/clips/{{clip}}/command"
-    name = "api:mega_home:trassir-clip-command"
-
-    async def post(self, request: web.Request, clip: str) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        try:
-            payload = await request.json()
-        except ValueError:
-            payload = {}
-        if not isinstance(payload, dict):
-            return self.json_message("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
-        fn = payload.get("fn")
-        params = payload.get("params")
-        try:
-            return self.json(
-                await ops.trassir_session_command(coordinator, clip, fn, params)
-            )
-        except ops.OpError as err:
-            return self.json_message(err.message, err.status)
-
-
-class MegaHomeRecorderCallView(_MegaHomeView):
-    """Универсальная дверь к регистратору: дом ИСПОЛНЯЕТ описанный вызов.
+class MegaHomeGatewayCallView(_MegaHomeView):
+    """Универсальная дверь наружу: дом ИСПОЛНЯЕТ вызов, составленный бандлом.
 
     ⚠ Ни словаря команд, ни разбора ответов здесь нет и не будет: дом выполняет
-    запрос, описанный в конфиге объекта, и отдаёт ответ КАК ЕСТЬ. Что значат
+    вызов, описанный в конфиге объекта, и отдаёт ответ КАК ЕСТЬ. Что значат
     поля, где тут дни и шкала — решает бандл, который обновляется сам
-    (`recorder.py`, `docs/plan-thin-integration.md`).
+    (`gateway.py`, `docs/plan-thin-integration.md`).
 
-    ⚠ Поэтому новая функция архива и новый регистратор не стоят релиза: первый
-    — правка бандла, второй — описание в конфиге (его собирает менеджер).
+    ⚠ Адресат — ДОСТУП (`access` в теле), а не «регистратор»: одна и та же
+    дверь несёт вызовы к регистратору, к домофону и завтра к брокеру, меняются
+    только глаголы (`docs/plan-video-rework.md`, «Сквозной принцип»).
 
-    Ответ: JSON как есть, если регистратор ответил JSON; иначе конверт
+    ⚠ Поэтому новая функция архива и новый вендор не стоят релиза: первая —
+    правка бандла, второй — описание в конфиге (его собирает менеджер).
+
+    Ответ: JSON как есть, если та система ответила JSON; иначе конверт
     `{status, contentType, body}` с base64 — так же, как носит файлы реле.
     """
 
-    url = f"{URL_API}/recorder/call"
-    name = "api:mega_home:recorder-call"
+    url = f"{URL_API}/gateway/call"
+    name = "api:mega_home:gateway-call"
 
     async def post(self, request: web.Request) -> web.Response:
         coordinator, error = self.coordinator_or_error(request)
@@ -721,7 +622,7 @@ class MegaHomeRecorderCallView(_MegaHomeView):
         # пришедшего СНАРУЖИ через менеджер (`relay_api.py`). Копия правил двери
         # на каждый транспорт разъехалась бы.
         try:
-            return self.json(await ops.recorder_call(coordinator, payload))
+            return self.json(await ops.gateway_call(coordinator, payload))
         except ops.OpError as err:
             return self.json_message(err.message, err.status)
 
@@ -965,7 +866,7 @@ def _serve(request: web.Request, relative: str) -> web.StreamResponse:
 # ⚠ СПИСОК РЕГИСТРИРУЕМЫХ ДВЕРЕЙ — модульной константой, а не выражением внутри
 # функции, и это не стиль. Класс, ОПРЕДЕЛЁННЫЙ, но не попавший сюда, живёт в
 # коде, проходит замок маршрутов и отвечает жильцу обычным 404: ровно так
-# `MegaHomeTrassirPreviewView` пролежал мёртвым с 0.2.53 по 0.2.59, и превью
+# `MegaHomeVideoPreviewView` пролежал мёртвым с 0.2.53 по 0.2.59, и превью
 # при перемотке «не работало» на всех объектах. Теперь список читает и замок.
 VIEWS: tuple[type[HomeAssistantView], ...] = (
     MegaHomeConfigView,
@@ -977,16 +878,13 @@ VIEWS: tuple[type[HomeAssistantView], ...] = (
     MegaHomePhotoView,
     MegaHomeAssetView,
     MegaHomeCameraFrameView,
-    MegaHomeTrassirCamerasView,
-    MegaHomeTrassirEventsView,
-    MegaHomeTrassirThumbView,
-    MegaHomeTrassirPreviewView,
-    MegaHomeTrassirPlayView,
-    MegaHomeTrassirArchiveClipView,
-    MegaHomeTrassirClipSeekView,
-    MegaHomeTrassirClipReadyView,
-    MegaHomeTrassirClipCommandView,
-    MegaHomeRecorderCallView,
+    MegaHomeVideoCamerasView,
+    MegaHomeVideoEventsView,
+    MegaHomeVideoThumbView,
+    MegaHomeVideoPreviewView,
+    MegaHomeVideoClipView,
+    MegaHomeVideoClipReadyView,
+    MegaHomeGatewayCallView,
     MegaHomeWebRtcView,
     MegaHomeWebRtcCandidatesView,
     MegaHomeWebRtcCloseView,

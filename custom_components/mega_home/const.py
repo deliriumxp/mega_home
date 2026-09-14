@@ -24,7 +24,7 @@ LOGGER = logging.getLogger(__package__)
 #
 # ⚠ Держится в паре с `manifest.json`, их сверяет `tests/test_version.py`:
 # поднимать ОБА, одним релизом.
-INTEGRATION_VERSION = "0.2.65"
+INTEGRATION_VERSION = "0.2.66"
 
 CONF_MANAGER_URL = "manager_url"
 CONF_TOKEN = "token"
@@ -144,10 +144,10 @@ TRASSIR_THUMB_LEAD = 1
 TRASSIR_THUMB_TTL = 600
 TRASSIR_THUMB_CAP = 50
 # Поля кадра с технической информацией камеры/регистратора: время и имя канала
-# Клип события: сколько показать ДО метки (движение начинается раньше, чем его
-# заметил детектор) и потолок длины, что бы ни стояло в настройке объекта.
-TRASSIR_CLIP_LEAD = 10
-TRASSIR_CLIP_MAX_SECONDS = 600
+# ⚠ Окна клипа СОБЫТИЯ здесь больше нет (`TRASSIR_CLIP_LEAD`,
+# `TRASSIR_CLIP_MAX_SECONDS`, сняты 2026-09-14). Запись открывается по КАНАЛУ и
+# метке, окно считает приложение и присылает готовым — у дома своих часов в
+# шкале Trassir нет и не будет (`docs/plan-video-rework.md`, этап 1).
 # Продление токена видео. Дока обещает 10 секунд жизни без запросов; стенд
 # оказался щедрее, но полагаться на чужую щедрость нельзя.
 TRASSIR_PING_INTERVAL = 5

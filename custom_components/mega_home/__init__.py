@@ -131,6 +131,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     )
     await gateway.async_load()
     coordinator.trassir = gateway
+    # ⚠ Дверь читается ОТСЮДА, а не из драйвера: она не принадлежит
+    # видеонаблюдению (`gateway.py`). Живёт она пока у драйвера только потому,
+    # что учётку и живую сессию держит он.
+    coordinator.accesses = gateway.accesses
     entry.async_on_unload(lambda: hass.async_create_task(gateway.async_stop()))
     if coordinator.data:
         await gateway.async_apply(coordinator.data)

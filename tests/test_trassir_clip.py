@@ -27,6 +27,13 @@ import pytest
 from mega_home import ops
 from mega_home.trassir_clip import CLIP_PREFIX, ClipSessions
 
+# ⚠ Метка и окно, с которыми запись открывает ПРИЛОЖЕНИЕ: по каналу и метке,
+# окно считает оно. Открытие по СОБЫТИЮ у дома снято 2026-09-14 вместе с
+# маршрутом — событие лишь одна из причин посмотреть запись, и отдельной двери
+# у него больше нет (`docs/plan-video-rework.md`, этап 1).
+AT = 1_788_960_000_000_000
+WINDOW = (AT - 10_000_000, AT + 60_000_000)
+
 EVENT = {
     "id": "e1",
     "type": "Motion Start",
@@ -138,42 +145,20 @@ def gateway() -> FakeGateway:
     return FakeGateway()
 
 
-def test_окно_клипа_строится_в_шкале_trassir(gateway: FakeGateway) -> None:
-    answer = asyncio.run(gateway.clips.async_open("e1"))
-
-    assert answer["id"] == f"{CLIP_PREFIX}tok1"
-    # −10 секунд до метки: движение начинается раньше, чем его заметил детектор.
-    assert answer["startUs"] == EVENT["timestampUs"] - 10_000_000
-    assert answer["stopUs"] == EVENT["timestampUs"] + 60_000_000
-    assert answer["cameraName"] == "Вход"
-
-
 def test_дома_основной_архив_снаружи_суб(gateway: FakeGateway) -> None:
     """⚠ Замер стенда 2026-09-09 по прицеленному окну: основной архив
     1.43 Мбит/с и 13.4 к/с, суб — 0.16 Мбит/с и 10.7 к/с. Суб ВЕЗДЕ выглядел
     ровно тем, чем был: мелкой картинкой с выпадающими кадрами при живой
     камере в полном качестве рядом."""
-    asyncio.run(gateway.clips.async_open("e1"))
+    asyncio.run(gateway.clips.async_open_at("cam1", AT, "Вход", window_start_us=WINDOW[0], window_stop_us=WINDOW[1]))
     call = next(params for name, params in gateway.client.calls if name == "get_video")
     assert call["stream"] == "archive_main"
     assert call["container"] == "rtsp"
 
     gateway.client.calls.clear()
-    asyncio.run(gateway.clips.async_open("e1", remote=True))
+    asyncio.run(gateway.clips.async_open_at("cam1", AT, remote=True))
     call = next(params for name, params in gateway.client.calls if name == "get_video")
     assert call["stream"] == "archive_sub", "снаружи канал мобильный"
-
-
-def test_перемотка_держит_качество_двери(gateway: FakeGateway) -> None:
-    """⚠ Качество выбирает дверь при открытии. Официальный seek живой поток
-    не пересоздаёт вовсе: `get_video` на перемотке значил бы смену потока,
-    а это уже не перемотка."""
-    opened = asyncio.run(gateway.clips.async_open("e1"))
-    gateway.client.calls.clear()
-
-    asyncio.run(gateway.clips.async_seek(opened["id"], EVENT["timestampUs"]))
-
-    assert [n for n, _ in gateway.client.calls if n == "get_video"] == []
 
 
 def _offered(
@@ -259,7 +244,7 @@ def test_команда_одна_и_по_готовности(
     # полуночи 298 КБ и замерший курсор против 2118 КБ и идущего курсора после
     # повтора с названной метки.
     assert len(commands) == 2
-    assert commands[0]["start"] == _stamp(EVENT["timestampUs"] - 10_000_000), (
+    assert commands[0]["start"] == _stamp(AT), (
         "метка события уходит меткой регистратора"
     )
     assert commands[1]["start"] == "20260909T140000", "повтор с названной метки"
@@ -289,7 +274,7 @@ def test_закрытие_снимает_поток_и_токен(
 
     async def scenario() -> None:
         hass = FakeHass()
-        opened = await gateway.clips.async_open("e1")
+        opened = await gateway.clips.async_open_at("cam1", AT, "Вход", window_start_us=WINDOW[0], window_stop_us=WINDOW[1])
         await gateway.clips.async_offer(hass, opened["id"], "offer")
         await gateway.clips.async_close(hass, opened["id"], "s1")
         await _quiet(hass, gateway)
@@ -322,7 +307,7 @@ def test_клип_закрывается_даже_если_приложение_
 
     async def scenario() -> None:
         hass = FakeHass()
-        opened = await gateway.clips.async_open("e1")
+        opened = await gateway.clips.async_open_at("cam1", AT, "Вход", window_start_us=WINDOW[0], window_stop_us=WINDOW[1])
         await gateway.clips.async_offer(hass, opened["id"], "offer")
         await _quiet(hass, gateway)
 
@@ -339,7 +324,7 @@ def test_чужой_id_не_становится_клипом(gateway: FakeGatew
 
 
 def _opened_clip_id(gateway: FakeGateway) -> str:
-    opened = asyncio.run(gateway.clips.async_open("e1"))
+    opened = asyncio.run(gateway.clips.async_open_at("cam1", AT, "Вход", window_start_us=WINDOW[0], window_stop_us=WINDOW[1]))
     return opened["id"]
 
 
@@ -386,239 +371,7 @@ def test_сторож_стартует_вслепую_без_готовност�
     # ⚠ Две: `play` с запрошенной метки и повтор с той, что назвал регистратор
     # (запрошенная почти всегда попадает в дыру — см. `_play_where_told`).
     assert len(commands) == 2
-    assert commands[0]["start"] == _stamp(EVENT["timestampUs"] - 10_000_000)
-
-
-def test_seek_позиционирует_живой_поток_тем_же_клипом(
-    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Перемотка — документированный `command=seek` по живому токену
-    (`sdk-archive-command.md`): тот же токен, тот же поток go2rtc, та же
-    WebRTC-сессия — кадр продолжается с новой метки без переоткрытия и
-    заморозки. Ответ несёт ТОТ ЖЕ id: приложение по нему понимает, что
-    проигрыватель трогать не надо.
-
-    ⚠⚠ ЗА `seek` ОБЯЗАН ИДТИ `play` — и это замок, а не украшение. Замер на
-    объекте 2026-09-13 своим RTSP-читателем по живому регистратору (канал
-    IAtwTYwK): `play` даёт ровный поток ~200 КБ/с, курсор 14:34:32 → 14:34:38,
-    `state_desc: "P"`. Следом `seek` на 17:54:44 отвечает `success: 1`, курсор
-    честно уезжает — а ДАННЫЕ ПРЕКРАЩАЮТСЯ НАВСЕГДА, `state_desc` из "P"
-    становится ПУСТЫМ. Тот же опыт с `play` следом: данные сразу (899 → 2886
-    КБ), курсор 17:54:44 → 17:55:09, "P" держится. Это и была причина жалобы
-    «любая перемотка — и видео не доходит», которую чинили кругами.
-
-    ⚠ «Одна команда на соединение» этому НЕ противоречит: тот факт — про
-    ВТОРОЙ `play` по УЖЕ ИГРАЮЩЕМУ потоку. После seek поток СТОИТ, и его
-    останавливает сам регистратор.
-    """
-    clip_id = _opened_clip_id(gateway)
-    monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_ARCHIVE_SETTLE", 0.02)
-    # Архив должен быть ЗАПУЩЕН: seek позиционирует живой поток.
-    _offered(gateway, monkeypatch, clip_id)
-    asyncio.run(gateway.clips.async_ready(clip_id))
-    gateway.client.calls.clear()
-    middle = EVENT["timestampUs"] + 20_000_000
-
-    answer = asyncio.run(gateway.clips.async_seek(clip_id, middle))
-
-    # Клип тот же: источник в приложении не меняется, переговоров нет.
-    assert answer["id"] == clip_id
-    assert answer["positionUs"] == middle
-    assert answer["startUs"] == EVENT["timestampUs"] - 10_000_000, "окно не съезжает"
-    assert answer["stopUs"] == EVENT["timestampUs"] + 60_000_000
-    # ⚠ ТРИ команды: `seek` ставит курсор, `play` поднимает вставший поток, и
-    # ПОВТОР `play` — с метки, которую назвал сам регистратор. Запрошенная точка
-    # почти всегда попадает в дыру (архив пишется по движению), и на ней
-    # регистратор отвечает `success: 1`, честно называет ближайший кадр и НЕ
-    # ОТДАЁТ ДАННЫЕ: замер объекта 2026-09-14 — 298 КБ и замерший курсор против
-    # 2118 КБ и идущего после повтора.
-    commands = [p for n, p in gateway.client.calls if n == "archive_command"]
-    assert len(commands) == 3
-    assert commands[2]["command"] == "play"
-    assert commands[2]["start"] == "20260909T140000", "повтор с названной метки"
-    assert commands[0]["command"] == "seek"
-    assert commands[0]["timestamp"] == middle
-    assert commands[0]["direction"] == 0
-    assert commands[1]["command"] == "play"
-    # ⚠⚠ МЕТКОЙ РЕГИСТРАТОРА, а не микросекундами: дока говорит
-    # `start=[дата и время]`, и замер объекта 2026-09-14 показывает цену
-    # отступления — при одной и той же посадке строкой приходит 1798 КБ и
-    # курсор идёт секунда в секунду, числом 167 КБ и курсор улетает на четыре
-    # минуты за шесть секунд. Числом регистратор отвечает `success: 1` и
-    # встаёт куда просили: врёт убедительно.
-    assert commands[1]["start"] == _stamp(middle)
-    assert commands[1]["stop"] == _stamp(EVENT["timestampUs"] + 60_000_000)
-    assert re.fullmatch(r"\d{8}T\d{6}", commands[1]["start"])
-    assert commands[1]["speed"] == 1
-    # ⚠ Куда регистратор встал НА САМОМ ДЕЛЕ — уходит наружу. Без этого подпись
-    # под шкалой после перемотки оставалась на месте ОТКРЫТИЯ: замер объекта
-    # 2026-09-13 — игла уехала на 16:01, а подпись сорок секунд показывала
-    # 23:20:38, два разных времени на одном экране.
-    assert answer["firstFrameTs"], "перемотка не сказала, куда встал регистратор"
-    # Ни нового токена, ни разбора потока.
-    assert [n for n, _ in gateway.client.calls if n == "get_video"] == []
-    assert gateway.clips._clips.get(clip_id) is not None  # noqa: SLF001
-
-
-def test_seek_до_старта_не_шлёт_команду(
-    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Архив ещё не стартовал (`play` уйдёт по готовности телефона): seek
-    просто сдвигает старт — команда по неоткрытому потоку получает
-    `stream is expired` (факт стенда). Стартовать надо уже с новой метки."""
-    monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_ARCHIVE_SETTLE", 0.02)
-    clip_id = _opened_clip_id(gateway)
-    gateway.client.calls.clear()
-    middle = EVENT["timestampUs"] + 20_000_000
-
-    answer = asyncio.run(gateway.clips.async_seek(clip_id, middle))
-
-    assert answer["id"] == clip_id
-    assert answer["positionUs"] == middle
-    assert [n for n, _ in gateway.client.calls if n == "archive_command"] == []
-
-    # Стартовавший архив играет уже с новой метки.
-    asyncio.run(gateway.clips.async_ready(clip_id))
-    commands = [p for n, p in gateway.client.calls if n == "archive_command"]
-    assert commands and commands[0]["start"] == _stamp(middle)
-
-
-def test_смену_качества_seek_переоткрывает(
-    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Поток регистратора привязан к качеству: позиционировать нельзя, только
-    новый токен и новый поток. Это единственный оставшийся путь переоткрытия —
-    обычная перемотка им больше не ходит."""
-    dropped: list[str] = []
-    monkeypatch.setattr(
-        ClipSessions,
-        "_async_drop_stream",
-        lambda self, name: _record(dropped, name),
-    )
-    clip_id = _opened_clip_id(gateway)
-    gateway.client.calls.clear()
-    middle = EVENT["timestampUs"] + 20_000_000
-
-    answer = asyncio.run(gateway.clips.async_seek(clip_id, middle, "sub"))
-
-    assert answer["id"] == f"{CLIP_PREFIX}tok2"
-    tokens = [p for n, p in gateway.client.calls if n == "get_video"]
-    assert tokens and tokens[0]["stream"] == "archive_sub"
-    assert dropped == ["trassir_tok1"]
-
-
-def test_команда_сессии_едет_в_регистратор_с_токеном_клипа(
-    gateway: FakeGateway,
-) -> None:
-    """Инструмент новых функций: бандл составляет команду словаря регистратора
-    (`sdk-archive-command.md`), драйвер подставляет токен живой сессии. Новая
-    медиа-функция бандла — без релиза интеграции."""
-    clip_id = _opened_clip_id(gateway)
-    gateway.client.calls.clear()
-
-    answer = asyncio.run(
-        gateway.clips.async_session_command(
-            clip_id,
-            "archive_command",
-            {"command": "seek", "timestamp": 123, "direction": 0},
-        )
-    )
-
-    assert answer == {"success": 1, "first_frame_ts": "2026-09-09 14:00:00"}
-    commands = [p for n, p in gateway.client.calls if n == "archive_command"]
-    assert len(commands) == 1
-    assert commands[0]["token"] == "tok1"
-    assert commands[0]["command"] == "seek"
-
-
-def test_команда_сессии_читает_статус_по_типу(gateway: FakeGateway) -> None:
-    clip_id = _opened_clip_id(gateway)
-    gateway.client.calls.clear()
-
-    asyncio.run(
-        gateway.clips.async_session_command(clip_id, "archive_status", {"type": "state"})
-    )
-
-    statuses = [p for n, p in gateway.client.calls if n == "archive_status"]
-    assert statuses == [{"type": "state"}]
-
-
-def test_команда_сессии_за_границами_словаря_запрещена(gateway: FakeGateway) -> None:
-    """Выдача токена и пинг — жизненный цикл сессии: с ними связаны сторож
-    и уборка, бандлу они не отдаются. Инструмент — не прокси на регистратор."""
-    clip_id = _opened_clip_id(gateway)
-
-    for fn in ("get_video", "ping", "login", ""):
-        with pytest.raises(ops.OpError) as err:
-            asyncio.run(gateway.clips.async_session_command(clip_id, fn, {}))
-        assert err.value.status == 403
-
-
-def test_команда_закрытой_сессии_отказывает(gateway: FakeGateway) -> None:
-    with pytest.raises(ops.OpError) as err:
-        asyncio.run(
-            gateway.clips.async_session_command(
-                f"{CLIP_PREFIX}мёртвый", "archive_command", {}
-            )
-        )
-    assert err.value.status == 404
-
-
-def test_seek_без_позиции_отказывает(gateway: FakeGateway) -> None:
-    """«Вернуть на начало» без метки — это жест «к событию», и приложение шлёт
-    его меткой само. Пустой позыв — 400, а не угадывание."""
-    with pytest.raises(ops.OpError) as err:
-        asyncio.run(gateway.clips.async_seek(_opened_clip_id(gateway), None))
-
-    assert err.value.status == 400
-
-
-def test_seek_не_поджимает_метку_к_окну_открытия(gateway: FakeGateway) -> None:
-    """⚠ Дом метку НЕ ТРОГАЕТ — иначе прыжок на другой день отменяется им же.
-
-    Кламп к окну здесь был и снят: окно у клипа — то, с которым его ОТКРЫЛИ, а
-    выбор дня в календаре просит метку заведомо за его краем. Дом поджимал её
-    обратно, и жилец, выбрав 9 сентября, оставался в сутках открытия — при этом
-    шкала приложения уже показывала новый день. Край гасит тот, кто рисует
-    шкалу; в доме это была последняя арифметика окна.
-    """
-    clip_id = _opened_clip_id(gateway)
-    far = EVENT["timestampUs"] + 3 * 86_400_000_000
-
-    answer = asyncio.run(gateway.clips.async_seek(clip_id, far))
-
-    assert answer["positionUs"] == far, "метка уходит регистратору как есть"
-    # ⚠ Окно НЕ съезжает: шкала таймлайна стоит на нём, а перемотка двигает
-    # только позицию. Пока окно подменялось позицией, жилец перематывал на
-    # середину и снова оказывался «в начале записи».
-    assert answer["startUs"] == EVENT["timestampUs"] - 10_000_000
-    assert answer["stopUs"] == EVENT["timestampUs"] + 60_000_000
-
-
-def test_seek_мусором_объясняется(gateway: FakeGateway) -> None:
-    with pytest.raises(ops.OpError) as err:
-        asyncio.run(gateway.clips.async_seek(_opened_clip_id(gateway), "мимо"))  # type: ignore[arg-type]
-
-    assert err.value.status == 400
-
-
-def test_seek_закрытой_записи_объясняется(gateway: FakeGateway) -> None:
-    with pytest.raises(ops.OpError) as err:
-        asyncio.run(gateway.clips.async_seek("trassir:ghost", 1))
-
-    assert "заново" in err.value.message
-
-
-def test_seek_доходит_через_ops(gateway: FakeGateway) -> None:
-    """Обёртка для HTTP-дверей (местной и переноса наружу)."""
-    coordinator = type("Coordinator", (), {"trassir": gateway})()
-    clip_id = _opened_clip_id(gateway)
-    middle = EVENT["timestampUs"] + 20_000_000
-
-    answer = asyncio.run(ops.trassir_seek(coordinator, clip_id, middle))
-
-    assert answer["positionUs"] == middle
-    assert answer["startUs"] == EVENT["timestampUs"] - 10_000_000, "окно не съезжает"
+    assert commands[0]["start"] == _stamp(AT)
 
 
 def test_ready_доходит_через_ops(
@@ -637,7 +390,7 @@ def test_ready_доходит_через_ops(
     answer = asyncio.run(scenario())
 
     assert answer["ready"] is True
-    assert answer["positionUs"] == EVENT["timestampUs"] - 10_000_000
+    assert answer["positionUs"] == AT
 
 
 def test_закрытие_до_готовности_не_командует(
@@ -657,7 +410,7 @@ def test_закрытие_до_готовности_не_командует(
 
     async def scenario() -> None:
         hass = FakeHass()
-        opened = await gateway.clips.async_open("e1")
+        opened = await gateway.clips.async_open_at("cam1", AT, "Вход", window_start_us=WINDOW[0], window_stop_us=WINDOW[1])
         await gateway.clips.async_offer(hass, opened["id"], "offer")
         clip = gateway.clips._clips[opened["id"]]  # noqa: SLF001
         ping, fallback = clip.ping, clip.fallback
@@ -684,21 +437,6 @@ def test_живая_камера_переключает_поток_адресо�
     # ⚠ Имена потоков РАЗНЫЕ: одно имя на два источника значит, что go2rtc
     # оставит первый producer, и переключение качества ничего не поменяет.
     assert main_name != sub_name
-
-
-def test_смена_качества_записи_переоткрывает_клип(gateway: FakeGateway) -> None:
-    """Поток и токен привязаны к качеству, поэтому смена качества у записи —
-    то же переоткрытие, что перемотка, только позиция остаётся прежней."""
-    opened = asyncio.run(gateway.clips.async_open("e1"))
-    position = EVENT["timestampUs"]
-    gateway.client.calls.clear()
-
-    answer = asyncio.run(gateway.clips.async_seek(opened["id"], position, "sub"))
-
-    call = next(params for name, params in gateway.client.calls if name == "get_video")
-    assert call["stream"] == "archive_sub"
-    assert answer["positionUs"] == position
-    assert answer["startUs"] == EVENT["timestampUs"] - 10_000_000, "окно не съезжает"
 
 
 def test_канал_без_постоянного_адреса_идёт_по_токену(
@@ -778,12 +516,12 @@ def test_качество_архива_решает_приложение(gateway
     знает свою дверь лучше нас (у него два транспорта), а политика в Python
     стоит релиза HACS на каждом объекте.
     """
-    asyncio.run(gateway.clips.async_open("e1", remote=True, quality="main"))
+    asyncio.run(gateway.clips.async_open_at("cam1", AT, remote=True, quality="main"))
     call = next(p for n, p in gateway.client.calls if n == "get_video")
     assert call["stream"] == "archive_main", "снаружи, но приложение просит основной"
 
     gateway.client.calls.clear()
-    asyncio.run(gateway.clips.async_open("e1", remote=False, quality="sub"))
+    asyncio.run(gateway.clips.async_open_at("cam1", AT, remote=False, quality="sub"))
     call = next(p for n, p in gateway.client.calls if n == "get_video")
     assert call["stream"] == "archive_sub", "дома, но приложение просит суб"
 
@@ -792,12 +530,12 @@ def test_старый_бандл_получает_умолчание_по_две
     """⚠ Умолчание — ТОЛЬКО для бандлов, которые качества не шлют: иначе
     удалённый жилец получил бы основной архив на мобильном канале. Снять вместе
     со свёрткой событий, когда релизный бандл поднимут (правило выпуска)."""
-    asyncio.run(gateway.clips.async_open("e1", remote=True))
+    asyncio.run(gateway.clips.async_open_at("cam1", AT, remote=True))
     call = next(p for n, p in gateway.client.calls if n == "get_video")
     assert call["stream"] == "archive_sub"
 
     gateway.client.calls.clear()
-    asyncio.run(gateway.clips.async_open("e1", remote=False))
+    asyncio.run(gateway.clips.async_open_at("cam1", AT, remote=False))
     call = next(p for n, p in gateway.client.calls if n == "get_video")
     assert call["stream"] == "archive_main"
 
@@ -881,20 +619,6 @@ def test_окно_можно_уточнить_на_готовности(gateway:
     # и НЕ отдаёт данные (замер объекта 2026-09-14 — 167 КБ против 1798 КБ).
     assert command["start"] == _stamp(day)
     assert command["stop"] == _stamp(day + 86_400_000_000)
-
-def test_событие_не_двигает_окно(gateway: FakeGateway) -> None:
-    """У клипа СОБЫТИЯ окно стоит на месте: его задало событие, и приложение
-    старых сборок рисует по нему шкалу — сдвинуть его значит сломать шкалу."""
-    opened = asyncio.run(gateway.clips.async_open("e1"))
-    gateway.client.calls.clear()
-
-    answer = asyncio.run(gateway.clips.async_seek(opened["id"], EVENT["timestampUs"] + 5_000_000))
-
-    assert answer["startUs"] == opened["startUs"]
-    assert answer["stopUs"] == opened["stopUs"]
-
-
-
 
 def test_сторож_не_съедает_попытку_старта_без_окна(gateway: FakeGateway, monkeypatch) -> None:
     """⚠ Команда архива на соединение ОДНА, и претендентов на неё двое.

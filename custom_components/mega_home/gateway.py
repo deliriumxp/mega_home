@@ -1,10 +1,22 @@
-"""Универсальная дверь к регистратору: дом ИСПОЛНЯЕТ описанный вызов.
+"""Универсальная дверь наружу: дом ИСПОЛНЯЕТ вызов, СОСТАВЛЕННЫЙ бандлом.
 
-⚠ Дом не знает ни одного вендора и не разбирает ни одного ответа. Он умеет
-ровно две вещи: выполнить запрос, ОПИСАННЫЙ в конфиге объекта, и отдать ответ
+⚠ Дверь не знает ни одного вендора и не разбирает ни одного ответа. Она умеет
+ровно две вещи: выполнить вызов, ОПИСАННЫЙ в конфиге объекта, и отдать ответ
 как есть. Что значат поля, где тут дни, где шкала, где «эпоха вместо дня» —
 решает бандл, который обновляется сам
 (`docs/plan-thin-integration.md`, «Широкая дверь»).
+
+⚠ ДОСТУП, а не «регистратор». Имя роли здесь было последним, что про
+видеонаблюдение: дверь одинаково несёт вызов к регистратору, к домофону и к
+шине сообщений — меняются только ГЛАГОЛЫ (у HTTP это метод и путь, у MQTT
+будут топик и полезная нагрузка), а форма одна. Правило заказчика 2026-09-14:
+дом даёт ДОСТУП, бандл задаёт ФУНКЦИОНАЛ
+(`docs/plan-video-rework.md`, «Сквозной принцип»).
+
+⚠ ВИД доступа (`kind`) — данные конфига, а не ветка в коде вызывающего. Сегодня
+поднят один вид, `http`; незнакомый вид дверь отвергает ОТКАЗОМ ПОЛИТИКИ с
+именем вида, а не падением — конфиг объекта может приехать от менеджера
+поновее, и молча делать вид, что доступа нет, нельзя.
 
 ⚠ Почему так, а не «словарь команд». Словарь в доме — это код, который нельзя
 обновить: каждая новая надобность приложения просит релиза HACS и перезапуска
@@ -16,8 +28,8 @@ Home Assistant на КАЖДОМ объекте. Вечер 2026-09-12 пока�
 (`sid`) и подставляет её в запрос. Телефон жильца знает пути, но не пароли.
 
 ⚠ Границы широкой двери (политика, а не список команд):
-  * адресат — только регистратор из конфига объекта (никакого «сходи по LAN»);
-  * запрещены вход, настройки и всё, что меняет состояние регистратора (запрос
+  * адресат — только доступ из конфига объекта (никакого «сходи по LAN»);
+  * запрещены вход, настройки и всё, что меняет состояние той системы (запрос
     воспроизведения — можно, перенастройку — нет);
   * потолок размера ответа и срок: дверь не превращается в выкачивание;
   * метод — GET/HEAD/POST; тело уходит как есть.
@@ -82,15 +94,20 @@ MAX_MARKER_BYTES = 4096
 
 
 @dataclass
-class RecorderDescriptor:
-    """Описание ОДНОГО регистратора объекта — данные, а не код.
+class AccessDescriptor:
+    """Описание ОДНОГО доступа объекта — данные, а не код.
 
-    ⚠ Ничего вендорского в питоне: новый регистратор приезжает этим описанием в
-    конфиге (его собирает менеджер), и релиза интеграции для этого не нужно.
+    ⚠ Ничего вендорского в питоне: новый регистратор, домофон или брокер
+    приезжает этим описанием в конфиге (его собирает менеджер), и релиза
+    интеграции для этого не нужно.
     """
 
     id: str
     host: str
+    # ⚠ ВИД доступа: `http` сегодня, `mqtt` — первый кандидат на проверку формы.
+    # Это ДАННЫЕ: если ради брокера придётся править исполнителя, значит форма
+    # двери выбрана неверно (`docs/plan-video-rework.md`, этап 1).
+    kind: str = "http"
     # ⚠ Схема — ДАННЫЕ: у Trassir SDK живёт на HTTPS, у другого регистратора
     # может быть иначе, и знать это дом не обязан. Замер стенда 2026-09-12: по
     # http:// регистратор молча рвёт соединение — «Server disconnected», а
@@ -123,7 +140,7 @@ class RecorderDescriptor:
     session_expired: str = ""
 
 
-def descriptor_of(block: Any) -> RecorderDescriptor | None:
+def descriptor_of(block: Any) -> AccessDescriptor | None:
     """Собрать описание из блока конфига; мусор — «описания нет».
 
     ⚠ Не бросаем: конфиг дома может быть от менеджера постарше, и падать из-за
@@ -140,9 +157,10 @@ def descriptor_of(block: Any) -> RecorderDescriptor | None:
         if not isinstance(value, dict):
             return {}
         return {str(key): str(item) for key, item in value.items()}
-    return RecorderDescriptor(
-        id=str(block.get("id") or block.get("vendor") or "recorder"),
+    return AccessDescriptor(
+        id=str(block.get("id") or block.get("vendor") or "access"),
         host=host,
+        kind=str(block.get("kind") or "http"),
         scheme=str(block.get("scheme") or "https"),
         port=int(block.get("port") or 443),
         rtsp_port=int(block.get("rtspPort") or block.get("rtsp_port") or 554),
@@ -161,11 +179,11 @@ def descriptor_of(block: Any) -> RecorderDescriptor | None:
     )
 
 
-class RecorderError(Exception):
+class AccessError(Exception):
     """Дверь не выполнила вызов. Дальше важно ПОЧЕМУ — см. наследников."""
 
 
-class RecorderDenied(RecorderError):
+class AccessDenied(AccessError):
     """Вызов не проходит ПОЛИТИКУ двери — регистратор тут вообще ни при чём.
 
     ⚠ Это про НАС: бандл попросил путь или метод, которых дверь не пускает.
@@ -174,8 +192,8 @@ class RecorderDenied(RecorderError):
     """
 
 
-class RecorderUnreachable(RecorderError):
-    """Регистратор не ответил, отказал во входе или порвал соединение.
+class AccessUnreachable(AccessError):
+    """Та система не ответила, отказала во входе или порвала соединение.
 
     ⚠ Разделено с отказом политики намеренно (2026-09-13). Пока обе беды
     приезжали одним 403, приложение считало ЛЮБУЮ из них за «двери нет» и
@@ -186,11 +204,18 @@ class RecorderUnreachable(RecorderError):
     """
 
 
-class RecorderCall:
-    """Сессии регистраторов и исполнение описанных вызовов."""
+class AccessGateway:
+    """Доступы объекта: их сессии и исполнение описанных вызовов.
+
+    ⚠ Учётку и живую сессию дверь берёт у того, кто ими владеет (драйвер
+    вендора), — поэтому провайдеры приходят снаружи, а не заводятся здесь.
+    Сегодня их набор ОДИН на объект: пока доступ с сессией тоже один. Появится
+    второй такой — набор станет на доступ, и менять ради этого придётся только
+    эти две строки, а не форму двери.
+    """
 
     def __init__(self, credentials: Any = None, sid_provider: Any = None) -> None:
-        self._descriptors: dict[str, RecorderDescriptor] = {}
+        self._descriptors: dict[str, AccessDescriptor] = {}
         # Учётка на регистратор: тем же маршрутом менеджера, что и раньше.
         self._credentials = credentials
         # ⚠ ЖИВАЯ сессия драйвера этого объекта. Дверь обязана говорить ТОЙ ЖЕ
@@ -206,7 +231,7 @@ class RecorderCall:
     # --- описание -------------------------------------------------------
 
     def apply(self, blocks: Any) -> None:
-        """Принять описания из конфига объекта (список блоков `recorders`)."""
+        """Принять описания из конфига объекта (список блоков `accesses`)."""
         self._descriptors = {}
         self._sids.clear()
         if not isinstance(blocks, list):
@@ -219,10 +244,10 @@ class RecorderCall:
     def ids(self) -> list[str]:
         return list(self._descriptors)
 
-    def descriptor(self, recorder: str | None) -> RecorderDescriptor | None:
-        """Описание по имени; без имени — единственный регистратор объекта."""
-        if recorder:
-            return self._descriptors.get(recorder)
+    def descriptor(self, access: str | None) -> AccessDescriptor | None:
+        """Описание по имени; без имени — единственный доступ объекта."""
+        if access:
+            return self._descriptors.get(access)
         if len(self._descriptors) == 1:
             return next(iter(self._descriptors.values()))
         return None
@@ -230,7 +255,7 @@ class RecorderCall:
     # --- политика -------------------------------------------------------
 
     @staticmethod
-    def check(descriptor: RecorderDescriptor, method: str, path: str) -> str:
+    def check(descriptor: AccessDescriptor, method: str, path: str) -> str:
         """Пропустить вызов или объяснить, почему нет; вернуть ПРОВЕРЕННЫЙ путь.
 
         ⚠ Это ГРАНИЦА двери, и она намеренно простая: запрет по префиксам путей
@@ -246,20 +271,20 @@ class RecorderCall:
         аутентификации нет вовсе — любой в Wi-Fi объекта.
         """
         if method not in ALLOWED_METHODS:
-            raise RecorderDenied(f"Метод {method} через дверь не ходит")
+            raise AccessDenied(f"Метод {method} через дверь не ходит")
         if not path.startswith("/"):
-            raise RecorderDenied("Путь начинается с «/»")
+            raise AccessDenied("Путь начинается с «/»")
         clean = _normalized(path)
         for prefix in (*DENY_ALWAYS, *descriptor.deny):
             if clean.split("?")[0].startswith(prefix):
-                raise RecorderDenied(f"{prefix}* через дверь не ходит")
+                raise AccessDenied(f"{prefix}* через дверь не ходит")
         return clean
 
     # --- исполнение -----------------------------------------------------
 
     async def call(
         self,
-        recorder: str | None,
+        access: str | None,
         method: str,
         path: str,
         params: dict[str, Any] | None = None,
@@ -267,9 +292,14 @@ class RecorderCall:
         session: dict[str, str] | None = None,
     ) -> tuple[int, str, bytes]:
         """Выполнить описанный вызов. Ответ отдаётся КАК ЕСТЬ — без разбора."""
-        descriptor = self.descriptor(recorder)
+        descriptor = self.descriptor(access)
         if descriptor is None:
-            raise RecorderDenied("Такого регистратора у объекта нет")
+            raise AccessDenied("Такого доступа у объекта нет")
+        # ⚠ Вид проверяется ЗДЕСЬ и по имени: незнакомый вид — это конфиг от
+        # менеджера поновее, и жилец обязан прочитать причину словами, а не
+        # получить «дом не смог выполнить запрос» из упавшего HTTP-пути.
+        if descriptor.kind != "http":
+            raise AccessDenied(f"Доступ вида «{descriptor.kind}» дом пока не умеет")
         method = method.upper()
         # ⚠ Дальше идёт ПРОВЕРЕННЫЙ путь, а не присланный: иначе нормализация
         # в сети вернула бы обратно то, что политика только что отвергла.
@@ -298,21 +328,21 @@ class RecorderCall:
                     payload = await _read_all(response)
                     status, kind = response.status, response.content_type
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-                raise RecorderUnreachable(_reason(err)) from err
+                raise AccessUnreachable(_reason(err)) from err
             if attempt == 1 and self._expired(descriptor, payload):
                 LOGGER.debug("Регистратор не признал сессию — входим заново")
                 continue
             return status, kind, payload
-        raise RecorderUnreachable("Регистратор не признал сессию дважды подряд")
+        raise AccessUnreachable("Регистратор не признал сессию дважды подряд")
 
     @staticmethod
-    def _expired(descriptor: RecorderDescriptor, payload: bytes) -> bool:
+    def _expired(descriptor: AccessDescriptor, payload: bytes) -> bool:
         """Сказал ли регистратор, что сессия умерла. Маркер — из описания."""
         if not descriptor.session_expired:
             return False
         return descriptor.session_expired.encode("utf-8") in payload[:MAX_MARKER_BYTES]
 
-    async def _sid(self, descriptor: RecorderDescriptor, fresh: bool = False) -> str:
+    async def _sid(self, descriptor: AccessDescriptor, fresh: bool = False) -> str:
         """Сессия регистратора — ЖИВАЯ ДРАЙВЕРСКАЯ, если она есть.
 
         ⚠ Свой вход остаётся только там, где драйвера нет вовсе (регистратор
@@ -327,14 +357,14 @@ class RecorderCall:
             # `TrassirError` при недоступном регистраторе, `TrassirAuthError`
             # при неверной учётке. До 0.2.49 дверь входила сама и отвечала на это
             # отказом; с провайдером исключение полетело МИМО обработчиков
-            # `ops.recorder_call` и стало неперехваченным 500 — то есть архив и
+            # `ops.gateway_call` и стало неперехваченным 500 — то есть архив и
             # календарь умирали целиком всякий раз, когда регистратор просто
             # медленно отвечает (живой отчёт 2026-09-13). Беда регистратора
             # обязана оставаться вердиктом двери.
             try:
                 sid = await self._sid_provider(fresh)
             except Exception as err:  # noqa: BLE001 — любое падение драйвера
-                raise RecorderUnreachable(_reason(err)) from err
+                raise AccessUnreachable(_reason(err)) from err
             if sid:
                 return str(sid)
         cached = self._sids.get(descriptor.id)
@@ -354,12 +384,12 @@ class RecorderCall:
         if status != 200 or not sid:
             # ⚠ Отказ ВХОДА — беда регистратора (или учётки объекта), а не
             # политики двери: прежние пути упрутся в него точно так же.
-            raise RecorderUnreachable("Регистратор не пустил дом в сессию")
+            raise AccessUnreachable("Регистратор не пустил дом в сессию")
         self._sids[descriptor.id] = (sid, monotonic() + descriptor.session_ttl)
         return sid
 
     async def _plain(
-        self, descriptor: RecorderDescriptor, path: str, params: dict[str, str]
+        self, descriptor: AccessDescriptor, path: str, params: dict[str, str]
     ) -> tuple[int, str, bytes]:
         """Запрос БЕЗ подстановки сессии — им же входим.
 
@@ -377,13 +407,13 @@ class RecorderCall:
             ) as response:
                 return response.status, response.content_type, await response.content.read()
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-            raise RecorderUnreachable(_reason(err)) from err
+            raise AccessUnreachable(_reason(err)) from err
 
     async def stream_url(self, camera: str, quality: str) -> str:
         """Адрес потока по описанию: дом идёт за токеном сам, шаблон — из данных."""
         descriptor = self.descriptor(None)
         if descriptor is None or not descriptor.stream_path:
-            raise RecorderDenied("Регистратор объекта не описан")
+            raise AccessDenied("Доступ к потоку у объекта не описан")
         params = {
             key: value.replace("{camera}", camera).replace("{quality}", quality)
             for key, value in descriptor.stream_params.items()
@@ -391,13 +421,13 @@ class RecorderCall:
         status, _, payload = await self._read_with_session(descriptor, descriptor.stream_path, params)
         token = _field(payload, descriptor.stream_field)
         if status != 200 or not token:
-            raise RecorderUnreachable("Регистратор не выдал поток")
+            raise AccessUnreachable("Регистратор не выдал поток")
         return descriptor.stream_url.format(
             host=descriptor.host, rtspPort=descriptor.rtsp_port, token=token
         )
 
     async def _read_with_session(
-        self, descriptor: RecorderDescriptor, path: str, params: dict[str, str]
+        self, descriptor: AccessDescriptor, path: str, params: dict[str, str]
     ) -> tuple[int, str, bytes]:
         query = dict(params)
         if descriptor.login_path:
@@ -406,7 +436,7 @@ class RecorderCall:
 
     async def _login_credentials(self) -> tuple[str, str]:
         if self._credentials is None:
-            raise RecorderDenied("Учётка регистратора недоступна")
+            raise AccessDenied("Учётка регистратора недоступна")
         return await self._credentials()
 
     async def _client(self) -> aiohttp.ClientSession:
@@ -452,7 +482,7 @@ async def _read_all(response: Any) -> bytes:
     async for кусок in response.content.iter_chunked(64 * 1024):
         всего += len(кусок)
         if всего > MAX_RESPONSE_BYTES:
-            raise RecorderDenied("Ответ регистратора больше потолка двери")
+            raise AccessDenied("Ответ регистратора больше потолка двери")
         куски.append(кусок)
     return b"".join(куски)
 

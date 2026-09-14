@@ -134,6 +134,15 @@ def config(coordinator: MegaHomeCoordinator) -> dict[str, Any]:
     он показывает отсутствием, и повторить историю превью станет нечем.
     Заодно это единственный честный способ спросить дом «а ты это умеешь?» — по
     версии судить нельзя, версия говорит лишь о намерении.
+
+    ⚠ `accesses` — что дом умеет ДОСТАТЬ снаружи: имя доступа, его ВИД и вендор
+    за ним. Без этого бандл вынужден гадать по версии, а версия говорит лишь о
+    намерении (урок 2026-09-14 с дверью превью, объявленной и не
+    зарегистрированной). Здесь ровно то, что приехало конфигом и было ПРИНЯТО:
+    описание с пустым хостом дом молча отбрасывает, и увидеть это иначе нельзя.
+
+    ⚠ Ни адресов, ни портов, ни учёток: тело `config` уходит браузеру жильца
+    как есть. Паспорт отвечает «что есть», а не «как туда ходить».
     """
     from .const import INTEGRATION_VERSION
     from .http import VIEWS
@@ -157,9 +166,26 @@ def config(coordinator: MegaHomeCoordinator) -> dict[str, Any]:
             "version": INTEGRATION_VERSION,
             "appVersion": coordinator.bundle.version if coordinator.bundle else None,
             "routes": sorted(getattr(view, "url", "") for view in VIEWS),
+            "accesses": _accesses(coordinator),
             "go2rtc": media,
         },
     }
+
+
+def _accesses(coordinator: MegaHomeCoordinator) -> list[dict[str, str]]:
+    """Доступы, которые дом ПРИНЯЛ: имя, вид, вендор. Двери нет — пустой список."""
+    door = getattr(coordinator, "accesses", None)
+    if door is None:
+        return []
+    out: list[dict[str, str]] = []
+    for access in door.ids():
+        descriptor = door.descriptor(access)
+        if descriptor is None:
+            continue
+        out.append(
+            {"id": descriptor.id, "kind": descriptor.kind, "vendor": descriptor.vendor}
+        )
+    return out
 
 
 def states(hass: HomeAssistant, coordinator: MegaHomeCoordinator) -> dict[str, Any]:
@@ -427,11 +453,11 @@ def camera_entity(
         # ⚠ У камеры ВИДЕОНАБЛЮДЕНИЯ сущности Home Assistant нет и не будет —
         # это самостоятельная система, её показывает дом сам. Отказ здесь
         # означал бы «камера не настроена» там, где всё настроено.
-        # ⚠ Через `_trassir_guid`, а не по полю на месте: имя поля сменилось
-        # (`trassirGuid` → `videoId`), и ЗДЕСЬ оно осталось старым. Менеджер с
-        # 0.2.56 шлёт новое, поэтому камера видеонаблюдения объясняла себя
-        # чужими словами — «Элемент ещё не отправлен в Home Assistant» вместо
-        # «Это камера видеонаблюдения». Читатель имени в доме должен быть ОДИН.
+        # ⚠ Через `video_id`, а не по полю на месте. Имя поля однажды сменилось
+        # (`trassirGuid` → `videoId`), и ЗДЕСЬ оно осталось старым: камера
+        # видеонаблюдения объясняла себя чужими словами — «Элемент ещё не
+        # отправлен в Home Assistant» вместо «Это камера видеонаблюдения».
+        # Читатель имени в доме должен быть ОДИН.
         if video_id(tile):
             raise OpError("Это камера видеонаблюдения", HTTPStatus.CONFLICT)
         raise OpError(
@@ -655,12 +681,14 @@ def video_id(tile: dict[str, Any] | None) -> str | None:
     старое уйдёт — камера видеонаблюдения станет «недоступной» с надписью «Нет
     данных» поверх работающей картинки. Отсюда правило: имя читает ОДНА функция.
 
-    ⚠ Старое имя читаем ТОЖЕ и ещё какое-то время: менеджер обновляется сам, а
-    дом — нет, и снимать замену вместе с заменяемым здесь нельзя.
+    ⚠ Старое имя (`trassirGuid`) СНЯТО 2026-09-14, вместе со сломом маршрутов:
+    менеджер шлёт нейтральное с 0.2.56, а окно слома совместимости открыто
+    одно, и тащить замену рядом с заменяемым дальше незачем
+    (`docs/plan-video-rework.md`, этап 1).
     """
     if not tile:
         return None
-    guid = tile.get("videoId") or tile.get("trassirGuid")
+    guid = tile.get("videoId")
     return guid if isinstance(guid, str) and guid else None
 
 
@@ -747,68 +775,37 @@ def trassir_events(
     }
 
 
-async def trassir_play(
-    coordinator: MegaHomeCoordinator,
-    event_id: str,
-    remote: bool = False,
-    quality: str | None = None,
-) -> dict[str, Any]:
-    """Открыть запись события и вернуть её id — дальше обычный просмотр.
-
-    ⚠ Возвращает НЕ ссылку на видео: адрес потока наружу не уходит вовсе.
-    Приложение получает id, который отдаёт в `webrtc` ровно так же, как id
-    плитки камеры, — и поэтому снаружи запись работает тем же путём, что живой
-    просмотр, без единой новой трубы.
-
-    ⚠ КАЧЕСТВО выбирает ПРИЛОЖЕНИЕ и присылает его сюда (`quality`). Оно знает
-    свою дверь лучше нас — у него для этого два разных транспорта, —  а правило
-    «дома основной, снаружи суб» это ПОЛИТИКА, а не физика. Политика, лежащая в
-    Python, стоит релиза HACS и перезапуска Home Assistant на каждом объекте
-    (docs/plan-thin-integration.md), поэтому её здесь больше нет.
-
-    ⚠ `remote` остался ТОЛЬКО как умолчание для старых бандлов, которые качества
-    не присылают: без него удалённый жилец получил бы основной архив на мобильном
-    канале. СНЯТЬ вместе со свёрткой событий, когда релизный бандл поднимут, —
-    правило выпуска запрещает убирать замену и заменяемое одним выпуском.
-    """
-    from .trassir_client import TrassirError
-
-    try:
-        return await trassir(coordinator).clips.async_open(
-            event_id, remote=remote, quality=quality
-        )
-    except TrassirError as err:
-        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
-
-
-async def recorder_call(
+async def gateway_call(
     coordinator: MegaHomeCoordinator, payload: dict[str, Any]
 ) -> Any:
-    """Исполнить ОПИСАННЫЙ вызов регистратора — универсальная дверь.
+    """Исполнить ОПИСАННЫЙ вызов — универсальная дверь наружу.
 
     ⚠ Дом не знает ни одного вендора и не разбирает ни одного ответа: он
-    подставляет сессию (и токен открытой записи), выполняет запрос у
-    регистратора из конфига и отдаёт ответ КАК ЕСТЬ
-    (`recorder.py`, docs/plan-thin-integration.md).
+    подставляет сессию (и токен открытой записи), выполняет вызов у доступа из
+    конфига объекта и отдаёт ответ КАК ЕСТЬ
+    (`gateway.py`, docs/plan-thin-integration.md).
+
+    ⚠ Дверь берётся у КООРДИНАТОРА, а не у драйвера видеонаблюдения: она несёт
+    вызовы к любой описанной системе, и объект без регистратора обязан ею
+    пользоваться так же (`docs/plan-video-rework.md`, «Сквозной принцип»).
     """
     import base64 as _base64
     import json as _json
 
-    from .recorder import RecorderDenied, RecorderUnreachable
+    from .gateway import AccessDenied, AccessUnreachable
 
-    gateway = getattr(coordinator, "trassir", None)
-    door = getattr(gateway, "recorders", None)
+    door = getattr(coordinator, "accesses", None)
     if door is None:
-        raise OpError("У объекта нет регистратора", HTTPStatus.NOT_FOUND)
-    # ⚠ Описания ещё не приехали (конфиг дома постарше) — двери ЭТО НЕТ, и это
-    # 404, а не отказ: бандл по 404 переходит на прежние пути, а по отказу
-    # решил бы, что ему нельзя, и перемотка у жильца упала бы с ошибкой
-    # (живой отчёт 2026-09-12).
-    if door.descriptor(payload.get("recorder")) is None:
-        raise OpError("У объекта нет такого регистратора", HTTPStatus.NOT_FOUND)
+        raise OpError("У объекта нет ни одного доступа", HTTPStatus.NOT_FOUND)
+    # ⚠ Описания ещё не приехали (конфиг дома постарше) — доступа ЭТОГО НЕТ, и
+    # это 404, а не отказ: по отказу бандл решил бы, что ему нельзя, и вызов у
+    # жильца упал бы с ошибкой (живой отчёт 2026-09-12).
+    if door.descriptor(payload.get("access")) is None:
+        raise OpError("У объекта нет такого доступа", HTTPStatus.NOT_FOUND)
 
     session: dict[str, str] = {}
     clip_id = payload.get("clip")
+    gateway = getattr(coordinator, "trassir", None)
     if clip_id and gateway is not None:
         token = gateway.clips.token_of(str(clip_id))
         if token:
@@ -826,21 +823,21 @@ async def recorder_call(
         raw = None
     try:
         status, content_type, answer = await door.call(
-            payload.get("recorder"),
+            payload.get("access"),
             str(payload.get("method") or "GET"),
             str(payload.get("path") or ""),
             payload.get("params"),
             raw,
             session,
         )
-    except RecorderUnreachable as err:
-        # ⚠ 502, а НЕ 403. Разница не косметическая: по отказу политики бандл
-        # уходит на прежние именованные пути, а по недоступности регистратора
-        # идти туда некуда — там тот же регистратор, только другой дорогой.
-        # Пока обе беды приезжали одним кодом, жилец читал «Дом не смог
-        # выполнить запрос» и поломку шли искать в доме (ревизия 2026-09-13).
+    except AccessUnreachable as err:
+        # ⚠ 502, а НЕ 403. Разница не косметическая: отказ политики — это наша
+        # ошибка в описании вызова, а недоступность той системы — беда объекта,
+        # и жилец обязан прочитать её словами. Пока обе беды приезжали одним
+        # кодом, жилец читал «Дом не смог выполнить запрос» и поломку шли
+        # искать в доме (ревизия 2026-09-13).
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
-    except RecorderDenied as err:
+    except AccessDenied as err:
         raise OpError(str(err), HTTPStatus.FORBIDDEN) from err
     if "json" in (content_type or "") and not payload.get("binary"):
         return _json.loads(answer.decode("utf-8", "ignore"))
@@ -884,57 +881,6 @@ async def trassir_clip_at(
             quality=quality,
             window_start_us=window_start_us,
             window_stop_us=window_stop_us,
-        )
-    except TrassirError as err:
-        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
-
-
-async def trassir_seek(
-    coordinator: MegaHomeCoordinator,
-    clip_id: str,
-    position_us: int | None,
-    quality: str | None = None,
-    direction: int = 0,
-) -> dict[str, Any]:
-    """Перемотка: при неизменном качестве — официальный `command=seek` по
-    живому токену, ответ несёт ТОТ ЖЕ id (кадр продолжается без переоткрытия);
-    при смене качества — переоткрытие: поток регистратора привязан к качеству.
-
-    ⚠ `play` остаётся одним на соединение (факт стенда), seek — отдельная
-    документированная команда (`trassir_clip.async_seek`, §13.7 плана).
-
-    ⚠ `direction` присылает приложение: им прыгают на другой ДЕНЬ. «9 сентября»
-    — это полночь, а запись в тот день началась в 01:18, и «ближайший кадр в
-    любую сторону» (0) уехал бы в конец 8-го.
-    """
-    from .trassir_client import TrassirError
-
-    try:
-        return await trassir(coordinator).clips.async_seek(
-            clip_id, position_us, quality, direction
-        )
-    except TrassirError as err:
-        raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
-
-
-async def trassir_session_command(
-    coordinator: MegaHomeCoordinator,
-    clip_id: str,
-    fn: str | None,
-    params: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Команда живой сессии из разрешённого словаря — канал новых функций.
-
-    ⚠ Не произвольный прокси: драйвер держит границы (`SESSION_COMMANDS` в
-    `trassir_clip.py`) — выдача токена и пинг не отдаются бандлу, с ними
-    связаны сторож и уборка. Новая медиа-функция бандла едет этим каналом
-    БЕЗ релиза интеграции (`docs/plan-thin-integration.md`).
-    """
-    from .trassir_client import TrassirError
-
-    try:
-        return await trassir(coordinator).clips.async_session_command(
-            clip_id, fn, params
         )
     except TrassirError as err:
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err

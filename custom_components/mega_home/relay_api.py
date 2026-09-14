@@ -127,47 +127,32 @@ async def _dispatch(
             # Кадр живой: закешированный постер показывал бы вчерашний двор.
             "no-store",
         )
-    if path == "api/trassir/cameras" and method == "GET":
+    if path == "api/video/cameras" and method == "GET":
         return _json(await ops.trassir_cameras(hass, coordinator))
-    if path == "api/trassir/events" and method == "GET":
+    if path == "api/video/events" and method == "GET":
         # ⚠ Именно здесь query и понадобился впервые: без него жилец СНАРУЖИ
         # получал бы всю ленту вместо одной камеры — то есть другое поведение
         # той же кнопки. Разница «дома/снаружи» обязана оставаться только в
         # адресе базы.
         return _json(ops.trassir_events(coordinator, query))
-    if path.startswith("api/trassir/events/") and path.endswith("/play") and method == "POST":
-        event = unquote(path[len("api/trassir/events/") : -len("/play")])
-        # ⚠ `remote=True`: жилец пришёл переносом, значит канал у него
-        # мобильный — архив отдаём субпотоком (§5а плана).
-        # ⚠ Качество присылает приложение; не прислало — умолчание по двери, а
-        # перенос это всегда «снаружи» (мобильный канал → субархив).
-        played = _json_body(body)
-        return _json(
-            await ops.trassir_play(
-                coordinator,
-                event,
-                remote=True,
-                quality=played.get("quality") if isinstance(played, dict) else None,
-            )
-        )
-    if path == "api/recorder/call" and method == "POST":
+    if path == "api/gateway/call" and method == "POST":
         # ⚠ Универсальная дверь — ОБЕИМИ дверями приложения, как и всё
         # остальное: снаружи новая функция архива обязана работать так же, как
         # дома. Границы двери (адресат из конфига, запрет входа и настроек,
-        # потолок ответа) — в `recorder.py`, они одни на оба транспорта.
+        # потолок ответа) — в `gateway.py`, они одни на оба транспорта.
         payload = _json_body(body)
         if not isinstance(payload, dict):
             raise ops.OpError("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
-        return _json(await ops.recorder_call(coordinator, payload))
-    if path.startswith("api/trassir/channels/") and path.endswith("/preview") and method == "GET":
+        return _json(await ops.gateway_call(coordinator, payload))
+    if path.startswith("api/video/channels/") and path.endswith("/preview") and method == "GET":
         # Превью под пальцем — снаружи тем же одним запросом, что и дома.
-        channel = unquote(path[len("api/trassir/channels/") : -len("/preview")])
+        channel = unquote(path[len("api/video/channels/") : -len("/preview")])
         kind, frame = await ops.trassir_preview(coordinator, channel, query.get("at"))
         return {"status": 200, "contentType": kind, "body": frame}
-    if path.startswith("api/trassir/channels/") and path.endswith("/clip") and method == "POST":
+    if path.startswith("api/video/channels/") and path.endswith("/clip") and method == "POST":
         # Открытие архива канала по метке — та же дверь, что и всё остальное:
         # снаружи «что было вчера в 21:40» обязано работать так же, как дома.
-        channel = unquote(path[len("api/trassir/channels/") : -len("/clip")])
+        channel = unquote(path[len("api/video/channels/") : -len("/clip")])
         body_json = _json_body(body)
         if not isinstance(body_json, dict):
             raise ops.OpError("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
@@ -182,26 +167,10 @@ async def _dispatch(
                 window_stop_us=body_json.get("windowStopUs"),
             )
         )
-    if path.startswith("api/trassir/clips/") and path.endswith("/seek") and method == "POST":
-        # Перемотка переоткрытием — та же дверь, что и открытие: снаружи
-        # запись идёт тем же путём, что живой просмотр, без единой новой трубы.
-        clip = unquote(path[len("api/trassir/clips/") : -len("/seek")])
-        body_json = _json_body(body)
-        if not isinstance(body_json, dict):
-            raise ops.OpError("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
-        return _json(
-            await ops.trassir_seek(
-                coordinator,
-                clip,
-                body_json.get("positionUs"),
-                body_json.get("quality"),
-                body_json.get("direction"),
-            )
-        )
-    if path.startswith("api/trassir/clips/") and path.endswith("/ready") and method == "POST":
+    if path.startswith("api/video/clips/") and path.endswith("/ready") and method == "POST":
         # Готовность телефона — команда старта архива. Той же дверью, что
         # открытие: это команда дому, а не данные для конфига.
-        clip = unquote(path[len("api/trassir/clips/") : -len("/ready")])
+        clip = unquote(path[len("api/video/clips/") : -len("/ready")])
         ready_body = _json_body(body)
         if not isinstance(ready_body, dict):
             ready_body = {}
@@ -214,24 +183,8 @@ async def _dispatch(
                 ready_body.get("windowStopUs"),
             )
         )
-    if path.startswith("api/trassir/clips/") and path.endswith("/command") and method == "POST":
-        # ⚠ Инструмент живой сессии обязан доезжать ОБЕИМИ дверями. Иначе
-        # «дома» и «снаружи» перестают отличаться только адресом базы:
-        # приложение снаружи не узнало бы, что регистратор ищет метку, — и
-        # строка состояния архива работала бы лишь в домашней сети. Словарь
-        # команд остаётся разрешённым (`ops.trassir_session_command`), это не
-        # произвольный прокси на регистратор.
-        clip = unquote(path[len("api/trassir/clips/") : -len("/command")])
-        body_json = _json_body(body)
-        if not isinstance(body_json, dict):
-            raise ops.OpError("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
-        return _json(
-            await ops.trassir_session_command(
-                coordinator, clip, body_json.get("fn"), body_json.get("params")
-            )
-        )
-    if path.startswith("api/trassir/events/") and path.endswith("/thumb") and method == "GET":
-        event = unquote(path[len("api/trassir/events/") : -len("/thumb")])
+    if path.startswith("api/video/events/") and path.endswith("/thumb") and method == "GET":
+        event = unquote(path[len("api/video/events/") : -len("/thumb")])
         content_type, raw = await ops.trassir_thumb(
             coordinator, event, ops.lead_of(query.get("lead"))
         )

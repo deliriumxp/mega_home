@@ -241,25 +241,42 @@ def test_фон_снятой_из_состава_комнаты_читается
     assert err.value.status == HTTPStatus.NOT_FOUND
 
 
-def test_состояние_архива_доезжает_и_снаружи(coordinator, monkeypatch):
-    """⚠ Строка «поиск в архиве…» обязана работать ОБЕИМИ дверями.
+def test_универсальная_дверь_доезжает_и_снаружи(coordinator, monkeypatch):
+    """⚠ Дверь обязана работать ОБЕИМИ дверями приложения.
 
-    Состояние архива спрашивают инструментом живой сессии (`/command`), а он
-    до этой правки был открыт только дома: снаружи приложение получало бы 404 и
-    молча показывало иглу, бегущую впереди картинки. Разница «дома/снаружи»
-    обязана оставаться только в адресе базы.
+    Дорога к регистратору теперь ОДНА: именованные маршруты перемотки,
+    состояния и словаря команд сняты (`docs/plan-video-rework.md`, этап 1).
+    Значит всё, что жилец делает с архивом, снаружи идёт этим переносом — и
+    если он отвалится, дома всё работает, а снаружи не работает НИЧЕГО: ни
+    перемотка, ни календарь, ни разметка суток, ни строка «поиск в архиве…».
+    Разница «дома/снаружи» обязана оставаться только в адресе базы.
     """
-    asked: list[tuple] = []
+    asked: list[dict] = []
 
-    async def session_command(coordinator, clip, fn, params):
-        asked.append((clip, fn, params))
+    async def gateway_call(coordinator, payload):
+        asked.append(payload)
         return [{"token": "tok1", "state": "4", "time": "2026-09-12 11:56:58"}]
 
-    monkeypatch.setattr(ops, "trassir_session_command", session_command)
-    payload = json.dumps({"fn": "archive_status", "params": {"type": "state"}}).encode()
-    answer = call(coordinator, "POST", "api/trassir/clips/trassir:tok1/command", payload)
+    monkeypatch.setattr(ops, "gateway_call", gateway_call)
+    payload = json.dumps(
+        {
+            "method": "GET",
+            "path": "/archive_status",
+            "params": {"type": "state"},
+            "clip": "trassir:tok1",
+        }
+    ).encode()
+    answer = call(coordinator, "POST", "api/gateway/call", payload)
 
-    assert asked == [("trassir:tok1", "archive_status", {"type": "state"})]
+    # ⚠ Вызов уходит дому КАК СОСТАВЛЕН: перенос не толкует ни путь, ни params.
+    assert asked == [
+        {
+            "method": "GET",
+            "path": "/archive_status",
+            "params": {"type": "state"},
+            "clip": "trassir:tok1",
+        }
+    ]
     assert json_of(answer)[0]["state"] == "4"
 
 
@@ -290,7 +307,7 @@ def test_архив_по_метке_доезжает_снаружи(coordinator,
             "windowStopUs": 1788986400000000,
         }
     ).encode()
-    clip = json_of(call(coordinator, "POST", "api/trassir/channels/cam1/clip", body))
+    clip = json_of(call(coordinator, "POST", "api/video/channels/cam1/clip", body))
 
     assert opened == [
         ("cam1", 1788960000000000, None, "sub", 1788900000000000, 1788986400000000)
