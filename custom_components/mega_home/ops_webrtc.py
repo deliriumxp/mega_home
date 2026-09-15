@@ -45,7 +45,7 @@ async def webrtc_offer(
     # ⚠ Запись события идёт ТОЙ ЖЕ операцией, что и живая камера, и это не
     # экономия строк: своя операция под архив означала бы второй сеанс со своими
     # сроками, своим закрытием и своей диагностикой — то есть вторую трубу
-    # (docs/trassir-integration-plan.md, §5а у менеджера). Отличается только
+    # (docs/trassir-integration-plan.md §3 у менеджера). Отличается только
     # источник, и решает это приставка id.
     tile = payload.get("id")
     if isinstance(tile, str) and tile.startswith(CLIP_PREFIX):

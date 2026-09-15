@@ -35,7 +35,7 @@ def trassir(coordinator: MegaHomeCoordinator) -> Any:
 # ⚠ Обработчики ПУТЕЙ, а не именованные операции канала: их зовут обе двери —
 # локальная (`http.py`) и перенос запроса снаружи (`relay_api.py`). Ровно ради
 # этого перенос и заведён, и заводить под видеонаблюдение свою операцию значило
-# бы строить вторую трубу (docs/trassir-integration-plan.md, §5а у менеджера).
+# бы строить вторую трубу (docs/trassir-integration-plan.md §3 у менеджера).
 
 
 def video_id(tile: dict[str, Any] | None) -> str | None:

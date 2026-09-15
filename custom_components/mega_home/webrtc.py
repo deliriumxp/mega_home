@@ -374,7 +374,7 @@ async def negotiate_source(
     поток go2rtc, только источник у него эфемерный (`rtsp://…/<token>`), а не
     камера Home Assistant. Второй способ показывать видео мы не заводим —
     ровно поэтому здесь нет ни слова про то, чей это источник
-    (docs/trassir-integration-plan.md, §5а у менеджера).
+    (docs/trassir-integration-plan.md §3 у менеджера).
 
     ⚠ `skip_list` — имя потока заведомо НОВОЕ (эфемерный токен клипа или
     запасной live-путь): `GET /api/streams` на критическом пути тогда ничего не

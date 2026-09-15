@@ -447,7 +447,7 @@ made from outside is the SAME request, and a query string is part of one.
 
 ⚠ **Watching the recording adds no route here.** The clip opens through the same
 WebRTC path as a live camera, with the archive entering go2rtc as an ephemeral
-stream — see §5а of the plan in the manager repository. A second way to show
+stream — see §3 плана Trassir of the plan in the manager repository. A second way to show
 video would be a second set of timeouts, posters and diagnostics.
 
 
