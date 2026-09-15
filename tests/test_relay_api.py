@@ -20,6 +20,7 @@ import pytest
 from homeassistant.core import State
 
 from mega_home import ops
+from mega_home.crops import CropStore
 from mega_home.photos import PhotoStore
 
 JPEG = b"\xff\xd8\xff\xe0" + b"0" * 32
@@ -38,7 +39,14 @@ CONFIG = {
             "entityId": "light.kitchen",
             "dimmable": True,
             "commands": {"turn_on": {"domain": "light", "service": "turn_on"}},
-        }
+        },
+        {
+            "id": "crop-cam",
+            "roomId": "r1",
+            "name": "Камера входа",
+            "domain": "camera",
+            "entityId": None,
+        },
     ],
     "scenarios": [],
     "assets": {"photo/tile/t1": {"v": "a1", "type": "image/jpeg"}},
@@ -86,9 +94,10 @@ class _Coordinator:
     def __init__(self, tmp: Path) -> None:
         self.data = CONFIG
         self.photos = PhotoStore(tmp / "own")
+        self.crops = CropStore(tmp / "crops")
         self.assets = _Assets(tmp / "assets")
         self.icons_dir = tmp / "icons"
-        for directory in ("own", "assets", "icons"):
+        for directory in ("own", "crops", "assets", "icons"):
             (tmp / directory).mkdir(parents=True, exist_ok=True)
 
 
@@ -144,6 +153,35 @@ def test_фото_комнаты_снаружи_ложится_в_дом_и_по
 def test_фон_плитки_снаружи_тоже_ложится_в_дом(coordinator):
     call(coordinator, "POST", "api/photo/tile:t1", JPEG)
     assert "tile:t1" in json_of(call(coordinator, "GET", "api/photos"))["photos"]
+
+
+# Кадр камеры, подправленный СНАРУЖИ, — та же дисциплина, что у фото: ложится в
+# дом, а не остаётся у менеджера или в браузере телефона (2026-09-15).
+def test_кадр_камеры_снаружи_тоже_ложится_в_дом(coordinator):
+    crop = {"x": 0.5, "y": 0.4, "w": 0.3}
+    posted = call(coordinator, "POST", "api/crop/crop-cam", json.dumps(crop).encode())
+    assert json_of(posted) == {"accepted": True, "crop": crop}
+
+    listed = json_of(call(coordinator, "GET", "api/crops"))["crops"]
+    assert listed == {"crop-cam": crop}
+
+    assert json_of(call(coordinator, "DELETE", "api/crop/crop-cam"))["accepted"] is True
+    assert json_of(call(coordinator, "GET", "api/crops"))["crops"] == {}
+
+
+def test_чужая_плитка_и_не_камера_и_кривое_тело_отвергаются(coordinator):
+    crop = {"x": 0.5, "y": 0.4, "w": 0.3}
+    with pytest.raises(ops.OpError) as err:
+        call(coordinator, "POST", "api/crop/неизвестная", json.dumps(crop).encode())
+    assert err.value.status == HTTPStatus.NOT_FOUND
+
+    with pytest.raises(ops.OpError) as err:
+        call(coordinator, "POST", "api/crop/t1", json.dumps(crop).encode())  # свет, не камера
+    assert err.value.status == HTTPStatus.NOT_FOUND
+
+    with pytest.raises(ops.OpError) as err:
+        call(coordinator, "POST", "api/crop/crop-cam", json.dumps({"x": 2, "y": 0, "w": 0}).encode())
+    assert err.value.status == HTTPStatus.BAD_REQUEST
 
 
 # Границы переноса. ⚠ Они те же, что у локальной двери: ключ обязан быть в

@@ -34,6 +34,7 @@ from .const import (
 from . import ops
 from .api import ManagerError
 from .coordinator import MegaHomeCoordinator
+from .crops import crop_key_known, crop_keys, crop_value_valid, MAX_CROP_BYTES
 from .events import StateStream
 from .photos import (
     JPEG_MAGIC,
@@ -314,6 +315,85 @@ class MegaHomePhotoView(_MegaHomeView):
         removed = await hass.async_add_executor_job(coordinator.photos.delete, room)
         if not removed:
             return self.json_message("Фото не найдено", HTTPStatus.NOT_FOUND)
+        return self.json({"accepted": True})
+
+
+class MegaHomeCropsView(_MegaHomeView):
+    """What camera tiles have their OWN crop, and what it is.
+
+    ⚠ Тот же приём, что `MegaHomePhotosView`: приложение спрашивает «что вообще
+    подправлено» одним запросом на открытие и мешает ответ поверх кадра из
+    конфига (`tiles[].crop`) — сам дом это смешение не делает и делать не
+    должен (`docs/local-ha-app.md`): интеграция остаётся тонкой, толкование
+    живёт в бандле, как и у остального состояния.
+    """
+
+    url = f"{URL_API}/crops"
+    name = "api:mega_home:crops"
+
+    async def get(self, request: web.Request) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        hass: HomeAssistant = request.app["hass"]
+        crops = await hass.async_add_executor_job(
+            coordinator.crops.all, crop_keys(coordinator.data)
+        )
+        return self.json({"crops": crops})
+
+
+class MegaHomeCropView(_MegaHomeView):
+    """Один участок кадра камеры, который подправил жилец: записать, снять.
+
+    ⚠ Писать можно только КАМЕРУ из ТЕКУЩЕГО состава — та же дисциплина, что у
+    `MegaHomePhotoView`, и по той же причине: без неё любой в локальной сети
+    забил бы диск объекта файлами (аутентификации у HTTP-контура пока нет, см.
+    docstring модуля). Кадр из менеджера при этом остаётся ЗАГОТОВКОЙ: снял
+    жилец свою правку — вернулся он, а не пустой центр кадра (`tile-crops.ts`
+    в менеджере ведёт то же самое правило для фона плитки).
+    """
+
+    url = f"{URL_API}/crop/{{tile}}"
+    name = "api:mega_home:crop"
+
+    async def post(self, request: web.Request, tile: str) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        if not crop_key_known(coordinator.data, tile):
+            return self.json_message("Камера не найдена", HTTPStatus.NOT_FOUND)
+        if (request.content_length or 0) > MAX_CROP_BYTES:
+            return self.json_message(
+                "Запрос слишком большой", HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+            )
+        try:
+            payload = await request.json()
+        except ValueError:
+            return self.json_message("Некорректный запрос", HTTPStatus.BAD_REQUEST)
+        if not crop_value_valid(payload):
+            return self.json_message("Некорректный участок кадра", HTTPStatus.BAD_REQUEST)
+
+        hass: HomeAssistant = request.app["hass"]
+        try:
+            await hass.async_add_executor_job(coordinator.crops.save, tile, payload)
+        except OSError as err:
+            LOGGER.warning("Could not store the crop of tile %s: %s", tile, err)
+            return self.json_message(
+                "Дом не смог сохранить кадр", HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+        return self.json({"accepted": True, "crop": payload})
+
+    async def delete(self, request: web.Request, tile: str) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        hass: HomeAssistant = request.app["hass"]
+        removed = await hass.async_add_executor_job(coordinator.crops.delete, tile)
+        if not removed:
+            return self.json_message("Кадр не найден", HTTPStatus.NOT_FOUND)
         return self.json({"accepted": True})
 
 
@@ -876,6 +956,8 @@ VIEWS: tuple[type[HomeAssistantView], ...] = (
     MegaHomeScenarioView,
     MegaHomePhotosView,
     MegaHomePhotoView,
+    MegaHomeCropsView,
+    MegaHomeCropView,
     MegaHomeAssetView,
     MegaHomeCameraFrameView,
     MegaHomeVideoCamerasView,

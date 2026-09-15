@@ -181,3 +181,24 @@ def test_писать_можно_только_то_что_есть_в_соста
     # Приставка без идентификатора — тоже не ключ.
     assert not _photo_key_known(PHOTO_CONFIG, "tile:")
 
+
+# Тот же контракт, что у ключей фона выше, но для кадра камеры (2026-09-15):
+# писать можно только КАМЕРУ текущего состава, а не любую плитку.
+
+from mega_home.crops import crop_key_known as _crop_key_known, crop_keys as _crop_keys
+
+CROP_CONFIG = {
+    "tiles": [
+        {"id": "camera.entrance", "domain": "camera"},
+        {"id": "light.kitchen_main", "domain": "light"},
+    ]
+}
+
+
+def test_кадр_можно_завести_только_у_камеры() -> None:
+    assert _crop_keys(CROP_CONFIG) == ["camera.entrance"]
+    assert _crop_key_known(CROP_CONFIG, "camera.entrance")
+    # Не камера, чужой id и id без записи в составе — не ключ.
+    assert not _crop_key_known(CROP_CONFIG, "light.kitchen_main")
+    assert not _crop_key_known(CROP_CONFIG, "camera.unknown")
+

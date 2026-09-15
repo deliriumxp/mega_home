@@ -34,6 +34,7 @@ from homeassistant.core import HomeAssistant
 
 from . import ops
 from .coordinator import MegaHomeCoordinator
+from .crops import crop_key_known, crop_keys, crop_value_valid
 from .photos import (
     JPEG_MAGIC,
     MAX_PHOTO_BYTES,
@@ -107,6 +108,13 @@ async def _dispatch(
         return _json({"photos": versions})
     if path.startswith("api/photo/"):
         return await _photo(hass, coordinator, method, unquote(path[len("api/photo/") :]), body)
+    if path == "api/crops" and method == "GET":
+        crops = await hass.async_add_executor_job(
+            coordinator.crops.all, crop_keys(coordinator.data)
+        )
+        return _json({"crops": crops})
+    if path.startswith("api/crop/"):
+        return await _crop(hass, coordinator, method, unquote(path[len("api/crop/") :]), body)
     if path.startswith("api/camera-frame/") and method == "GET":
         # Постер камеры: один кадр на открытие просмотра. ⚠ Не поток — кадр на
         # ПЛИТКЕ обновляется по таймеру, и снаружи его нет вовсе
@@ -232,6 +240,34 @@ async def _photo(
         removed = await hass.async_add_executor_job(coordinator.photos.delete, key)
         if not removed:
             raise ops.OpError("Фото не найдено", HTTPStatus.NOT_FOUND)
+        return _json({"accepted": True})
+    raise ops.OpError("Дом не знает такого запроса", HTTPStatus.METHOD_NOT_ALLOWED)
+
+
+async def _crop(
+    hass: HomeAssistant,
+    coordinator: MegaHomeCoordinator,
+    method: str,
+    tile: str,
+    body: bytes,
+) -> tuple[int, str, bytes, str]:
+    """Участок кадра камеры, подправленный САМИМ ЖИЛЬЦОМ: записать, снять.
+
+    ⚠ Проверки те же, что у локального маршрута (`http.py`), той же дисциплиной,
+    что и у `_photo`: ключ сверяется с составом только на ЗАПИСИ.
+    """
+    if method == "POST":
+        if not crop_key_known(coordinator.data, tile):
+            raise ops.OpError("Камера не найдена", HTTPStatus.NOT_FOUND)
+        payload = _json_body(body)
+        if not crop_value_valid(payload):
+            raise ops.OpError("Некорректный участок кадра", HTTPStatus.BAD_REQUEST)
+        await hass.async_add_executor_job(coordinator.crops.save, tile, payload)
+        return _json({"accepted": True, "crop": payload})
+    if method == "DELETE":
+        removed = await hass.async_add_executor_job(coordinator.crops.delete, tile)
+        if not removed:
+            raise ops.OpError("Кадр не найден", HTTPStatus.NOT_FOUND)
         return _json({"accepted": True})
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.METHOD_NOT_ALLOWED)
 

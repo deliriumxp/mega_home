@@ -18,6 +18,7 @@ from .bundle import BundleStore
 from .const import (
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
+    CROP_DIR,
     ICON_DIR,
     ICON_SIZE,
     LOGGER,
@@ -29,6 +30,7 @@ from .const import (
     STORAGE_VERSION,
 )
 from .assets import AssetStore
+from .crops import CropStore
 from .photos import PhotoStore
 
 type MegaHomeConfigEntry = ConfigEntry["MegaHomeCoordinator"]
@@ -103,6 +105,9 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # they are not synchronised from the manager — the home is where they
         # are created and the only place that holds them.
         self.photos = PhotoStore(Path(hass.config.path(STORAGE_DIR, PHOTO_DIR)))
+        # Кадр камеры, который жилец подправил сам — своя копия установочного
+        # значения из конфига, той же природы, что и фото выше.
+        self.crops = CropStore(Path(hass.config.path(STORAGE_DIR, CROP_DIR)))
         # ОБЩИЙ канал файлов: что именно в нём лежит, дом не знает и знать не
         # должен — см. `assets.py`.
         self.assets = AssetStore(Path(hass.config.path(STORAGE_DIR, ASSET_DIR)))

@@ -24,7 +24,7 @@ LOGGER = logging.getLogger(__package__)
 #
 # ⚠ Держится в паре с `manifest.json`, их сверяет `tests/test_version.py`:
 # поднимать ОБА, одним релизом.
-INTEGRATION_VERSION = "0.2.66"
+INTEGRATION_VERSION = "0.2.67"
 
 CONF_MANAGER_URL = "manager_url"
 CONF_TOKEN = "token"
@@ -69,6 +69,9 @@ ICON_SIZE = "300"
 # Room background photos the resident uploads from the app. They belong to the
 # home, not to a device, so they live next to the rest of our cache.
 PHOTO_DIR = "mega_home_photos"
+# Camera tile crops the resident nudges from the app (`crops.py`) — same
+# reasoning as PHOTO_DIR: the adjustment belongs to the home, not a device.
+CROP_DIR = "mega_home_crops"
 # Фоны-ЗАГОТОВКИ, которые инсталлятор загрузил в менеджере. Они приезжают сюда
 # файлами, как иконки сценариев: приложение раздаёт эта интеграция, а дороги от
 # телефона жильца до менеджера может не быть вовсе (объект без интернета,
