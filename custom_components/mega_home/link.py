@@ -64,6 +64,9 @@ class ManagerLink:
         # Открытые сессии инженера к устройствам объекта (`stream.py`). Живут
         # внутри одного подключения к менеджеру и умирают вместе с ним.
         self._streams: Any = None
+        # Живые состояния для жильца снаружи (`watch.py`) — тоже внутри одного
+        # подключения: оборвался канал, менеджер попросит заново.
+        self._watch: Any = None
 
     @property
     def connected(self) -> bool:
@@ -142,6 +145,9 @@ class ManagerLink:
                 if self._streams is not None:
                     await self._streams.close_all()
                     self._streams = None
+                if self._watch is not None:
+                    self._watch.stop()
+                    self._watch = None
             await asyncio.sleep(delay)
             delay = min(delay * 2, MAX_RETRY)
 
@@ -192,6 +198,34 @@ class ManagerLink:
             await socket.send_json(reply)
         except Exception as err:  # noqa: BLE001 - the link reconnects on its own
             LOGGER.debug("Could not send the answer: %s", err)
+
+    async def _watch_op(self, socket: Any, frame: dict[str, Any]) -> None:
+        """Включить или выключить живые состояния для менеджера (`watch.py`).
+
+        ⚠ Отвечает ОБЫЧНЫМ ответом, и в этом смысл операции: дом со старым кодом
+        ответит «Неизвестная операция», и менеджер оставит жильцу опрос — по
+        ФАКТУ ответа, а не по номеру версии (тот же принцип, что у переноса
+        запросов, `docs/remote-access.md` в репозитории менеджера).
+        """
+        request_id = frame.get("id")
+        if socket is None or not isinstance(request_id, str):
+            return
+        on = bool((frame.get("payload") or {}).get("on"))
+        if on:
+            from .watch import LinkWatch
+
+            if self._watch is None:
+                self._watch = LinkWatch(self._hass, self._coordinator, socket)
+            self._watch.start()
+        elif self._watch is not None:
+            self._watch.stop()
+            self._watch = None
+        try:
+            await socket.send_json(
+                {"t": "res", "id": request_id, "ok": True, "payload": {"on": on}}
+            )
+        except Exception as err:  # noqa: BLE001 - канал переподключится сам
+            LOGGER.debug("Could not answer the watch request: %s", err)
 
     async def _sync_bundle(self, version: Any, socket: Any) -> None:
         """Скачать новый интерфейс и СРАЗУ доложить, чем дом теперь раздаётся.
@@ -249,6 +283,11 @@ class ManagerLink:
         if isinstance(kind, str) and kind.startswith("stream."):
             if self._streams is not None:
                 await self._streams.handle(payload)
+            return
+        if kind == "req" and payload.get("op") == "watch":
+            # Подписка — сеанс КАНАЛА, а не чтение ресурса: ей нужен сокет, а
+            # `ops.run` про сокеты не знает и знать не должен (`watch.py`).
+            await self._watch_op(socket, payload)
             return
         if kind == "req":
             # ⚠ ОТДЕЛЬНОЙ задачей, а не по месту. Этот метод зовётся из цикла
