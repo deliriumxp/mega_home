@@ -81,6 +81,9 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Сторож объекта (`agent.py`), если он заведён. Координатор им не
         # владеет — он только зовёт синхронизацию правил в своём цикле.
         self.agent: Any = None
+        # SIP-мост домофонии (`sip_bridge.py`). Включается конфигом объекта;
+        # координатор только отдаёт ему свежий конфиг.
+        self.sip_bridge: Any = None
         # Бандл интерфейса: качается с менеджера и раздаётся из кэша, поэтому
         # новая версия приложения не требует ни HACS, ни перезапуска.
         #
@@ -190,6 +193,7 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # release, and nothing anywhere said so.
                 await self._async_sync_bundle()
                 await self._async_apply_trassir(self.data)
+                self._apply_sip_bridge(self.data)
                 await self._async_sync_agent()
                 self._on_success()
                 return self.data
@@ -215,6 +219,7 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._async_sync_assets(config)
         await self._async_sync_bundle()
         await self._async_apply_trassir(config)
+        self._apply_sip_bridge(config)
         await self._async_sync_agent()
         self._on_success()
         LOGGER.info("Home config updated to %s", config.get("version"))
@@ -270,6 +275,20 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self.trassir.async_apply(config)
         except Exception as err:  # noqa: BLE001 — видеонаблюдение не роняет синхронизацию
             LOGGER.warning("Настройки Trassir не применились: %s", err)
+
+    def _apply_sip_bridge(self, config: dict[str, Any] | None) -> None:
+        """Включить или снять SIP-мост по конфигу объекта.
+
+        ⚠ Из ОБЕИХ ветвей опроса — тот же урок, что у бандла и сторожа: на
+        ветке «версия не изменилась» мост, упавший между опросами, иначе не
+        поднимался бы до смены конфига. Сам вызов не ждёт установки пакетов.
+        """
+        if not self.sip_bridge or not config:
+            return
+        try:
+            self.sip_bridge.apply(config)
+        except Exception as err:  # noqa: BLE001 — мост не роняет синхронизацию
+            LOGGER.warning("SIP-мост: конфиг не применился: %s", err)
 
     def _on_success(self) -> None:
         self.last_error = None

@@ -34,6 +34,7 @@ from .trassir import TrassirGateway
 from .http import async_register_http
 from .agent import AgentRunner
 from .link import ManagerLink
+from .sip_bridge import SipBridge
 
 PLATFORMS: list[Platform] = []
 
@@ -138,6 +139,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     entry.async_on_unload(lambda: hass.async_create_task(gateway.async_stop()))
     if coordinator.data:
         await gateway.async_apply(coordinator.data)
+
+    # SIP-мост домофонии (`sip_bridge.py`): поднимается только конфигом объекта,
+    # и сразу получает уже загруженный — как видеонаблюдение строкой выше.
+    # ⚠ Остановка — и на выгрузке записи, и на остановке HA: осиротевший
+    # Asterisk держит 5060 (правило своего go2rtc).
+    sip_bridge = SipBridge(hass)
+    coordinator.sip_bridge = sip_bridge
+    entry.async_on_unload(
+        hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STOP, lambda _event: hass.async_create_task(sip_bridge.async_stop())
+        )
+    )
+    entry.async_on_unload(lambda: hass.async_create_task(sip_bridge.async_stop()))
+    if coordinator.data:
+        sip_bridge.apply(coordinator.data)
 
     # Живой канал к менеджеру: правка состава доезжает за секунды вместо интервала
     # опроса. Опрос при этом остаётся страховкой — канал может не подняться вовсе

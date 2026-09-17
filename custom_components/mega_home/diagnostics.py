@@ -71,6 +71,11 @@ async def async_get_config_entry_diagnostics(
         # уезжала в журнал Home Assistant уровнем debug — то есть инсталлятору
         # оставалось слово «не поднят» без продолжения (живой отчёт 2026-09-13).
         "go2rtc": _go2rtc_state(),
+        # SIP-мост домофонии: включён ли конфигом, поднят ли, почему нет, сколько
+        # шла установка пакетов (повторяется после каждого обновления образа HA).
+        "sip_bridge": (
+            coordinator.sip_bridge.state() if coordinator.sip_bridge else None
+        ),
         "home": {
             "name": config.get("home", {}).get("name"),
             "floors": len(config.get("floors", [])),
