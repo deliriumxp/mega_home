@@ -24,7 +24,7 @@ LOGGER = logging.getLogger(__package__)
 #
 # ⚠ Держится в паре с `manifest.json`, их сверяет `tests/test_version.py`:
 # поднимать ОБА, одним релизом.
-INTEGRATION_VERSION = "0.2.68"
+INTEGRATION_VERSION = "0.2.69"
 
 CONF_MANAGER_URL = "manager_url"
 CONF_TOKEN = "token"
@@ -88,6 +88,8 @@ STOCK_PHOTO_DIR = "mega_home_stock_photos"
 # вид файла НЕ СТОИЛ РЕЛИЗА этой интеграции: её код единственный, что не
 # обновляется сам, и каждый выпуск это ожидание на всех объектах сразу.
 ASSET_DIR = "mega_home_assets"
+# Готовые варианты фотографий (размер, размытие, ч/б) — `imaging.py`.
+LOOK_DIR = "mega_home_looks"
 API_ASSET = "/inbound/home-config/asset"
 # Розетка «спросить менеджера»: приложению рано или поздно понадобится не файл,
 # а разговор (ИИ-чат жильца первым делом), а до менеджера из квартиры доходит

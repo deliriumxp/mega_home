@@ -86,5 +86,8 @@ async def async_get_config_entry_diagnostics(
             # this is the only way to tell "this flat has no photos" from "the
             # photos are here and the app is not showing them".
             "room_photos": await hass.async_add_executor_job(coordinator.photos.count),
+            # Готовые варианты фото (`imaging.py`): ноль при фото в доме значит,
+            # что приложение их ни разу не запросило.
+            "photo_looks": await hass.async_add_executor_job(coordinator.looks.count),
         },
     }

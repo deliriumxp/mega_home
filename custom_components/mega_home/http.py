@@ -36,6 +36,7 @@ from .api import ManagerError
 from .coordinator import MegaHomeCoordinator
 from .crops import crop_key_known, crop_keys, crop_value_valid, MAX_CROP_BYTES
 from .events import StateStream
+from .imaging import asset_file, photo_file
 from .photos import (
     JPEG_MAGIC,
     MAX_PHOTO_BYTES,
@@ -238,7 +239,10 @@ class MegaHomePhotosView(_MegaHomeView):
         versions = await hass.async_add_executor_job(
             coordinator.photos.versions, photo_keys(coordinator.data)
         )
-        return self.json({"photos": versions})
+        # `imaging` — дом сам готовит варианты фото (`imaging.py`). Приложение
+        # узнаёт это ОТВЕТОМ, а не номером версии: без флага оно рисует вид
+        # фильтрами CSS, как раньше.
+        return self.json({"photos": versions, "imaging": True})
 
 
 class MegaHomePhotoView(_MegaHomeView):
@@ -266,8 +270,9 @@ class MegaHomePhotoView(_MegaHomeView):
             return error
         assert coordinator is not None
         hass: HomeAssistant = request.app["hass"]
-        target = coordinator.photos.path(room)
-        if not await hass.async_add_executor_job(target.is_file):
+        # Query может просить готовый вариант (`?w=1080&blur=14`, `imaging.py`).
+        target = await photo_file(hass, coordinator, room, request.query)
+        if target is None:
             return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
         # Адрес несёт версию файла (`?v=<mtime>`), поэтому картинку можно отдать
         # неизменяемой: сменилось фото — сменился адрес.
@@ -418,23 +423,16 @@ class MegaHomeAssetView(_MegaHomeView):
         if error is not None:
             return error
         assert coordinator is not None
-        entry = (coordinator.data.get("assets") or {}).get(key)
-        if not isinstance(entry, dict) or not isinstance(entry.get("v"), str):
-            return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
         hass: HomeAssistant = request.app["hass"]
-        target = coordinator.assets.path(key, entry["v"])
-        if not await hass.async_add_executor_job(target.is_file):
-            # Манифест файл обещает, а синхронизация ещё не дошла (дом только
-            # поднялся, менеджер был недоступен). Это не ошибка приложения.
+        found = await asset_file(hass, coordinator, key, request.query)
+        if found is None:
             return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
-        content_type = entry.get("type")
+        target, content_type = found
         return web.FileResponse(
             target,
             headers={
                 "Cache-Control": "public, max-age=31536000, immutable",
-                "Content-Type": content_type
-                if isinstance(content_type, str) and content_type
-                else "application/octet-stream",
+                "Content-Type": content_type,
             },
         )
 

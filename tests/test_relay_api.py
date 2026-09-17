@@ -21,6 +21,7 @@ from homeassistant.core import State
 
 from mega_home import ops
 from mega_home.crops import CropStore
+from mega_home.imaging import LookStore
 from mega_home.photos import PhotoStore
 
 JPEG = b"\xff\xd8\xff\xe0" + b"0" * 32
@@ -96,6 +97,7 @@ class _Coordinator:
         self.photos = PhotoStore(tmp / "own")
         self.crops = CropStore(tmp / "crops")
         self.assets = _Assets(tmp / "assets")
+        self.looks = LookStore(tmp / "looks", {"p": tmp / "own", "a": tmp / "assets"})
         self.icons_dir = tmp / "icons"
         for directory in ("own", "crops", "assets", "icons"):
             (tmp / directory).mkdir(parents=True, exist_ok=True)
@@ -204,6 +206,27 @@ def test_файл_общего_канала_отдаётся_тем_же_пер�
     answer = call(coordinator, "GET", "api/asset/photo/tile/t1")
     assert answer["contentType"] == "image/jpeg"
     assert body_of(answer) == JPEG
+
+
+def test_готовый_вид_фото_едет_тем_же_переносом(coordinator):
+    """⚠ Снаружи и в макете у инсталлятора вид фото считает ТОТ ЖЕ дом.
+
+    Query не теряется по дороге, и приложение узнаёт умение дома ответом
+    (`imaging`), а не номером версии.
+    """
+    from io import BytesIO
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (1920, 1080), (200, 50, 50)).save(buffer, "JPEG")
+    coordinator.assets.path("photo/tile/t1", "a1").write_bytes(buffer.getvalue())
+
+    assert json_of(call(coordinator, "GET", "api/photos"))["imaging"] is True
+    answer = call(coordinator, "GET", "api/asset/photo%2Ftile%2Ft1?v=a1&w=540&gray=1&dim=35")
+    variant = Image.open(BytesIO(body_of(answer)))
+    assert answer["contentType"] == "image/jpeg"
+    assert variant.mode == "L" and max(variant.size) == 540
 
 
 def test_иконка_сценария_не_выпускает_за_свой_каталог(coordinator):

@@ -35,6 +35,7 @@ from homeassistant.core import HomeAssistant
 from . import ops
 from .coordinator import MegaHomeCoordinator
 from .crops import crop_key_known, crop_keys, crop_value_valid
+from .imaging import asset_file, photo_file
 from .photos import (
     JPEG_MAGIC,
     MAX_PHOTO_BYTES,
@@ -105,9 +106,11 @@ async def _dispatch(
         versions = await hass.async_add_executor_job(
             coordinator.photos.versions, photo_keys(coordinator.data)
         )
-        return _json({"photos": versions})
+        # `imaging` — тот же флаг, что у локальной двери (`http.py`).
+        return _json({"photos": versions, "imaging": True})
     if path.startswith("api/photo/"):
-        return await _photo(hass, coordinator, method, unquote(path[len("api/photo/") :]), body)
+        key = unquote(path[len("api/photo/") :])
+        return await _photo(hass, coordinator, method, key, body, query)
     if path == "api/crops" and method == "GET":
         crops = await hass.async_add_executor_job(
             coordinator.crops.all, crop_keys(coordinator.data)
@@ -200,7 +203,7 @@ async def _dispatch(
         # его у себя, лента листается вверх-вниз.
         return HTTPStatus.OK, content_type, raw, IMMUTABLE
     if path.startswith("api/asset/") and method == "GET":
-        return await _asset(hass, coordinator, unquote(path[len("api/asset/") :]))
+        return await _asset(hass, coordinator, unquote(path[len("api/asset/") :]), query)
     if path.startswith("icons/") and method == "GET":
         return await _icon(hass, coordinator, unquote(path[len("icons/") :]))
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.NOT_FOUND)
@@ -212,6 +215,7 @@ async def _photo(
     method: str,
     key: str,
     body: bytes,
+    query: dict[str, str] | None = None,
 ) -> tuple[int, str, bytes, str]:
     """Фон, снятый САМИМ ЖИЛЬЦОМ: комната или плитка (`tile:<id>`).
 
@@ -224,9 +228,10 @@ async def _photo(
     Ограничение набора ключей нужно затем, чтобы диск объекта нельзя было
     забить, а прочитать можно только то, что там уже лежит.
     """
-    target = coordinator.photos.path(key)
     if method == "GET":
-        if not await hass.async_add_executor_job(target.is_file):
+        # Вариант по query — тем же разбором, что дома (`imaging.py`).
+        target = await photo_file(hass, coordinator, key, query or {})
+        if target is None:
             raise ops.OpError("Фото не найдено", HTTPStatus.NOT_FOUND)
         return (HTTPStatus.OK, JPEG_TYPE, await _read(hass, target), IMMUTABLE)
     if method == "POST":
@@ -273,22 +278,17 @@ async def _crop(
 
 
 async def _asset(
-    hass: HomeAssistant, coordinator: MegaHomeCoordinator, key: str
+    hass: HomeAssistant,
+    coordinator: MegaHomeCoordinator,
+    key: str,
+    query: dict[str, str] | None = None,
 ) -> tuple[int, str, bytes, str]:
     """Любой файл общего канала: тип и версия — из манифеста в конфиге."""
-    entry = (coordinator.data.get("assets") or {}).get(key)
-    if not isinstance(entry, dict) or not isinstance(entry.get("v"), str):
+    found = await asset_file(hass, coordinator, key, query or {})
+    if found is None:
         raise ops.OpError("Файл не найден", HTTPStatus.NOT_FOUND)
-    target = coordinator.assets.path(key, entry["v"])
-    if not await hass.async_add_executor_job(target.is_file):
-        raise ops.OpError("Файл не найден", HTTPStatus.NOT_FOUND)
-    content_type = entry.get("type")
-    return (
-        HTTPStatus.OK,
-        content_type if isinstance(content_type, str) and content_type else "application/octet-stream",
-        await _read(hass, target),
-        IMMUTABLE,
-    )
+    target, content_type = found
+    return (HTTPStatus.OK, content_type, await _read(hass, target), IMMUTABLE)
 
 
 async def _icon(

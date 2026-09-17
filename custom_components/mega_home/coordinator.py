@@ -26,11 +26,13 @@ from .const import (
     PHOTO_DIR,
     STOCK_PHOTO_DIR,
     ASSET_DIR,
+    LOOK_DIR,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
 from .assets import AssetStore
 from .crops import CropStore
+from .imaging import LookStore
 from .photos import PhotoStore
 
 type MegaHomeConfigEntry = ConfigEntry["MegaHomeCoordinator"]
@@ -111,6 +113,12 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # ОБЩИЙ канал файлов: что именно в нём лежит, дом не знает и знать не
         # должен — см. `assets.py`.
         self.assets = AssetStore(Path(hass.config.path(STORAGE_DIR, ASSET_DIR)))
+        # Готовые варианты ОБОИХ видов фото: снимков жильца (`p`) и файлов
+        # менеджера (`a`). Считает их только дом — см. `imaging.py`.
+        self.looks = LookStore(
+            Path(hass.config.path(STORAGE_DIR, LOOK_DIR)),
+            {"p": self.photos.directory, "a": self.assets.directory},
+        )
         # ⚠ Отдельного зеркала «заготовок инсталлятора» здесь БОЛЬШЕ НЕТ
         # (0.2.20). Оно появилось раньше общего канала и делало то же самое:
         # фон комнаты качался своим маршрутом, фон плитки — ОБОИМИ сразу, по
@@ -302,6 +310,9 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self.hass.async_add_executor_job(self.assets.save, key, version, payload)
             LOGGER.debug("Stored the asset %s", key)
         await self.hass.async_add_executor_job(self.assets.prune, wanted)
+        # Новая версия файла — пересчитать виды, которые устройства уже просили;
+        # заодно уходят варианты снятых и заменённых фото (`imaging.py`).
+        await self.hass.async_add_executor_job(self.looks.refresh)
 
     async def _async_sync_icons(self, config: dict[str, Any]) -> None:
         """Download every scenario icon the config names.
