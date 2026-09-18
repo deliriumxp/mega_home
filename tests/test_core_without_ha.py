@@ -29,6 +29,7 @@ CORE = {
     "crops",
     "gateway",
     "go2rtc_embed",
+    "go2rtc_session",
     "host",
     "imaging",
     "ops_base",
@@ -39,8 +40,10 @@ CORE = {
     "sip_calls",
     "sip_config",
     "stream",
+    "trassir",
     "trassir_archive",
     "trassir_client",
+    "trassir_clip",
 }
 
 

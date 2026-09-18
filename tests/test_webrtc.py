@@ -22,6 +22,8 @@ from typing import Any
 
 import pytest
 
+from fake_host import FakeHost
+from mega_home import go2rtc_session
 from mega_home import ops
 
 
@@ -105,6 +107,8 @@ class _Camera:
 
 
 class _Coordinator:
+    env = FakeHost()
+
     def __init__(self, tiles: list[dict[str, Any]]) -> None:
         self.data = {"tiles": tiles}
         self.version = None
@@ -264,6 +268,9 @@ class _OwnHass:
         self.tasks.append(coro)
         asyncio.ensure_future(coro)
 
+    def async_create_background_task(self, coro, name):
+        self.async_create_task(coro)
+
 
 @pytest.fixture
 def own_go2rtc(monkeypatch):
@@ -296,7 +303,7 @@ def own_go2rtc(monkeypatch):
     sys.modules.update(added)
     monkeypatch.setattr(embed, "is_running", lambda: True)
     monkeypatch.setattr(embed, "URL", "http://127.0.0.1:1985")
-    monkeypatch.setattr(webrtc, "ANSWER_TIMEOUT", 0.2)
+    monkeypatch.setattr(go2rtc_session, "ANSWER_TIMEOUT", 0.2)
 
     _Go2RtcWsClient.instances.clear()
     _Go2RtcRestClient.instances.clear()
@@ -306,7 +313,7 @@ def own_go2rtc(monkeypatch):
         for name in added:
             sys.modules.pop(name, None)
         # Реестр сессий не должен протекать между тестами.
-        webrtc._own_sessions.clear()
+        go2rtc_session._own_sessions.clear()
 
 
 CAMERA_TILE = {"id": "cam1", "domain": "camera", "entityId": "camera.hall"}
@@ -379,8 +386,8 @@ def _instant_gathering(monkeypatch):
     """Окно сбора кандидатов в тесте не ждём — проверяется сбор, а не часы."""
     from mega_home import webrtc
 
-    monkeypatch.setattr(webrtc, "CANDIDATE_WINDOW", 0.02)
-    monkeypatch.setattr(webrtc, "ANSWER_TIMEOUT", 0.2)
+    monkeypatch.setattr(go2rtc_session, "CANDIDATE_WINDOW", 0.02)
+    monkeypatch.setattr(go2rtc_session, "ANSWER_TIMEOUT", 0.2)
 
 
 def run(coro):
@@ -656,7 +663,7 @@ def test_свой_go2rtc_кандидаты_едут_с_mline(_ha_camera_modules
 
     # (когда открыта, клиент): срок нужен, чтобы забытая сессия не держала
     # камеру вечно — телефон с убитым приложением `close` не пришлёт никогда.
-    assert webrtc._own_sessions[result["sessionId"]][1] is ws
+    assert go2rtc_session._own_sessions[result["sessionId"]][1] is ws
 
 
 def test_эфемерный_поток_не_спрашивает_список(own_go2rtc):
@@ -667,8 +674,8 @@ def test_эфемерный_поток_не_спрашивает_список(ow
 
     async def scenario():
         task = asyncio.ensure_future(
-            webrtc.negotiate_source(
-                object(),
+            go2rtc_session.negotiate_source(
+                FakeHost(),
                 "http://127.0.0.1:1985",
                 "trassir_tok",
                 "rtsp://cam/tok",
@@ -720,7 +727,7 @@ def test_ошибка_своего_go2rtc_закрывает_ws(_ha_camera_modul
 
     from mega_home import webrtc
 
-    assert not webrtc._own_sessions
+    assert not go2rtc_session._own_sessions
 
 
 def test_закрытие_просмотра_закрывает_сессию_своего_go2rtc(_ha_camera_modules, own_go2rtc):
@@ -741,7 +748,7 @@ def test_закрытие_просмотра_закрывает_сессию_с�
 
     run(scenario())
     assert ws.closed
-    assert not webrtc._own_sessions
+    assert not go2rtc_session._own_sessions
     # HA-камеру не трогали: сессия была не её.
     assert _ha_camera_modules["camera.hall"].closed == []
 
@@ -759,8 +766,8 @@ def test_ответ_не_ждёт_всё_окно_когда_srflx_уже_ест
 
     from mega_home import webrtc
 
-    monkeypatch.setattr(webrtc, "CANDIDATE_WINDOW", 5.0)
-    monkeypatch.setattr(webrtc, "CANDIDATE_GRACE", 0.1)
+    monkeypatch.setattr(go2rtc_session, "CANDIDATE_WINDOW", 5.0)
+    monkeypatch.setattr(go2rtc_session, "CANDIDATE_GRACE", 0.1)
 
     class _SlowCamera(_Camera):
         async def async_handle_async_webrtc_offer(self, offer_sdp, session_id, send_message):
@@ -797,7 +804,7 @@ def test_без_srflx_ждём_всё_окно_как_раньше(_ha_camera_mo
 
     from mega_home import webrtc
 
-    monkeypatch.setattr(webrtc, "CANDIDATE_WINDOW", 0.3)
+    monkeypatch.setattr(go2rtc_session, "CANDIDATE_WINDOW", 0.3)
 
     camera = _Camera(
         [_Answer("v=0 answer"), _Candidate(_Ice("candidate:1 udp typ host"))]
@@ -827,8 +834,8 @@ def test_свой_go2rtc_не_ждёт_всё_окно(_ha_camera_modules, own_g
 
     from mega_home import webrtc
 
-    monkeypatch.setattr(webrtc, "CANDIDATE_WINDOW", 5.0)
-    monkeypatch.setattr(webrtc, "CANDIDATE_GRACE", 0.1)
+    monkeypatch.setattr(go2rtc_session, "CANDIDATE_WINDOW", 5.0)
+    monkeypatch.setattr(go2rtc_session, "CANDIDATE_GRACE", 0.1)
     _ha_camera_modules["camera.hall"] = _OwnCamera()
 
     async def scenario():
@@ -868,7 +875,7 @@ def test_без_внешнего_адреса_ждём_дольше_только
     ⚠ Дома ждать нечего: телефон в той же сети, host-кандидатов ему довольно, —
     поэтому длинное окно только для переноса.
     """
-    from mega_home.webrtc import CANDIDATE_WINDOW, CANDIDATE_WINDOW_COLD
+    from mega_home.go2rtc_session import CANDIDATE_WINDOW, CANDIDATE_WINDOW_COLD
 
     assert CANDIDATE_WINDOW_COLD > CANDIDATE_WINDOW
 
@@ -881,14 +888,14 @@ def test_окно_кандидатов_выбирается_дверью() -> No
     async def scenario(remote: bool) -> float:
         started = aio.get_event_loop().time()
         # Готовность не наступает никогда: меряем, каким окном нас оборвало.
-        await webrtc._wait_candidates(aio.Event(), lambda: False, remote)  # noqa: SLF001
+        await go2rtc_session._wait_candidates(aio.Event(), lambda: False, remote)  # noqa: SLF001
         return aio.get_event_loop().time() - started
 
     import pytest as _pytest
 
     monkey = _pytest.MonkeyPatch()
-    monkey.setattr(webrtc, "CANDIDATE_WINDOW", 0.05)
-    monkey.setattr(webrtc, "CANDIDATE_WINDOW_COLD", 0.25)
+    monkey.setattr(go2rtc_session, "CANDIDATE_WINDOW", 0.05)
+    monkey.setattr(go2rtc_session, "CANDIDATE_WINDOW_COLD", 0.25)
     try:
         assert aio.run(scenario(False)) < 0.2, "дома — короткое окно"
         assert aio.run(scenario(True)) > 0.2, "снаружи — длинное"
@@ -901,7 +908,7 @@ def test_публичный_host_считается_внешним_адресо�
     публичный (найден у STUN). Проверка только по `srflx` не видела внешний путь,
     и дом ждал окно ЦЕЛИКОМ на каждом открытии: живой отчёт 2026-09-10 —
     «Кандидаты дома: host 4», «Соединение: connected», а переговоры 6844 мс."""
-    from mega_home.webrtc import _has_srflx  # noqa: SLF001
+    from mega_home.go2rtc_session import _has_srflx  # noqa: SLF001
 
     public_host = "candidate:1 1 udp 2130706431 8.8.8.8 8555 typ host"
     private_host = "candidate:2 1 udp 2130706431 192.168.1.10 8555 typ host"
@@ -918,12 +925,12 @@ def test_trickle_отдаёт_ответ_сразу_и_досылает_канд
     операцией `webrtc-candidates`: телефонные — в ws go2rtc, домовые — обратно.
     Именно это убирает и «холодный STUN», и 6-секундное ожидание."""
     from mega_home import webrtc
-    from mega_home.webrtc import _trickle  # noqa: SLF001
+    from mega_home.go2rtc_session import _trickle  # noqa: SLF001
 
     async def scenario() -> None:
         task = asyncio.ensure_future(
-            webrtc.negotiate_source(
-                object(),
+            go2rtc_session.negotiate_source(
+                FakeHost(),
                 "http://127.0.0.1:1985",
                 "trassir_tok",
                 "rtsp://cam/tok",
@@ -944,7 +951,7 @@ def test_trickle_отдаёт_ответ_сразу_и_досылает_канд
 
         # Кандидат дома появился уже ПОСЛЕ ответа — и всё равно доедет.
         ws.receive(_GoCandidate("candidate:1 1 udp 1 8.8.8.8 8555 typ host"))
-        drained = await webrtc.async_candidates(
+        drained = await go2rtc_session.async_candidates(
             answer["sessionId"], ["candidate:9 1 udp 1 1.2.3.4 9 typ host"]
         )
         assert drained["candidates"] == [
@@ -961,4 +968,4 @@ def test_trickle_отдаёт_ответ_сразу_и_досылает_канд
         asyncio.run(scenario())
     finally:
         _trickle.clear()
-        webrtc._own_sessions.clear()  # noqa: SLF001
+        go2rtc_session._own_sessions.clear()  # noqa: SLF001

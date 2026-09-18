@@ -11,6 +11,7 @@ from typing import Any
 
 from homeassistant.core import HomeAssistant
 
+from . import go2rtc_session
 from .const import LOGGER
 from .coordinator import MegaHomeCoordinator
 from .ops_base import OpError
@@ -29,9 +30,8 @@ async def webrtc_offer(
     Через менеджер проходит только этот обмен (килобайты SDP), видео идёт мимо
     него — ради этого всё и затевалось (remote-access.md у менеджера).
 
-    ⚠ Импорт локальный: `webrtc.py` берёт отсюда `OpError`, и разорвать
-    кольцо иначе нечем. Заодно модуль камеры Home Assistant не грузится в домах,
-    где камер нет вовсе.
+    ⚠ Импорт `webrtc` локальный: модуль камер Home Assistant не грузится в
+    домах, где камер нет вовсе. Своя go2rtc (`go2rtc_session`) от него не зависит.
     """
     from . import webrtc
     from .trassir_clip import CLIP_PREFIX
@@ -50,7 +50,7 @@ async def webrtc_offer(
     tile = payload.get("id")
     if isinstance(tile, str) and tile.startswith(CLIP_PREFIX):
         return await trassir(coordinator).clips.async_offer(
-            hass, tile, sdp, remote, trickle
+            tile, sdp, remote, trickle
         )
     guid = _trassir_guid(coordinator, tile)
     if guid:
@@ -74,7 +74,7 @@ async def webrtc_offer(
         # документированный токен. Решает это сам сеанс, потому что там же живут
         # пинг и уборка, которые запасному пути нужны (`async_live_offer`).
         return await gateway.clips.async_live_offer(
-            hass, guid, sdp, "sub" if quality == "sub" else "main", remote, trickle
+            guid, sdp, "sub" if quality == "sub" else "main", remote, trickle
         )
     return await webrtc.negotiate(
         hass, camera_entity(coordinator, payload), sdp, remote, trickle
@@ -98,7 +98,9 @@ def webrtc_close(
         # ключ, и потерять уборку из-за отсутствующего поля нельзя.
         clip_id = gateway.clips.clip_of_session(session_id)
     if clip_id is not None and gateway is not None:
-        hass.async_create_task(gateway.clips.async_close(hass, clip_id, session_id))
+        coordinator.env.spawn(
+            gateway.clips.async_close(clip_id, session_id), "mega_home clip close"
+        )
         return {"closed": True}
     # ⚠ СНАЧАЛА своя сессия, и только потом сущность камеры. `webrtc.close`
     # пробует `close_own` первой строкой — но `camera_entity(...)` вычислялся
@@ -110,7 +112,7 @@ def webrtc_close(
     # вкладку «Архив» слал `webrtc/close`, получал `409 «Это камера
     # видеонаблюдения»`, и поток к регистратору оставался висеть до своих
     # таймаутов. У регистратора соединения на IP считаны, и течь им нельзя.
-    if webrtc.close_own(hass, session_id):
+    if go2rtc_session.close_own(coordinator.env, session_id):
         return {"closed": True}
     return webrtc.close(hass, camera_entity(coordinator, payload), session_id)
 
@@ -121,8 +123,6 @@ async def webrtc_candidates(payload: dict[str, Any]) -> dict[str, Any]:
     поднято `webrtc`, и живут по его `sessionId`. Закрылась — ответ `done`, и
     приложение перестаёт спрашивать.
     """
-    from . import webrtc
-
     session_id = payload.get("sessionId")
     if not isinstance(session_id, str) or not session_id:
         raise OpError("Сессия не указана")
@@ -132,4 +132,4 @@ async def webrtc_candidates(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(incoming, list)
         else []
     )
-    return await webrtc.async_candidates(session_id, lines)
+    return await go2rtc_session.async_candidates(session_id, lines)

@@ -46,8 +46,7 @@ from http import HTTPStatus
 from time import monotonic
 from typing import Any
 
-from homeassistant.core import HomeAssistant
-
+from . import go2rtc_session
 from .const import (
     LOGGER,
     TRASSIR_CLIP_IDLE_TIMEOUT,
@@ -168,7 +167,6 @@ class ClipSessions:
 
     async def async_offer(
         self,
-        hass: HomeAssistant,
         clip_id: str,
         sdp: str,
         remote: bool = False,
@@ -192,14 +190,12 @@ class ClipSessions:
                 HTTPStatus.SERVICE_UNAVAILABLE,
             )
 
-        from . import webrtc
-
         settings = self._gateway.settings
         source = f"rtsp://{settings['host']}:{settings['rtspPort']}/{clip.token}"
         # ⚠ `skip_list=True`: имя потока клипа эфемерно (в нём токен), списком
         # его существование не проверяем — это лишний круг на критическом пути.
-        answer = await webrtc.negotiate_source(
-            hass, OWN_URL, clip.stream, source, sdp, "запись события", remote, True, trickle
+        answer = await go2rtc_session.negotiate_source(
+            self._gateway.env, OWN_URL, clip.stream, source, sdp, "запись события", remote, True, trickle
         )
         clip.session_id = answer.get("sessionId")
         # ⚠ Момент, от которого отсчитывается пауза перед командой архива:
@@ -272,7 +268,7 @@ class ClipSessions:
             "error": clip.start_error,
         }
 
-    async def async_close(self, hass: HomeAssistant, clip_id: str, session_id: str) -> dict[str, Any]:
+    async def async_close(self, clip_id: str, session_id: str) -> dict[str, Any]:
         """Жилец закрыл запись: снять сессию, поток и токен.
 
         ⚠ Убирать обязательно и сразу. Забытый клип держит соединение с
@@ -280,9 +276,7 @@ class ClipSessions:
         быть вовсе (`connections_per_ip = -1` на стенде), то есть остановить
         это будет некому.
         """
-        from . import webrtc
-
-        webrtc.close_own(hass, session_id)
+        go2rtc_session.close_own(self._gateway.env, session_id)
         clip = self._clips.get(clip_id)
         if clip is None:
             return {"closed": True}
@@ -320,7 +314,6 @@ class ClipSessions:
 
     async def async_live_offer(
         self,
-        hass: HomeAssistant,
         guid: str,
         sdp: str,
         quality: str,
@@ -340,14 +333,13 @@ class ClipSessions:
         однажды ответивший отказом, дальше идёт сразу запасным путём: платить
         двумя переговорами за каждое открытие незачем.
         """
-        from . import webrtc
         from .go2rtc_embed import URL as OWN_URL
 
         if guid not in self._no_permanent:
             name, source = self.live_stream(guid, quality)
             try:
-                return await webrtc.negotiate_source(
-                    hass, OWN_URL, name, source, sdp, "с этой камеры", remote, False, trickle
+                return await go2rtc_session.negotiate_source(
+                    self._gateway.env, OWN_URL, name, source, sdp, "с этой камеры", remote, False, trickle
                 )
             except Exception as err:  # noqa: BLE001 — причин отказа много, путь один
                 LOGGER.info(
@@ -382,8 +374,8 @@ class ClipSessions:
         source = f"rtsp://{settings['host']}:{settings['rtspPort']}/{token}"
         # ⚠ `skip_list=True`: имя потока запасного пути тоже эфемерно (токен),
         # списком его существование проверять нечего.
-        answer = await webrtc.negotiate_source(
-            hass, OWN_URL, clip.stream, source, sdp, "с этой камеры", remote, True, trickle
+        answer = await go2rtc_session.negotiate_source(
+            self._gateway.env, OWN_URL, clip.stream, source, sdp, "с этой камеры", remote, True, trickle
         )
         clip.session_id = answer.get("sessionId")
         if clip.idle:

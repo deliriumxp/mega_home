@@ -23,6 +23,8 @@ from typing import Any
 
 import pytest
 
+from fake_host import FakeHost
+from mega_home import go2rtc_session
 from mega_home import ops
 
 # ⚠ Механика команды архива живёт в `trassir_archive.py`, реестр просмотров — в
@@ -182,12 +184,12 @@ def _offered(
 
     from mega_home import webrtc
 
-    monkeypatch.setattr(webrtc, "negotiate_source", fake_negotiate)
+    monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
     monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
 
     async def scenario() -> FakeHass:
         hass = FakeHass()
-        await gateway.clips.async_offer(hass, clip_id, "offer-sdp")
+        await gateway.clips.async_offer(clip_id, "offer-sdp")
         return hass
 
     return asyncio.run(scenario())
@@ -271,8 +273,8 @@ def test_закрытие_снимает_поток_и_токен(
 
     from mega_home import webrtc
 
-    monkeypatch.setattr(webrtc, "negotiate_source", fake_negotiate)
-    monkeypatch.setattr(webrtc, "close_own", lambda hass, sid: closed.append(sid) or True)
+    monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
+    monkeypatch.setattr(go2rtc_session, "close_own", lambda hass, sid: closed.append(sid) or True)
     monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
     monkeypatch.setattr(
         ClipSessions,
@@ -283,8 +285,8 @@ def test_закрытие_снимает_поток_и_токен(
     async def scenario() -> None:
         hass = FakeHass()
         opened = await gateway.clips.async_open_at("cam1", AT, "Вход", window_start_us=WINDOW[0], window_stop_us=WINDOW[1])
-        await gateway.clips.async_offer(hass, opened["id"], "offer")
-        await gateway.clips.async_close(hass, opened["id"], "s1")
+        await gateway.clips.async_offer(opened["id"], "offer")
+        await gateway.clips.async_close(opened["id"], "s1")
         await _quiet(hass, gateway)
 
     asyncio.run(scenario())
@@ -310,13 +312,13 @@ def test_клип_закрывается_даже_если_приложение_
 
     from mega_home import webrtc
 
-    monkeypatch.setattr(webrtc, "negotiate_source", fake_negotiate)
+    monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
     monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
 
     async def scenario() -> None:
         hass = FakeHass()
         opened = await gateway.clips.async_open_at("cam1", AT, "Вход", window_start_us=WINDOW[0], window_stop_us=WINDOW[1])
-        await gateway.clips.async_offer(hass, opened["id"], "offer")
+        await gateway.clips.async_offer(opened["id"], "offer")
         await _quiet(hass, gateway)
 
     asyncio.run(scenario())
@@ -326,7 +328,7 @@ def test_клип_закрывается_даже_если_приложение_
 
 def test_чужой_id_не_становится_клипом(gateway: FakeGateway) -> None:
     with pytest.raises(ops.OpError) as err:
-        asyncio.run(gateway.clips.async_offer(FakeHass(), "trassir:ghost", "offer"))
+        asyncio.run(gateway.clips.async_offer("trassir:ghost", "offer"))
 
     assert "заново" in err.value.message
 
@@ -354,14 +356,14 @@ def test_сторож_стартует_вслепую_без_готовност�
 
     from mega_home import webrtc
 
-    monkeypatch.setattr(webrtc, "negotiate_source", fake_negotiate)
+    monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
     monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
     clip_id = _opened_clip_id(gateway)
 
     async def scenario() -> None:
         hass = FakeHass()
         gateway.client.calls.clear()
-        await gateway.clips.async_offer(hass, clip_id, "offer-sdp")
+        await gateway.clips.async_offer(clip_id, "offer-sdp")
         for _ in range(200):
             if any(n == "archive_command" for n, _ in gateway.client.calls):
                 break
@@ -413,16 +415,16 @@ def test_закрытие_до_готовности_не_командует(
 
     from mega_home import webrtc
 
-    monkeypatch.setattr(webrtc, "negotiate_source", fake_negotiate)
+    monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
     monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
 
     async def scenario() -> None:
         hass = FakeHass()
         opened = await gateway.clips.async_open_at("cam1", AT, "Вход", window_start_us=WINDOW[0], window_stop_us=WINDOW[1])
-        await gateway.clips.async_offer(hass, opened["id"], "offer")
+        await gateway.clips.async_offer(opened["id"], "offer")
         clip = gateway.clips._clips[opened["id"]]  # noqa: SLF001
         ping, fallback = clip.ping, clip.fallback
-        await gateway.clips.async_close(hass, opened["id"], "s1")
+        await gateway.clips.async_close(opened["id"], "s1")
         assert ping.cancelled and fallback.cancelled, "задачи сняты"
         await _quiet(hass, gateway)
 
@@ -465,15 +467,15 @@ def test_канал_без_постоянного_адреса_идёт_по_т�
 
     from mega_home import webrtc
 
-    monkeypatch.setattr(webrtc, "negotiate_source", fake_negotiate)
+    monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
     monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
 
     async def scenario() -> dict[str, Any]:
         hass = FakeHass()
-        answer = await gateway.clips.async_live_offer(hass, "cam1", "offer", "main")
+        answer = await gateway.clips.async_live_offer("cam1", "offer", "main")
         # Второе открытие того же канала идёт СРАЗУ по токену: платить двумя
         # переговорами за каждое открытие незачем.
-        await gateway.clips.async_live_offer(hass, "cam1", "offer", "main")
+        await gateway.clips.async_live_offer("cam1", "offer", "main")
         return answer
 
     answer = asyncio.run(scenario())
@@ -501,12 +503,12 @@ def test_живой_просмотр_по_токену_ничем_не_кома�
 
     from mega_home import webrtc
 
-    monkeypatch.setattr(webrtc, "negotiate_source", fake_negotiate)
+    monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
     monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
 
     async def scenario() -> None:
         hass = FakeHass()
-        await gateway.clips.async_live_offer(hass, "cam1", "offer", "main")
+        await gateway.clips.async_live_offer("cam1", "offer", "main")
         await _quiet(hass, gateway)
 
     asyncio.run(scenario())
@@ -713,7 +715,7 @@ def test_команда_дверью_считается_началом_соед�
 
     from mega_home import webrtc
 
-    monkeypatch.setattr(webrtc, "negotiate_source", fake_negotiate)
+    monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
     monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
 
     door = _Door()
@@ -725,7 +727,7 @@ def test_команда_дверью_считается_началом_соед�
     async def scenario() -> dict[str, Any]:
         hass = FakeHass()
         # Переговоры прошли, сторож слепого старта взведён — и жилец мотает.
-        await gateway.clips.async_offer(hass, clip_id, "offer-sdp")
+        await gateway.clips.async_offer(clip_id, "offer-sdp")
         gateway.client.calls.clear()
         for command in ("seek", "play"):
             await ops.gateway_call(

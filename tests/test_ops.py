@@ -15,6 +15,8 @@ import pytest
 from homeassistant.core import State
 from homeassistant.exceptions import ServiceNotFound
 
+from fake_host import FakeHost
+from mega_home import go2rtc_session
 from mega_home import ops
 
 
@@ -48,6 +50,7 @@ class _Bundle:
 
 
 class _Coordinator:
+    env = FakeHost()
     version = "sha256:abc"
     bundle = _Bundle()
 
@@ -440,7 +443,7 @@ def test_своя_сессия_закрывается_РАНЬШЕ_чем_спр
 
     closed: list[str] = []
     monkeypatch.setattr(
-        webrtc, "close_own", lambda hass, sid: (closed.append(sid), True)[1]
+        go2rtc_session, "close_own", lambda env, sid: (closed.append(sid), True)[1]
     )
     # Если до сущности дойдёт — тест это увидит: такой камеры в доме нет.
     monkeypatch.setattr(
@@ -466,7 +469,7 @@ def test_чужая_сессия_по_прежнему_идёт_к_сущнос�
     закрываться вовсе."""
     from mega_home import webrtc
 
-    monkeypatch.setattr(webrtc, "close_own", lambda hass, sid: False)
+    monkeypatch.setattr(go2rtc_session, "close_own", lambda env, sid: False)
     asked: list[str] = []
     monkeypatch.setattr(
         webrtc,

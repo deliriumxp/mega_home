@@ -105,12 +105,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # запуск слушатель уже не поднимет: снаружи камеры молча перестают
     # открываться, а лечится это только ребутом машины.
     try:
-        from . import webrtc as _webrtc
+        from . import go2rtc_session as _go2rtc_session
         from .go2rtc_embed import async_start as _go2rtc_start
         from .go2rtc_embed import async_stop as _go2rtc_stop
 
         async def _shutdown(_event: Any = None) -> None:
-            await _webrtc.async_shutdown()
+            await _go2rtc_session.async_shutdown()
             await _go2rtc_stop()
 
         await _go2rtc_start(coordinator.env)
