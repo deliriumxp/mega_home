@@ -137,7 +137,7 @@ class _MegaHomeView(HomeAssistantView):
     async def run(self, request: web.Request, op: str) -> web.Response:
         hass: HomeAssistant = request.app["hass"]
         try:
-            return self.json(await ops.run(hass, _coordinator(hass), op, None))
+            return self.json(await ops.run(_coordinator(hass), op, None))
         except ops.OpError as err:
             return self.json_message(err.message, err.status)
 
@@ -148,7 +148,7 @@ class _MegaHomeView(HomeAssistantView):
             return self.json_message("Некорректный запрос", HTTPStatus.BAD_REQUEST)
         hass: HomeAssistant = request.app["hass"]
         try:
-            return self.json(await ops.run(hass, _coordinator(hass), op, payload))
+            return self.json(await ops.run(_coordinator(hass), op, payload))
         except ops.OpError as err:
             return self.json_message(err.message, err.status)
 
@@ -190,7 +190,7 @@ class MegaHomeEventsView(_MegaHomeView):
             return error
         assert coordinator is not None
         hass: HomeAssistant = request.app["hass"]
-        return await StateStream(hass, coordinator).run(request)
+        return await StateStream(coordinator).run(request)
 
 
 class MegaHomeCommandView(_MegaHomeView):
@@ -456,7 +456,7 @@ class MegaHomeCameraFrameView(_MegaHomeView):
         assert coordinator is not None
         hass: HomeAssistant = request.app["hass"]
         try:
-            content_type, body = await ops.camera_frame(hass, coordinator, {"id": tile})
+            content_type, body = await ops.camera_frame(coordinator, {"id": tile})
         except ops.OpError as err:
             return web.Response(status=err.status, text=err.message)
 

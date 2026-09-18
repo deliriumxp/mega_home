@@ -30,7 +30,6 @@ class _DeadSocket(_Socket):
 
 def link(answer):
     instance = ManagerLink.__new__(ManagerLink)
-    instance._hass = object()
     instance._coordinator = object()
     # Ответы уходят отдельными задачами (иначе длинный запрос — переговоры
     # WebRTC — застопорил бы чтение сокета), поэтому помощник ниже обязан их
@@ -38,7 +37,7 @@ def link(answer):
     instance._answers = set()
     ops_run = ops.run
 
-    async def patched(hass, coordinator, op, payload, remote=False):
+    async def patched(coordinator, op, payload, remote=False):
         return answer(op, payload)
 
     ops.run = patched
@@ -76,11 +75,10 @@ def test_ответ_не_держит_чтение_сокета():
         return {"ok": True}
 
     instance = ManagerLink.__new__(ManagerLink)
-    instance._hass = object()
     instance._coordinator = object()
     instance._answers = set()
     ops_run = ops.run
-    ops.run = lambda hass, coordinator, op, payload, remote=False: slow(op, payload)
+    ops.run = lambda coordinator, op, payload, remote=False: slow(op, payload)
     socket = _Socket()
 
     async def run():
@@ -133,13 +131,12 @@ def test_дверь_линка_помечает_запрос_снаружи():
     это и выглядело как «камера открывается со второго раза».
     """
     instance = ManagerLink.__new__(ManagerLink)
-    instance._hass = object()
     instance._coordinator = object()
     instance._answers = set()
     seen: list[bool] = []
     ops_run = ops.run
 
-    async def patched(hass, coordinator, op, payload, remote=False):
+    async def patched(coordinator, op, payload, remote=False):
         seen.append(remote)
         return {}
 

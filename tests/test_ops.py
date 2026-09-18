@@ -9,40 +9,16 @@ only place where that promise can be checked once instead of twice.
 from __future__ import annotations
 
 import asyncio
+import types
 from http import HTTPStatus
 
 import pytest
 from homeassistant.core import State
-from homeassistant.exceptions import ServiceNotFound
 
-from fake_host import FakeHost
+from fake_host import FakeHost, FakeSource
 from mega_home import go2rtc_session
 from mega_home import ops
-
-
-class _States:
-    def __init__(self, states: dict[str, State]) -> None:
-        self._states = states
-
-    def get(self, entity_id: str) -> State | None:
-        return self._states.get(entity_id)
-
-
-class _Services:
-    def __init__(self, raises: Exception | None = None) -> None:
-        self.calls: list[tuple[str, str, dict]] = []
-        self._raises = raises
-
-    async def async_call(self, domain, service, data, blocking=False):
-        if self._raises:
-            raise self._raises
-        self.calls.append((domain, service, data))
-
-
-class _Hass:
-    def __init__(self, states=None, raises=None) -> None:
-        self.states = _States(states or {})
-        self.services = _Services(raises)
+from mega_home.source import CommandUnknown
 
 
 class _Bundle:
@@ -99,27 +75,29 @@ _CONFIG = {
 }
 
 
-def run(hass, coordinator, op, payload=None):
-    return asyncio.run(ops.run(hass, coordinator, op, payload))
+def run(source, coordinator, op, payload=None):
+    if coordinator is not None:
+        coordinator.source = source
+    return asyncio.run(ops.run(coordinator, op, payload))
 
 
 def test_дом_без_конфига_отвечает_понятным_отказом():
     with pytest.raises(ops.OpError) as err:
-        run(_Hass(), None, "config")
+        run(FakeSource(), None, "config")
     assert err.value.status == HTTPStatus.SERVICE_UNAVAILABLE
     with pytest.raises(ops.OpError):
-        run(_Hass(), _Coordinator(data={}), "states")
+        run(FakeSource(), _Coordinator(data={}), "states")
 
 
 def test_неизвестная_операция_это_отказ_а_не_падение():
     with pytest.raises(ops.OpError) as err:
-        run(_Hass(), _Coordinator(), "выключи-всё")
+        run(FakeSource(), _Coordinator(), "выключи-всё")
     assert err.value.status == HTTPStatus.NOT_FOUND
 
 
 def test_состояния_несут_версии_конфига_и_бандла():
-    hass = _Hass({"light.kitchen": State("on", {"brightness": 255})})
-    answer = run(hass, _Coordinator(), "states")
+    source = FakeSource({"light.kitchen": State("on", {"brightness": 255})})
+    answer = run(source, _Coordinator(), "states")
     assert answer["configVersion"] == "sha256:abc"
     assert answer["appVersion"] == "1.4.0"
     # Плитка без сущности в Home Assistant остаётся в списке, но недоступна:
@@ -136,10 +114,10 @@ def test_состояния_несут_версии_конфига_и_бандл
 
 
 def test_команда_превращается_в_вызов_службы():
-    hass = _Hass({"light.kitchen": State("off")})
-    answer = run(hass, _Coordinator(), "command", {"id": "t1", "command": "set_brightness", "value": 40})
+    source = FakeSource({"light.kitchen": State("off")})
+    answer = run(source, _Coordinator(), "command", {"id": "t1", "command": "set_brightness", "value": 40})
     assert answer["accepted"] is True
-    assert hass.services.calls == [
+    assert source.calls == [
         ("light", "turn_on", {"entity_id": "light.kitchen", "brightness_pct": 40.0})
     ]
     # ⚠ Ответ несёт НОВОЕ состояние плитки: иначе приложение либо ждёт снимка,
@@ -149,40 +127,40 @@ def test_команда_превращается_в_вызов_службы():
 
 
 def test_чужая_команда_и_чужое_устройство_отвергаются():
-    hass = _Hass()
+    source = FakeSource()
     # Команды вне таблицы нет — через нас нельзя позвать произвольную службу.
     with pytest.raises(ops.OpError):
-        run(hass, _Coordinator(), "command", {"id": "t1", "command": "delete_everything"})
+        run(source, _Coordinator(), "command", {"id": "t1", "command": "delete_everything"})
     with pytest.raises(ops.OpError):
-        run(hass, _Coordinator(), "command", {"id": "нет-такого", "command": "turn_on"})
+        run(source, _Coordinator(), "command", {"id": "нет-такого", "command": "turn_on"})
     # Элемент есть в составе, но в Home Assistant не отправлен — управлять нечем.
     with pytest.raises(ops.OpError) as err:
-        run(hass, _Coordinator(), "command", {"id": "t2", "command": "turn_on"})
+        run(source, _Coordinator(), "command", {"id": "t2", "command": "turn_on"})
     assert "не отправлен" in err.value.message
-    assert hass.services.calls == []
+    assert source.calls == []
 
 
 def test_значение_вне_диапазона_не_уходит_в_дом():
-    hass = _Hass()
+    source = FakeSource()
     with pytest.raises(ops.OpError) as err:
-        run(hass, _Coordinator(), "command", {"id": "t1", "command": "set_brightness", "value": 900})
+        run(source, _Coordinator(), "command", {"id": "t1", "command": "set_brightness", "value": 900})
     assert "от 0 до 100" in err.value.message
-    assert hass.services.calls == []
+    assert source.calls == []
 
 
 def test_отсутствующая_служба_это_понятный_отказ_а_не_пятисотка():
-    hass = _Hass(raises=ServiceNotFound())
+    source = FakeSource(raises=CommandUnknown())
     with pytest.raises(ops.OpError) as err:
-        run(hass, _Coordinator(), "command", {"id": "t1", "command": "turn_on"})
+        run(source, _Coordinator(), "command", {"id": "t1", "command": "turn_on"})
     assert err.value.status == HTTPStatus.NOT_FOUND
 
 
 def test_сценарий_запускает_скрипт():
-    hass = _Hass()
-    assert run(hass, _Coordinator(), "scenario", {"id": "s1"}) == {"accepted": True}
-    assert hass.services.calls == [("script", "turn_on", {"entity_id": "script.evening"})]
+    source = FakeSource()
+    assert run(source, _Coordinator(), "scenario", {"id": "s1"}) == {"accepted": True}
+    assert source.calls == [("script", "turn_on", {"entity_id": "script.evening"})]
     with pytest.raises(ops.OpError):
-        run(hass, _Coordinator(), "scenario", {"id": "нет-такого"})
+        run(source, _Coordinator(), "scenario", {"id": "нет-такого"})
 
 
 # Камера. ⚠ Форма состояния — КОНТРАКТ с менеджером (smart-home-view.util.ts):
@@ -334,7 +312,7 @@ def test_без_состояния_атрибуты_пустые():
 
 
 def test_служба_берётся_из_конфига_плитки():
-    hass = _Hass()
+    source = FakeSource()
     config = {
         **_CONFIG,
         "tiles": [
@@ -360,15 +338,15 @@ def test_служба_берётся_из_конфига_плитки():
         ],
     }
 
-    run(hass, _Coordinator(data=config), "command", {"id": "t9", "command": "turn_on"})
+    run(source, _Coordinator(data=config), "command", {"id": "t9", "command": "turn_on"})
     run(
-        hass,
+        source,
         _Coordinator(data=config),
         "command",
         {"id": "t9", "command": "set_speed", "value": 30},
     )
 
-    assert hass.services.calls == [
+    assert source.calls == [
         ("fan", "turn_on", {"entity_id": "fan.hood"}),
         ("fan", "set_percentage", {"entity_id": "fan.hood", "percentage": 30.0}),
     ]
@@ -377,16 +355,16 @@ def test_служба_берётся_из_конфига_плитки():
 def test_границы_из_конфига_проверяет_дом():
     # ⚠ Границы приходят данными, но проверяет их ЭТА сторона: службу зовём мы,
     # а браузеру жильца верить нельзя.
-    hass = _Hass()
+    source = FakeSource()
     with pytest.raises(ops.OpError) as err:
         run(
-            hass,
+            source,
             _Coordinator(),
             "command",
             {"id": "t1", "command": "set_brightness", "value": 900},
         )
     assert "от 0 до 100" in err.value.message
-    assert hass.services.calls == []
+    assert source.calls == []
 
 
 def test_плитка_без_карты_команд_не_исполняется_втихую():
@@ -395,7 +373,7 @@ def test_плитка_без_карты_команд_не_исполняется
     # интеграция обновляется через HACS, то есть по интернету, и тот же интернет
     # приносит конфиг. Важно, чтобы отказ был ЯВНЫМ: угадать службу по домену
     # значит завести здесь вторую карту команд, расходящуюся с менеджерской.
-    hass = _Hass()
+    source = FakeSource()
     no_commands = {
         **_CONFIG,
         "tiles": [
@@ -412,14 +390,14 @@ def test_плитка_без_карты_команд_не_исполняется
 
     with pytest.raises(ops.OpError) as err:
         run(
-            hass,
+            source,
             _Coordinator(data=no_commands),
             "command",
             {"id": "t1", "command": "set_brightness", "value": 40},
         )
 
     assert err.value.status == HTTPStatus.NOT_FOUND
-    assert hass.services.calls == []
+    assert source.calls == []
 
 
 # Закрытие просмотра. ⚠ Живая камера видеонаблюдения открывается БЫСТРЫМ путём
@@ -439,23 +417,20 @@ def test_своя_сессия_закрывается_РАНЬШЕ_чем_спр
     «Архив» ронял закрытие живого просмотра). У регистратора соединения на IP
     считаны, течь им нельзя.
     """
-    from mega_home import webrtc
-
     closed: list[str] = []
     monkeypatch.setattr(
         go2rtc_session, "close_own", lambda env, sid: (closed.append(sid), True)[1]
     )
     # Если до сущности дойдёт — тест это увидит: такой камеры в доме нет.
-    monkeypatch.setattr(
-        webrtc, "close", lambda *a, **k: pytest.fail("спросили сущность камеры")
+    cameras = types.SimpleNamespace(
+        close=lambda *a, **k: pytest.fail("спросили сущность камеры")
     )
     tile = {"id": "cam2", "roomId": "r1", "name": "Вход", "domain": "camera",
             "entityId": None, "videoId": "IAtwTYwK"}
     coordinator = _Coordinator({**_CONFIG, "tiles": [*_CONFIG["tiles"], tile]})
 
-    answer = ops.webrtc_close(
-        _Hass(), coordinator, {"id": "cam2", "sessionId": "sess-1"}
-    )
+    coordinator.source = FakeSource(cameras=cameras)
+    answer = ops.webrtc_close(coordinator, {"id": "cam2", "sessionId": "sess-1"})
 
     assert answer == {"closed": True}
     assert closed == ["sess-1"], "закрыли не ту сессию или не закрыли вовсе"
@@ -467,22 +442,17 @@ def test_чужая_сессия_по_прежнему_идёт_к_сущнос�
     """`close_own` отвечает False на сессию, которая не наша, — и тогда её
     обязан закрыть штатный путь Home Assistant. Иначе камеры HA перестали бы
     закрываться вовсе."""
-    from mega_home import webrtc
-
     monkeypatch.setattr(go2rtc_session, "close_own", lambda env, sid: False)
     asked: list[str] = []
-    monkeypatch.setattr(
-        webrtc,
-        "close",
-        lambda hass, entity_id, sid: (asked.append(entity_id), {"closed": True})[1],
+    cameras = types.SimpleNamespace(
+        close=lambda entity_id, sid: (asked.append(entity_id), {"closed": True})[1]
     )
     tile = {"id": "cam3", "roomId": "r1", "name": "Калитка", "domain": "camera",
             "entityId": "camera.gate"}
     coordinator = _Coordinator({**_CONFIG, "tiles": [*_CONFIG["tiles"], tile]})
 
-    answer = ops.webrtc_close(
-        _Hass(), coordinator, {"id": "cam3", "sessionId": "sess-2"}
-    )
+    coordinator.source = FakeSource(cameras=cameras)
+    answer = ops.webrtc_close(coordinator, {"id": "cam3", "sessionId": "sess-2"})
 
     assert answer == {"closed": True}
     assert asked == ["camera.gate"]
@@ -550,7 +520,10 @@ def test_дом_говорит_о_себе_в_общем_канале_а_не_с
     from mega_home.const import INTEGRATION_VERSION
     from mega_home.http import VIEWS
 
-    answer = ops.config(_Coordinator())
+    coordinator = _Coordinator()
+    # Пути ставит тот, кто поднимал двери (`__init__.py`), — ровно из `VIEWS`.
+    coordinator.routes = sorted(view.url for view in VIEWS)
+    answer = ops.config(coordinator)
     passport = answer["integration"]
 
     assert passport["version"] == INTEGRATION_VERSION

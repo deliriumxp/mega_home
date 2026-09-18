@@ -11,18 +11,16 @@ from http import HTTPStatus
 from typing import Any
 from urllib.parse import quote
 
-from homeassistant.core import HomeAssistant
-
 from .const import LOGGER
-from .coordinator import MegaHomeCoordinator
 from .ops_base import OpError, find
 from .ops_video import _trassir_guid, trassir, video_id
+from .source import Cameras
 
 
 async def camera_frame(
-    hass: HomeAssistant, coordinator: MegaHomeCoordinator, payload: dict[str, Any]
+    coordinator: Any, payload: dict[str, Any]
 ) -> tuple[str, bytes]:
-    """Один кадр камеры — постер, пока идут переговоры (`webrtc.snapshot`).
+    """Один кадр камеры — постер, пока идут переговоры (`Cameras.snapshot`).
 
     ⚠ Не операция канала, а обработчик ПУТИ: зовётся и локальной дверью
     (`http.py`), и переносом (`relay_api.py`). Новых именованных операций мы не
@@ -51,12 +49,10 @@ async def camera_frame(
         except TrassirError as err:
             raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
 
-    from . import webrtc
-
-    return await webrtc.snapshot(hass, camera_entity(coordinator, payload))
+    return await source_cameras(coordinator).snapshot(camera_entity(coordinator, payload))
 
 def camera_entity(
-    coordinator: MegaHomeCoordinator, payload: dict[str, Any]
+    coordinator: Any, payload: dict[str, Any]
 ) -> str:
     """Плитка-камера из конфига → сущность Home Assistant.
 
@@ -112,7 +108,7 @@ def _camera_urls(entity_id: Any, attributes: Any) -> dict[str, str]:
         "stream": f"/api/camera_proxy_stream/{ident}{query}",
     }
 
-def _warm_cameras(hass: HomeAssistant, coordinator: MegaHomeCoordinator) -> None:
+def _warm_cameras(coordinator: Any) -> None:
     """Держать наготове кадр каждой камеры, пока приложение открыто.
 
     ⚠ Опрос состояний — единственный признак «приложение открыто», который у
@@ -121,10 +117,19 @@ def _warm_cameras(hass: HomeAssistant, coordinator: MegaHomeCoordinator) -> None
     секунду с лишним (ffmpeg у камеры без снапшот-адреса), и добывать его в
     момент открытия — значит показывать пустой прямоугольник ровно столько,
     сколько идут переговоры (жалоба 2026-09-08). Частоту ограничивает сам
-    `webrtc.warm`, здесь только перечень камер.
+    `Cameras.warm`, здесь только перечень камер.
     """
-    from . import webrtc
-
+    cameras = getattr(coordinator.source, "cameras", None)
+    if cameras is None:
+        return
     for tile in coordinator.data.get("tiles", []):
         if tile.get("domain") == "camera" and tile.get("entityId"):
-            webrtc.warm(hass, tile["entityId"])
+            cameras.warm(tile["entityId"])
+
+
+def source_cameras(coordinator: Any) -> Cameras:
+    """Камеры источника дома (`source.Cameras`) — или отказ, понятный жильцу."""
+    cameras = getattr(coordinator.source, "cameras", None)
+    if cameras is None:
+        raise OpError("Камеры этого дома показать нечем", HTTPStatus.NOT_IMPLEMENTED)
+    return cameras

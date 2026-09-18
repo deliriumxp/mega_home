@@ -23,17 +23,11 @@ from http import HTTPStatus
 from typing import Any
 from urllib.parse import quote
 
-import voluptuous as vol
-
-from homeassistant.core import HomeAssistant, State
-from homeassistant.exceptions import ServiceNotFound
-
 from .const import LOGGER
-from .coordinator import MegaHomeCoordinator
-
 from .ops_base import OpError, _int, find, number
 from .probe import run as run_probe
 from .scan import run as run_scan
+from .source import CommandRejected, CommandUnknown, EntityState, StateSource
 from .ops_camera import _camera_urls, _warm_cameras, camera_entity, camera_frame
 from .ops_video import (
     _guid_of,
@@ -84,8 +78,7 @@ __all__ = [
 ]
 
 async def run(
-    hass: HomeAssistant,
-    coordinator: MegaHomeCoordinator | None,
+    coordinator: Any,
     op: str,
     payload: dict[str, Any] | None,
     remote: bool = False,
@@ -105,15 +98,15 @@ async def run(
     if op == "config":
         return config(coordinator)
     if op == "states":
-        return states(hass, coordinator)
+        return states(coordinator)
     if op == "command":
-        return await command(hass, coordinator, data)
+        return await command(coordinator, data)
     if op == "scenario":
-        return await scenario(hass, coordinator, data)
+        return await scenario(coordinator, data)
     if op == "webrtc":
-        return await webrtc_offer(hass, coordinator, data, remote)
+        return await webrtc_offer(coordinator, data, remote)
     if op == "webrtc-close":
-        return webrtc_close(hass, coordinator, data)
+        return webrtc_close(coordinator, data)
     if op == "webrtc-candidates":
         # ⚠ Именованная операция тут — исключение, а не привычка: сигналинг
         # WebRTC не ресурс HTTP, через перенос (`http`) он не едет. Trickle —
@@ -132,7 +125,7 @@ async def run(
         # это был бы цикл.
         from .relay_api import handle
 
-        return await handle(hass, coordinator, data)
+        return await handle(coordinator, data)
     if op == "probe":
         # Проба устройства объекта по заданию МЕНЕДЖЕРА (`probe.py`): мониторинг
         # больше не ходит в LAN объекта по WG-туннелю, которого у части парка
@@ -146,7 +139,7 @@ async def run(
         return await run_scan(coordinator.env, data)
     raise OpError("Неизвестная операция", HTTPStatus.NOT_FOUND)
 
-def config(coordinator: MegaHomeCoordinator) -> dict[str, Any]:
+def config(coordinator: Any) -> dict[str, Any]:
     """Состав дома из кэша — плюс ПАСПОРТ САМОГО ДОМА.
 
     ⚠ `integration` — ответ на вопрос «что этот дом умеет», и завести его
@@ -177,7 +170,6 @@ def config(coordinator: MegaHomeCoordinator) -> dict[str, Any]:
     как есть. Паспорт отвечает «что есть», а не «как туда ходить».
     """
     from .const import INTEGRATION_VERSION
-    from .http import VIEWS
 
     # ⚠ И ПОЧЕМУ дом чего-то не может — тоже сюда. Причина у него была всегда
     # (`go2rtc_embed._why`), но лежала в диагностике Home Assistant, за
@@ -197,13 +189,13 @@ def config(coordinator: MegaHomeCoordinator) -> dict[str, Any]:
         "integration": {
             "version": INTEGRATION_VERSION,
             "appVersion": coordinator.bundle.version if coordinator.bundle else None,
-            "routes": sorted(getattr(view, "url", "") for view in VIEWS),
+            "routes": list(getattr(coordinator, "routes", [])),
             "accesses": _accesses(coordinator),
             "go2rtc": media,
         },
     }
 
-def _accesses(coordinator: MegaHomeCoordinator) -> list[dict[str, str]]:
+def _accesses(coordinator: Any) -> list[dict[str, str]]:
     """Доступы, которые дом ПРИНЯЛ: имя, вид, вендор. Двери нет — пустой список."""
     door = getattr(coordinator, "accesses", None)
     if door is None:
@@ -218,13 +210,14 @@ def _accesses(coordinator: MegaHomeCoordinator) -> list[dict[str, str]]:
         )
     return out
 
-def states(hass: HomeAssistant, coordinator: MegaHomeCoordinator) -> dict[str, Any]:
-    """Current states of every tile, read straight from this Home Assistant."""
+def states(coordinator: Any) -> dict[str, Any]:
+    """Current states of every tile, read straight from the source of this home."""
+    source: StateSource = coordinator.source
     entities = [
-        entity_view(tile, hass.states.get(tile["entityId"]) if tile.get("entityId") else None)
+        entity_view(tile, source.get(tile["entityId"]) if tile.get("entityId") else None)
         for tile in coordinator.data.get("tiles", [])
     ]
-    _warm_cameras(hass, coordinator)
+    _warm_cameras(coordinator)
     return {
         # Always connected: this runs inside the home, so there is no link to
         # lose between here and Home Assistant. When the manager forwards this
@@ -240,7 +233,7 @@ def states(hass: HomeAssistant, coordinator: MegaHomeCoordinator) -> dict[str, A
     }
 
 async def command(
-    hass: HomeAssistant, coordinator: MegaHomeCoordinator, payload: dict[str, Any]
+    coordinator: Any, payload: dict[str, Any]
 ) -> dict[str, Any]:
     """One command for one tile, mapped onto a Home Assistant service call."""
     tile = find(coordinator.data.get("tiles", []), payload.get("id"))
@@ -264,7 +257,7 @@ async def command(
         raise OpError(str(err)) from err
 
     await call(
-        hass, spec["domain"], spec["service"], {"entity_id": tile["entityId"], **data}
+        coordinator.source, spec["domain"], spec["service"], {"entity_id": tile["entityId"], **data}
     )
     # ⚠ Ответ несёт НОВОЕ состояние плитки, а не только «принято». Иначе
     # приложению остаётся либо ждать следующего снимка (тап выглядит
@@ -273,11 +266,11 @@ async def command(
     # Служба вызвана блокирующе, поэтому машина состояний уже обновлена.
     return {
         "accepted": True,
-        "entity": entity_view(tile, hass.states.get(tile["entityId"])),
+        "entity": entity_view(tile, coordinator.source.get(tile["entityId"])),
     }
 
 async def scenario(
-    hass: HomeAssistant, coordinator: MegaHomeCoordinator, payload: dict[str, Any]
+    coordinator: Any, payload: dict[str, Any]
 ) -> dict[str, Any]:
     """Run one scenario (a Home Assistant script)."""
     item = find(coordinator.data.get("scenarios", []), payload.get("id"))
@@ -285,12 +278,12 @@ async def scenario(
         raise OpError("Сценарий не найден", HTTPStatus.NOT_FOUND)
     if not item.get("entityId"):
         raise OpError("Сценарий не создан в Home Assistant", HTTPStatus.NOT_FOUND)
-    return await call(hass, "script", "turn_on", {"entity_id": item["entityId"]})
+    return await call(coordinator.source, "script", "turn_on", {"entity_id": item["entityId"]})
 
 async def call(
-    hass: HomeAssistant, domain: str, service: str, data: dict[str, Any]
+    source: StateSource, domain: str, service: str, data: dict[str, Any]
 ) -> dict[str, Any]:
-    """Call a Home Assistant service and turn its refusals into plain answers.
+    """Command the source of states and turn its refusals into plain answers.
 
     A service can be missing outright — `climate.set_temperature` does not exist
     on an installation with no climate integration loaded — and that raises.
@@ -298,17 +291,16 @@ async def call(
     not set up yet.
     """
     try:
-        # blocking=True: ответ обязан нести состояние ПОСЛЕ выполнения команды
-        # (см. command). Служба выполняется внутри того же Home Assistant, так
-        # что ожидание здесь — это доли миллисекунды, а не сетевой поход.
-        await hass.services.async_call(domain, service, data, blocking=True)
-    except ServiceNotFound as err:
+        # Источник ждёт выполнения: ответ обязан нести состояние ПОСЛЕ команды
+        # (см. command).
+        await source.call(domain, service, data)
+    except CommandUnknown as err:
         LOGGER.warning("Service %s.%s is not available", domain, service)
         raise OpError(
             "Home Assistant не умеет выполнять эту команду на этом объекте",
             HTTPStatus.NOT_FOUND,
         ) from err
-    except vol.Invalid as err:
+    except CommandRejected as err:
         LOGGER.warning("Service %s.%s rejected the payload: %s", domain, service, err)
         raise OpError("Home Assistant отклонил команду") from err
     return {"accepted": True}
@@ -375,7 +367,7 @@ def _public_attributes(attributes: Any) -> dict[str, Any]:
         if key not in HIDDEN_ATTRIBUTES
     }
 
-def entity_view(tile: dict[str, Any], state: State | None) -> dict[str, Any]:
+def entity_view(tile: dict[str, Any], state: EntityState | None) -> dict[str, Any]:
     """Что дом отвечает о приборе: сырое состояние Home Assistant и атрибуты.
 
     ⚠ Проекции здесь БОЛЬШЕ НЕТ (docs/plan-thin-integration.md, фаза 1).

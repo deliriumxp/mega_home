@@ -13,13 +13,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import types
 from http import HTTPStatus
 from pathlib import Path
 
 import pytest
 from homeassistant.core import State
 
-from fake_host import FakeHost
+from fake_host import FakeHost, FakeSource
 from mega_home import ops
 from mega_home.crops import CropStore
 from mega_home.imaging import LookStore
@@ -55,28 +56,6 @@ CONFIG = {
 }
 
 
-class _States:
-    def get(self, entity_id: str) -> State | None:
-        return State("on", {}) if entity_id == "light.kitchen" else None
-
-
-class _Services:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str, dict]] = []
-
-    async def async_call(self, domain, service, data, blocking=False):
-        self.calls.append((domain, service, data))
-
-
-class _Hass:
-    def __init__(self) -> None:
-        self.states = _States()
-        self.services = _Services()
-
-    async def async_add_executor_job(self, func, *args):
-        return func(*args)
-
-
 class _Assets:
     def __init__(self, directory: Path) -> None:
         self._dir = directory
@@ -101,6 +80,7 @@ class _Coordinator:
         self.looks = LookStore(tmp / "looks", {"p": tmp / "own", "a": tmp / "assets"})
         self.icons_dir = tmp / "icons"
         self.env = FakeHost(tmp)
+        self.source = FakeSource({"light.kitchen": State("on", {})})
         for directory in ("own", "crops", "assets", "icons"):
             (tmp / directory).mkdir(parents=True, exist_ok=True)
 
@@ -109,7 +89,7 @@ def call(coordinator, method: str, path: str, body: bytes | None = None):
     payload = {"method": method, "path": path}
     if body is not None:
         payload["body"] = base64.b64encode(body).decode("ascii")
-    return asyncio.run(ops.run(_Hass(), coordinator, "http", payload))
+    return asyncio.run(ops.run(coordinator, "http", payload))
 
 
 def body_of(answer) -> bytes:
@@ -249,8 +229,6 @@ def test_постер_камеры_едет_тем_же_переносом(coord
     прямоугольником. Один кадр на ОТКРЫТИЕ камеры — кадра для плитки снаружи
     нет вовсе, он обновляется по таймеру и был бы потоком через менеджер.
     """
-    from mega_home import webrtc
-
     coordinator.data = {
         **CONFIG,
         "tiles": [
@@ -260,14 +238,14 @@ def test_постер_камеры_едет_тем_же_переносом(coord
         ],
     }
 
-    async def snapshot(hass, entity_id):
+    async def snapshot(entity_id):
         assert entity_id == "camera.hall"
         # ⚠ Сырые байты, не base64: `webrtc.snapshot` отдаёт кадр как есть
         # (2026-09-08), кодирует его в base64 только `relay_api.handle` —
         # ровно один раз, а не дважды туда-обратно.
         return "image/jpeg", JPEG
 
-    monkeypatch.setattr(webrtc, "snapshot", snapshot)
+    coordinator.source.cameras = types.SimpleNamespace(snapshot=snapshot, warm=lambda _id: None)
     answer = call(coordinator, "GET", "api/camera-frame/cam1")
 
     assert body_of(answer) == JPEG

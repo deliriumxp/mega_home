@@ -16,6 +16,7 @@ from homeassistant.util import dt as dt_util
 from .api import ManagerClient, ManagerError
 from .bundle import BundleStore
 from .ha_host import HaHost
+from .ha_source import HaSource
 from .const import (
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
@@ -67,6 +68,12 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Пять примитивов среды для модулей без HA (`host.py`): им передаётся он,
         # а не `hass`.
         self.env = HaHost(hass)
+        # Источник состояний и команд (`source.py`): операции жильца читают и
+        # командуют через него, а не через `hass`.
+        self.source = HaSource(hass)
+        # Поднятые пути дверей — для паспорта дома (`ops.config`). Ставит тот,
+        # кто поднимает двери: в HA это `http.py`.
+        self.routes: list[str] = []
         # Живой канал к менеджеру; ставится в async_setup_entry после регистрации
         # HTTP, потому что сам канал ничего не раздаёт — он только будит опрос.
         self.link: Any = None

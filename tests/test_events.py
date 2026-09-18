@@ -10,10 +10,9 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from homeassistant.core import State
-from homeassistant.helpers import event as event_helper
-
+from fake_host import FakeSource
 from mega_home.events import StateStream
+from mega_home.source import PlainState as State
 
 CONFIG: dict[str, Any] = {
     "version": "sha256:abc",
@@ -25,17 +24,11 @@ CONFIG: dict[str, Any] = {
 }
 
 
-class _StateEvent:
-    """Home Assistant отдаёт событие объектом с полем `data`."""
-
-    def __init__(self, entity_id: str, new_state: Any) -> None:
-        self.data = {"entity_id": entity_id, "new_state": new_state}
-
-
 class _Coordinator:
     def __init__(self) -> None:
         self.data = dict(CONFIG)
         self.listener: Any = None
+        self.source = FakeSource()
 
     @property
     def version(self) -> str:
@@ -54,19 +47,18 @@ def _drain(stream: StateStream) -> list[tuple[str, Any]]:
 
 
 def test_подписка_только_на_сущности_плиток():
-    event_helper.async_track_state_change_event.calls.clear()
-    stream = StateStream(object(), _Coordinator())
+    stream = StateStream(_Coordinator())
     stream.start()
 
-    entity_ids, _ = event_helper.async_track_state_change_event.calls[-1]
+    entity_ids, _ = stream.coordinator.source.subscriptions[-1]
     # Плитка без сущности подписки не даёт, дубликат сущности — одной записи.
     assert entity_ids == ["light.kitchen"]
 
 
 def test_изменение_состояния_уходит_каждой_своей_плитке():
-    stream = StateStream(object(), _Coordinator())
+    stream = StateStream(_Coordinator())
     stream.start()
-    stream._on_state(_StateEvent("light.kitchen", State("on", {"brightness": 255})))
+    stream._on_state("light.kitchen", State("on", {"brightness": 255}))
 
     events = _drain(stream)
     assert [name for name, _ in events] == ["entity", "entity"]
@@ -78,9 +70,8 @@ def test_изменение_состояния_уходит_каждой_сво�
 
 
 def test_смена_конфига_переподписывает_и_сообщает_версию():
-    event_helper.async_track_state_change_event.calls.clear()
     coordinator = _Coordinator()
-    stream = StateStream(object(), coordinator)
+    stream = StateStream(coordinator)
     stream.start()
 
     coordinator.data = {
@@ -91,13 +82,13 @@ def test_смена_конфига_переподписывает_и_сообщ�
 
     # Инсталлятор добавил розетку — жилец не должен перезагружать страницу, а
     # плитка с новым entity_id обязана начать стримить.
-    entity_ids, _ = event_helper.async_track_state_change_event.calls[-1]
+    entity_ids, _ = coordinator.source.subscriptions[-1]
     assert entity_ids == ["light.hall"]
     assert _drain(stream) == [("config", {"configVersion": "sha256:def"})]
 
 
 def test_переполнение_очереди_закрывает_поток_а_не_копит_память():
-    stream = StateStream(object(), _Coordinator())
+    stream = StateStream(_Coordinator())
     stream.queue = asyncio.Queue(2)
     for _ in range(5):
         stream._put("entity", {"id": "t1"})

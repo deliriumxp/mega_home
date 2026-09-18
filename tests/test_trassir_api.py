@@ -12,12 +12,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import types
 from http import HTTPStatus
 from pathlib import Path
 
 import pytest
 
-from fake_host import FakeHost
+from fake_host import FakeHost, FakeSource
 from mega_home import go2rtc_session
 from mega_home import ops
 
@@ -26,11 +27,6 @@ EVENTS = [
     {"id": "e2", "type": "Motion Stop", "guid": "cam2", "cameraName": "Склад", "timestampUs": 200},
 ]
 JPEG = b"\xff\xd8\xff\xe0" + b"0" * 32
-
-
-class _Hass:
-    async def async_add_executor_job(self, func, *args):
-        return func(*args)
 
 
 class FakeGateway:
@@ -75,11 +71,12 @@ class _Coordinator:
     def __init__(self, gateway=None) -> None:
         self.data = {"version": "v1", "tiles": []}
         self.trassir = gateway
+        self.source = FakeSource()
 
 
 def call(coordinator, method: str, path: str):
     return asyncio.run(
-        ops.run(_Hass(), coordinator, "http", {"method": method, "path": path})
+        ops.run(coordinator, "http", {"method": method, "path": path})
     )
 
 
@@ -173,7 +170,7 @@ def test_запись_идёт_той_же_операцией_что_и_каме
     coordinator = _Coordinator(gateway)
 
     answer = asyncio.run(
-        ops.run(_Hass(), coordinator, "webrtc", {"id": "trassir:tok1", "offer": "sdp"})
+        ops.run(coordinator, "webrtc", {"id": "trassir:tok1", "offer": "sdp"})
     )
 
     assert answer["sessionId"] == "s1"
@@ -200,11 +197,11 @@ def test_плитка_опознаётся_по_адресу_потока(monkey
         "camera.vhod": "rtsp://192.168.1.50:555/IAtwTYwK_m/",
         "camera.dvor": "rtsp://192.168.1.77:554/stream1",  # чужая камера
     }
-    monkeypatch.setattr(
-        "mega_home.webrtc._camera", lambda hass, entity_id: _Camera(sources[entity_id])
-    )
+    async def stream_source(entity_id: str) -> str:
+        return await _Camera(sources[entity_id]).stream_source()
 
     coordinator = _Coordinator(FakeGateway())
+    coordinator.source = FakeSource(cameras=types.SimpleNamespace(stream_source=stream_source))
     coordinator.data = {
         "tiles": [
             {"id": "t1", "domain": "camera", "entityId": "camera.vhod"},
@@ -213,7 +210,7 @@ def test_плитка_опознаётся_по_адресу_потока(monkey
         ]
     }
 
-    found = asyncio.run(ops_module._tiles_by_guid(_Hass(), coordinator))
+    found = asyncio.run(ops_module._tiles_by_guid(coordinator))
 
     assert found == {"IAtwTYwK": "t1"}, "чужой адрес плиткой Trassir не становится"
 
@@ -267,7 +264,7 @@ def test_камера_регистратора_показывается_домо
     }
 
     answer = asyncio.run(
-        ops_module.run(_Hass(), coordinator, "webrtc", {"id": "t1", "offer": "sdp"})
+        ops_module.run(coordinator, "webrtc", {"id": "t1", "offer": "sdp"})
     )
 
     assert answer["sessionId"] == "s1"

@@ -11,11 +11,10 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from homeassistant.core import State
-from homeassistant.helpers import event as event_helper
-
+from fake_host import FakeSource
 from mega_home import ops
 from mega_home.link import ManagerLink
+from mega_home.source import PlainState as State
 from mega_home.watch import LinkWatch
 
 CONFIG: dict[str, Any] = {
@@ -33,6 +32,9 @@ class _Socket:
 
 
 class _Coordinator:
+    # Один источник на все экземпляры: спеке важно, СКОЛЬКО подписок завёл дом.
+    source = FakeSource()
+
     def __init__(self) -> None:
         self.data = dict(CONFIG)
         self.listener: Any = None
@@ -46,15 +48,10 @@ class _Coordinator:
         return lambda: None
 
 
-class _Event:
-    def __init__(self, entity_id: str, new_state: Any) -> None:
-        self.data = {"entity_id": entity_id, "new_state": new_state}
-
-
 def _patch_states(order: list[str]):
     original = ops.states
 
-    def fake(hass, coordinator):
+    def fake(coordinator):
         order.append("snapshot")
         return {"connected": True, "entities": []}
 
@@ -65,16 +62,16 @@ def _patch_states(order: list[str]):
 def test_снимок_уходит_после_подписки_и_первым_кадром():
     order: list[str] = []
     restore = _patch_states(order)
-    track = event_helper.async_track_state_change_event
-    track.calls.clear()
+    track = _Coordinator.source.subscriptions
+    track.clear()
     socket = _Socket()
 
     async def run():
-        watch = LinkWatch(object(), _Coordinator(), socket)
+        watch = LinkWatch(_Coordinator(), socket)
         watch.start()
         await asyncio.sleep(0)
         # ⚠ Подписка раньше снимка: изменение между ними иначе потерялось бы.
-        assert track.calls, "подписки нет"
+        assert track, "подписки нет"
         watch.stop()
 
     try:
@@ -94,10 +91,10 @@ def test_изменение_состояния_уходит_кадром_кан�
     socket = _Socket()
 
     async def run():
-        watch = LinkWatch(object(), _Coordinator(), socket)
+        watch = LinkWatch(_Coordinator(), socket)
         watch.start()
         await asyncio.sleep(0)
-        watch._stream._on_state(_Event("light.kitchen", State("on", {"brightness": 128})))
+        watch._stream._on_state("light.kitchen", State("on", {"brightness": 128}))
         await asyncio.sleep(0)
         watch.stop()
 
@@ -121,7 +118,7 @@ def test_переполнение_отдаёт_свежий_снимок_а_не
     socket = _Socket()
 
     async def run():
-        watch = LinkWatch(object(), _Coordinator(), socket)
+        watch = LinkWatch(_Coordinator(), socket)
         watch.start()
         for _ in range(3):
             await asyncio.sleep(0)
@@ -145,7 +142,6 @@ def test_переполнение_отдаёт_свежий_снимок_а_не
 
 def _link() -> ManagerLink:
     instance = ManagerLink.__new__(ManagerLink)
-    instance._hass = object()
     instance._coordinator = _Coordinator()
     instance._answers = set()
     instance._watch = None
@@ -179,8 +175,8 @@ def test_операция_включает_и_выключает_подписк�
 
 def test_повторное_включение_не_заводит_вторую_подписку_но_шлёт_снимок():
     restore = _patch_states([])
-    track = event_helper.async_track_state_change_event
-    track.calls.clear()
+    track = _Coordinator.source.subscriptions
+    track.clear()
     socket = _Socket()
     instance = _link()
 
@@ -198,6 +194,6 @@ def test_повторное_включение_не_заводит_вторую_
     finally:
         restore()
     # Подписка в доме одна, сколько бы телефонов ни смотрело…
-    assert len(track.calls) == 1
+    assert len(track) == 1
     # …а новый телефон получает весь дом: менеджер копии не держит.
     assert [frame.get("event") for frame in socket.sent].count("states") == 2

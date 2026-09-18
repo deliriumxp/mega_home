@@ -166,7 +166,6 @@ class ManagerLink:
             # go2rtc отдавал одни host-кандидаты — телефон снаружи не достучался
             # бы ни с первого раза, ни со второго (живой отчёт 2026-09-10).
             payload = await ops.run(
-                self._hass,
                 self._coordinator,
                 frame.get("op") or "",
                 frame.get("payload"),
@@ -211,7 +210,7 @@ class ManagerLink:
             from .watch import LinkWatch
 
             if self._watch is None:
-                self._watch = LinkWatch(self._hass, self._coordinator, socket)
+                self._watch = LinkWatch(self._coordinator, socket)
             self._watch.start()
         elif self._watch is not None:
             self._watch.stop()

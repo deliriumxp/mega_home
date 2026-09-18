@@ -31,7 +31,6 @@ from typing import Any
 
 from . import ops
 from .const import LOGGER
-from .coordinator import MegaHomeCoordinator
 from .events import StateStream
 
 # Атрибуты HA бывают датами и прочим, чего `json` не знает. Поток SSE пишет
@@ -42,8 +41,7 @@ _dumps = partial(json.dumps, default=str)
 class LinkWatch:
     """One subscription of the house to itself, pumped into the manager link."""
 
-    def __init__(self, hass: Any, coordinator: MegaHomeCoordinator, socket: Any) -> None:
-        self._hass = hass
+    def __init__(self, coordinator: Any, socket: Any) -> None:
         self._coordinator = coordinator
         self._socket = socket
         self._stream: StateStream | None = None
@@ -80,7 +78,7 @@ class LinkWatch:
 
     async def _snapshot(self) -> None:
         try:
-            await self._send("states", ops.states(self._hass, self._coordinator))
+            await self._send("states", ops.states(self._coordinator))
         except asyncio.CancelledError:
             raise
         except Exception as err:  # noqa: BLE001 - следующий зритель попросит снова
@@ -90,7 +88,7 @@ class LinkWatch:
 
     def _subscribe(self) -> StateStream:
         self._unsubscribe()
-        self._stream = StateStream(self._hass, self._coordinator)
+        self._stream = StateStream(self._coordinator)
         self._stream.start()
         return self._stream
 
@@ -104,7 +102,7 @@ class LinkWatch:
         try:
             # ⚠ Снимок ПОСЛЕ подписки, а не до: изменение, случившееся между
             # ними, иначе не попало бы ни в снимок, ни в поток.
-            await self._send("states", ops.states(self._hass, self._coordinator))
+            await self._send("states", ops.states(self._coordinator))
             while True:
                 name, payload = await stream.queue.get()
                 if name == "overflow":
@@ -112,7 +110,7 @@ class LinkWatch:
                     # канал). Копить в памяти Home Assistant нельзя — подписываемся
                     # заново и отдаём полный снимок: он и есть «наверстать».
                     stream = self._subscribe()
-                    name, payload = "states", ops.states(self._hass, self._coordinator)
+                    name, payload = "states", ops.states(self._coordinator)
                 await self._send(name, payload)
         except asyncio.CancelledError:
             raise

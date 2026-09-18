@@ -20,6 +20,35 @@ class _Pending:
         pass
 
 
+class FakeSource:
+    """Поддельный источник состояний (`source.StateSource`).
+
+    Команды запоминаются (или падают `raises`), подписки — тоже: спека дёргает
+    `on_change` сама, как это сделал бы источник.
+    """
+
+    def __init__(
+        self, states: dict[str, Any] | None = None, raises: Exception | None = None, cameras: Any = None
+    ) -> None:
+        self.states = dict(states or {})
+        self.calls: list[tuple[str, str, dict]] = []
+        self.raises = raises
+        self.cameras = cameras
+        self.subscriptions: list[tuple[list[str], Any]] = []
+
+    def get(self, entity_id: str) -> Any:
+        return self.states.get(entity_id)
+
+    async def call(self, domain: str, service: str, data: dict[str, Any]) -> None:
+        if self.raises:
+            raise self.raises
+        self.calls.append((domain, service, data))
+
+    def subscribe(self, entity_ids: list[str], on_change: Any) -> Any:
+        self.subscriptions.append((list(entity_ids), on_change))
+        return lambda: None
+
+
 class _MemoryStore:
     def __init__(self) -> None:
         self.data: Any = None

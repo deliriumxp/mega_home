@@ -30,10 +30,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, unquote
 
-from homeassistant.core import HomeAssistant
-
 from . import ops
-from .coordinator import MegaHomeCoordinator
+from .host import Host
 from .crops import crop_key_known, crop_keys, crop_value_valid
 from .imaging import asset_file, photo_file
 from .photos import (
@@ -53,8 +51,7 @@ IMMUTABLE = "public, max-age=31536000, immutable"
 
 
 async def handle(
-    hass: HomeAssistant,
-    coordinator: MegaHomeCoordinator,
+    coordinator: Any,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
     """Выполнить один перенесённый запрос и вернуть ответ для менеджера.
@@ -70,7 +67,7 @@ async def handle(
     if len(body) > MAX_PHOTO_BYTES:
         raise ops.OpError("Запрос слишком большой", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
 
-    result = await _dispatch(hass, coordinator, method, path, body, query)
+    result = await _dispatch(coordinator, method, path, body, query)
     if len(result[2]) > MAX_RESPONSE_BYTES:
         raise ops.OpError("Ответ слишком большой", HTTPStatus.INSUFFICIENT_STORAGE)
     status, content_type, raw, cache = result
@@ -85,8 +82,7 @@ async def handle(
 
 
 async def _dispatch(
-    hass: HomeAssistant,
-    coordinator: MegaHomeCoordinator,
+    coordinator: Any,
     method: str,
     path: str,
     body: bytes,
@@ -97,27 +93,27 @@ async def _dispatch(
     if path == "api/config" and method == "GET":
         return _json(ops.config(coordinator))
     if path == "api/states" and method == "GET":
-        return _json(ops.states(hass, coordinator))
+        return _json(ops.states(coordinator))
     if path == "api/command" and method == "POST":
-        return _json(await ops.command(hass, coordinator, _json_body(body)))
+        return _json(await ops.command(coordinator, _json_body(body)))
     if path == "api/scenario" and method == "POST":
-        return _json(await ops.scenario(hass, coordinator, _json_body(body)))
+        return _json(await ops.scenario(coordinator, _json_body(body)))
     if path == "api/photos" and method == "GET":
-        versions = await hass.async_add_executor_job(
+        versions = await coordinator.env.run(
             coordinator.photos.versions, photo_keys(coordinator.data)
         )
         # `imaging` — тот же флаг, что у локальной двери (`http.py`).
         return _json({"photos": versions, "imaging": True})
     if path.startswith("api/photo/"):
         key = unquote(path[len("api/photo/") :])
-        return await _photo(hass, coordinator, method, key, body, query)
+        return await _photo(coordinator, method, key, body, query)
     if path == "api/crops" and method == "GET":
-        crops = await hass.async_add_executor_job(
+        crops = await coordinator.env.run(
             coordinator.crops.all, crop_keys(coordinator.data)
         )
         return _json({"crops": crops})
     if path.startswith("api/crop/"):
-        return await _crop(hass, coordinator, method, unquote(path[len("api/crop/") :]), body)
+        return await _crop(coordinator, method, unquote(path[len("api/crop/") :]), body)
     if path.startswith("api/camera-frame/") and method == "GET":
         # Постер камеры: один кадр на открытие просмотра. ⚠ Не поток — кадр на
         # ПЛИТКЕ обновляется по таймеру, и снаружи его нет вовсе
@@ -129,7 +125,7 @@ async def _dispatch(
         # до 400 КБ на каждое открытие камеры. base64 — форма ОТВЕТА этой
         # двери, и кодируется он один раз, в `handle()`.
         content_type, raw = await ops.camera_frame(
-            hass, coordinator, {"id": unquote(path[len("api/camera-frame/") :])}
+            coordinator, {"id": unquote(path[len("api/camera-frame/") :])}
         )
         return (
             HTTPStatus.OK,
@@ -139,7 +135,7 @@ async def _dispatch(
             "no-store",
         )
     if path == "api/video/cameras" and method == "GET":
-        return _json(await ops.trassir_cameras(hass, coordinator))
+        return _json(await ops.trassir_cameras(coordinator))
     if path == "api/video/events" and method == "GET":
         # ⚠ Именно здесь query и понадобился впервые: без него жилец СНАРУЖИ
         # получал бы всю ленту вместо одной камеры — то есть другое поведение
@@ -203,15 +199,14 @@ async def _dispatch(
         # его у себя, лента листается вверх-вниз.
         return HTTPStatus.OK, content_type, raw, IMMUTABLE
     if path.startswith("api/asset/") and method == "GET":
-        return await _asset(hass, coordinator, unquote(path[len("api/asset/") :]), query)
+        return await _asset(coordinator, unquote(path[len("api/asset/") :]), query)
     if path.startswith("icons/") and method == "GET":
-        return await _icon(hass, coordinator, unquote(path[len("icons/") :]))
+        return await _icon(coordinator, unquote(path[len("icons/") :]))
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.NOT_FOUND)
 
 
 async def _photo(
-    hass: HomeAssistant,
-    coordinator: MegaHomeCoordinator,
+    coordinator: Any,
     method: str,
     key: str,
     body: bytes,
@@ -233,16 +228,16 @@ async def _photo(
         target = await photo_file(coordinator.env, coordinator, key, query or {})
         if target is None:
             raise ops.OpError("Фото не найдено", HTTPStatus.NOT_FOUND)
-        return (HTTPStatus.OK, JPEG_TYPE, await _read(hass, target), IMMUTABLE)
+        return (HTTPStatus.OK, JPEG_TYPE, await _read(coordinator.env, target), IMMUTABLE)
     if method == "POST":
         if not photo_key_known(coordinator.data, key):
             raise ops.OpError("Комната или плитка не найдена", HTTPStatus.NOT_FOUND)
         if not body.startswith(JPEG_MAGIC):
             raise ops.OpError("Ожидается фотография JPEG", HTTPStatus.BAD_REQUEST)
-        version = await hass.async_add_executor_job(coordinator.photos.save, key, body)
+        version = await coordinator.env.run(coordinator.photos.save, key, body)
         return _json({"accepted": True, "version": version})
     if method == "DELETE":
-        removed = await hass.async_add_executor_job(coordinator.photos.delete, key)
+        removed = await coordinator.env.run(coordinator.photos.delete, key)
         if not removed:
             raise ops.OpError("Фото не найдено", HTTPStatus.NOT_FOUND)
         return _json({"accepted": True})
@@ -250,8 +245,7 @@ async def _photo(
 
 
 async def _crop(
-    hass: HomeAssistant,
-    coordinator: MegaHomeCoordinator,
+    coordinator: Any,
     method: str,
     tile: str,
     body: bytes,
@@ -267,10 +261,10 @@ async def _crop(
         payload = _json_body(body)
         if not crop_value_valid(payload):
             raise ops.OpError("Некорректный участок кадра", HTTPStatus.BAD_REQUEST)
-        await hass.async_add_executor_job(coordinator.crops.save, tile, payload)
+        await coordinator.env.run(coordinator.crops.save, tile, payload)
         return _json({"accepted": True, "crop": payload})
     if method == "DELETE":
-        removed = await hass.async_add_executor_job(coordinator.crops.delete, tile)
+        removed = await coordinator.env.run(coordinator.crops.delete, tile)
         if not removed:
             raise ops.OpError("Кадр не найден", HTTPStatus.NOT_FOUND)
         return _json({"accepted": True})
@@ -278,8 +272,7 @@ async def _crop(
 
 
 async def _asset(
-    hass: HomeAssistant,
-    coordinator: MegaHomeCoordinator,
+    coordinator: Any,
     key: str,
     query: dict[str, str] | None = None,
 ) -> tuple[int, str, bytes, str]:
@@ -288,11 +281,11 @@ async def _asset(
     if found is None:
         raise ops.OpError("Файл не найден", HTTPStatus.NOT_FOUND)
     target, content_type = found
-    return (HTTPStatus.OK, content_type, await _read(hass, target), IMMUTABLE)
+    return (HTTPStatus.OK, content_type, await _read(coordinator.env, target), IMMUTABLE)
 
 
 async def _icon(
-    hass: HomeAssistant, coordinator: MegaHomeCoordinator, name: str
+    coordinator: Any, name: str
 ) -> tuple[int, str, bytes, str]:
     """Иконка сценария из выкачанных домом.
 
@@ -302,13 +295,13 @@ async def _icon(
     if not name or "/" in name or "\\" in name or ".." in name:
         raise ops.OpError("Иконка не найдена", HTTPStatus.NOT_FOUND)
     target = coordinator.icons_dir / name
-    if not await hass.async_add_executor_job(target.is_file):
+    if not await coordinator.env.run(target.is_file):
         raise ops.OpError("Иконка не найдена", HTTPStatus.NOT_FOUND)
-    return (HTTPStatus.OK, "image/png", await _read(hass, target), IMMUTABLE)
+    return (HTTPStatus.OK, "image/png", await _read(coordinator.env, target), IMMUTABLE)
 
 
-async def _read(hass: HomeAssistant, target: Path) -> bytes:
-    return await hass.async_add_executor_job(target.read_bytes)
+async def _read(env: Host, target: Path) -> bytes:
+    return await env.run(target.read_bytes)
 
 
 def _json(payload: Any) -> tuple[int, str, bytes, str]:

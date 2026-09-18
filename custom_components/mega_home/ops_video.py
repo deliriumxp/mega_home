@@ -14,14 +14,11 @@ from __future__ import annotations
 from http import HTTPStatus
 from typing import Any
 
-from homeassistant.core import HomeAssistant
-
 from .const import LOGGER
-from .coordinator import MegaHomeCoordinator
 from .ops_base import OpError, _int, find, number
 
 
-def trassir(coordinator: MegaHomeCoordinator) -> Any:
+def trassir(coordinator: Any) -> Any:
     """Шлюз к регистратору объекта — или понятный отказ, если его нет."""
     gateway = getattr(coordinator, "trassir", None)
     if gateway is None or not gateway.configured:
@@ -63,19 +60,15 @@ def video_id(tile: dict[str, Any] | None) -> str | None:
     guid = tile.get("videoId")
     return guid if isinstance(guid, str) and guid else None
 
-def _trassir_guid(coordinator: MegaHomeCoordinator, tile_id: Any) -> str | None:
+def _trassir_guid(coordinator: Any, tile_id: Any) -> str | None:
     """То же самое, но по id плитки: искать её в составе дома нужно почти всем."""
     return video_id(find((coordinator.data or {}).get("tiles", []), tile_id))
 
-async def trassir_cameras(
-    hass: HomeAssistant, coordinator: MegaHomeCoordinator
-) -> dict[str, Any]:
+async def trassir_cameras(coordinator: Any) -> dict[str, Any]:
     """Камеры регистратора: id, имя, кодек, архив и ПЛИТКА дома, если она есть."""
-    return {"cameras": await trassir(coordinator).async_cameras(await _tiles_by_guid(hass, coordinator))}
+    return {"cameras": await trassir(coordinator).async_cameras(await _tiles_by_guid(coordinator))}
 
-async def _tiles_by_guid(
-    hass: HomeAssistant, coordinator: MegaHomeCoordinator
-) -> dict[str, str]:
+async def _tiles_by_guid(coordinator: Any) -> dict[str, str]:
     """Плитки-камеры дома, разложенные по guid канала Trassir.
 
     ⚠ Опознаём по АДРЕСУ ПОТОКА камеры, а не по имени: постоянная ссылка
@@ -87,14 +80,14 @@ async def _tiles_by_guid(
     всех из-за одной нельзя.
     """
     found: dict[str, str] = {}
+    cameras = getattr(coordinator.source, "cameras", None)
+    if cameras is None:
+        return found
     for tile in (coordinator.data or {}).get("tiles", []):
         if tile.get("domain") != "camera" or not tile.get("entityId"):
             continue
         try:
-            from . import webrtc
-
-            camera = webrtc._camera(hass, tile["entityId"])  # noqa: SLF001
-            source = await camera.stream_source()
+            source = await cameras.stream_source(tile["entityId"])
         except Exception as err:  # noqa: BLE001
             LOGGER.debug("Адрес потока камеры %s не прочитан: %s", tile.get("id"), err)
             continue
@@ -113,7 +106,7 @@ def _guid_of(source: str | None) -> str | None:
     return match.group(1) if match else None
 
 def trassir_events(
-    coordinator: MegaHomeCoordinator, query: dict[str, Any]
+    coordinator: Any, query: dict[str, Any]
 ) -> dict[str, Any]:
     """Лента событий, новые сверху; можно по одной камере и постранично.
 
@@ -132,7 +125,7 @@ def trassir_events(
     }
 
 async def gateway_call(
-    coordinator: MegaHomeCoordinator, payload: dict[str, Any]
+    coordinator: Any, payload: dict[str, Any]
 ) -> Any:
     """Исполнить ОПИСАННЫЙ вызов — универсальная дверь наружу.
 
@@ -212,7 +205,7 @@ async def gateway_call(
     }
 
 async def trassir_clip_at(
-    coordinator: MegaHomeCoordinator,
+    coordinator: Any,
     guid: str,
     timestamp_us: int | None = None,
     camera_name: str | None = None,
@@ -249,7 +242,7 @@ async def trassir_clip_at(
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
 
 async def trassir_ready(
-    coordinator: MegaHomeCoordinator,
+    coordinator: Any,
     clip_id: str,
     position_us: Any = None,
     window_start_us: Any = None,
@@ -281,7 +274,7 @@ async def trassir_ready(
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
 
 async def trassir_preview(
-    coordinator: MegaHomeCoordinator, channel: str, timestamp_us: Any
+    coordinator: Any, channel: str, timestamp_us: Any
 ) -> tuple[str, bytes]:
     """Маленький кадр архива канала на метке — превью при перемотке."""
     from .trassir_client import TrassirError
@@ -296,7 +289,7 @@ async def trassir_preview(
         raise OpError(str(err), HTTPStatus.BAD_GATEWAY) from err
 
 async def trassir_thumb(
-    coordinator: MegaHomeCoordinator, event_id: str, lead_s: int | None = None
+    coordinator: Any, event_id: str, lead_s: int | None = None
 ) -> tuple[str, bytes]:
     """Превью события — кадр архива, уже уменьшенный домом.
 

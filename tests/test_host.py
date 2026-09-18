@@ -37,7 +37,12 @@ def test_таймер_тикает_и_снимается(tmp_path: Path) -> None
             ticks.append(now)
 
         unsub = host.every(timedelta(seconds=0.01), tick)
-        await asyncio.sleep(0.05)
+        # Ждём два тика с запасом, а не фиксированную паузу: под нагрузкой
+        # цикл событий медленнее, и спека на время иначе плавает.
+        for _ in range(200):
+            if len(ticks) >= 2:
+                break
+            await asyncio.sleep(0.01)
         unsub()
         seen = len(ticks)
         await asyncio.sleep(0.03)
@@ -56,7 +61,11 @@ def test_отложенная_запись_сливается_в_одну(tmp_pa
         store.async_delay_save(lambda: {"n": 1}, 0.02)
         store.async_delay_save(lambda: {"n": 2}, 0.02)
         assert not (tmp_path / "feed").exists()
-        await asyncio.sleep(0.1)
+        for _ in range(200):
+            if (tmp_path / "feed").exists():
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.02)
         return await store.async_load()
 
     assert asyncio.run(scenario()) == {"n": 2}

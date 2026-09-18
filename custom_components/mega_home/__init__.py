@@ -31,7 +31,7 @@ from .const import (
 )
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
 from .trassir import TrassirGateway
-from .http import async_register_http
+from .http import VIEWS as HTTP_VIEWS, async_register_http
 from .agent import AgentRunner
 from .link import ManagerLink
 from .sip_bridge import SipBridge
@@ -97,6 +97,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     coordinator.keep_polling(entry)
 
     await async_register_http(hass, coordinator)
+    # Паспорт дома называет ПОДНЯТЫЕ пути (`ops.config`) — их знает тот, кто
+    # поднимал двери.
+    coordinator.routes = sorted(getattr(view, "url", "") for view in HTTP_VIEWS)
 
     # Свой go2rtc :8555 stun:8555 без патча HA core — одна схема.
     #

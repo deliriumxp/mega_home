@@ -25,6 +25,7 @@ import pytest
 from fake_host import FakeHost
 from mega_home import go2rtc_session
 from mega_home import ops
+from mega_home.ha_source import HaSource
 
 
 class _StreamType:
@@ -113,6 +114,25 @@ class _Coordinator:
         self.data = {"tiles": tiles}
         self.version = None
         self.bundle = None
+
+
+def _bind(hass: Any, coordinator: Any) -> Any:
+    """Камеры HA идут через источник дома — источник строится над `hass` спеки."""
+    if coordinator is not None:
+        coordinator.source = HaSource(hass)
+    return coordinator
+
+
+def _run(hass, coordinator, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+    return ops.run(_bind(hass, coordinator), *args, **kwargs)
+
+
+def _camera_frame(hass, coordinator, payload):  # noqa: ANN001, ANN202
+    return ops.camera_frame(_bind(hass, coordinator), payload)
+
+
+def _states(hass, coordinator):  # noqa: ANN001, ANN202
+    return ops.states(_bind(hass, coordinator))
 
 
 class _Hass:
@@ -401,7 +421,7 @@ def test_ответ_и_кандидаты_едут_одним_пакетом(_ha
     _ha_camera_modules["camera.hall"] = camera
 
     result = run(
-        ops.run(
+        _run(
             object(),
             _Coordinator([CAMERA_TILE]),
             "webrtc",
@@ -428,7 +448,7 @@ def test_камера_без_webrtc_отказывает_понятно(_ha_came
 
     with pytest.raises(ops.OpError) as err:
         run(
-            ops.run(
+            _run(
                 object(),
                 _Coordinator([CAMERA_TILE]),
                 "webrtc",
@@ -444,7 +464,7 @@ def test_молчание_камеры_закрывает_сессию(_ha_camer
 
     with pytest.raises(ops.OpError) as err:
         run(
-            ops.run(
+            _run(
                 object(),
                 _Coordinator([CAMERA_TILE]),
                 "webrtc",
@@ -462,7 +482,7 @@ def test_ошибка_камеры_едет_текстом_и_закрывает
 
     with pytest.raises(ops.OpError) as err:
         run(
-            ops.run(
+            _run(
                 object(),
                 _Coordinator([CAMERA_TILE]),
                 "webrtc",
@@ -478,7 +498,7 @@ def test_закрытие_просмотра_отпускает_камеру(_ha
     _ha_camera_modules["camera.hall"] = camera
 
     result = run(
-        ops.run(
+        _run(
             object(),
             _Coordinator([CAMERA_TILE]),
             "webrtc-close",
@@ -500,7 +520,7 @@ def test_сущность_берётся_из_состава_а_не_из_зап
     _ha_camera_modules["camera.neighbour"] = _Camera([_Answer("чужая")])
 
     result = run(
-        ops.run(
+        _run(
             object(),
             _Coordinator([CAMERA_TILE]),
             "webrtc",
@@ -515,16 +535,16 @@ def test_не_камера_и_ненайденная_плитка_отказыв
         [CAMERA_TILE, {"id": "l1", "domain": "light", "entityId": "light.hall"}]
     )
     with pytest.raises(ops.OpError):
-        run(ops.run(object(), coordinator, "webrtc", {"id": "l1", "offer": "v=0"}))
+        run(_run(object(), coordinator, "webrtc", {"id": "l1", "offer": "v=0"}))
     with pytest.raises(ops.OpError) as err:
-        run(ops.run(object(), coordinator, "webrtc", {"id": "нет", "offer": "v=0"}))
+        run(_run(object(), coordinator, "webrtc", {"id": "нет", "offer": "v=0"}))
     assert err.value.status == HTTPStatus.NOT_FOUND
 
 
 def test_предложение_обязательно(_ha_camera_modules):
     _ha_camera_modules["camera.hall"] = _Camera([])
     with pytest.raises(ops.OpError):
-        run(ops.run(object(), _Coordinator([CAMERA_TILE]), "webrtc", {"id": "cam1"}))
+        run(_run(object(), _Coordinator([CAMERA_TILE]), "webrtc", {"id": "cam1"}))
 
 
 def test_постер_отдаётся_сырыми_байтами(_ha_camera_modules):
@@ -546,7 +566,7 @@ def test_постер_отдаётся_сырыми_байтами(_ha_camera_mo
     _ha_camera_modules["camera.hall"] = _Camera(frame=b"\xff\xd8jpeg")
 
     content_type, raw = run(
-        ops.camera_frame(object(), _Coordinator([CAMERA_TILE]), {"id": "cam1"})
+        _camera_frame(object(), _Coordinator([CAMERA_TILE]), {"id": "cam1"})
     )
     assert raw == b"\xff\xd8jpeg"
     assert content_type == "image/jpeg"
@@ -563,8 +583,8 @@ def test_кадр_отдаётся_из_памяти_а_не_с_камеры(_ha
     hass = _Hass()
     _ha_camera_modules["camera.hall"] = _Camera(frame=b"\xff\xd8jpeg")
 
-    first = run(ops.camera_frame(hass, _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
-    second = run(ops.camera_frame(hass, _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
+    first = run(_camera_frame(hass, _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
+    second = run(_camera_frame(hass, _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
 
     assert second[1] == first[1]
     # Камеру дёрнули РОВНО раз, второй кадр пришёл из памяти.
@@ -582,11 +602,11 @@ def test_опрос_состояний_греет_кадр_заранее(_ha_ca
     hass = _Hass()
     _ha_camera_modules["camera.hall"] = _Camera(frame=b"\xff\xd8jpeg")
 
-    ops.states(hass, _Coordinator([CAMERA_TILE]))
+    _states(hass, _Coordinator([CAMERA_TILE]))
     assert len(hass.tasks) == 1
     run(hass.tasks[0])
 
-    content_type, raw = run(ops.camera_frame(hass, _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
+    content_type, raw = run(_camera_frame(hass, _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
 
     assert raw == b"\xff\xd8jpeg"
     # Кадр снят ОДИН раз — заранее; открытие камеры не стоило похода к ней.
@@ -602,14 +622,14 @@ def test_слишком_большой_кадр_отклоняется(_ha_camer
     _ha_camera_modules["camera.hall"] = _Camera(frame=b"too long a frame")
 
     with pytest.raises(ops.OpError) as err:
-        run(ops.camera_frame(object(), _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
+        run(_camera_frame(object(), _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
     assert err.value.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
 
 
 def test_камера_без_кадра_отказывает_понятно(_ha_camera_modules):
     _ha_camera_modules["camera.hall"] = _Camera()
     with pytest.raises(ops.OpError) as err:
-        run(ops.camera_frame(object(), _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
+        run(_camera_frame(object(), _Coordinator([CAMERA_TILE]), {"id": "cam1"}))
     assert err.value.message == "Камера не отдала кадр"
 
 
@@ -621,7 +641,7 @@ def _own_negotiate(ws_messages):
 
     async def scenario():
         task = asyncio.ensure_future(
-            ops.run(
+            _run(
                 object(), _Coordinator([CAMERA_TILE]), "webrtc", {"id": "cam1", "offer": "v=0 offer"}
             )
         )
@@ -708,7 +728,7 @@ def test_отказ_своего_go2rtc_не_подменяется_фолбэк
 
     with pytest.raises(ops.OpError) as err:
         run(
-            ops.run(
+            _run(
                 object(), _Coordinator([CAMERA_TILE]), "webrtc", {"id": "cam1", "offer": "v=0"}
             )
         )
@@ -782,7 +802,7 @@ def test_ответ_не_ждёт_всё_окно_когда_srflx_уже_ест
 
     start = monotonic()
     result = run(
-        ops.run(
+        _run(
             object(),
             _Coordinator([CAMERA_TILE]),
             "webrtc",
@@ -813,7 +833,7 @@ def test_без_srflx_ждём_всё_окно_как_раньше(_ha_camera_mo
 
     start = monotonic()
     result = run(
-        ops.run(
+        _run(
             object(),
             _Coordinator([CAMERA_TILE]),
             "webrtc",
@@ -840,7 +860,7 @@ def test_свой_go2rtc_не_ждёт_всё_окно(_ha_camera_modules, own_g
 
     async def scenario():
         task = asyncio.ensure_future(
-            ops.run(
+            _run(
                 object(),
                 _Coordinator([CAMERA_TILE]),
                 "webrtc",

@@ -31,12 +31,9 @@ from typing import Any
 
 from aiohttp import web
 
-from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
-from homeassistant.helpers.event import async_track_state_change_event
-
 from . import ops
 from .const import LOGGER
-from .coordinator import MegaHomeCoordinator
+from .source import EntityState
 
 # Комментарий-пинг: держит соединение открытым через реверс-прокси с таймаутом
 # простоя (у nginx по умолчанию 60 с) и даёт заметить оборванный сокет.
@@ -49,10 +46,9 @@ QUEUE_LIMIT = 100
 
 
 class StateStream:
-    """One connected client: a queue fed by Home Assistant, drained by aiohttp."""
+    """One connected client: a queue fed by the source of states, drained by aiohttp."""
 
-    def __init__(self, hass: HomeAssistant, coordinator: MegaHomeCoordinator) -> None:
-        self.hass = hass
+    def __init__(self, coordinator: Any) -> None:
         self.coordinator = coordinator
         self.queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(QUEUE_LIMIT)
         self._unsubscribe: Any = None
@@ -98,27 +94,22 @@ class StateStream:
         self._by_entity = by_entity
         if not by_entity:
             return
-        self._unsubscribe = async_track_state_change_event(
-            self.hass, list(by_entity), self._on_state
+        self._unsubscribe = self.coordinator.source.subscribe(
+            list(by_entity), self._on_state
         )
 
     # --- источники событий ---
 
-    @callback
-    def _on_state(self, event: Event[EventStateChangedData]) -> None:
-        state = event.data.get("new_state")
-        entity_id = event.data.get("entity_id")
+    def _on_state(self, entity_id: str, state: EntityState | None) -> None:
         # Несколько плиток на одну сущность — законный случай: тот же прибор
         # может стоять в двух комнатах приложения.
-        for tile in self._by_entity.get(entity_id or "", []):
+        for tile in self._by_entity.get(entity_id, []):
             self._put("entity", ops.entity_view(tile, state))
 
-    @callback
     def _on_config(self) -> None:
         self._subscribe_entities()
         self._put("config", {"configVersion": self.coordinator.version})
 
-    @callback
     def _put(self, name: str, payload: Any) -> None:
         if self._overflowed:
             return
@@ -148,7 +139,7 @@ class StateStream:
         await response.prepare(request)
         self.start()
         try:
-            await self._write(response, "states", ops.states(self.hass, self.coordinator))
+            await self._write(response, "states", ops.states(self.coordinator))
             while True:
                 try:
                     name, payload = await asyncio.wait_for(

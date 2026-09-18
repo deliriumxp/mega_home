@@ -9,19 +9,15 @@ from __future__ import annotations
 from http import HTTPStatus
 from typing import Any
 
-from homeassistant.core import HomeAssistant
-
 from . import go2rtc_session
 from .const import LOGGER
-from .coordinator import MegaHomeCoordinator
 from .ops_base import OpError
-from .ops_camera import camera_entity
+from .ops_camera import camera_entity, source_cameras
 from .ops_video import _trassir_guid, trassir
 
 
 async def webrtc_offer(
-    hass: HomeAssistant,
-    coordinator: MegaHomeCoordinator,
+    coordinator: Any,
     payload: dict[str, Any],
     remote: bool = False,
 ) -> dict[str, Any]:
@@ -30,10 +26,7 @@ async def webrtc_offer(
     Через менеджер проходит только этот обмен (килобайты SDP), видео идёт мимо
     него — ради этого всё и затевалось (remote-access.md у менеджера).
 
-    ⚠ Импорт `webrtc` локальный: модуль камер Home Assistant не грузится в
-    домах, где камер нет вовсе. Своя go2rtc (`go2rtc_session`) от него не зависит.
     """
-    from . import webrtc
     from .trassir_clip import CLIP_PREFIX
 
     sdp = payload.get("offer")
@@ -76,15 +69,14 @@ async def webrtc_offer(
         return await gateway.clips.async_live_offer(
             guid, sdp, "sub" if quality == "sub" else "main", remote, trickle
         )
-    return await webrtc.negotiate(
-        hass, camera_entity(coordinator, payload), sdp, remote, trickle
+    return await source_cameras(coordinator).negotiate(
+        camera_entity(coordinator, payload), sdp, remote, trickle
     )
 
 def webrtc_close(
-    hass: HomeAssistant, coordinator: MegaHomeCoordinator, payload: dict[str, Any]
+    coordinator: Any, payload: dict[str, Any]
 ) -> dict[str, Any]:
     """Жилец закрыл просмотр — отпустить камеру, не дожидаясь развала связи."""
-    from . import webrtc
     from .trassir_clip import CLIP_PREFIX
 
     session_id = payload.get("sessionId")
@@ -114,7 +106,7 @@ def webrtc_close(
     # таймаутов. У регистратора соединения на IP считаны, и течь им нельзя.
     if go2rtc_session.close_own(coordinator.env, session_id):
         return {"closed": True}
-    return webrtc.close(hass, camera_entity(coordinator, payload), session_id)
+    return source_cameras(coordinator).close(camera_entity(coordinator, payload), session_id)
 
 async def webrtc_candidates(payload: dict[str, Any]) -> dict[str, Any]:
     """Trickle: кандидаты телефона — туда, накопленные домом — оттуда.
