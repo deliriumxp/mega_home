@@ -6,10 +6,10 @@ IP-вызов панели — обычный `INVITE` на 5060, RTSP мони�
 Asterisk; своего SIP-стека здесь нет и не будет (`docs/intercom-remote.md` в
 менеджере, Часть II).
 
-⚠ Этап ПРОВЕРКИ: мост принимает прямой IP-вызов из локальной сети, звонит пять
-секунд, отвечает и возвращает звук и видео эхом. Так проверяется ровно то, от
-чего зависит вся домофония: ставится ли Asterisk в контейнер Home Assistant на
-объекте, переживает ли его перезапуск и слышен ли разговор через него.
+⚠ Этап ПРОВЕРКИ: мост принимает прямой IP-вызов из локальной сети и держит его
+звонящим, пока телефон по WebSocket не наберёт `answer` (`sip_calls.py`);
+`echo` — звук телефон ⇄ мост без панели. Учётка телефона одна на дом, её пароль
+— в диагностике. Конфиг Asterisk — `sip_config.py`.
 
 ⚠ Включается ТОЛЬКО конфигом объекта (`intercom.sipBridge`), а не релизом:
 релиз доезжает до всех домов, а мост ставит пакеты в их контейнер.
@@ -36,18 +36,13 @@ from time import monotonic
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import STORAGE_DIR
 
 from .const import LOGGER
+from .sip_calls import DoorCalls
+from .sip_config import HTTP_PORT, RESIDENT, RTP_END, RTP_START, SIP_PORT, write_config
 
-# Прямой IP-вызов панели Akuvox идёт на 5060 по UDP (статья Intercom Call
-# Configuration и запись трафика стенда) — порт у панели настраивается, но
-# меняется для всех её адресатов разом, поэтому подстраиваемся мы.
-SIP_PORT = 5060
-# Медиа моста. Узкий диапазон: вызовов в доме единицы, а каждый порт — это
-# правило, которое придётся объяснять, если между панелью и хостом есть фильтр.
-RTP_START = 20000
-RTP_END = 20200
 # Пакеты из репозитория Alpine, на котором собран образ Home Assistant.
 # ⚠ Контейнер пересоздаётся при КАЖДОМ обновлении HA, и установка пропадает —
 # сколько стоит её повтор, пишем в `install_seconds`.
@@ -58,10 +53,6 @@ INSTALL_TIMEOUT = 300.0
 READY_TIMEOUT = 30.0
 LOG_TAIL = 40
 STORE_DIR = "mega_home_sip"
-# Откуда принимаем вызов без регистрации. ⚠ Только частные сети: мост на
-# 5060 без аутентификации, и вызов «из интернета» означал бы чужое эхо на нашем
-# канале. Адреса конкретных панелей приедут конфигом вместе с модулем домофонии.
-PRIVATE_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
 
 
 class SipBridge:
@@ -81,6 +72,8 @@ class SipBridge:
         # Почему моста нет. ⚠ Причины разные и лечатся в разных местах: выключен
         # в менеджере, нечем поставить, не поставился, порт занят, не поднялся.
         self._why = "выключен в конфиге объекта"
+        self._keys: dict[str, str] = {}
+        self.calls: DoorCalls | None = None
         self.install_seconds: float | None = None
 
     # --- снаружи --------------------------------------------------------
@@ -130,7 +123,16 @@ class SipBridge:
             "adopted": self._ready and self._adopted,
             "why": "" if self.is_running() else self._why,
             "sip_port": SIP_PORT,
+            "ws": f"ws://<хост>:{HTTP_PORT}/ws",
             "rtp": f"{RTP_START}-{RTP_END}",
+            # ⚠ Этап проверки: единственная учётка телефона, чтобы инсталлятор
+            # мог позвонить из тестового клиента. Уходит вместе с этапом 2.
+            "test_account": (
+                {"user": RESIDENT, "password": self._keys["resident"]}
+                if self._keys.get("resident")
+                else None
+            ),
+            "calls": self.calls.state() if self.calls else None,
             "install_seconds": self.install_seconds,
             "log": list(self._log),
         }
@@ -141,11 +143,12 @@ class SipBridge:
         binary = await self._async_binary()
         if not binary:
             return
-        await self._hass.async_add_executor_job(write_config, self._root)
+        self._keys = await self._hass.async_add_executor_job(write_config, self._root)
         if await self._async_ctl("core show uptime") is not None:
             # Сирота прошлого запуска: конфиг наш, перечитываем его и живём дальше.
             await self._async_ctl("core reload")
             self._ready, self._adopted, self._why = True, True, ""
+            self._start_calls()
             LOGGER.info("SIP-мост: усыновлён Asterisk прошлого запуска")
             return
         busy = await self._hass.async_add_executor_job(_port_busy)
@@ -173,7 +176,11 @@ class SipBridge:
         self._adopted = False
         if await self._async_await_listener():
             self._ready, self._why = True, ""
-            LOGGER.info("SIP-мост готов: UDP %s, медиа %s-%s", SIP_PORT, RTP_START, RTP_END)
+            self._start_calls()
+            LOGGER.info(
+                "SIP-мост готов: UDP %s, WebSocket %s, медиа %s-%s",
+                SIP_PORT, HTTP_PORT, RTP_START, RTP_END,
+            )
             return
         self._why = (
             f"SIP-слушатель не поднялся за {READY_TIMEOUT:.0f} с. "
@@ -182,7 +189,16 @@ class SipBridge:
         LOGGER.warning("SIP-мост: %s", self._why)
         await self._async_stop()
 
+    def _start_calls(self) -> None:
+        if self.calls is None:
+            self.calls = DoorCalls(
+                async_get_clientsession(self._hass), HTTP_PORT, self._keys["ari"]
+            )
+        self.calls.start()
+
     async def _async_stop(self) -> None:
+        if self.calls is not None:
+            await self.calls.stop()
         ready, adopted = self._ready, self._adopted
         self._ready = self._adopted = False
         proc, self._proc = self._proc, None
@@ -282,107 +298,15 @@ async def _run(argv: list[str], timeout: float) -> tuple[int, str]:
 
 
 def _port_busy() -> str:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-        # Без SO_REUSEADDR: нужен честный ответ «занят», а не место рядом.
-        try:
-            probe.bind(("0.0.0.0", SIP_PORT))
-        except OSError:
-            return f"UDP {SIP_PORT}"
+    for kind, name, port in (
+        (socket.SOCK_DGRAM, "UDP", SIP_PORT),
+        (socket.SOCK_STREAM, "TCP", HTTP_PORT),
+    ):
+        with socket.socket(socket.AF_INET, kind) as probe:
+            # Без SO_REUSEADDR: нужен честный ответ «занят», а не место рядом.
+            try:
+                probe.bind(("0.0.0.0", port))
+            except OSError:
+                return f"{name} {port}"
     return ""
 
-
-def write_config(root: Path) -> None:
-    """Разложить конфиг моста по своим каталогам (синхронно, в executor)."""
-    for name in ("etc", "lib", "run", "log", "spool", "cache", "agi-bin"):
-        (root / name).mkdir(parents=True, exist_ok=True)
-    for name, text in render_config(root).items():
-        (root / "etc" / name).write_text(text, encoding="utf-8")
-
-
-def render_config(root: Path) -> dict[str, str]:
-    """Файлы конфига Asterisk. Чистая функция — её и проверяют тесты."""
-    identify = "\n".join(f"match={net}" for net in PRIVATE_NETS)
-    return {
-        "asterisk.conf": f"""[directories]
-astcachedir => {root}/cache
-astetcdir => {root}/etc
-astmoddir => /usr/lib/asterisk/modules
-astvarlibdir => {root}/lib
-astdbdir => {root}/lib
-astkeydir => {root}/lib
-astdatadir => /usr/share/asterisk
-astagidir => {root}/agi-bin
-astspooldir => {root}/spool
-astrundir => {root}/run
-astlogdir => {root}/log
-astsbindir => /usr/sbin
-
-[options]
-verbose = 3
-""",
-        # ⚠ autoload, а не белый список: зависимости PJSIP (sorcery, pjproject,
-        # сессия, SDP) легко недосчитаться, и мост молча не встанет. Модули без
-        # своего конфига сами отказываются грузиться; снимаем только железо и
-        # то, что ходит в сеть без спроса.
-        "modules.conf": """[modules]
-autoload = yes
-noload => chan_dahdi.so
-noload => chan_mobile.so
-noload => chan_unistim.so
-noload => chan_iax2.so
-noload => chan_console.so
-noload => res_corosync.so
-noload => res_hep.so
-noload => res_hep_pjsip.so
-noload => res_hep_rtcp.so
-noload => res_xmpp.so
-noload => chan_motif.so
-""",
-        "logger.conf": """[general]
-[logfiles]
-console => notice,warning,error,verbose
-messages => notice,warning,error,verbose
-""",
-        "rtp.conf": f"""[general]
-rtpstart={RTP_START}
-rtpend={RTP_END}
-""",
-        "pjsip.conf": f"""[global]
-type=global
-user_agent=mega_home-sip-bridge
-
-[transport-udp]
-type=transport
-protocol=udp
-bind=0.0.0.0:{SIP_PORT}
-
-[panel]
-type=endpoint
-transport=transport-udp
-context=from-panel
-disallow=all
-allow=ulaw,alaw,h264
-direct_media=no
-rtp_symmetric=yes
-dtmf_mode=rfc4733
-
-[panel]
-type=identify
-endpoint=panel
-{identify}
-""",
-        # Любой номер, которым панель позвала мост: прямой IP-вызов приходит как
-        # `sip:<IP>@<IP>`, поэтому образец начинается с цифры или буквы.
-        "extensions.conf": """[general]
-static=yes
-writeprotect=yes
-
-[from-panel]
-exten => _[0-9a-zA-Z].,1,NoOp(SIP-мост: вызов от ${CALLERID(all)} на ${EXTEN})
- same => n,Ringing()
- same => n,Wait(5)
- same => n,Answer()
- same => n,Echo()
- same => n,Hangup()
-""",
-    }

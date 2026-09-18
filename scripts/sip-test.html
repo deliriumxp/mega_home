@@ -1,0 +1,81 @@
+<!doctype html>
+<!--
+  Проверка SIP-моста домофонии (`sip_bridge.py`) на стенде: ответить панели из браузера.
+
+  ⚠ Открывать ФАЙЛОМ (file://), а не с сервера: микрофон браузер даёт только в
+  secure context, а страница с http://<дом>:8123 им не является; file:// — является,
+  и ws:// из него не блокируется как mixed content.
+
+  Адрес: ws://<IP хоста HA>:8188/ws. Пароль — диагностика интеграции,
+  `sip_bridge.test_account`. Порядок: «Подключить» → позвонить с панели на IP хоста →
+  «Ответить». «Эхо» — звук телефон ⇄ мост без панели.
+-->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>SIP-мост: проверка</title>
+<style>
+  body { font: 15px system-ui, sans-serif; max-width: 520px; margin: 24px auto; padding: 0 16px; }
+  label { display: block; margin: 8px 0 2px; }
+  input { width: 100%; padding: 6px; box-sizing: border-box; }
+  button { margin: 12px 8px 0 0; padding: 8px 14px; }
+  pre { background: #f3f3f3; padding: 8px; white-space: pre-wrap; max-height: 320px; overflow: auto; }
+</style>
+</head>
+<body>
+<h2>SIP-мост: проверка</h2>
+<label>WebSocket моста <input id="ws" value="ws://192.168.88.102:8188/ws"></label>
+<label>Пароль (test_account) <input id="pass" type="password"></label>
+<button id="connect">Подключить</button>
+<button id="answer" disabled>Ответить</button>
+<button id="echo" disabled>Эхо</button>
+<button id="hangup" disabled>Положить</button>
+<audio id="remote" autoplay></audio>
+<pre id="log"></pre>
+<script type="module">
+  import * as JsSIP from 'https://cdn.jsdelivr.net/npm/jssip@3.13.8/+esm';
+
+  const $ = (id) => document.getElementById(id);
+  const log = (text) => { $('log').textContent += `${new Date().toLocaleTimeString()} ${text}\n`; };
+  let ua = null;
+  let session = null;
+  let host = '';
+
+  $('connect').onclick = () => {
+    const ws = $('ws').value.trim();
+    host = new URL(ws.replace(/^ws/, 'http')).hostname;
+    ua?.stop();
+    ua = new JsSIP.UA({
+      sockets: [new JsSIP.WebSocketInterface(ws)],
+      uri: `sip:resident@${host}`,
+      password: $('pass').value,
+      // Регистрация не нужна: телефон сам набирает `answer`, мост его не зовёт.
+      register: false,
+    });
+    ua.on('connected', () => { log('WebSocket подключён'); $('answer').disabled = $('echo').disabled = false; });
+    ua.on('disconnected', () => { log('WebSocket отключён'); $('answer').disabled = $('echo').disabled = true; });
+    ua.start();
+  };
+
+  function dial(target) {
+    session = ua.call(`sip:${target}@${host}`, {
+      mediaConstraints: { audio: true, video: false },
+      // В офисной сети ICE обходится своими адресами; снаружи — этап 1 плана.
+      pcConfig: { iceServers: [] },
+    });
+    session.on('peerconnection', ({ peerconnection }) => {
+      peerconnection.addEventListener('track', (e) => { $('remote').srcObject = e.streams[0]; });
+    });
+    session.on('progress', () => log(`${target}: звоним`));
+    session.on('confirmed', () => log(`${target}: разговор`));
+    session.on('ended', (e) => { log(`${target}: окончен (${e.cause})`); $('hangup').disabled = true; });
+    session.on('failed', (e) => { log(`${target}: не удалось (${e.cause})`); $('hangup').disabled = true; });
+    $('hangup').disabled = false;
+  }
+
+  $('answer').onclick = () => dial('answer');
+  $('echo').onclick = () => dial('echo');
+  $('hangup').onclick = () => session?.terminate();
+</script>
+</body>
+</html>

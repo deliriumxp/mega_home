@@ -12,6 +12,7 @@ import asyncio
 from pathlib import Path
 
 from mega_home import sip_bridge as sb
+from mega_home import sip_config as sc
 
 
 class _Config:
@@ -67,22 +68,52 @@ def test_нет_ни_asterisk_ни_apk(monkeypatch) -> None:  # noqa: ANN001
     assert "поставить нечем" in bridge.state()["why"]
 
 
+KEYS = {"ari": "a" * 24, "resident": "r" * 24}
+
+
 def test_конфиг_в_своих_каталогах_и_только_частные_сети() -> None:
     root = Path("/config/.storage/mega_home_sip")
-    files = sb.render_config(root)
+    files = sc.render_config(root, KEYS)
     assert f"astetcdir => {root}/etc" in files["asterisk.conf"]
     assert f"astrundir => {root}/run" in files["asterisk.conf"]
     pjsip = files["pjsip.conf"]
-    assert f"bind=0.0.0.0:{sb.SIP_PORT}" in pjsip
-    for net in sb.PRIVATE_NETS:
+    assert f"bind=0.0.0.0:{sc.SIP_PORT}" in pjsip
+    for net in sc.PRIVATE_NETS:
         assert f"match={net}" in pjsip
     assert "0.0.0.0/0" not in pjsip
-    assert f"rtpstart={sb.RTP_START}" in files["rtp.conf"]
-    assert "Echo()" in files["extensions.conf"]
+    assert f"rtpstart={sc.RTP_START}" in files["rtp.conf"]
 
 
-def test_конфиг_раскладывается_на_диск(tmp_path: Path) -> None:
-    sb.write_config(tmp_path)
-    for name in ("asterisk.conf", "pjsip.conf", "extensions.conf", "modules.conf"):
+def test_телефон_опознаётся_по_имени_раньше_чем_по_адресу() -> None:
+    # Телефон приходит каналом дома с ЧАСТНОГО адреса хоста: при порядке
+    # по умолчанию (ip первым) он стал бы панелью — без пароля.
+    pjsip = sc.render_config(Path("/x"), KEYS)["pjsip.conf"]
+    assert "endpoint_identifier_order=username,ip" in pjsip
+    assert f"password={KEYS['resident']}" in pjsip
+    assert "webrtc=yes" in pjsip
+    assert "protocol=ws" in pjsip
+
+
+def test_ari_только_с_loopback() -> None:
+    ari = sc.render_config(Path("/x"), KEYS)["ari.conf"]
+    assert "deny = 0.0.0.0/0.0.0.0" in ari
+    assert "permit = 127.0.0.1/255.255.255.255" in ari
+    assert f"password = {KEYS['ari']}" in ari
+
+
+def test_панель_не_отвечаем_в_диалплане() -> None:
+    # Ответ гасит мониторы: вызов панели уходит в Stasis звонящим.
+    dialplan = sc.render_config(Path("/x"), KEYS)["extensions.conf"]
+    panel = dialplan.split("[from-panel]")[1].split("[from-resident]")[0]
+    assert f"Stasis({sc.ARI_APP},panel)" in panel
+    assert "Answer" not in panel
+
+
+def test_конфиг_раскладывается_на_диск_и_пароли_не_меняются(tmp_path: Path) -> None:
+    first = sc.write_config(tmp_path)
+    for name in ("asterisk.conf", "pjsip.conf", "extensions.conf", "http.conf", "ari.conf"):
         assert (tmp_path / "etc" / name).is_file()
     assert (tmp_path / "run").is_dir()
+    # Сирота усыновляется со старым конфигом — новый пароль ARI запер бы его.
+    assert sc.write_config(tmp_path) == first
+    assert len(first["ari"]) >= 16 and first["ari"] != first["resident"]
