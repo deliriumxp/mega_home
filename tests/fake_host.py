@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from mega_home.host import PlainHost
+from mega_home.core.host import PlainHost
 
 
 class _Pending:

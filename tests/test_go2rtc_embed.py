@@ -13,7 +13,7 @@ import socket
 
 import pytest
 
-from mega_home import go2rtc_embed as embed
+from mega_home.core import go2rtc_embed as embed
 
 from fake_host import FakeHost
 

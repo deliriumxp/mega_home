@@ -11,8 +11,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from mega_home import sip_bridge as sb
-from mega_home import sip_config as sc
+from mega_home.core import sip_bridge as sb
+from mega_home.core import sip_config as sc
 
 from fake_host import FakeHost
 

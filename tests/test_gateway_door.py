@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from mega_home.gateway import (
+from mega_home.core.gateway import (
     AccessGateway,
     AccessDenied,
     AccessUnreachable,
@@ -176,8 +176,8 @@ def test_дверь_через_ops_выполняет_описанный_выз�
     вид и перенос через менеджера). Здесь ловим Wiring: неожиданное исключение
     на этом пути менеджер отдаёт жильцу как «Дом не смог выполнить запрос» —
     то есть живой отчёт 2026-09-12 про перемотку начинается ровно отсюда."""
-    from mega_home import ops
-    from mega_home.gateway import AccessGateway
+    from mega_home.core import ops
+    from mega_home.core.gateway import AccessGateway
 
     class Clips:
         _clips: dict[str, Any] = {}
@@ -219,11 +219,11 @@ def test_дверь_без_описания_это_404_а_не_отказ() -> N
     переходит на прежние пути, и перемотка у жильца падает с ошибкой."""
     from http import HTTPStatus
 
-    from mega_home import ops
+    from mega_home.core import ops
 
     class Gateway:
         def __init__(self) -> None:
-            from mega_home.gateway import AccessGateway
+            from mega_home.core.gateway import AccessGateway
 
             self.clips = type("Clips", (), {"_clips": {}})()
             self.accesses = AccessGateway()  # описаний нет вовсе
@@ -277,7 +277,7 @@ def test_недоступность_регистратора_отдаётся_50
     """
     import aiohttp
 
-    from mega_home import ops
+    from mega_home.core import ops
 
     call = door()
 
@@ -635,7 +635,7 @@ def test_ответ_читается_ЦЕЛИКОМ_а_не_первым_кус�
 
 def test_потолок_ответа_считается_ПО_ХОДУ() -> None:
     """Потолок остаётся потолком — но не ценой порчи всех остальных ответов."""
-    from mega_home.gateway import MAX_RESPONSE_BYTES
+    from mega_home.core.gateway import MAX_RESPONSE_BYTES
 
     call = door()
 
@@ -684,7 +684,7 @@ def test_длинный_опрос_держится_дольше_обычног�
     частый опрос. Тот же урок уже стоил ленты событий (`/events`: 7 потерянных
     событий из 8 за минуту).
     """
-    from mega_home.gateway import CALL_TIMEOUT, LONG_POLL_TIMEOUT, _call_timeout
+    from mega_home.core.gateway import CALL_TIMEOUT, LONG_POLL_TIMEOUT, _call_timeout
 
     assert _call_timeout("/archive_events") == LONG_POLL_TIMEOUT
     assert _call_timeout("/events") == LONG_POLL_TIMEOUT
@@ -737,7 +737,7 @@ def test_паспорт_называет_доступы_их_вид_и_венд�
     ⚠ Адресов, портов и учёток здесь нет и быть не может: тело `config` уходит
     браузеру жильца КАК ЕСТЬ.
     """
-    from mega_home import ops
+    from mega_home.core import ops
 
     call = door()
     coordinator = type(
@@ -759,7 +759,7 @@ def test_описание_с_пустым_хостом_в_паспорт_НЕ_п
     Иначе бандл считает доступ живым, шлёт в него вызовы и получает отказы, а
     инсталлятор ищет поломку в регистраторе вместо пустого поля в карточке.
     """
-    from mega_home import ops
+    from mega_home.core import ops
 
     call = AccessGateway()
     call.apply([{**TRASSIR, "host": "   "}])

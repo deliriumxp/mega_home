@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mega_home.crops import CropStore, crop_value_valid
+from mega_home.core.crops import CropStore, crop_value_valid
 
 CROP = {"x": 0.5, "y": 0.4, "w": 0.3}
 

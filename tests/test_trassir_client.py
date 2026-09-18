@@ -15,8 +15,8 @@ from typing import Any
 
 import pytest
 
-from mega_home import trassir_client as module
-from mega_home.trassir_client import TrassirAuthError, TrassirClient, TrassirError
+from mega_home.core import trassir_client as module
+from mega_home.core.trassir_client import TrassirAuthError, TrassirClient, TrassirError
 
 
 @pytest.fixture(autouse=True)

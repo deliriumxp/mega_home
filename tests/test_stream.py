@@ -15,8 +15,8 @@ import asyncio
 
 import pytest
 
-from mega_home import stream as stream_mod
-from mega_home.stream import HEADER, Streams, frame
+from mega_home.core import stream as stream_mod
+from mega_home.core.stream import HEADER, Streams, frame
 
 
 class FakeSocket:

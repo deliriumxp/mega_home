@@ -9,8 +9,8 @@ import aiohttp
 
 from homeassistant.core import HomeAssistant
 
-from . import ops
-from .const import CONF_MANAGER_URL, CONF_TOKEN, CONF_VERIFY_SSL, LOGGER
+from .core import ops
+from .core.const import CONF_MANAGER_URL, CONF_TOKEN, CONF_VERIFY_SSL, LOGGER
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
 
 WS_PATH = "/inbound/home"
@@ -105,7 +105,7 @@ class ManagerLink:
                     # Сессии инженера живут ровно столько, сколько это
                     # подключение: оборвался канал — TCP-соединения закрыты, и
                     # менеджер откроет заново (`stream.py`).
-                    from .stream import Streams
+                    from .core.stream import Streams
 
                     self._streams = Streams(socket)
                     async for message in socket:
@@ -207,7 +207,7 @@ class ManagerLink:
             return
         on = bool((frame.get("payload") or {}).get("on"))
         if on:
-            from .watch import LinkWatch
+            from .core.watch import LinkWatch
 
             if self._watch is None:
                 self._watch = LinkWatch(self._coordinator, socket)
@@ -341,7 +341,7 @@ def _integration_version() -> str:
     исполняемым кодом и уезжает вместе с ним; что лежит на диске, дом сообщает
     отдельным полем (`_disk_version`). Подробности — `const.py`.
     """
-    from .const import INTEGRATION_VERSION
+    from .core.const import INTEGRATION_VERSION
 
     return INTEGRATION_VERSION
 

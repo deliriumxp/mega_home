@@ -10,7 +10,7 @@ docker, which is a different kind of check and does not replace this one.
 ⚠ `mega_home` is registered here as a package with a `__path__` but WITHOUT its
 real `__init__.py`. That is deliberate: importing the package for real drags in
 config entries, the HTTP layer and the coordinator, so a test of one file would
-depend on stubs for all of them. Submodules (`mega_home.bundle` and the
+depend on stubs for all of them. Submodules (`mega_home.core.bundle` and the
 `.api` / `.const` they import) load normally.
 """
 

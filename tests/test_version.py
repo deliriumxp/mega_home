@@ -14,7 +14,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from mega_home.const import INTEGRATION_VERSION
+from mega_home.core.const import INTEGRATION_VERSION
 from fake_host import FakeHost
 from mega_home.link import ManagerLink, _disk_version, _integration_version
 

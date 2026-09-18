@@ -150,7 +150,7 @@ def test_без_бандла_редиректа_нет_а_есть_заглуш�
 # (`room-photos.ts`, `tilePhotoKey`): чужой ключ дом не пишет, свой —
 # перечисляет, иначе фон лежит на диске и не показывается.
 
-from mega_home.photos import photo_key_known as _photo_key_known, photo_keys as _photo_keys
+from mega_home.core.photos import photo_key_known as _photo_key_known, photo_keys as _photo_keys
 
 PHOTO_CONFIG = {
     "rooms": [{"id": "kitchen"}, {"id": "hall"}],
@@ -185,7 +185,7 @@ def test_писать_можно_только_то_что_есть_в_соста
 # Тот же контракт, что у ключей фона выше, но для кадра камеры (2026-09-15):
 # писать можно только КАМЕРУ текущего состава, а не любую плитку.
 
-from mega_home.crops import crop_key_known as _crop_key_known, crop_keys as _crop_keys
+from mega_home.core.crops import crop_key_known as _crop_key_known, crop_keys as _crop_keys
 
 CROP_CONFIG = {
     "tiles": [

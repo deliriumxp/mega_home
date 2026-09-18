@@ -12,10 +12,10 @@ import asyncio
 from typing import Any
 
 from fake_host import FakeSource
-from mega_home import ops
+from mega_home.core import ops
 from mega_home.link import ManagerLink
-from mega_home.source import PlainState as State
-from mega_home.watch import LinkWatch
+from mega_home.core.source import PlainState as State
+from mega_home.core.watch import LinkWatch
 
 CONFIG: dict[str, Any] = {
     "version": "sha256:abc",
@@ -109,7 +109,7 @@ def test_изменение_состояния_уходит_кадром_кан�
 
 
 def test_переполнение_отдаёт_свежий_снимок_а_не_рвёт_подписку():
-    from mega_home import events
+    from mega_home.core import events
 
     order: list[str] = []
     restore = _patch_states(order)

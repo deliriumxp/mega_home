@@ -11,8 +11,8 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .api import ManagerAuthError, ManagerClient, ManagerError
-from .const import (
+from .core.api import ManagerAuthError, ManagerClient, ManagerError
+from .core.const import (
     CONF_MANAGER_URL,
     CONF_TOKEN,
     CONF_VERIFY_SSL,

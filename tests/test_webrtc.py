@@ -23,8 +23,8 @@ from typing import Any
 import pytest
 
 from fake_host import FakeHost
-from mega_home import go2rtc_session
-from mega_home import ops
+from mega_home.core import go2rtc_session
+from mega_home.core import ops
 from mega_home.ha_source import HaSource
 
 
@@ -295,7 +295,7 @@ class _OwnHass:
 @pytest.fixture
 def own_go2rtc(monkeypatch):
     """Включить «свой go2rtc работает» и подменить библиотеку клиента."""
-    import mega_home.go2rtc_embed as embed
+    import mega_home.core.go2rtc_embed as embed
     from mega_home import webrtc
 
     go2rtc_client = types.ModuleType("go2rtc_client")
@@ -895,7 +895,7 @@ def test_без_внешнего_адреса_ждём_дольше_только
     ⚠ Дома ждать нечего: телефон в той же сети, host-кандидатов ему довольно, —
     поэтому длинное окно только для переноса.
     """
-    from mega_home.go2rtc_session import CANDIDATE_WINDOW, CANDIDATE_WINDOW_COLD
+    from mega_home.core.go2rtc_session import CANDIDATE_WINDOW, CANDIDATE_WINDOW_COLD
 
     assert CANDIDATE_WINDOW_COLD > CANDIDATE_WINDOW
 
@@ -928,7 +928,7 @@ def test_публичный_host_считается_внешним_адресо�
     публичный (найден у STUN). Проверка только по `srflx` не видела внешний путь,
     и дом ждал окно ЦЕЛИКОМ на каждом открытии: живой отчёт 2026-09-10 —
     «Кандидаты дома: host 4», «Соединение: connected», а переговоры 6844 мс."""
-    from mega_home.go2rtc_session import _has_srflx  # noqa: SLF001
+    from mega_home.core.go2rtc_session import _has_srflx  # noqa: SLF001
 
     public_host = "candidate:1 1 udp 2130706431 8.8.8.8 8555 typ host"
     private_host = "candidate:2 1 udp 2130706431 192.168.1.10 8555 typ host"
@@ -945,7 +945,7 @@ def test_trickle_отдаёт_ответ_сразу_и_досылает_канд
     операцией `webrtc-candidates`: телефонные — в ws go2rtc, домовые — обратно.
     Именно это убирает и «холодный STUN», и 6-секундное ожидание."""
     from mega_home import webrtc
-    from mega_home.go2rtc_session import _trickle  # noqa: SLF001
+    from mega_home.core.go2rtc_session import _trickle  # noqa: SLF001
 
     async def scenario() -> None:
         task = asyncio.ensure_future(

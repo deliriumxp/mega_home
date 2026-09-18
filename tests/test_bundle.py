@@ -14,7 +14,7 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-from mega_home.bundle import BundleStore
+from mega_home.core.bundle import BundleStore
 
 from fake_host import FakeHost
 

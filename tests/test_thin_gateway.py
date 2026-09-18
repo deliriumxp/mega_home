@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-MODULES = Path(__file__).resolve().parent.parent / "custom_components" / "mega_home"
+MODULES = Path(__file__).resolve().parent.parent / "custom_components" / "mega_home" / "core"
 
 # Файлы, которые говорят с регистратором. Толкование ищем только здесь: в
 # остальном доме даты — своё дело Home Assistant.

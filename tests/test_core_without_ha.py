@@ -1,16 +1,19 @@
-"""ЗАМОК: модули ядра не знают о Home Assistant.
+"""ЗАМОК: ядро (`core/`) не знает о Home Assistant и об адаптере над собой.
 
 HA — один из адаптеров дома, а не его основа (`docs/plan-core-without-ha.md` в
-менеджере): модули ниже получают среду хозяином (`host.py`), а не `hass`, и
-поднимутся под самостоятельным демоном без переписывания.
+менеджере): модули ядра получают среду хозяином (`host.py`) и сущности
+источником (`source.py`), а не `hass`, и поднимутся под самостоятельным демоном
+без переписывания.
 
-Проверяется ЗАМЫКАНИЕ, а не только прямой импорт: модуль списка, импортирующий
-наш модуль вне списка, тянет HA через него (так `probe.py` брал `OpError` из
-`ops.py`). Импорты внутри функций считаются тоже — локальный импорт прячет
-зависимость, а не снимает её.
+Ядро — это КАТАЛОГ, а не список: всё, что лежит в `core/`, обязано пройти.
+Запрещены два хода наружу:
+* `homeassistant` (и `voluptuous`, который приезжает с ним);
+* импорт уровнем выше (`from ..`) — через адаптер HA пришёл бы транзитивно.
+Импорты внутри функций считаются тоже: локальный импорт прячет зависимость, а
+не снимает её.
 
-⚠ Список ТОЛЬКО РАСТЁТ. Модуль выпал — значит в него вернулся `homeassistant`:
-вынеси связку в `__init__.py`/`coordinator.py`/`ha_host.py`, а не вычёркивай.
+⚠ Модулю ядра понадобился HA — вынеси связку в адаптер (`ha_host.py`,
+`ha_source.py`, `coordinator.py`), а не модуль из `core/`.
 """
 
 from __future__ import annotations
@@ -18,70 +21,31 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-MODULES = Path(__file__).resolve().parent.parent / "custom_components" / "mega_home"
+import pytest
 
-CORE = {
-    "agent",
-    "api",
-    "assets",
-    "bundle",
-    "const",
-    "crops",
-    "events",
-    "gateway",
-    "go2rtc_embed",
-    "go2rtc_session",
-    "host",
-    "imaging",
-    "ops",
-    "ops_base",
-    "ops_camera",
-    "ops_video",
-    "ops_webrtc",
-    "photos",
-    "probe",
-    "relay_api",
-    "scan",
-    "sip_bridge",
-    "sip_calls",
-    "sip_config",
-    "source",
-    "stream",
-    "trassir",
-    "trassir_archive",
-    "trassir_client",
-    "trassir_clip",
-    "watch",
-}
+CORE = Path(__file__).resolve().parent.parent / "custom_components" / "mega_home" / "core"
+FORBIDDEN = {"homeassistant", "voluptuous"}
+MODULES = sorted(CORE.glob("*.py"))
 
 
-def _imports(name: str) -> tuple[set[str], set[str]]:
-    """Внешние корни и свои модули, которые импортирует файл."""
-    tree = ast.parse((MODULES / f"{name}.py").read_text("utf-8"))
-    external: set[str] = set()
-    local: set[str] = set()
-    for node in ast.walk(tree):
+def _offences(path: Path) -> list[str]:
+    found: list[str] = []
+    for node in ast.walk(ast.parse(path.read_text("utf-8"))):
         if isinstance(node, ast.Import):
-            external.update(alias.name.split(".")[0] for alias in node.names)
+            found += [a.name for a in node.names if a.name.split(".")[0] in FORBIDDEN]
         elif isinstance(node, ast.ImportFrom):
-            if node.level == 0:
-                external.add((node.module or "").split(".")[0])
-            elif node.module:
-                local.add(node.module.split(".")[0])
-            else:
-                local.update(alias.name for alias in node.names)
-    return external, local
+            if node.level == 0 and (node.module or "").split(".")[0] in FORBIDDEN:
+                found.append(node.module or "")
+            elif node.level > 1:
+                found.append("." * node.level + (node.module or ""))
+    return found
 
 
-def test_ядро_не_импортирует_homeassistant() -> None:
-    bad = sorted(name for name in CORE if "homeassistant" in _imports(name)[0])
-    assert bad == [], f"в модулях ядра появился homeassistant: {bad}"
+def test_ядро_не_пустое() -> None:
+    """Каталог переехал — замок обязан упасть, а не молча проверить ничего."""
+    assert len(MODULES) > 20
 
 
-def test_ядро_замкнуто() -> None:
-    leaks = {
-        name: sorted(_imports(name)[1] - CORE)
-        for name in sorted(CORE)
-        if _imports(name)[1] - CORE
-    }
-    assert leaks == {}, f"модули ядра тянут модули вне ядра: {leaks}"
+@pytest.mark.parametrize("path", MODULES, ids=lambda p: p.name)
+def test_модуль_ядра_не_выходит_наружу(path: Path) -> None:
+    assert _offences(path) == [], f"{path.name} тянет наружу ядра"

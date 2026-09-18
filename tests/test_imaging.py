@@ -16,7 +16,7 @@ from pathlib import Path
 from PIL import Image
 
 from fake_host import FakeHost
-from mega_home.imaging import (
+from mega_home.core.imaging import (
     SIDES,
     Look,
     LookStore,

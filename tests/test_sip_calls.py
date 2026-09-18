@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from mega_home.sip_calls import DoorCalls
+from mega_home.core.sip_calls import DoorCalls
 
 
 class _Calls(DoorCalls):

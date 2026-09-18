@@ -10,7 +10,7 @@ from homeassistant.exceptions import ServiceNotFound
 from homeassistant.helpers import event as event_helper
 
 from mega_home.ha_source import HaSource
-from mega_home.source import CommandRejected, CommandUnknown
+from mega_home.core.source import CommandRejected, CommandUnknown
 
 
 class _Services:

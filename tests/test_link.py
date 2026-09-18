@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from http import HTTPStatus
 
-from mega_home import ops
+from mega_home.core import ops
 from mega_home.link import ManagerLink
 
 

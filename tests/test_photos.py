@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mega_home.photos import JPEG_MAGIC, PhotoStore
+from mega_home.core.photos import JPEG_MAGIC, PhotoStore
 
 JPEG = JPEG_MAGIC + b"...body..."
 

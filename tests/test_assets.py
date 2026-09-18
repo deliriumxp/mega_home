@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mega_home.assets import AssetStore
+from mega_home.core.assets import AssetStore
 
 
 def test_имя_файла_не_выходит_из_каталога(tmp_path: Path) -> None:

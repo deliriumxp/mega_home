@@ -22,7 +22,7 @@ from aiohttp import web
 from homeassistant.components.http import HomeAssistantView, StaticPathConfig
 from homeassistant.core import HomeAssistant
 
-from .const import (
+from .core.const import (
     TRASSIR_TILE_CACHE,
     DOMAIN,
     LOGGER,
@@ -31,13 +31,13 @@ from .const import (
     URL_ICONS,
     URL_PREFIX,
 )
-from . import ops
-from .api import ManagerError
+from .core import ops
+from .core.api import ManagerError
 from .coordinator import MegaHomeCoordinator
-from .crops import crop_key_known, crop_keys, crop_value_valid, MAX_CROP_BYTES
-from .events import StateStream
-from .imaging import asset_file, photo_file
-from .photos import (
+from .core.crops import crop_key_known, crop_keys, crop_value_valid, MAX_CROP_BYTES
+from .core.events import StateStream
+from .core.imaging import asset_file, photo_file
+from .core.photos import (
     JPEG_MAGIC,
     MAX_PHOTO_BYTES,
     photo_key_known,

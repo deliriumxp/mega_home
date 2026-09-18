@@ -7,7 +7,7 @@ import json
 from datetime import timedelta
 from pathlib import Path
 
-from mega_home.host import PlainHost
+from mega_home.core.host import PlainHost
 
 
 def test_хранилище_в_конверте_ha(tmp_path: Path) -> None:

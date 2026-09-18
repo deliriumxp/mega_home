@@ -24,13 +24,13 @@ from typing import Any
 import pytest
 
 from fake_host import FakeHost
-from mega_home import go2rtc_session
-from mega_home import ops
+from mega_home.core import go2rtc_session
+from mega_home.core import ops
 
 # ⚠ Механика команды архива живёт в `trassir_archive.py`, реестр просмотров — в
 # `trassir_clip.py`: файл перерос порог дробления, и его разрезали по владению.
-from mega_home.trassir_archive import _stamp
-from mega_home.trassir_clip import CLIP_PREFIX, ClipSessions
+from mega_home.core.trassir_archive import _stamp
+from mega_home.core.trassir_clip import CLIP_PREFIX, ClipSessions
 
 # ⚠ Метка и окно, с которыми запись открывает ПРИЛОЖЕНИЕ: по каналу и метке,
 # окно считает оно. Открытие по СОБЫТИЮ у дома снято 2026-09-14 вместе с
@@ -185,7 +185,7 @@ def _offered(
     from mega_home import webrtc
 
     monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
-    monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
+    monkeypatch.setattr("mega_home.core.go2rtc_embed.is_running", lambda: True)
 
     async def scenario() -> FakeHass:
         hass = FakeHass()
@@ -275,7 +275,7 @@ def test_закрытие_снимает_поток_и_токен(
 
     monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
     monkeypatch.setattr(go2rtc_session, "close_own", lambda hass, sid: closed.append(sid) or True)
-    monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
+    monkeypatch.setattr("mega_home.core.go2rtc_embed.is_running", lambda: True)
     monkeypatch.setattr(
         ClipSessions,
         "_async_drop_stream",
@@ -313,7 +313,7 @@ def test_клип_закрывается_даже_если_приложение_
     from mega_home import webrtc
 
     monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
-    monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
+    monkeypatch.setattr("mega_home.core.go2rtc_embed.is_running", lambda: True)
 
     async def scenario() -> None:
         hass = FakeHass()
@@ -343,11 +343,11 @@ def test_сторож_стартует_вслепую_без_готовност�
 ) -> None:
     """Старое приложение готовности не шлёт: ему достаётся прежнее поведение
     (команда после переговоров), а не чёрный экран."""
-    monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_READY_TIMEOUT", 0.01)
+    monkeypatch.setattr("mega_home.core.trassir_clip.TRASSIR_READY_TIMEOUT", 0.01)
     # ⚠ Паузу перед командой архива тоже укорачиваем, а не отменяем: она несущая
     # (без неё регистратор отдаёт ноль байтов), и спека обязана ходить через
     # неё, а не мимо.
-    monkeypatch.setattr("mega_home.trassir_archive.TRASSIR_ARCHIVE_SETTLE", 0.02)
+    monkeypatch.setattr("mega_home.core.trassir_archive.TRASSIR_ARCHIVE_SETTLE", 0.02)
 
     async def fake_negotiate(
         hass, url, identifier, source, sdp, what="", remote=False, skip_list=False, trickle=False
@@ -357,7 +357,7 @@ def test_сторож_стартует_вслепую_без_готовност�
     from mega_home import webrtc
 
     monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
-    monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
+    monkeypatch.setattr("mega_home.core.go2rtc_embed.is_running", lambda: True)
     clip_id = _opened_clip_id(gateway)
 
     async def scenario() -> None:
@@ -416,7 +416,7 @@ def test_закрытие_до_готовности_не_командует(
     from mega_home import webrtc
 
     monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
-    monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
+    monkeypatch.setattr("mega_home.core.go2rtc_embed.is_running", lambda: True)
 
     async def scenario() -> None:
         hass = FakeHass()
@@ -468,7 +468,7 @@ def test_канал_без_постоянного_адреса_идёт_по_т�
     from mega_home import webrtc
 
     monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
-    monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
+    monkeypatch.setattr("mega_home.core.go2rtc_embed.is_running", lambda: True)
 
     async def scenario() -> dict[str, Any]:
         hass = FakeHass()
@@ -504,7 +504,7 @@ def test_живой_просмотр_по_токену_ничем_не_кома�
     from mega_home import webrtc
 
     monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
-    monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
+    monkeypatch.setattr("mega_home.core.go2rtc_embed.is_running", lambda: True)
 
     async def scenario() -> None:
         hass = FakeHass()
@@ -703,10 +703,10 @@ def test_команда_дверью_считается_началом_соед�
     ⚠ Дом при этом ничего не толкует: он видит ПУТЬ `archive_command` и делает
     из него один вывод — «по этому соединению уже командуют».
     """
-    monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_READY_TIMEOUT", 0.01)
+    monkeypatch.setattr("mega_home.core.trassir_clip.TRASSIR_READY_TIMEOUT", 0.01)
     # ⚠ Паузу укорачиваем, а не отменяем: без неё лишний `play` не успел бы
     # дойти до клиента за время спеки, и она проходила бы и ДО правки.
-    monkeypatch.setattr("mega_home.trassir_archive.TRASSIR_ARCHIVE_SETTLE", 0.0)
+    monkeypatch.setattr("mega_home.core.trassir_archive.TRASSIR_ARCHIVE_SETTLE", 0.0)
 
     async def fake_negotiate(
         hass, url, identifier, source, sdp, what="", remote=False, skip_list=False, trickle=False
@@ -716,7 +716,7 @@ def test_команда_дверью_считается_началом_соед�
     from mega_home import webrtc
 
     monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
-    monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
+    monkeypatch.setattr("mega_home.core.go2rtc_embed.is_running", lambda: True)
 
     door = _Door()
     coordinator = type(
@@ -795,10 +795,10 @@ def test_пинг_переживает_сбой_и_гаснет_только_о�
     ⚠ Гаснуть цикл обязан только по отмене — иначе уборка клипа не останавливает
     ничего, а пинг продолжает ходить к регистратору за закрытым просмотром.
     """
-    monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_PING_INTERVAL", 0.001)
+    monkeypatch.setattr("mega_home.core.trassir_clip.TRASSIR_PING_INTERVAL", 0.001)
 
-    from mega_home.trassir_archive import Clip
-    from mega_home.trassir_client import TrassirError
+    from mega_home.core.trassir_archive import Clip
+    from mega_home.core.trassir_client import TrassirError
 
     beats: list[str] = []
     breaks: list[Any] = [
@@ -841,7 +841,7 @@ def test_метка_регистратора_симметрична_чтению
     """
     from datetime import datetime, timezone
 
-    from mega_home.trassir_archive import _stamp
+    from mega_home.core.trassir_archive import _stamp
 
     # 2026-09-14 09:43:51 UTC
     us = int(datetime(2026, 9, 14, 9, 43, 51, tzinfo=timezone.utc).timestamp()) * 1_000_000
@@ -871,7 +871,7 @@ def test_повтор_play_идёт_с_метки_НАЗВАННОЙ_регис�
     ⚠ Повтор РОВНО ОДИН и только при расхождении: второй круг значил бы, что мы
     спорим с регистратором о его же ответе.
     """
-    from mega_home.trassir_archive import _stamp_of_text
+    from mega_home.core.trassir_archive import _stamp_of_text
 
     # Перестановка символов, а не разбор даты: дом не толкует ответы.
     assert _stamp_of_text("2026-09-13 00:22:42") == "20260913T002242"

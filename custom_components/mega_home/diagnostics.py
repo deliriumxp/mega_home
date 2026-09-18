@@ -7,7 +7,7 @@ from typing import Any
 from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_TOKEN
+from .core.const import CONF_TOKEN
 from .coordinator import MegaHomeConfigEntry
 
 TO_REDACT = [CONF_TOKEN]
@@ -16,7 +16,7 @@ TO_REDACT = [CONF_TOKEN]
 def _go2rtc_state() -> dict[str, Any]:
     """Состояние своего go2rtc; модуля нет — так и скажем."""
     try:
-        from .go2rtc_embed import state
+        from .core.go2rtc_embed import state
 
         return state()
     except Exception as err:  # noqa: BLE001 — диагностика не имеет права падать

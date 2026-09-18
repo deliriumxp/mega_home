@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import asyncio
 
-from mega_home import agent as agent_module
-from mega_home.agent import AgentRunner
-from mega_home.api import ManagerError
+from mega_home.core import agent as agent_module
+from mega_home.core.agent import AgentRunner
+from mega_home.core.api import ManagerError
 
 from fake_host import FakeHost
 

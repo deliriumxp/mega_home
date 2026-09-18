@@ -11,8 +11,8 @@ import asyncio
 from typing import Any
 
 from fake_host import FakeSource
-from mega_home.events import StateStream
-from mega_home.source import PlainState as State
+from mega_home.core.events import StateStream
+from mega_home.core.source import PlainState as State
 
 CONFIG: dict[str, Any] = {
     "version": "sha256:abc",

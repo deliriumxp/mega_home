@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from fake_host import FakeHost
-from mega_home.api import ManagerError
-from mega_home.trassir import TrassirGateway
+from mega_home.core.api import ManagerError
+from mega_home.core.trassir import TrassirGateway
 
 
 class _Task:
@@ -441,7 +441,7 @@ def test_events_ждёт_дольше_обычного_запроса() -> None:
     эталонной» за 60 секунд дал 8 событий у эталона и 1 у рвущейся, то есть
     семь из восьми не дошли вовсе. Отвечать обязан сервер, а не наш таймер.
     """
-    from mega_home.const import TRASSIR_EVENTS_TIMEOUT, TRASSIR_TIMEOUT
+    from mega_home.core.const import TRASSIR_EVENTS_TIMEOUT, TRASSIR_TIMEOUT
 
     assert TRASSIR_EVENTS_TIMEOUT > 47, (
         "срок обязан перекрывать измеренное удержание сервера (46.7 с), "
@@ -454,8 +454,8 @@ def test_ленту_событий_спрашивают_длинным_срок�
     """Срок из константы доезжает до самого запроса, а не остаётся в файле."""
     import asyncio as _asyncio
 
-    from mega_home.const import TRASSIR_EVENTS_TIMEOUT
-    from mega_home.trassir_client import TrassirClient
+    from mega_home.core.const import TRASSIR_EVENTS_TIMEOUT
+    from mega_home.core.trassir_client import TrassirClient
 
     client = TrassirClient.__new__(TrassirClient)
     deadlines: list[float] = []

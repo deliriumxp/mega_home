@@ -20,8 +20,8 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
-from .api import ManagerAuthError, ManagerClient
-from .const import (
+from .core.api import ManagerAuthError, ManagerClient
+from .core.const import (
     CONF_MANAGER_URL,
     CONF_TOKEN,
     CONF_VERIFY_SSL,
@@ -30,11 +30,11 @@ from .const import (
     SERVICE_SYNC,
 )
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
-from .trassir import TrassirGateway
+from .core.trassir import TrassirGateway
 from .http import VIEWS as HTTP_VIEWS, async_register_http
-from .agent import AgentRunner
+from .core.agent import AgentRunner
 from .link import ManagerLink
-from .sip_bridge import SipBridge
+from .core.sip_bridge import SipBridge
 
 PLATFORMS: list[Platform] = []
 
@@ -108,9 +108,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # запуск слушатель уже не поднимет: снаружи камеры молча перестают
     # открываться, а лечится это только ребутом машины.
     try:
-        from . import go2rtc_session as _go2rtc_session
-        from .go2rtc_embed import async_start as _go2rtc_start
-        from .go2rtc_embed import async_stop as _go2rtc_stop
+        from .core import go2rtc_session as _go2rtc_session
+        from .core.go2rtc_embed import async_start as _go2rtc_start
+        from .core.go2rtc_embed import async_stop as _go2rtc_stop
 
         async def _shutdown(_event: Any = None) -> None:
             await _go2rtc_session.async_shutdown()

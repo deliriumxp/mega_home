@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 
-from mega_home import scan
+from mega_home.core import scan
 
 from fake_host import FakeHost
 

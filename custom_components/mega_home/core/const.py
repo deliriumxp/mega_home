@@ -6,7 +6,9 @@ from datetime import timedelta
 import logging
 
 DOMAIN = "mega_home"
-LOGGER = logging.getLogger(__package__)
+# ⚠ Имя логгера — ИНТЕГРАЦИИ, а не подпакета: настройки логов HA
+# (`custom_components.mega_home: debug`) иначе перестали бы действовать на ядро.
+LOGGER = logging.getLogger((__package__ or "").removesuffix(".core"))
 
 # Версия ЗАГРУЖЕННОГО кода — та, что уезжает менеджеру в hello (`link.py`).
 #

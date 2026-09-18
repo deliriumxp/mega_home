@@ -14,7 +14,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-from mega_home.api import ManagerError
+from mega_home.core.api import ManagerError
 from mega_home.coordinator import MegaHomeCoordinator
 
 

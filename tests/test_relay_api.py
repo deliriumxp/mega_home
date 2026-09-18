@@ -21,10 +21,10 @@ import pytest
 from homeassistant.core import State
 
 from fake_host import FakeHost, FakeSource
-from mega_home import ops
-from mega_home.crops import CropStore
-from mega_home.imaging import LookStore
-from mega_home.photos import PhotoStore
+from mega_home.core import ops
+from mega_home.core.crops import CropStore
+from mega_home.core.imaging import LookStore
+from mega_home.core.photos import PhotoStore
 
 JPEG = b"\xff\xd8\xff\xe0" + b"0" * 32
 

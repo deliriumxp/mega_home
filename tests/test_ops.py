@@ -16,9 +16,9 @@ import pytest
 from homeassistant.core import State
 
 from fake_host import FakeHost, FakeSource
-from mega_home import go2rtc_session
-from mega_home import ops
-from mega_home.source import CommandUnknown
+from mega_home.core import go2rtc_session
+from mega_home.core import ops
+from mega_home.core.source import CommandUnknown
 
 
 class _Bundle:
@@ -517,7 +517,7 @@ def test_дом_говорит_о_себе_в_общем_канале_а_не_с
     ⚠ И это ОБЩИЙ КАНАЛ, а не новый маршрут: правило требует сперва обойтись
     тем, за чем приложение и так приходит первым запросом.
     """
-    from mega_home.const import INTEGRATION_VERSION
+    from mega_home.core.const import INTEGRATION_VERSION
     from mega_home.http import VIEWS
 
     coordinator = _Coordinator()

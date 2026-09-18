@@ -40,10 +40,10 @@ from typing import Any
 
 from homeassistant.core import HomeAssistant, callback
 
-from . import go2rtc_session
-from .const import LOGGER
+from .core import go2rtc_session
+from .core.const import LOGGER
 from .ha_host import HaHost
-from .ops_base import OpError
+from .core.ops_base import OpError
 
 
 async def negotiate(
@@ -62,7 +62,7 @@ async def negotiate(
     # на доме без go2rtc в HA отвечала «камера не умеет WebRTC» — текст уводил
     # настройщика чинить не то, и настоящий отказ не попадал даже в лог.
     try:
-        from .go2rtc_embed import URL as _OWN_URL, is_running as _own_running
+        from .core.go2rtc_embed import URL as _OWN_URL, is_running as _own_running
     except Exception as err:  # noqa: BLE001
         LOGGER.debug("own go2rtc not used: %s", err)
     else:

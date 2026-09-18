@@ -13,11 +13,11 @@ from homeassistant.helpers.storage import STORAGE_DIR, Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
-from .api import ManagerClient, ManagerError
-from .bundle import BundleStore
+from .core.api import ManagerClient, ManagerError
+from .core.bundle import BundleStore
 from .ha_host import HaHost
 from .ha_source import HaSource
-from .const import (
+from .core.const import (
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
     CROP_DIR,
@@ -32,10 +32,10 @@ from .const import (
     STORAGE_KEY,
     STORAGE_VERSION,
 )
-from .assets import AssetStore
-from .crops import CropStore
-from .imaging import LookStore
-from .photos import PhotoStore
+from .core.assets import AssetStore
+from .core.crops import CropStore
+from .core.imaging import LookStore
+from .core.photos import PhotoStore
 
 type MegaHomeConfigEntry = ConfigEntry["MegaHomeCoordinator"]
 

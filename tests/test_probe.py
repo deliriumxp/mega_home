@@ -19,8 +19,8 @@ from http import HTTPStatus
 
 import pytest
 
-from mega_home import probe
-from mega_home.ops import OpError
+from mega_home.core import probe
+from mega_home.core.ops import OpError
 
 
 def run(coro):

@@ -19,8 +19,8 @@ from pathlib import Path
 import pytest
 
 from fake_host import FakeHost, FakeSource
-from mega_home import go2rtc_session
-from mega_home import ops
+from mega_home.core import go2rtc_session
+from mega_home.core import ops
 
 EVENTS = [
     {"id": "e1", "type": "Motion Start", "guid": "cam1", "cameraName": "Вход", "timestampUs": 300},
@@ -184,7 +184,7 @@ def test_плитка_опознаётся_по_адресу_потока(monkey
     Trassir. Совпадение по ним однажды подсунуло бы жильцу записи ЧУЖОЙ
     камеры — а это хуже, чем отсутствие ленты вовсе.
     """
-    from mega_home import ops as ops_module
+    from mega_home.core import ops as ops_module
 
     class _Camera:
         def __init__(self, source: str) -> None:
@@ -231,10 +231,11 @@ def test_камера_регистратора_показывается_домо
         negotiated.append((identifier, source))
         return {"sessionId": "s1", "answer": "sdp", "candidates": []}
 
-    from mega_home import ops as ops_module, webrtc
+    from mega_home import webrtc
+    from mega_home.core import ops as ops_module
 
     monkeypatch.setattr(go2rtc_session, "negotiate_source", fake_negotiate)
-    monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
+    monkeypatch.setattr("mega_home.core.go2rtc_embed.is_running", lambda: True)
 
     class _Clips:
         async def async_live_offer(self, guid, sdp, quality, remote=False, trickle=False):
@@ -273,7 +274,7 @@ def test_камера_регистратора_показывается_домо
 
 def test_камера_регистратора_доступна_без_состояния():
     """Иначе жилец прочитал бы «Нет данных» поверх работающей камеры."""
-    from mega_home import ops as ops_module
+    from mega_home.core import ops as ops_module
 
     view = ops_module.entity_view(
         {"id": "t1", "domain": "camera", "entityId": None, "videoId": "IAtwTYwK"},
