@@ -33,7 +33,17 @@ MODULES = Path(__file__).resolve().parent.parent / "custom_components" / "mega_h
 
 # Файлы, которые говорят с регистратором. Толкование ищем только здесь: в
 # остальном доме даты — своё дело Home Assistant.
-SCANNED = ("trassir.py", "trassir_client.py", "trassir_clip.py", "gateway.py")
+# ⚠ `trassir_archive.py` в списке С САМОГО ПОЯВЛЕНИЯ: это отрезанная часть
+# `trassir_clip.py` (метки, пауза, `play`), то есть ровно то место, куда
+# толкование дат и приезжает. Замок, не переехавший вместе с кодом, — это
+# замок, снятый молча.
+SCANNED = (
+    "trassir.py",
+    "trassir_client.py",
+    "trassir_clip.py",
+    "trassir_archive.py",
+    "gateway.py",
+)
 
 # Что считать толкованием: разбор и счёт дат/шкалы регистратора.
 FORBIDDEN = (

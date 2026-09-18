@@ -161,11 +161,19 @@ async def gateway_call(
 
     session: dict[str, str] = {}
     clip_id = payload.get("clip")
+    path = str(payload.get("path") or "")
     gateway = getattr(coordinator, "trassir", None)
     if clip_id and gateway is not None:
         token = gateway.clips.token_of(str(clip_id))
         if token:
             session["token"] = token
+            # ⚠ Соединение, по которому бандл КОМАНДУЕТ архивом, дом считает
+            # начатым — иначе он отдаст следом СВОЙ `play` (по готовности или
+            # сторожем), а это второй `play` по играющему потоку: данные
+            # встают. Пометка стоит ДО вызова: сама команда архива отвечает
+            # 0,8–1,4 с (замер стенда), и сторож просыпается ровно в этом окне.
+            # Толкования тут нет — только факт пути (`is_archive_command`).
+            gateway.clips.note_gateway_call(str(clip_id), path)
 
     body = payload.get("body")
     # ⚠ Тело строкой — это base64 (им же носит файлы реле); объект — это JSON.
@@ -181,7 +189,7 @@ async def gateway_call(
         status, content_type, answer = await door.call(
             payload.get("access"),
             str(payload.get("method") or "GET"),
-            str(payload.get("path") or ""),
+            path,
             payload.get("params"),
             raw,
             session,

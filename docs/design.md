@@ -466,6 +466,14 @@ Three things here are load-bearing:
   earlier the recorder answers `stream is expired`, which reads like a timeout
   and is not one. go2rtc opens the source when a viewer arrives, so the command
   goes out AFTER the offer is answered.
+* **A command through the door counts as the start** (contract with the bundle,
+  0.2.71). Seeking belongs to the bundle: it sends `seek` and the `play` that
+  must follow it through the universal door, and the house may not add a `play`
+  of its own — on a connection somebody else already drives that is the second
+  one, and the data stops. Hence any `/archive_command` sent for an open clip
+  marks that clip started and disarms the blind-start watchdog. The house reads
+  the PATH only: what is being asked of the archive is the bundle's knowledge,
+  what happened to the connection is the house's.
 * **The event timestamp goes into the window untouched** — TRASSIR's scale, not
   ours (see the note above).
 * **The substream is what remote viewers get** (`archive_sub`): 0.45 Mbit/s

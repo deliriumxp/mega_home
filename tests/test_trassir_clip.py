@@ -19,12 +19,15 @@ from __future__ import annotations
 import asyncio
 import re
 
-from mega_home.trassir_clip import _stamp
 from typing import Any
 
 import pytest
 
 from mega_home import ops
+
+# ⚠ Механика команды архива живёт в `trassir_archive.py`, реестр просмотров — в
+# `trassir_clip.py`: файл перерос порог дробления, и его разрезали по владению.
+from mega_home.trassir_archive import _stamp
 from mega_home.trassir_clip import CLIP_PREFIX, ClipSessions
 
 # ⚠ Метка и окно, с которыми запись открывает ПРИЛОЖЕНИЕ: по каналу и метке,
@@ -337,7 +340,7 @@ def test_сторож_стартует_вслепую_без_готовност�
     # ⚠ Паузу перед командой архива тоже укорачиваем, а не отменяем: она несущая
     # (без неё регистратор отдаёт ноль байтов), и спека обязана ходить через
     # неё, а не мимо.
-    monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_ARCHIVE_SETTLE", 0.02)
+    monkeypatch.setattr("mega_home.trassir_archive.TRASSIR_ARCHIVE_SETTLE", 0.02)
 
     async def fake_negotiate(
         hass, url, identifier, source, sdp, what="", remote=False, skip_list=False, trickle=False
@@ -648,6 +651,181 @@ def test_сторож_не_съедает_попытку_старта_без_о�
     assert not answer["error"], "состоявшийся старт не жалуется на прошлый отказ"
 
 
+# --- гонка двух `play` по одному соединению (правка по ревью) ---------------
+
+
+class _Door:
+    """Универсальная дверь, какой её видит `ops.gateway_call`."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def descriptor(self, access: Any) -> Any:
+        # Описание доступа есть: «двери нет» — это отдельный, уже запертый путь.
+        return {"kind": "http"}
+
+    async def call(
+        self,
+        access: Any,
+        method: str,
+        path: str,
+        params: Any,
+        body: Any,
+        session: dict[str, str],
+    ) -> tuple[int, str, bytes]:
+        self.calls.append(
+            {"path": path, "params": params, "session": dict(session)}
+        )
+        return 200, "application/json", b'{"success": 1}'
+
+
+def test_команда_дверью_считается_началом_соединения(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """⚠⚠ ГОНКА ДВУХ `play` по одному соединению, и стоит она данных.
+
+    Перемотка идёт универсальной дверью, а бандл шлёт по ней ДВЕ команды: `seek`
+    и обязательный за ним `play` (после `seek` поток СТОИТ — замер объекта
+    2026-09-13). Если жилец мотнул раньше, чем приехала готовность, дом отдавал
+    следом СВОЙ `play` от точки открытия: сторожем слепого старта
+    (`TRASSIR_READY_TIMEOUT`) или пришедшей позже готовностью. Это второй `play`
+    по уже играющему соединению — данные встают (замер стенда 2026-09-09, в
+    документации SDK этого нет вовсе), а в лучшем случае курсор жильца
+    возвращается в начало записи.
+
+    ⚠ Дом при этом ничего не толкует: он видит ПУТЬ `archive_command` и делает
+    из него один вывод — «по этому соединению уже командуют».
+    """
+    monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_READY_TIMEOUT", 0.01)
+    # ⚠ Паузу укорачиваем, а не отменяем: без неё лишний `play` не успел бы
+    # дойти до клиента за время спеки, и она проходила бы и ДО правки.
+    monkeypatch.setattr("mega_home.trassir_archive.TRASSIR_ARCHIVE_SETTLE", 0.0)
+
+    async def fake_negotiate(
+        hass, url, identifier, source, sdp, what="", remote=False, skip_list=False, trickle=False
+    ):
+        return {"sessionId": "s1", "answer": "sdp", "candidates": []}
+
+    from mega_home import webrtc
+
+    monkeypatch.setattr(webrtc, "negotiate_source", fake_negotiate)
+    monkeypatch.setattr("mega_home.go2rtc_embed.is_running", lambda: True)
+
+    door = _Door()
+    coordinator = type(
+        "Coordinator", (), {"trassir": gateway, "accesses": door}
+    )()
+    clip_id = _opened_clip_id(gateway)
+
+    async def scenario() -> dict[str, Any]:
+        hass = FakeHass()
+        # Переговоры прошли, сторож слепого старта взведён — и жилец мотает.
+        await gateway.clips.async_offer(hass, clip_id, "offer-sdp")
+        gateway.client.calls.clear()
+        for command in ("seek", "play"):
+            await ops.gateway_call(
+                coordinator,
+                {
+                    "access": "video",
+                    "method": "GET",
+                    "path": "/archive_command",
+                    "params": {"command": command},
+                    "clip": clip_id,
+                },
+            )
+        clip = gateway.clips._clips[clip_id]  # noqa: SLF001
+        assert clip.started, "по соединению уже командуют — оно НАЧАТО"
+        assert clip.fallback is None, "сторож слепого старта снят"
+        # Дать сторожу проснуться: до правки он стартовал бы здесь.
+        await asyncio.sleep(0.08)
+        late = await gateway.clips.async_ready(clip_id)
+        await _quiet(hass, gateway)
+        return late
+
+    late = asyncio.run(scenario())
+
+    assert door.calls[0]["session"]["token"] == "tok1", "токен клипа подставляет дом"
+    assert late["ready"] is False, "опоздавшая готовность второй командой не становится"
+    assert not [n for n, _ in gateway.client.calls if n == "archive_command"], (
+        "своего `play` дом не отдаёт: второй `play` по играющему соединению роняет данные"
+    )
+
+
+def test_чужой_путь_дверью_началом_не_считается(gateway: FakeGateway) -> None:
+    """⚠ Началом соединения считается ТОЛЬКО команда архива.
+
+    Дверью ходит и всё остальное — календарь, шкала, подписка на события, — и
+    пометить клип начатым по ним значит отобрать у него единственный `play`:
+    просмотр остался бы мёртвым навсегда (ровно та беда, от которой сторож и
+    завёлся).
+    """
+    clip_id = _opened_clip_id(gateway)
+    clip = gateway.clips._clips[clip_id]  # noqa: SLF001
+
+    gateway.clips.note_gateway_call(clip_id, "/archive_status")
+    assert not clip.started
+    gateway.clips.note_gateway_call(clip_id, "/archive_events")
+    assert not clip.started
+
+    # …а команда архива — считается, и с параметрами в пути тоже.
+    gateway.clips.note_gateway_call(clip_id, "/archive_command?command=play")
+    assert clip.started
+    # Неизвестный клип не роняет дверь: жилец мог закрыть просмотр раньше.
+    gateway.clips.note_gateway_call("trassir:ghost", "/archive_command")
+
+
+def test_пинг_переживает_сбой_и_гаснет_только_отменой(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """⚠⚠ Один таймаут не имеет права убивать просмотр.
+
+    Токен живёт десять секунд без запросов (`docs/docs-trassir/sdk-video.md`,
+    блок «Важно»), а пинг идёт раз в пять. Цикл выходил по ЛЮБОЙ ошибке — и
+    одна неудачная попытка означала смерть потока через десять секунд: токен
+    оставался без запросов, регистратор его прибирал, жилец видел замерший
+    кадр. Причём молча: в журнале оставалась строка `debug`.
+
+    ⚠ Гаснуть цикл обязан только по отмене — иначе уборка клипа не останавливает
+    ничего, а пинг продолжает ходить к регистратору за закрытым просмотром.
+    """
+    monkeypatch.setattr("mega_home.trassir_clip.TRASSIR_PING_INTERVAL", 0.001)
+
+    from mega_home.trassir_archive import Clip
+    from mega_home.trassir_client import TrassirError
+
+    beats: list[str] = []
+    breaks: list[Any] = [
+        TrassirError("Trassir не отвечает на продление токена"),
+        RuntimeError("что-то совсем другое"),
+    ]
+
+    async def flaky_ping(token: str) -> None:
+        if breaks:
+            raise breaks.pop(0)
+        beats.append(token)
+
+    gateway.client.async_ping = flaky_ping
+    clip = Clip(token="tok1", guid="cam1", stream="trassir_tok1")
+
+    async def scenario() -> asyncio.Task:
+        task = asyncio.ensure_future(gateway.clips._async_ping(clip))  # noqa: SLF001
+        for _ in range(500):
+            if len(beats) >= 3:
+                break
+            await asyncio.sleep(0.001)
+        task.cancel()
+        # ⚠ Отмена работает штатно: `CancelledError` не проглочен, иначе задача
+        # переживала бы закрытие просмотра.
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return task
+
+    task = asyncio.run(scenario())
+
+    assert len(beats) >= 3, "цикл обязан продолжаться после сбоев, а не выходить"
+    assert task.cancelled()
+
+
 def test_метка_регистратора_симметрична_чтению_приложения() -> None:
     """⚠ Перевод «микросекунды → метка» обязан быть обратным тому, как
     приложение ЧИТАЕТ метки регистратора (`trassirTimeUs` разбирает их как
@@ -656,7 +834,7 @@ def test_метка_регистратора_симметрична_чтению
     """
     from datetime import datetime, timezone
 
-    from mega_home.trassir_clip import _stamp
+    from mega_home.trassir_archive import _stamp
 
     # 2026-09-14 09:43:51 UTC
     us = int(datetime(2026, 9, 14, 9, 43, 51, tzinfo=timezone.utc).timestamp()) * 1_000_000
@@ -686,7 +864,7 @@ def test_повтор_play_идёт_с_метки_НАЗВАННОЙ_регис�
     ⚠ Повтор РОВНО ОДИН и только при расхождении: второй круг значил бы, что мы
     спорим с регистратором о его же ответе.
     """
-    from mega_home.trassir_clip import _stamp_of_text
+    from mega_home.trassir_archive import _stamp_of_text
 
     # Перестановка символов, а не разбор даты: дом не толкует ответы.
     assert _stamp_of_text("2026-09-13 00:22:42") == "20260913T002242"
