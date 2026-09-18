@@ -14,16 +14,11 @@ import asyncio
 
 from mega_home import scan
 
+from fake_host import FakeHost
+
 
 def run(coro):
     return asyncio.run(coro)
-
-
-class _Hass:
-    """Заглушка: обход зовёт executor только за ARP, там сети нет."""
-
-    async def async_add_executor_job(self, func, *args):
-        return func(*args)
 
 
 async def _serve(handler, host: str = "127.0.0.1"):
@@ -84,7 +79,7 @@ def test_run_reports_host_with_web_port_and_title(monkeypatch):
 
         monkeypatch.setattr(scan, "_fetch", fake_fetch)
         try:
-            result = await scan.run(_Hass(), {"subnet": "127.0.0.1/32"})
+            result = await scan.run(FakeHost(), {"subnet": "127.0.0.1/32"})
         finally:
             server.close()
             await server.wait_closed()

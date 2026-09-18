@@ -15,6 +15,7 @@ from homeassistant.util import dt as dt_util
 
 from .api import ManagerClient, ManagerError
 from .bundle import BundleStore
+from .ha_host import HaHost
 from .const import (
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
@@ -63,6 +64,9 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=DEFAULT_UPDATE_INTERVAL,
         )
         self.client = client
+        # Пять примитивов среды для модулей без HA (`host.py`): им передаётся он,
+        # а не `hass`.
+        self.env = HaHost(hass)
         # Живой канал к менеджеру; ставится в async_setup_entry после регистрации
         # HTTP, потому что сам канал ничего не раздаёт — он только будит опрос.
         self.link: Any = None
@@ -94,7 +98,7 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # вовсе. Найдено на живом объекте по диагностике: `app_checked_at: null`
         # при `last_update_success: true`, то есть «не пробовало», а не «не
         # смогло». Порядок инициализации теперь не решает ничего.
-        self.bundle = BundleStore(hass, client)
+        self.bundle = BundleStore(self.env, client)
         # Почему интерфейс мог не доехать и когда его проверяли в последний раз —
         # это уходит в диагностику: «старый интерфейс» иначе неотличим от нормы.
         self.app_error: str | None = None

@@ -113,7 +113,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
             await _webrtc.async_shutdown()
             await _go2rtc_stop()
 
-        await _go2rtc_start(hass)
+        await _go2rtc_start(coordinator.env)
         entry.async_on_unload(
             hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _shutdown)
         )
@@ -144,7 +144,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # и сразу получает уже загруженный — как видеонаблюдение строкой выше.
     # ⚠ Остановка — и на выгрузке записи, и на остановке HA: осиротевший
     # Asterisk держит 5060 (правило своего go2rtc).
-    sip_bridge = SipBridge(hass)
+    sip_bridge = SipBridge(coordinator.env)
     coordinator.sip_bridge = sip_bridge
     entry.async_on_unload(
         hass.bus.async_listen_once(
@@ -165,7 +165,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # Поднимается ПОСЛЕ первого опроса, но живёт независимо от него: правила
     # лежат в своём кэше, и объект, потерявший связь с менеджером, продолжает
     # сторожить себя — ровно тогда, когда чинить его больше некому.
-    agent = AgentRunner(hass, client)
+    agent = AgentRunner(coordinator.env, client)
     await agent.async_start()
     coordinator.agent = agent
     entry.async_on_unload(lambda: hass.async_create_task(agent.async_stop()))

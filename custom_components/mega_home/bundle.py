@@ -18,11 +18,9 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.storage import STORAGE_DIR
-
 from .api import ManagerClient, ManagerError
 from .const import LOGGER
+from .host import Host
 
 BUNDLE_DIR = "mega_home_www"
 # Сколько версий держим на диске: активная и предыдущая. Предыдущая — это откат
@@ -43,10 +41,10 @@ class BundleStore:
     on every nudge (see `async_sync`).
     """
 
-    def __init__(self, hass: HomeAssistant, client: ManagerClient) -> None:
-        self._hass = hass
+    def __init__(self, env: Host, client: ManagerClient) -> None:
+        self._env = env
         self._client = client
-        self._root = Path(hass.config.path(STORAGE_DIR, BUNDLE_DIR))
+        self._root = env.path(BUNDLE_DIR)
         self._active: Path | None = None
         self.version: str | None = None
         # ⚠ Почему бандл не обновился — НАРУЖУ, а не только в debug-журнал.
@@ -87,7 +85,7 @@ class BundleStore:
 
     async def async_load(self) -> None:
         """Pick up the newest complete version left by a previous run."""
-        versions = await self._hass.async_add_executor_job(self._stored_versions)
+        versions = await self._env.run(self._stored_versions)
         if versions:
             self._active = versions[-1]
             self.version = self._active.name
@@ -154,7 +152,7 @@ class BundleStore:
         target = self._root / name
         staging = self._root / f".partial-{name}"
         try:
-            await self._hass.async_add_executor_job(_reset_dir, staging)
+            await self._env.run(_reset_dir, staging)
             for item in files:
                 await self._async_fetch_file(staging, item)
         except (ManagerError, OSError, ValueError) as err:
@@ -163,17 +161,17 @@ class BundleStore:
             # is thrown away and the old bundle keeps serving.
             self.last_error = f"download failed: {err}"
             LOGGER.warning("App bundle %s not downloaded: %s", wanted[:19], err)
-            await self._hass.async_add_executor_job(
+            await self._env.run(
                 shutil.rmtree, staging, True
             )
             return False
 
-        await self._hass.async_add_executor_job(_swap, staging, target)
+        await self._env.run(_swap, staging, target)
         self._active = target
         self.version = target.name
         self.last_error = None
         LOGGER.info("App bundle updated to %s", self.version)
-        await self._hass.async_add_executor_job(self._prune)
+        await self._env.run(self._prune)
         return True
 
     async def _async_fetch_file(self, staging: Path, item: dict[str, Any]) -> None:
@@ -187,7 +185,7 @@ class BundleStore:
         # файл выглядят одинаково — как бандл, который «почти» скачался.
         if hashlib.sha256(payload).hexdigest() != digest:
             raise ValueError(f"checksum mismatch for {path}")
-        await self._hass.async_add_executor_job(_write, target, payload)
+        await self._env.run(_write, target, payload)
 
     def _stored_versions(self) -> list[Path]:
         if not self._root.is_dir():

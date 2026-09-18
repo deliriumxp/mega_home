@@ -32,12 +32,10 @@ import time
 from datetime import timedelta
 from typing import Any
 
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.helpers.storage import Store
-
 from .api import ManagerClient, ManagerError
 from .const import LOGGER
+from .host import Host
+from .probe import run as run_probe
 
 # Тик сторожа. Само правило говорит, как часто ему выполняться (`everySec`);
 # тик только будит проверку «кому пора». Мельче незачем: минута — самый частый
@@ -58,10 +56,10 @@ MAX_PROBES = 8
 class AgentRunner:
     """Исполнитель правил. Ничего не знает о том, ЧТО он сторожит."""
 
-    def __init__(self, hass: HomeAssistant, client: ManagerClient) -> None:
-        self._hass = hass
+    def __init__(self, env: Host, client: ManagerClient) -> None:
+        self._env = env
         self._client = client
-        self._store = Store[dict[str, Any]](hass, STORE_VERSION, STORE_KEY)
+        self._store = env.store(STORE_KEY, STORE_VERSION)
         self._version: str | None = None
         self._rules: list[dict[str, Any]] = []
         # Состояние по правилу: когда началась непрерывная серия нарушений,
@@ -87,7 +85,7 @@ class AgentRunner:
         self._pending = cached.get("pending", [])
         if self._rules:
             LOGGER.info("Сторож объекта поднят из кэша: правил %d", len(self._rules))
-        self._unsub = async_track_time_interval(self._hass, self._async_tick, TICK)
+        self._unsub = self._env.every(TICK, self._async_tick)
 
     async def async_stop(self) -> None:
         if self._unsub:
@@ -148,8 +146,6 @@ class AgentRunner:
             self._busy = False
 
     async def _async_run_rule(self, rule: dict[str, Any]) -> None:
-        from .probe import run as run_probe
-
         now = time.time()
         rule_id = rule["id"]
         state = self._state.setdefault(rule_id, {})
@@ -157,7 +153,7 @@ class AgentRunner:
             return
         state["ranAt"] = now
 
-        answer = await run_probe(self._hass, {"probes": rule["probes"][:MAX_PROBES]})
+        answer = await run_probe(self._env, {"probes": rule["probes"][:MAX_PROBES]})
         results = answer.get("results", [])
         healthy = all(_check(results, c) for c in rule["healthy"])
 
@@ -179,8 +175,6 @@ class AgentRunner:
         await self._async_act(rule, state, now)
 
     async def _async_act(self, rule: dict[str, Any], state: dict[str, Any], now: float) -> None:
-        from .probe import run as run_probe
-
         action = rule["action"]
         # Пауза: устройство после действия минуты недоступно, и без неё сторож
         # бил бы по нему на каждом тике — то есть не давал бы подняться.
@@ -207,7 +201,7 @@ class AgentRunner:
 
         state["actedAt"] = now
         state["actedToday"] = int(state.get("actedToday", 0)) + 1
-        answer = await run_probe(self._hass, {"probes": action["probes"][:MAX_PROBES]})
+        answer = await run_probe(self._env, {"probes": action["probes"][:MAX_PROBES]})
         # ⚠ Отказ задания действия НЕ считаем провалом: контроллер, которому
         # послали `reboot`, уходит в перезагрузку прямо в этой сессии и ответить
         # уже не может. В отчёт кладём то, что видели, и решает человек.

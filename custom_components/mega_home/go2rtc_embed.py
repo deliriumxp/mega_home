@@ -37,9 +37,9 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from homeassistant.core import HomeAssistant
 
 from .const import LOGGER
+from .host import Host
 
 # Порт сигналинга и медиа. Тот же и в кандидате `stun:8555`: наружу объект
 # отдаёт ровно этот адрес, и проброс на роутере (если он нужен) делается на него.
@@ -72,7 +72,7 @@ _ready = False
 _log: deque[str] = deque(maxlen=LOG_TAIL)
 
 
-async def async_start(hass: HomeAssistant) -> bool:
+async def async_start(env: Host) -> bool:
     """Поднять свой go2rtc. False — идём штатным путём Home Assistant."""
     global _proc, _tmp, _ready, _why
 
@@ -83,7 +83,7 @@ async def async_start(hass: HomeAssistant) -> bool:
     # «чужому аддону» значило бы навсегда остаться с «не поднят go2rtc»:
     # живой факт 2026-09-12 — два обновления подряд, и камера мертва до
     # ребута объекта. Отвечает НАШ API на петле — усыновляем, а не уступаем.
-    if await _api_alive(hass):
+    if await _api_alive(env):
         _ready = True
         _why = ""
         LOGGER.info(
@@ -92,12 +92,12 @@ async def async_start(hass: HomeAssistant) -> bool:
             URL,
         )
         return True
-    binary = await hass.async_add_executor_job(shutil.which, "go2rtc")
+    binary = await env.run(shutil.which, "go2rtc")
     if not binary:
         _why = "в системе нет go2rtc: запись и удалённая камера не заработают"
         LOGGER.warning("%s", _why)
         return False
-    busy = await hass.async_add_executor_job(_ports_busy)
+    busy = await env.run(_ports_busy)
     if busy:
         # ⚠ Не поднимаемся и НЕ жалуемся громко: чужой go2rtc на этом порту —
         # это, как правило, правильно настроенный аддон. Пусть работает он.
@@ -105,7 +105,7 @@ async def async_start(hass: HomeAssistant) -> bool:
         LOGGER.info("%s (%s)", _why, URL)
         return False
 
-    _tmp = await hass.async_add_executor_job(_write_config)
+    _tmp = await env.run(_write_config)
     LOGGER.info("Starting mega_home go2rtc %s :%s", binary, WEBRTC_PORT)
     try:
         _proc = await asyncio.create_subprocess_exec(
@@ -123,7 +123,7 @@ async def async_start(hass: HomeAssistant) -> bool:
 
     _log.clear()
     _start_drain()
-    _ready = await _await_api(hass)
+    _ready = await _await_api(env)
     if not _ready:
         _why = (
             f"go2rtc не ответил по {URL} за {READY_TIMEOUT:.0f} с. "
@@ -262,11 +262,9 @@ async def _read_output() -> None:
         LOGGER.debug("go2rtc output reader stopped", exc_info=True)
 
 
-async def _await_api(hass: HomeAssistant) -> bool:
+async def _await_api(env: Host) -> bool:
     """Дождаться ответа API — это и есть «поднялся», а не «процесс не умер»."""
-    from homeassistant.helpers.aiohttp_client import async_get_clientsession
-
-    session = async_get_clientsession(hass)
+    session = env.session()
     loop = asyncio.get_running_loop()
     deadline = loop.time() + READY_TIMEOUT
     while loop.time() < deadline:
@@ -282,16 +280,14 @@ async def _await_api(hass: HomeAssistant) -> bool:
     return False
 
 
-async def _api_alive(hass: HomeAssistant) -> bool:
+async def _api_alive(env: Host) -> bool:
     """Отвечает ли чей-то go2rtc на НАШЕМ API-порте (петля, один запрос).
 
     ⚠ Порт 1985 выбран среди незанятых и наружу не слушается вовсе, поэтому
     ответивший на нём — практически наверняка наш же процесс прошлого запуска.
     Шов для спек: настоящий HTTP здесь не тестируется.
     """
-    from homeassistant.helpers.aiohttp_client import async_get_clientsession
-
-    session = async_get_clientsession(hass)
+    session = env.session()
     try:
         async with session.get(f"{URL}/api/streams", timeout=_timeout(1)) as answer:
             return answer.status < 500

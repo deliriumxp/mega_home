@@ -15,10 +15,7 @@ import pytest
 
 from mega_home import go2rtc_embed as embed
 
-
-class _Hass:
-    async def async_add_executor_job(self, func, *args):  # noqa: ANN001, ANN201, D102
-        return func(*args)
+from fake_host import FakeHost
 
 
 class _Stdout:
@@ -74,7 +71,7 @@ def test_занятый_порт_оставляет_переговоры_шта�
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as busy:
         busy.bind(("0.0.0.0", embed.WEBRTC_PORT))
-        assert asyncio.run(embed.async_start(_Hass())) is False
+        assert asyncio.run(embed.async_start(FakeHost())) is False
 
     assert embed.is_running() is False
 
@@ -87,7 +84,7 @@ def test_лог_вычитывается_иначе_go2rtc_встанет(monkey
     _fake_launch(monkeypatch, proc)
 
     async def scenario() -> None:
-        assert await embed.async_start(_Hass()) is True
+        assert await embed.async_start(FakeHost()) is True
         assert embed.is_running() is True
         # Даём читателю разобрать то, что уже написано.
         await asyncio.sleep(0)
@@ -104,7 +101,7 @@ def test_остановка_снимает_процесс_и_читателя(mo
     _fake_launch(monkeypatch, proc)
 
     async def scenario() -> None:
-        assert await embed.async_start(_Hass()) is True
+        assert await embed.async_start(FakeHost()) is True
         await embed.async_stop()
         assert proc.terminated is True
         assert embed.is_running() is False
@@ -119,7 +116,7 @@ def test_не_ответивший_api_не_считается_поднятым(
     _fake_launch(monkeypatch, proc, ready=False)
 
     async def scenario() -> None:
-        assert await embed.async_start(_Hass()) is False
+        assert await embed.async_start(FakeHost()) is False
         assert embed.is_running() is False
         assert proc.terminated is True
 
@@ -158,5 +155,5 @@ def test_сирота_усыновляется_а_не_уступает_чужо
     monkeypatch.setattr(embed, "_api_alive", alive)
     monkeypatch.setattr(embed.shutil, "which", _must_not_start)
 
-    assert asyncio.run(embed.async_start(_Hass())) is True
+    assert asyncio.run(embed.async_start(FakeHost())) is True
     assert embed.is_running() is True

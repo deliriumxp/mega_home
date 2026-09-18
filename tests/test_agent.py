@@ -19,6 +19,8 @@ from mega_home import agent as agent_module
 from mega_home.agent import AgentRunner
 from mega_home.api import ManagerError
 
+from fake_host import FakeHost
+
 
 def run(coro):
     return asyncio.run(coro)
@@ -63,15 +65,13 @@ def make(monkeypatch, client, results):
     """Сторож с подменённой пробой: она возвращает заданные результаты."""
     calls: list[list[dict]] = []
 
-    async def fake_probe(hass, payload):
+    async def fake_probe(env, payload):
         calls.append(payload["probes"])
         answer = results[min(len(calls) - 1, len(results) - 1)]
         return {"results": answer}
 
-    import mega_home.probe as probe_module
-
-    monkeypatch.setattr(probe_module, "run", fake_probe)
-    return AgentRunner(None, client), calls
+    monkeypatch.setattr(agent_module, "run_probe", fake_probe)
+    return AgentRunner(FakeHost(), client), calls
 
 
 HEALTHY = [{"ok": True, "ms": 5, "status": 200, "body": '{"director": "connected"}'}]

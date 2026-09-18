@@ -35,10 +35,10 @@ from http import HTTPStatus
 from typing import Any
 
 import aiohttp
-from homeassistant.core import HomeAssistant
 
 from .const import LOGGER
-from .ops import OpError
+from .host import Host
+from .ops_base import OpError
 
 # Потолок ожидания одного TCP-соединения. Короче нельзя: домашние железки
 # отвечают за десятки миллисекунд, а вот камера под нагрузкой — за полсекунды.
@@ -76,7 +76,7 @@ NAME_CONCURRENCY = 32
 ARP_TOUCH_PORT = 9
 
 
-async def run(hass: HomeAssistant, payload: dict[str, Any]) -> dict[str, Any]:
+async def run(env: Host, payload: dict[str, Any]) -> dict[str, Any]:
     """Обойти подсеть и вернуть найденные хосты с открытыми веб-портами."""
     network = _target_network(payload.get("subnet") if payload else None)
     started = time.monotonic()
@@ -85,10 +85,10 @@ async def run(hass: HomeAssistant, payload: dict[str, Any]) -> dict[str, Any]:
 
     # Толчок ARP и TCP-обход идут ВМЕСТЕ: пока ядро ждёт ответов на ARP,
     # TCP-обход уже отрабатывает, и отдельная пауза на ARP не тратится дважды.
-    await hass.async_add_executor_job(_touch_arp, ips)
+    await env.run(_touch_arp, ips)
     alive, arp = await asyncio.gather(
         _tcp_sweep(ips),
-        _arp_after(hass),
+        _arp_after(env),
     )
 
     hosts: list[dict[str, Any]] = []
@@ -100,7 +100,7 @@ async def run(hass: HomeAssistant, payload: dict[str, Any]) -> dict[str, Any]:
     # веб-порт: их мониторинг появится позже, и терять их уже здесь нельзя.
     hosts.sort(key=lambda host: ipaddress.ip_address(host["ip"]))
     await _scan_ports(hosts)
-    await _fingerprint(hass, hosts)
+    await _fingerprint(env, hosts)
     await _names(hosts)
 
     LOGGER.info(
@@ -189,10 +189,10 @@ def _touch_arp(ips: list[str]) -> None:
         sock.close()
 
 
-async def _arp_after(hass: HomeAssistant) -> dict[str, str]:
+async def _arp_after(env: Host) -> dict[str, str]:
     """Дать ядру время и прочитать ARP-таблицу."""
     await asyncio.sleep(ARP_WAIT_S)
-    return await hass.async_add_executor_job(_arp_table)
+    return await env.run(_arp_table)
 
 
 def _arp_table() -> dict[str, str]:
@@ -272,11 +272,9 @@ async def _scan_ports(hosts: list[dict[str, Any]]) -> None:
     await asyncio.gather(*(one(host) for host in hosts))
 
 
-async def _fingerprint(hass: HomeAssistant, hosts: list[dict[str, Any]]) -> None:
+async def _fingerprint(env: Host, hosts: list[dict[str, Any]]) -> None:
     """Снять `Server` и `<title>` с открытых веб-портов: по ним видно, что это."""
-    from homeassistant.helpers.aiohttp_client import async_get_clientsession
-
-    session = async_get_clientsession(hass)
+    session = env.session()
     semaphore = asyncio.Semaphore(FINGERPRINT_CONCURRENCY)
 
     async def one(host: dict[str, Any], port: dict[str, Any]) -> None:

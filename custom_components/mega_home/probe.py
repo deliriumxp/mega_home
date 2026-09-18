@@ -30,10 +30,10 @@ from http import HTTPStatus
 from typing import Any
 
 import aiohttp
-from homeassistant.core import HomeAssistant
 
 from .const import LOGGER
-from .ops import OpError
+from .host import Host
+from .ops_base import OpError
 
 # Заданий в одном запросе. Больше — это уже не проба, а обход сети; менеджер
 # шлёт их пачкой по одному устройству (статус + версия + канал демонов).
@@ -46,7 +46,7 @@ MAX_TIMEOUT_S = 20.0
 MAX_BODY_BYTES = 256 * 1024
 
 
-async def run(hass: HomeAssistant, payload: dict[str, Any]) -> dict[str, Any]:
+async def run(env: Host, payload: dict[str, Any]) -> dict[str, Any]:
     """Выполнить пачку заданий и вернуть результаты В ТОМ ЖЕ ПОРЯДКЕ.
 
     ⚠ Отказ отдельной пробы — это НЕ отказ операции: недостижимый контроллер
@@ -61,18 +61,18 @@ async def run(hass: HomeAssistant, payload: dict[str, Any]) -> dict[str, Any]:
         raise OpError(
             f"Заданий в одном запросе больше {MAX_PROBES}", HTTPStatus.BAD_REQUEST
         )
-    results = await asyncio.gather(*(_one(hass, item) for item in probes))
+    results = await asyncio.gather(*(_one(env, item) for item in probes))
     return {"results": list(results)}
 
 
-async def _one(hass: HomeAssistant, item: Any) -> dict[str, Any]:
+async def _one(env: Host, item: Any) -> dict[str, Any]:
     if not isinstance(item, dict):
         return _failed("задание не является объектом")
     kind = str(item.get("kind") or "")
     started = time.monotonic()
     try:
         if kind == "http":
-            return await _http(hass, item, started)
+            return await _http(env, item, started)
         if kind == "tcp":
             return await _tcp(item, started)
     except asyncio.TimeoutError:
@@ -88,7 +88,7 @@ async def _one(hass: HomeAssistant, item: Any) -> dict[str, Any]:
 
 
 async def _http(
-    hass: HomeAssistant, item: dict[str, Any], started: float
+    env: Host, item: dict[str, Any], started: float
 ) -> dict[str, Any]:
     """Один HTTP(S)-запрос к устройству в LAN объекта.
 
@@ -97,14 +97,12 @@ async def _http(
     самоподписанный, и доверенной цепочки для них не существует в принципе.
     Решает это менеджер заданием: он один знает, с кем говорит.
     """
-    from homeassistant.helpers.aiohttp_client import async_get_clientsession
-
     url = str(item.get("url") or "")
     if not url.startswith(("http://", "https://")):
         return _failed("адрес пробы должен быть http(s)", started)
     body = item.get("body")
     headers = item.get("headers") if isinstance(item.get("headers"), dict) else None
-    session = async_get_clientsession(hass)
+    session = env.session()
     async with session.request(
         str(item.get("method") or "GET").upper(),
         url,

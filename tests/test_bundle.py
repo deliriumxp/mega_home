@@ -16,23 +16,7 @@ from typing import Any
 
 from mega_home.bundle import BundleStore
 
-
-class _Config:
-    def __init__(self, root: Path) -> None:
-        self._root = root
-
-    def path(self, *parts: str) -> str:
-        return str(self._root.joinpath(*parts))
-
-
-class FakeHass:
-    """Executor jobs run inline — the store only uses them for file work."""
-
-    def __init__(self, root: Path) -> None:
-        self.config = _Config(root)
-
-    async def async_add_executor_job(self, func: Any, *args: Any) -> Any:
-        return func(*args)
+from fake_host import FakeHost
 
 
 class FakeClient:
@@ -71,7 +55,7 @@ class FakeClient:
 
 
 def store(tmp_path: Path, client: FakeClient) -> BundleStore:
-    return BundleStore(FakeHass(tmp_path), client)
+    return BundleStore(FakeHost(tmp_path / ".storage"), client)
 
 
 def test_before_the_first_download_there_is_nothing_to_serve(tmp_path: Path) -> None:

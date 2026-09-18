@@ -29,17 +29,13 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from pathlib import Path
 import shutil
 import socket
 from time import monotonic
 from typing import Any
 
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.storage import STORAGE_DIR
-
 from .const import LOGGER
+from .host import Host
 from .sip_calls import DoorCalls
 from .sip_config import HTTP_PORT, RESIDENT, RTP_END, RTP_START, SIP_PORT, write_config
 
@@ -58,9 +54,9 @@ STORE_DIR = "mega_home_sip"
 class SipBridge:
     """Жизненный цикл моста одного Home Assistant."""
 
-    def __init__(self, hass: HomeAssistant) -> None:
-        self._hass = hass
-        self._root = Path(hass.config.path(STORAGE_DIR, STORE_DIR))
+    def __init__(self, env: Host) -> None:
+        self._env = env
+        self._root = env.path(STORE_DIR)
         self._proc: asyncio.subprocess.Process | None = None
         self._drain: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
@@ -92,7 +88,7 @@ class SipBridge:
             return
         if self._wanted == self.is_running():
             return
-        self._task = self._hass.async_create_background_task(
+        self._task = self._env.spawn(
             self._async_reconcile(), "mega_home sip bridge"
         )
 
@@ -143,7 +139,7 @@ class SipBridge:
         binary = await self._async_binary()
         if not binary:
             return
-        self._keys = await self._hass.async_add_executor_job(write_config, self._root)
+        self._keys = await self._env.run(write_config, self._root)
         if await self._async_ctl("core show uptime") is not None:
             # Сирота прошлого запуска: конфиг наш, перечитываем его и живём дальше.
             await self._async_ctl("core reload")
@@ -151,7 +147,7 @@ class SipBridge:
             self._start_calls()
             LOGGER.info("SIP-мост: усыновлён Asterisk прошлого запуска")
             return
-        busy = await self._hass.async_add_executor_job(_port_busy)
+        busy = await self._env.run(_port_busy)
         if busy:
             self._why = f"порт {busy} занят — мост не поднимаем"
             LOGGER.warning("SIP-мост: %s", self._why)
@@ -192,7 +188,7 @@ class SipBridge:
     def _start_calls(self) -> None:
         if self.calls is None:
             self.calls = DoorCalls(
-                async_get_clientsession(self._hass), HTTP_PORT, self._keys["ari"]
+                self._env.session(), HTTP_PORT, self._keys["ari"]
             )
         self.calls.start()
 
@@ -221,7 +217,7 @@ class SipBridge:
 
     async def _async_binary(self) -> str | None:
         """Asterisk в контейнере; нет — ставим пакетами Alpine."""
-        which = self._hass.async_add_executor_job
+        which = self._env.run
         binary = await which(shutil.which, "asterisk")
         if binary:
             return binary
@@ -257,7 +253,7 @@ class SipBridge:
 
     async def _async_ctl(self, command: str) -> str | None:
         """Команда НАШЕМУ Asterisk через его сокет; None — никто не ответил."""
-        binary = await self._hass.async_add_executor_job(shutil.which, "asterisk")
+        binary = await self._env.run(shutil.which, "asterisk")
         if not binary:
             return None
         conf = str(self._root / "etc" / "asterisk.conf")

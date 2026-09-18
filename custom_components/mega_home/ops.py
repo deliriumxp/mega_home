@@ -32,6 +32,8 @@ from .const import LOGGER
 from .coordinator import MegaHomeCoordinator
 
 from .ops_base import OpError, _int, find, number
+from .probe import run as run_probe
+from .scan import run as run_scan
 from .ops_camera import _camera_urls, _warm_cameras, camera_entity, camera_frame
 from .ops_video import (
     _guid_of,
@@ -136,21 +138,12 @@ async def run(
         # больше не ходит в LAN объекта по WG-туннелю, которого у части парка
         # нет вовсе. Здесь только примитивы — что и зачем спрашивать, знает
         # менеджер, и меняется это его деплоем, а не релизом HACS.
-        #
-        # ⚠ Импорт ЛОКАЛЬНЫЙ: `probe` берёт `OpError` отсюда, и на уровне файла
-        # это был бы цикл (то же, что у `relay_api`).
-        from .probe import run as run_probe
-
-        return await run_probe(hass, data)
+        return await run_probe(coordinator.env, data)
     if op == "scan":
         # Обход локальной сети объекта по заказу МЕНЕДЖЕРА (`scan.py`): какие
         # устройства стоят и куда из них можно войти по веб-интерфейсу. Список
         # DHCP-аренд роутера этого не даёт — статика в нём не появляется.
-        #
-        # ⚠ Импорт ЛОКАЛЬНЫЙ по той же причине, что у `probe`.
-        from .scan import run as run_scan
-
-        return await run_scan(hass, data)
+        return await run_scan(coordinator.env, data)
     raise OpError("Неизвестная операция", HTTPStatus.NOT_FOUND)
 
 def config(coordinator: MegaHomeCoordinator) -> dict[str, Any]:
