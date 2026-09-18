@@ -15,6 +15,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from fake_host import FakeHost
 from mega_home.imaging import (
     SIDES,
     Look,
@@ -34,11 +35,6 @@ def jpeg(path: Path, size=(1920, 1080), color=(200, 40, 40)) -> Path:
 
 def picture(payload: bytes) -> Image.Image:
     return Image.open(BytesIO(payload))
-
-
-class _Hass:
-    async def async_add_executor_job(self, func, *args):
-        return func(*args)
 
 
 def test_без_вида_отдаётся_исходник():
@@ -87,9 +83,9 @@ def test_чб_и_затенение_как_у_css(tmp_path: Path):
 def test_вариант_считается_один_раз(tmp_path: Path):
     source = jpeg(tmp_path / "photos" / "abc.jpg")
     store = LookStore(tmp_path / "looks", {"p": source.parent})
-    first = asyncio.run(store.async_file(_Hass(), "p", source, {"w": "540"}))
+    first = asyncio.run(store.async_file(FakeHost(), "p", source, {"w": "540"}))
     stamp = first.stat().st_mtime_ns
-    second = asyncio.run(store.async_file(_Hass(), "p", source, {"w": "540"}))
+    second = asyncio.run(store.async_file(FakeHost(), "p", source, {"w": "540"}))
     assert first == second and second.stat().st_mtime_ns == stamp
 
 
@@ -167,13 +163,13 @@ def test_устаревшая_версия_в_адресе_не_отдаёт_с�
     """
     coordinator = _Coordinator(tmp_path)
     jpeg(coordinator.assets.path("photo/room/r1", "v2"))
-    hass = _Hass()
-    assert asyncio.run(asset_file(hass, coordinator, "photo/room/r1", {"v": "v3"})) is None
+    env = FakeHost()
+    assert asyncio.run(asset_file(env, coordinator, "photo/room/r1", {"v": "v3"})) is None
     target, kind = asyncio.run(
-        asset_file(hass, coordinator, "photo/room/r1", {"v": "v2", "w": "360", "blur": "14"})
+        asset_file(env, coordinator, "photo/room/r1", {"v": "v2", "w": "360", "blur": "14"})
     )
     assert kind == "image/jpeg" and target.parent == tmp_path / "looks"
-    original, _ = asyncio.run(asset_file(hass, coordinator, "photo/room/r1", {"v": "v2"}))
+    original, _ = asyncio.run(asset_file(env, coordinator, "photo/room/r1", {"v": "v2"}))
     assert original == coordinator.assets.path("photo/room/r1", "v2")
 
 
@@ -182,5 +178,5 @@ def test_битая_картинка_отдаётся_как_есть(tmp_path: 
     broken = coordinator.photos.path("r1")
     broken.parent.mkdir(parents=True)
     broken.write_bytes(b"\xff\xd8\xff not really a jpeg")
-    served = asyncio.run(photo_file(_Hass(), coordinator, "r1", {"w": "360"}))
+    served = asyncio.run(photo_file(FakeHost(), coordinator, "r1", {"w": "360"}))
     assert served == broken

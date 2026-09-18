@@ -30,6 +30,7 @@ CORE = {
     "gateway",
     "go2rtc_embed",
     "host",
+    "imaging",
     "ops_base",
     "photos",
     "probe",

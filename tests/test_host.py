@@ -46,3 +46,17 @@ def test_таймер_тикает_и_снимается(tmp_path: Path) -> None
         return seen
 
     assert asyncio.run(scenario()) >= 2
+
+
+def test_отложенная_запись_сливается_в_одну(tmp_path: Path) -> None:
+    """Опрос каждые пять секунд не должен писать на флешку каждый раз."""
+
+    async def scenario() -> object:
+        store = PlainHost(tmp_path).store("feed")
+        store.async_delay_save(lambda: {"n": 1}, 0.02)
+        store.async_delay_save(lambda: {"n": 2}, 0.02)
+        assert not (tmp_path / "feed").exists()
+        await asyncio.sleep(0.1)
+        return await store.async_load()
+
+    assert asyncio.run(scenario()) == {"n": 2}

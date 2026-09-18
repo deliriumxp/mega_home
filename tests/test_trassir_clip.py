@@ -112,16 +112,22 @@ class FakeHass:
         self.tasks.append(asyncio.ensure_future(coro))
         return _Task()
 
+    # Хозяин (`host.Host`) шлюза: та же шина, под своим именем.
+    spawn = async_create_background_task
+
+    def session(self, verify_ssl: bool = True) -> Any:
+        return None
+
 
 async def _quiet(hass: FakeHass, gateway: FakeGateway) -> None:
     """Дождаться фоновых задач и снять их: висящий пинг переживал бы спеку."""
     for _ in range(200):
         await asyncio.sleep(0)
-    for owner in (hass, gateway.hass):
+    for owner in (hass, gateway.env):
         for task in owner.tasks:
             if isinstance(task, asyncio.Task):
                 task.cancel()
-    for owner in (hass, gateway.hass):
+    for owner in (hass, gateway.env):
         for task in owner.tasks:
             if isinstance(task, asyncio.Task):
                 try:
@@ -136,7 +142,7 @@ class FakeGateway:
     def __init__(self) -> None:
         self.client = FakeClient()
         self.settings = {"host": "192.168.1.50", "port": 8080, "rtspPort": 555, "clipSeconds": 60}
-        self.hass = FakeHass()
+        self.env = FakeHass()
         self.clips = ClipSessions(self)
 
     def event(self, event_id: str):
@@ -203,9 +209,8 @@ def test_переговоры_без_команды_греют_тракт(
     # запросов, а между «открыть» и предложением телефона лежит сбор
     # ICE-кандидатов, снаружи — ещё и дорога через менеджер. Пока пинг ждал
     # переговоров, токен успевал умереть, и просмотр уходил в долгое молчание.
-    assert any("ping" in name for name in gateway.hass.names), "токен под охраной с выдачи"
-    assert any("fallback" in name for name in hass.names), "сторож слепого старта взведён"
-    assert any("fallback" in name for name in hass.names), "сторож взведён"
+    assert any("ping" in name for name in gateway.env.names), "токен под охраной с выдачи"
+    assert any("fallback" in name for name in gateway.env.names), "сторож слепого старта взведён"
     asyncio.run(_quiet(hass, gateway))
 
 
@@ -479,7 +484,7 @@ def test_канал_без_постоянного_адреса_идёт_по_т�
     assert len(sources) == 3, "второе открытие постоянный адрес уже не пробует"
     assert sources[2] == sources[1].replace("tok1", "tok2")
     # ⚠ Токен живого просмотра тоже надо пинговать: он живёт 10 секунд.
-    assert any("ping" in name for name in gateway.hass.names)
+    assert any("ping" in name for name in gateway.env.names)
 
 
 def test_живой_просмотр_по_токену_ничем_не_командует(

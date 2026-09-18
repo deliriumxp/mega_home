@@ -30,6 +30,10 @@ class _MemoryStore:
     async def async_save(self, data: Any) -> None:
         self.data = data
 
+    def async_delay_save(self, data_func: Any, delay: float = 0) -> None:
+        """Настоящий откладывает запись; спеке важен только её факт."""
+        self.data = data_func()
+
 
 class FakeHost(PlainHost):
     def __init__(self, root: Path | str = "/config/.storage", session: Any = None) -> None:

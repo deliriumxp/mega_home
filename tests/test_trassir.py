@@ -18,31 +18,9 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from fake_host import FakeHost
 from mega_home.api import ManagerError
 from mega_home.trassir import TrassirGateway
-
-
-class _Config:
-    def __init__(self, root: Path) -> None:
-        self._root = root
-
-    def path(self, *parts: str) -> str:
-        return str(self._root.joinpath(*parts))
-
-
-class FakeHass:
-    def __init__(self, root: Path) -> None:
-        self.config = _Config(root)
-        self.tasks: list[Any] = []
-
-    def async_create_background_task(self, coro: Any, name: str) -> Any:
-        # Опрос в спеках не крутим: он проверяется вызовом одного прохода.
-        coro.close()
-        self.tasks.append(name)
-        return _Task()
-
-    async def async_add_executor_job(self, func: Any, *args: Any) -> Any:
-        return func(*args)
 
 
 class _Task:
@@ -105,7 +83,7 @@ class FakeClient:
 
 
 def gateway(tmp_path: Path, manager: FakeManager | None = None) -> TrassirGateway:
-    return TrassirGateway(FakeHass(tmp_path), manager or FakeManager(), object())
+    return TrassirGateway(FakeHost(tmp_path / ".storage"), manager or FakeManager(), object())
 
 
 def config(fingerprint: str = "fp1", host: str = "192.168.1.50") -> dict[str, Any]:

@@ -89,11 +89,7 @@ class ManagerLink:
         self._answers.clear()
 
     async def _run(self) -> None:
-        from homeassistant.helpers.aiohttp_client import async_get_clientsession
-
-        session = async_get_clientsession(
-            self._hass, self._entry.data.get(CONF_VERIFY_SSL, True)
-        )
+        session = self._coordinator.env.session(self._entry.data.get(CONF_VERIFY_SSL, True))
         url = _ws_url(self._entry.data[CONF_MANAGER_URL])
         headers = {"Authorization": f"Bearer {self._entry.data[CONF_TOKEN]}"}
         delay = FIRST_RETRY
@@ -264,8 +260,8 @@ class ManagerLink:
         bundle = self._coordinator.bundle
         return {
             "t": "hello",
-            "version": _integration_version(self._hass),
-            "disk_version": await self._hass.async_add_executor_job(_disk_version),
+            "version": _integration_version(),
+            "disk_version": await self._coordinator.env.run(_disk_version),
             # ⚠ Какой интерфейс дом РАЗДАЁТ прямо сейчас, и почему не новее.
             # Без этих двух полей вопрос «почему у жильца старые кнопки»
             # разбирался по скриншотам: у менеджера были канал и версия, а что
@@ -337,7 +333,7 @@ def _ws_url(manager_url: str) -> str:
     return f"ws://{base}{WS_PATH}"
 
 
-def _integration_version(hass: HomeAssistant) -> str:
+def _integration_version() -> str:
     """Версия ЗАГРУЖЕННОГО кода — константа, попавшая в память при старте.
 
     ⚠ Не `async_get_loaded_integration(...).version` и не чтение манифеста: обе

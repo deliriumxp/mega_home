@@ -41,6 +41,7 @@ from typing import Any, Mapping
 from PIL import Image, ImageFilter, ImageOps
 
 from .const import LOGGER
+from .host import Host
 
 # Ступени длинной стороны. Приложение просит ступень не меньше экрана или
 # плитки; промежуточные значения округляются ВВЕРХ до ближайшей.
@@ -170,7 +171,7 @@ class LookStore:
         return target
 
     async def async_file(
-        self, hass: Any, tag: str, source: Path, query: Mapping[str, str]
+        self, env: Host, tag: str, source: Path, query: Mapping[str, str]
     ) -> Path:
         """Файл для ответа: вариант по query или сам исходник.
 
@@ -180,14 +181,14 @@ class LookStore:
         look = look_from_query(query)
         if look is None:
             return source
-        target = await hass.async_add_executor_job(self.path, tag, source, look)
+        target = await env.run(self.path, tag, source, look)
         # Замков столько, сколько вариантов запрашивали, — набор ограничен (см.
         # шапку), поэтому словарь не чистится.
         lock = self._locks.setdefault(target.name, asyncio.Lock())
         if self._gate is None:
             self._gate = asyncio.Semaphore(PARALLEL)
         async with lock, self._gate:
-            return await hass.async_add_executor_job(self.ensure, tag, source, look)
+            return await env.run(self.ensure, tag, source, look)
 
     def refresh(self) -> None:
         """Пересчитать виды для сменившихся исходников и убрать осиротевшие.
@@ -258,16 +259,16 @@ class LookStore:
 # что у `photo_keys` в `photos.py`.
 
 
-async def photo_file(hass: Any, coordinator: Any, key: str, query: Mapping[str, str]) -> Path | None:
+async def photo_file(env: Host, coordinator: Any, key: str, query: Mapping[str, str]) -> Path | None:
     """Снимок жильца (или его вариант) по ключу; None — снимка нет."""
     target = coordinator.photos.path(key)
-    if not await hass.async_add_executor_job(target.is_file):
+    if not await env.run(target.is_file):
         return None
-    return await _look(hass, coordinator, "p", target, query)
+    return await _look(env, coordinator, "p", target, query)
 
 
 async def asset_file(
-    hass: Any, coordinator: Any, key: str, query: Mapping[str, str]
+    env: Host, coordinator: Any, key: str, query: Mapping[str, str]
 ) -> tuple[Path, str] | None:
     """Файл общего канала (или вариант картинки) и его тип; None — файла нет.
 
@@ -282,7 +283,7 @@ async def asset_file(
     if query.get("v") and query["v"] != entry["v"]:
         return None
     target = coordinator.assets.path(key, entry["v"])
-    if not await hass.async_add_executor_job(target.is_file):
+    if not await env.run(target.is_file):
         # Манифест файл обещает, а синхронизация ещё не дошла (дом только
         # поднялся, менеджер был недоступен). Это не ошибка приложения.
         return None
@@ -290,15 +291,15 @@ async def asset_file(
     kind = kind if isinstance(kind, str) and kind else "application/octet-stream"
     if not kind.startswith("image/"):
         return target, kind
-    served = await _look(hass, coordinator, "a", target, query)
+    served = await _look(env, coordinator, "a", target, query)
     return served, kind if served == target else "image/jpeg"
 
 
-async def _look(hass: Any, coordinator: Any, tag: str, source: Path, query: Mapping[str, str]) -> Path:
+async def _look(env: Host, coordinator: Any, tag: str, source: Path, query: Mapping[str, str]) -> Path:
     if look_from_query(query) is None:
         return source
     try:
-        return await coordinator.looks.async_file(hass, tag, source, query)
+        return await coordinator.looks.async_file(env, tag, source, query)
     except (OSError, ValueError, Image.DecompressionBombError) as err:
         # Картинка не разбирается — лучше показать исходник, чем пустое место.
         LOGGER.warning("Could not prepare a photo variant of %s: %s", source.name, err)

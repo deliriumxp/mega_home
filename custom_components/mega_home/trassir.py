@@ -27,9 +27,6 @@ import asyncio
 import time
 from typing import Any
 
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.storage import Store
-
 from .api import ManagerClient, ManagerError
 from .const import (
     LOGGER,
@@ -44,6 +41,7 @@ from .const import (
     STORAGE_VERSION,
 )
 from .gateway import AccessDenied, AccessGateway
+from .host import Host
 from .trassir_clip import ClipSessions
 from .trassir_client import TrassirClient, TrassirError
 
@@ -60,11 +58,11 @@ DEFAULT_CLIP_SECONDS = 60
 class TrassirGateway:
     """Everything this home does with its recorder, and nothing it does not."""
 
-    def __init__(self, hass: HomeAssistant, manager: ManagerClient, session: Any) -> None:
-        self._hass = hass
+    def __init__(self, env: Host, manager: ManagerClient, session: Any) -> None:
+        self._env = env
         self._manager = manager
         self._session = session
-        self._store = Store[dict[str, Any]](hass, STORAGE_VERSION, TRASSIR_STORAGE_KEY)
+        self._store = env.store(TRASSIR_STORAGE_KEY, STORAGE_VERSION)
         self._settings: dict[str, Any] = {}
         self._creds: dict[str, str] = {}
         self._fingerprint: str = ""
@@ -102,9 +100,9 @@ class TrassirGateway:
         self.last_error: str | None = None
 
     @property
-    def hass(self) -> HomeAssistant:
-        """Home Assistant этого дома — сеансам клипов нужен он же."""
-        return self._hass
+    def env(self) -> Host:
+        """Хозяин этого дома — сеансам клипов нужен он же."""
+        return self._env
 
     # --- жизненный цикл -------------------------------------------------
 
@@ -196,7 +194,7 @@ class TrassirGateway:
     def _start(self) -> None:
         if self._task and not self._task.done():
             return
-        self._task = self._hass.async_create_background_task(
+        self._task = self._env.spawn(
             self._async_poll(), "mega_home_trassir_events"
         )
 

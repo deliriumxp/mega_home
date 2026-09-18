@@ -271,7 +271,7 @@ class MegaHomePhotoView(_MegaHomeView):
         assert coordinator is not None
         hass: HomeAssistant = request.app["hass"]
         # Query может просить готовый вариант (`?w=1080&blur=14`, `imaging.py`).
-        target = await photo_file(hass, coordinator, room, request.query)
+        target = await photo_file(coordinator.env, coordinator, room, request.query)
         if target is None:
             return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
         # Адрес несёт версию файла (`?v=<mtime>`), поэтому картинку можно отдать
@@ -424,7 +424,7 @@ class MegaHomeAssetView(_MegaHomeView):
             return error
         assert coordinator is not None
         hass: HomeAssistant = request.app["hass"]
-        found = await asset_file(hass, coordinator, key, request.query)
+        found = await asset_file(coordinator.env, coordinator, key, request.query)
         if found is None:
             return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
         target, content_type = found

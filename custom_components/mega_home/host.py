@@ -56,6 +56,9 @@ class KeyStore(Protocol):
 
     async def async_save(self, data: Any) -> None: ...
 
+    def async_delay_save(self, data_func: Callable[[], Any], delay: float = 0) -> None:
+        """Записать позже; новые вызовы до записи сливаются в одну."""
+
 
 class JsonStore:
     """`KeyStore` без HA — в ТОМ ЖЕ конверте, что HA `Store`.
@@ -66,12 +69,32 @@ class JsonStore:
 
     def __init__(self, path: Path, key: str, version: int) -> None:
         self._path, self._key, self._version = path, key, version
+        self._delayed: asyncio.TimerHandle | None = None
+        self._pending: asyncio.Task[None] | None = None
 
     async def async_load(self) -> Any:
         return await asyncio.to_thread(self._read)
 
     async def async_save(self, data: Any) -> None:
+        if self._delayed is not None:
+            self._delayed.cancel()
+            self._delayed = None
         await asyncio.to_thread(self._write, data)
+
+    def async_delay_save(self, data_func: Callable[[], Any], delay: float = 0) -> None:
+        # Как у HA: срок считается от ПЕРВОГО вызова, а снимок берётся в момент
+        # записи — опрос каждые пять секунд иначе не записался бы никогда.
+        if self._delayed is not None:
+            self._data_func = data_func
+            return
+        self._data_func = data_func
+        loop = asyncio.get_running_loop()
+
+        def fire() -> None:
+            self._delayed = None
+            self._pending = loop.create_task(self.async_save(self._data_func()))
+
+        self._delayed = loop.call_later(delay, fire)
 
     def _read(self) -> Any:
         try:

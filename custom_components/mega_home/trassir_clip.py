@@ -149,11 +149,11 @@ class ClipSessions:
         смотреть, иначе пингуется вечно и копит соединения к регистратору
         (`connections_per_ip = -1` на стенде — остановить это будет некому).
         """
-        hass = self._gateway.hass
-        clip.ping = hass.async_create_background_task(
+        env = self._gateway.env
+        clip.ping = env.spawn(
             self._async_ping(clip), f"mega_home_trassir_ping_{clip.token}"
         )
-        clip.idle = hass.async_create_background_task(
+        clip.idle = env.spawn(
             self._async_idle(clip_id), f"mega_home_trassir_idle_{clip.token}"
         )
 
@@ -175,7 +175,7 @@ class ClipSessions:
         trickle: bool = False,
     ) -> dict[str, Any]:
         """Свести телефон с записью: тот же go2rtc, что и у живой камеры."""
-        from .ops import OpError
+        from .ops_base import OpError
 
         clip = self._clips.get(clip_id)
         if clip is None:
@@ -215,7 +215,7 @@ class ClipSessions:
         # держится пингом (взят под охрану ещё при открытии), а `play` уйдёт по
         # готовности телефона (`ready`) либо вслепую по таймауту (старое
         # приложение готовности не шлёт — ему достаётся прежнее поведение).
-        clip.fallback = hass.async_create_background_task(
+        clip.fallback = self._gateway.env.spawn(
             self._async_fallback(clip_id),
             f"mega_home_trassir_fallback_{clip.token}",
         )
@@ -235,7 +235,7 @@ class ClipSessions:
         это и есть старт, а не «ещё одна команда следом». Опоздавшая готовность
         (сторож уже стартовал вслепую) и повторная — безвредны.
         """
-        from .ops import OpError
+        from .ops_base import OpError
 
         clip = self._clips.get(clip_id)
         if clip is None:
@@ -516,11 +516,9 @@ class ClipSessions:
 
     async def _async_drop_stream(self, name: str) -> None:
         try:
-            from homeassistant.helpers.aiohttp_client import async_get_clientsession
-
             from .go2rtc_embed import URL as OWN_URL
 
-            session = async_get_clientsession(self._gateway.hass)
+            session = self._gateway.env.session()
             async with session.delete(f"{OWN_URL}/api/streams?src={name}") as answer:
                 await answer.read()
         except Exception as err:  # noqa: BLE001 — уборка не должна ронять закрытие

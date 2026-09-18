@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 
 from mega_home.const import INTEGRATION_VERSION
+from fake_host import FakeHost
 from mega_home.link import ManagerLink, _disk_version, _integration_version
 
 MANIFEST = Path(__file__).resolve().parents[1] / "custom_components" / "mega_home" / "manifest.json"
@@ -38,7 +39,7 @@ def test_loaded_version_does_not_touch_the_disk() -> None:
     снова спрашивают у Home Assistant, то есть о том, что лежит на диске, и
     различать «загружено» и «скачано» станет нечем.
     """
-    assert _integration_version(None) == INTEGRATION_VERSION
+    assert _integration_version() == INTEGRATION_VERSION
 
 
 def test_disk_version_reads_the_manifest_next_to_the_code() -> None:
@@ -53,20 +54,15 @@ def test_hello_carries_both_versions() -> None:
     цикле событий Home Assistant — то, за что интеграцию справедливо ругают.
     """
 
-    class _Hass:
-        @staticmethod
-        async def async_add_executor_job(func, *args):
-            return func(*args)
-
     class _Bundle:
         version = "561c5d8137ae5536"
         last_error = None
 
     class _Coordinator:
         bundle = _Bundle()
+        env = FakeHost()
 
     instance = ManagerLink.__new__(ManagerLink)
-    instance._hass = _Hass()
     instance._coordinator = _Coordinator()
 
     frame = asyncio.run(instance._hello())

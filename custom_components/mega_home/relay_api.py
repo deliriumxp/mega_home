@@ -230,7 +230,7 @@ async def _photo(
     """
     if method == "GET":
         # Вариант по query — тем же разбором, что дома (`imaging.py`).
-        target = await photo_file(hass, coordinator, key, query or {})
+        target = await photo_file(coordinator.env, coordinator, key, query or {})
         if target is None:
             raise ops.OpError("Фото не найдено", HTTPStatus.NOT_FOUND)
         return (HTTPStatus.OK, JPEG_TYPE, await _read(hass, target), IMMUTABLE)
@@ -284,7 +284,7 @@ async def _asset(
     query: dict[str, str] | None = None,
 ) -> tuple[int, str, bytes, str]:
     """Любой файл общего канала: тип и версия — из манифеста в конфиге."""
-    found = await asset_file(hass, coordinator, key, query or {})
+    found = await asset_file(coordinator.env, coordinator, key, query or {})
     if found is None:
         raise ops.OpError("Файл не найден", HTTPStatus.NOT_FOUND)
     target, content_type = found

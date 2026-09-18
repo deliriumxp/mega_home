@@ -126,9 +126,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # обычной синхронизацией, и ждать следующего тика опроса (15 минут) ради
     # первой ленты событий незачем.
     gateway = TrassirGateway(
-        hass,
+        coordinator.env,
         client,
-        async_get_clientsession(hass, entry.data.get(CONF_VERIFY_SSL, True)),
+        coordinator.env.session(entry.data.get(CONF_VERIFY_SSL, True)),
     )
     await gateway.async_load()
     coordinator.trassir = gateway

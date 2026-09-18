@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 from homeassistant.core import State
 
+from fake_host import FakeHost
 from mega_home import ops
 from mega_home.crops import CropStore
 from mega_home.imaging import LookStore
@@ -99,6 +100,7 @@ class _Coordinator:
         self.assets = _Assets(tmp / "assets")
         self.looks = LookStore(tmp / "looks", {"p": tmp / "own", "a": tmp / "assets"})
         self.icons_dir = tmp / "icons"
+        self.env = FakeHost(tmp)
         for directory in ("own", "crops", "assets", "icons"):
             (tmp / directory).mkdir(parents=True, exist_ok=True)
 
