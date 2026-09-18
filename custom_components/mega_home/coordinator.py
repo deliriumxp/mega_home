@@ -74,6 +74,8 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Поднятые пути дверей — для паспорта дома (`ops.config`). Ставит тот,
         # кто поднимает двери: в HA это `http.py`.
         self.routes: list[str] = []
+        # Обновить интеграцию с перезапуском (`ha_update.py`); ставит адаптер.
+        self.self_update: Any = None
         # Живой канал к менеджеру; ставится в async_setup_entry после регистрации
         # HTTP, потому что сам канал ничего не раздаёт — он только будит опрос.
         self.link: Any = None

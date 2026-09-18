@@ -137,6 +137,14 @@ async def run(
         # устройства стоят и куда из них можно войти по веб-интерфейсу. Список
         # DHCP-аренд роутера этого не даёт — статика в нём не появляется.
         return await run_scan(coordinator.env, data)
+    if op == "self-update":
+        # Обновить интеграцию и перезапустить дом по кнопке инсталлятора. Как —
+        # знает только адаптер (в HA это HACS и `homeassistant.restart`), ядро
+        # лишь зовёт то, что он дал; у адаптера без этого умения — честный отказ.
+        updater = getattr(coordinator, "self_update", None)
+        if updater is None:
+            raise OpError("Этот дом не умеет обновляться удалённо", HTTPStatus.NOT_IMPLEMENTED)
+        return await updater()
     raise OpError("Неизвестная операция", HTTPStatus.NOT_FOUND)
 
 def config(coordinator: Any) -> dict[str, Any]:

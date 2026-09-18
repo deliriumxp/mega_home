@@ -12,6 +12,7 @@ exist at all.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
@@ -34,6 +35,7 @@ from .core.trassir import TrassirGateway
 from .http import VIEWS as HTTP_VIEWS, async_register_http
 from .core.agent import AgentRunner
 from .link import ManagerLink
+from .ha_update import async_self_update
 from .core.sip_bridge import SipBridge
 
 PLATFORMS: list[Platform] = []
@@ -100,6 +102,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # Паспорт дома называет ПОДНЯТЫЕ пути (`ops.config`) — их знает тот, кто
     # поднимал двери.
     coordinator.routes = sorted(getattr(view, "url", "") for view in HTTP_VIEWS)
+    # Обновление по кнопке менеджера (`ha_update.py`): ядро зовёт его операцией
+    # `self-update`, не зная про HACS.
+    coordinator.self_update = partial(async_self_update, hass)
 
     # Свой go2rtc :8555 stun:8555 без патча HA core — одна схема.
     #
