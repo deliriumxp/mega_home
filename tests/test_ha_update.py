@@ -38,6 +38,7 @@ class _Hass:
     def __init__(self, entities: list[_Entity], fail: Exception | None = None) -> None:
         self.states = _States(entities)
         self.calls: list[tuple[str, str]] = []
+        self.payloads: list[dict[str, Any]] = []
         self.tasks: list[str] = []
         self.fail = fail
 
@@ -47,6 +48,7 @@ class _Hass:
 
         async def async_call(self, domain, service, data, blocking=False):  # noqa: ANN001, ANN201
             self.hass.calls.append((domain, service))
+            self.hass.payloads.append(data)
             if (domain, service) == ("update", "install") and self.hass.fail:
                 raise self.hass.fail
 
@@ -94,6 +96,23 @@ def test_нечего_ставить_но_перезапуск_всё_равно
     assert hass.tasks and answer["restarting"] is True
 
 
+def test_версию_менеджера_ставит_даже_если_hacs_о_ней_не_знает() -> None:
+    """Живой факт 2026-09-19: HACS ещё считал свежей 0.4.0, менеджер видел 0.4.1 —
+    без явной версии кнопка «ставила нечего» и перезапускала дом на старой."""
+    hass = _Hass([_ours("0.4.0", "0.4.0")])
+    answer = asyncio.run(ha_update.async_self_update(hass, "0.4.1"))
+    assert ("update", "install") in hass.calls
+    install = next(p for p in hass.payloads if "version" in p)
+    assert install["version"] == "0.4.1"
+    assert answer["installing"] is True and answer["target"] == "0.4.1"
+
+
+def test_версия_менеджера_уже_стоит_ставить_нечего() -> None:
+    hass = _Hass([_ours("0.4.1", "0.4.0")])
+    answer = asyncio.run(ha_update.async_self_update(hass, "0.4.1"))
+    assert ("update", "install") not in hass.calls and answer["restarting"] is True
+
+
 def test_без_hacs_отказ_понятный_и_без_перезапуска() -> None:
     hass = _Hass([_other()])
     with pytest.raises(OpError, match="HACS"):
@@ -114,10 +133,14 @@ def test_ядро_зовёт_то_что_дал_адаптер() -> None:
         data = {"tiles": []}
         source = FakeSource()
 
-        async def self_update(self) -> dict:
-            return {"restarting": True}
+        async def self_update(self, wanted: str | None = None) -> dict:
+            return {"restarting": True, "wanted": wanted}
 
-    assert asyncio.run(ops.run(_Coordinator(), "self-update", None)) == {"restarting": True}
+    assert asyncio.run(ops.run(_Coordinator(), "self-update", None)) == {
+        "restarting": True,
+        "wanted": None,
+    }
+    assert asyncio.run(ops.run(_Coordinator(), "self-update", {"version": "0.4.1"}))["wanted"] == "0.4.1"
     _Coordinator.self_update = None  # type: ignore[assignment]
     with pytest.raises(OpError, match="не умеет"):
         asyncio.run(ops.run(_Coordinator(), "self-update", None))

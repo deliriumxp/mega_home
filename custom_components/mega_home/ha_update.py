@@ -47,8 +47,15 @@ def find_update_entity(hass: HomeAssistant) -> State | None:
     return None
 
 
-async def async_self_update(hass: HomeAssistant) -> dict[str, Any]:
-    """Поставить свежий релиз (если он есть) и перезапустить Home Assistant.
+async def async_self_update(hass: HomeAssistant, wanted: str | None = None) -> dict[str, Any]:
+    """Поставить релиз `wanted` (или свежий по мнению HACS) и перезапустить HA.
+
+    ⚠ `wanted` — версия, которую менеджер сам увидел на GitHub. Без неё дом
+    верил `latest_version` HACS, а тот перечитывает релизы раз в несколько
+    часов, и `update_entity` этого не ускоряет: живой факт 2026-09-19 — релиз
+    0.4.1 вышел, менеджер его знал, а кнопка ставила «нечего ставить» и просто
+    перезапускала дом на 0.4.0. `update.install` с явной `version` ставит тег,
+    не дожидаясь, пока HACS о нём вспомнит.
 
     ⚠ Перезапуск — ВСЕГДА, даже если ставить нечего: кнопку жмут и ради дома,
     где HACS уже положил файлы, но HA их ещё не загрузил (на диске новая версия,
@@ -73,14 +80,16 @@ async def async_self_update(hass: HomeAssistant) -> dict[str, Any]:
     fresh = hass.states.get(entity_id) or entity
     installed = fresh.attributes.get("installed_version")
     latest = fresh.attributes.get("latest_version")
-    installing = bool(latest) and latest != installed
+    target = (wanted or "").strip() or latest
+    installing = bool(target) and target != installed
     if installing:
-        LOGGER.warning("Обновление по команде менеджера: %s → %s", installed, latest)
+        LOGGER.warning("Обновление по команде менеджера: %s → %s", installed, target)
+        data: dict[str, Any] = {"entity_id": entity_id}
+        if wanted:
+            data["version"] = target
         try:
             async with asyncio.timeout(INSTALL_TIMEOUT):
-                await hass.services.async_call(
-                    "update", "install", {"entity_id": entity_id}, blocking=True
-                )
+                await hass.services.async_call("update", "install", data, blocking=True)
         except TimeoutError as err:
             raise OpError(
                 "HACS не успел поставить обновление — перезапуск отменён",
@@ -96,6 +105,7 @@ async def async_self_update(hass: HomeAssistant) -> dict[str, Any]:
         "loaded": INTEGRATION_VERSION,
         "installed": installed,
         "latest": latest,
+        "target": target,
         "installing": installing,
         "restarting": True,
     }

@@ -116,7 +116,9 @@ async def run(
         updater = getattr(coordinator, "self_update", None)
         if updater is None:
             raise OpError("Этот дом не умеет обновляться удалённо", HTTPStatus.NOT_IMPLEMENTED)
-        return await updater()
+        # `version` — какую ставить: менеджер знает релиз раньше HACS (`ha_update.py`).
+        wanted = data.get("version")
+        return await updater(str(wanted) if isinstance(wanted, str) and wanted else None)
     raise OpError("Неизвестная операция", HTTPStatus.NOT_FOUND)
 
 async def connect(payload: dict[str, Any]) -> dict[str, Any]:
