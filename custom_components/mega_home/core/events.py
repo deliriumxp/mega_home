@@ -56,6 +56,7 @@ class StateStream:
         # закрывается, а EventSource переподключится за полным снимком.
         self._overflowed = False
         self._unsubscribe_config: Any = None
+        self._unsubscribe_device: Any = None
 
     # --- подписка на дом ---
 
@@ -65,13 +66,22 @@ class StateStream:
         self._unsubscribe_config = self.coordinator.async_add_listener(
             self._on_config
         )
+        # События устройств (`device_events.py`): настенная панель без интернета
+        # обязана узнать о звонке в дверь тем же потоком, что и о состояниях.
+        hub = getattr(self.coordinator, "events", None)
+        self._unsubscribe_device = (
+            hub.subscribe(lambda frame: self._put("device", {k: v for k, v in frame.items() if k != "t"}))
+            if hub is not None
+            else None
+        )
 
     def stop(self) -> None:
-        for unsubscribe in (self._unsubscribe, self._unsubscribe_config):
+        for unsubscribe in (self._unsubscribe, self._unsubscribe_config, self._unsubscribe_device):
             if unsubscribe:
                 unsubscribe()
         self._unsubscribe = None
         self._unsubscribe_config = None
+        self._unsubscribe_device = None
 
     def _tiles(self) -> list[dict[str, Any]]:
         return list(self.coordinator.data.get("tiles", []) or [])

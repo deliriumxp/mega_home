@@ -669,9 +669,9 @@ class _Door:
 
     def descriptor(self, access: Any) -> Any:
         # Описание доступа есть: «двери нет» — это отдельный, уже запертый путь.
-        return {"kind": "http"}
+        return type("Descriptor", (), {"kind": "http", "id": "trassir"})()
 
-    async def call(
+    async def call_full(
         self,
         access: Any,
         method: str,
@@ -679,11 +679,13 @@ class _Door:
         params: Any,
         body: Any,
         session: dict[str, str],
-    ) -> tuple[int, str, bytes]:
+        headers: Any = None,
+        scope: str = "resident",
+    ) -> tuple[int, str, bytes, dict[str, str]]:
         self.calls.append(
             {"path": path, "params": params, "session": dict(session)}
         )
-        return 200, "application/json", b'{"success": 1}'
+        return 200, "application/json", b'{"success": 1}', {}
 
 
 def test_команда_дверью_считается_началом_соединения(

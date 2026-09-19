@@ -40,6 +40,13 @@ async def webrtc_offer(
     # сроками, своим закрытием и своей диагностикой — то есть вторую трубу
     # (docs/trassir-integration-plan.md §3 у менеджера). Отличается только
     # источник, и решает это приставка id.
+    if payload.get("access") and payload.get("media"):
+        # Источник медиа доступа (`media.py`): камера, панель, что угодно, чей
+        # адрес описан в конфиге объекта. Плитка тут не нужна — бандл знает
+        # доступы из паспорта, дом не знает, чьё это видео.
+        from .media import live_offer
+
+        return await live_offer(coordinator, payload, sdp, remote, trickle)
     tile = payload.get("id")
     if isinstance(tile, str) and tile.startswith(CLIP_PREFIX):
         return await trassir(coordinator).clips.async_offer(

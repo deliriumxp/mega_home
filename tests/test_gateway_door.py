@@ -161,7 +161,7 @@ def test_сессия_подставляется_домом(monkeypatch: pytest.
             seen.append({"вход": url, "params": kwargs.get("params")})
             return Answer(b'{"sid": "abc"}')
 
-    call._session = Client()  # noqa: SLF001 — шов тот же, что у клиента драйвера
+    call._http._clients[False] = Client()  # noqa: SLF001 — шов HTTP-стороны двери
     asyncio.run(call.call(None, "GET", "/archive_status", {"type": "timeline"}))
 
     login = next(item for item in seen if "вход" in item)
@@ -198,10 +198,10 @@ def test_дверь_через_ops_выполняет_описанный_выз�
     coordinator = Coordinator()
     coordinator.accesses.apply([TRASSIR])
 
-    async def fake_call(*args: Any, **kwargs: Any) -> tuple[int, str, bytes]:
-        return 200, "application/json", b'{"success": 1, "num": 3}'
+    async def fake_call(*args: Any, **kwargs: Any) -> tuple[int, str, bytes, dict[str, str]]:
+        return 200, "application/json", b'{"success": 1, "num": 3}', {}
 
-    monkeypatch.setattr(coordinator.accesses, "call", fake_call)
+    monkeypatch.setattr(coordinator.accesses, "call_full", fake_call)
 
     answer = asyncio.run(
         ops.gateway_call(
@@ -258,7 +258,7 @@ def test_ошибка_связи_это_НЕДОСТУПНОСТЬ_а_не_от�
         def get(self, *_: Any, **__: Any) -> Any:
             raise aiohttp.ClientConnectionError("Server disconnected")
 
-    call._session = Broken()  # noqa: SLF001 — шов тот же, что у клиента драйвера
+    call._http._clients[False] = Broken()  # noqa: SLF001 — шов HTTP-стороны двери
     with pytest.raises(AccessUnreachable) as err:
         asyncio.run(call.call(None, "GET", "/channels"))
 
@@ -290,7 +290,7 @@ def test_недоступность_регистратора_отдаётся_50
         def request(self, *_: Any, **__: Any) -> Any:
             raise aiohttp.ClientConnectionError("Server disconnected")
 
-    call._session = Broken()  # noqa: SLF001
+    call._http._clients[False] = Broken()  # noqa: SLF001 — шов HTTP-стороны двери
 
     class _Clips:
         @staticmethod
@@ -429,7 +429,7 @@ def test_дверь_говорит_сессией_драйвера() -> None:
             seen.append({"вход": url})
             return Answer('{"sid": "своя"}'.encode("utf-8"))
 
-    call._session = Client()  # noqa: SLF001
+    call._http._clients[False] = Client()  # noqa: SLF001 — шов HTTP-стороны двери
     asyncio.run(call.call(None, "GET", "/archive_status", {"type": "calendar"}))
 
     assert not [item for item in seen if "вход" in item], (
@@ -528,7 +528,7 @@ def test_протухшая_сессия_перевходит_а_не_уезжа
                 return Answer(b'{"error_code":"no session","success":0}')
             return Answer(b'[{"token":"t","calendar":["2026-09-13"]}]')
 
-    call._session = Client()  # noqa: SLF001
+    call._http._clients[False] = Client()  # noqa: SLF001 — шов HTTP-стороны двери
     status, _, payload = asyncio.run(
         call.call(None, "GET", "/archive_status", {"type": "calendar"})
     )
@@ -574,7 +574,7 @@ def test_без_маркера_повтора_нет() -> None:
             rounds.append(1)
             return Answer()
 
-    call._session = Client()  # noqa: SLF001
+    call._http._clients[False] = Client()  # noqa: SLF001 — шов HTTP-стороны двери
     asyncio.run(call.call(None, "GET", "/archive_status", {"type": "calendar"}))
 
     assert len(rounds) == 1
@@ -627,7 +627,7 @@ def test_ответ_читается_ЦЕЛИКОМ_а_не_первым_кус�
         def get(self, *_: Any, **__: Any) -> Answer:
             return Answer()
 
-    call._session = Client()  # noqa: SLF001
+    call._http._clients[False] = Client()  # noqa: SLF001 — шов HTTP-стороны двери
     _, _, payload = asyncio.run(call.call(None, "GET", "/archive_status", {"type": "calendar"}))
 
     assert payload == whole, "тело обязано приехать целиком, а не первым куском"
@@ -669,7 +669,7 @@ def test_потолок_ответа_считается_ПО_ХОДУ() -> None:
         def get(self, *_: Any, **__: Any) -> Answer:
             return Answer()
 
-    call._session = Client()  # noqa: SLF001
+    call._http._clients[False] = Client()  # noqa: SLF001 — шов HTTP-стороны двери
     with pytest.raises(AccessDenied):
         asyncio.run(call.call(None, "GET", "/screenshot/cam"))
 

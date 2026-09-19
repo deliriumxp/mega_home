@@ -16,9 +16,11 @@
 любого, кто в его Wi-Fi.
 
 Кадры канала:
-  управление — JSON: `stream.open` {id, host, port} → `stream.ok` | `stream.error`,
-  `stream.close` {id, error?} в обе стороны;
+  управление — JSON: `stream.open` {id, host, port, proto?} → `stream.ok` |
+  `stream.error`, `stream.close` {id, error?} в обе стороны;
   данные — БИНАРНЫЕ: 4 байта номера потока (big-endian) + байты как есть.
+  `proto: "udp"` — кадр данных = ОДНА датаграмма в каждую сторону (SIP по UDP,
+  опрос устройств); умолчание — TCP.
 Бинарные, а не base64 в JSON: треть лишнего объёма и лишние проходы по каждому
 килобайту веб-морды — это заметно уже на одной странице с картинками.
 """
@@ -32,6 +34,11 @@ from typing import Any
 
 from .const import LOGGER
 from .sip_config import HTTP_PORT as SIP_BRIDGE_PORT
+
+# Службы САМОГО дома, до которых менеджер вправе открыть поток по loopback.
+# ⚠ Список, а не «весь loopback»: там же сам Home Assistant и соседи по машине.
+# Служба слушает только loopback ровно потому, что вход в неё — этот канал.
+LOCAL_SERVICES = {SIP_BRIDGE_PORT: "SIP-мост домофонии (WebSocket)"}
 
 # Сколько сессий разом на объект.
 #
@@ -115,16 +122,24 @@ class Streams:
             return
         host = str(payload.get("host"))
         port = int(payload.get("port"))
+        stream: _Stream | _Datagrams
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), 10
-            )
+            if payload.get("proto") == "udp":
+                loop = asyncio.get_running_loop()
+                transport, protocol = await loop.create_datagram_endpoint(
+                    _DatagramProtocol, remote_addr=(host, port)
+                )
+                stream = _Datagrams(stream_id, transport, protocol, self)
+            else:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), 10
+                )
+                stream = _Stream(stream_id, reader, writer, self)
         except (asyncio.TimeoutError, OSError) as err:
             await self._send_json(
                 {"t": "stream.error", "id": stream_id, "error": _describe(err)}
             )
             return
-        stream = _Stream(stream_id, reader, writer, self)
         self._streams[stream_id] = stream
         await self._send_json({"t": "stream.ok", "id": stream_id})
         stream.start()
@@ -138,10 +153,10 @@ class Streams:
         заодно анонимным выходом в сеть с его адреса. Устройства менеджер и так
         знает по скану и называет их адресами.
 
-        ⚠ Loopback — ровно одна дверь: SIP-мост домофонии (`sip_config.py`). Он
-        слушает только loopback, и канал менеджера — единственный путь к нему
-        телефона жильца. Остальной loopback — сам Home Assistant и соседи по
-        машине, не «устройство объекта».
+        ⚠ Loopback — только службы самого дома (`LOCAL_SERVICES`): они слушают
+        только loopback, и канал менеджера — единственный путь к ним (телефон
+        жильца до SIP-моста). Остальной loopback — сам Home Assistant и соседи
+        по машине, не «устройство объекта».
         """
         if len(self._streams) >= MAX_STREAMS:
             return f"на объекте уже {MAX_STREAMS} открытых сессии"
@@ -153,7 +168,7 @@ class Streams:
         except ValueError:
             return "адрес устройства должен быть IP, а не именем"
         if address.is_loopback:
-            if str(address) == "127.0.0.1" and port == SIP_BRIDGE_PORT:
+            if str(address) == "127.0.0.1" and port in LOCAL_SERVICES:
                 return None
             return "адрес вне локальной сети объекта"
         if not address.is_private:
@@ -274,6 +289,85 @@ class _Stream:
     async def _done(self, error: str | None) -> None:
         # ⚠ Сообщаем ВЛАДЕЛЬЦУ, а не закрываемся сами: реестр знает только он, и
         # забытая в нём сессия занимала бы место до конца связи.
+        await self._owner._finished(self.id, error)
+        await self.stop(error)
+
+
+class _DatagramProtocol(asyncio.DatagramProtocol):
+    def __init__(self) -> None:
+        self.owner: _Datagrams | None = None
+
+    def datagram_received(self, data: bytes, addr: Any) -> None:
+        if self.owner is not None:
+            self.owner.received(data)
+
+    def error_received(self, exc: Exception) -> None:
+        if self.owner is not None:
+            self.owner.failed(exc)
+
+
+class _Datagrams:
+    """UDP-сессия: кадр данных = одна датаграмма. Те же сроки и потолок, что у TCP."""
+
+    def __init__(self, stream_id: int, transport: Any, protocol: _DatagramProtocol, owner: Streams) -> None:
+        self.id = stream_id
+        self._transport = transport
+        self._owner = owner
+        self._bytes = 0
+        self._stopping = False
+        self._tasks: list[asyncio.Task[None]] = []
+        self._idle: asyncio.TimerHandle | None = None
+        protocol.owner = self
+
+    def start(self) -> None:
+        self._tasks = [asyncio.ensure_future(self._deadline())]
+        self._touch()
+
+    async def to_device(self, chunk: bytes) -> None:
+        if not self._stopping:
+            self._transport.sendto(chunk)
+            self._touch()
+
+    def received(self, data: bytes) -> None:
+        self._bytes += len(data)
+        self._touch()
+        if self._bytes > MAX_BYTES:
+            self._later(self._done("превышен потолок трафика сессии"))
+            return
+        self._later(self._owner._send_bytes(frame(self.id, data)))
+
+    def failed(self, exc: Exception) -> None:
+        self._later(self._done(_describe(exc)))
+
+    async def stop(self, error: str | None) -> None:
+        if self._stopping:
+            return
+        self._stopping = True
+        for task in self._tasks:
+            task.cancel()
+        if self._idle is not None:
+            self._idle.cancel()
+        self._transport.close()
+        if error:
+            LOGGER.info("Сессия %s закрыта: %s", self.id, error)
+
+    def _touch(self) -> None:
+        # ⚠ У UDP нет «закрыли соединение»: тишина — единственный признак, что
+        # сессия брошена, поэтому срок молчания обязателен и здесь.
+        if self._idle is not None:
+            self._idle.cancel()
+        loop = asyncio.get_running_loop()
+        self._idle = loop.call_later(IDLE_TIMEOUT_S, lambda: self._later(self._done("тишина в сессии")))
+
+    def _later(self, coro: Any) -> None:
+        task = asyncio.ensure_future(coro)
+        self._tasks.append(task)
+
+    async def _deadline(self) -> None:
+        await asyncio.sleep(MAX_LIFETIME_S)
+        await self._done("истёк срок сессии")
+
+    async def _done(self, error: str | None) -> None:
         await self._owner._finished(self.id, error)
         await self.stop(error)
 

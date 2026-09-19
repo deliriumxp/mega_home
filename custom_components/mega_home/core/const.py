@@ -26,7 +26,7 @@ LOGGER = logging.getLogger((__package__ or "").removesuffix(".core"))
 #
 # ⚠ Держится в паре с `manifest.json`, их сверяет `tests/test_version.py`:
 # поднимать ОБА, одним релизом.
-INTEGRATION_VERSION = "0.2.73"
+INTEGRATION_VERSION = "0.2.74"
 
 CONF_MANAGER_URL = "manager_url"
 CONF_TOKEN = "token"
@@ -110,6 +110,9 @@ RELAY_TIMEOUT = 60
 # Wi-Fi объекта. Перечитываем её, когда в конфиге сменился отпечаток
 # `trassir.credentials` (на содержимое он не разбирается, только сравнивается).
 API_TRASSIR = "/inbound/home-config/trassir"
+# Учётка ЛЮБОГО доступа по его id — та же граница, что у Trassir выше: учётки в
+# теле конфига нет (`docs/home-gateway.md` в менеджере).
+API_ACCESS_SECRET = "/inbound/home-config/access-secret"
 
 # Сессия SDK живёт 15 минут — обновляем чуть раньше, чтобы не ловить отказ на
 # ровном месте. Логин не чаще одного раза в 5 секунд: чаще — бан АДРЕСА.

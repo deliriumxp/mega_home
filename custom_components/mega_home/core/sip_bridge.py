@@ -65,8 +65,11 @@ STORE_DIR = "mega_home_sip"
 class SipBridge:
     """Жизненный цикл моста одного Home Assistant."""
 
-    def __init__(self, env: Host) -> None:
+    def __init__(self, env: Host, on_event: Any = None) -> None:
         self._env = env
+        # Куда уходят события вызова (`device_events.py`): вызов, отмена, ответ,
+        # конец. Это события SIP самой панели, а не вендора.
+        self._on_event = on_event
         self._root = env.path(STORE_DIR)
         self._proc: asyncio.subprocess.Process | None = None
         self._drain: asyncio.Task[None] | None = None
@@ -210,7 +213,7 @@ class SipBridge:
     def _start_calls(self) -> None:
         if self.calls is None:
             self.calls = DoorCalls(
-                self._env.session(), HTTP_PORT, self._keys["ari"]
+                self._env.session(), HTTP_PORT, self._keys["ari"], self._on_event
             )
         self.calls.start()
 

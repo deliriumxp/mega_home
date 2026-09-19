@@ -97,6 +97,11 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # SIP-мост домофонии (`sip_bridge.py`). Включается конфигом объекта;
         # координатор только отдаёт ему свежий конфиг.
         self.sip_bridge: Any = None
+        # События устройств (`device_events.py`) и их источники по описаниям
+        # доступов (`listeners.py`). Ставятся снаружи вместе с дверью.
+        self.events: Any = None
+        # ⚠ Не `listeners`: так зовётся поле подписчиков самого координатора HA.
+        self.event_sources: Any = None
         # Бандл интерфейса: качается с менеджера и раздаётся из кэша, поэтому
         # новая версия приложения не требует ни HACS, ни перезапуска.
         #
@@ -296,6 +301,13 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ветке «версия не изменилась» мост, упавший между опросами, иначе не
         поднимался бы до смены конфига. Сам вызов не ждёт установки пакетов.
         """
+        if self.event_sources and self.accesses and config:
+            # Источники событий — по тем же описаниям, что дверь: сверх того,
+            # что уже принял `trassir.async_apply`, конфиг не читается.
+            try:
+                self.event_sources.apply(self.accesses.descriptors())
+            except Exception as err:  # noqa: BLE001 — события не роняют синхронизацию
+                LOGGER.warning("События устройств: конфиг не применился: %s", err)
         if not self.sip_bridge or not config:
             return
         try:

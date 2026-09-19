@@ -88,6 +88,14 @@ class TrassirGateway:
         # принадлежит видеонаблюдению и обязана работать у объекта, где его нет
         # вовсе (`docs/plan-video-rework.md`, «Сквозной принцип»).
         self.accesses = AccessGateway(
+            # ⚠ Учётка СВОЯ у каждого доступа — маршрутом менеджера по отпечатку
+            # (`access_secrets.py`); учётка Trassir ниже — только для описаний
+            # прежней формы, без отпечатка.
+            secrets_fetch=getattr(manager, "async_access_secret", None),
+            # Живая сессия драйвера — только своему доступу: id `trassir` ему
+            # даёт менеджер (`accessConfigs`), второй доступ с сессией её не получит.
+            provider_access="trassir",
+            store=env.store("mega_home_access_secrets", 1),
             credentials=self._manager_trassir_credentials,
             # ⚠ Дверь говорит ЖИВОЙ сессией драйвера, а не своей: поток, открытый
             # одной сессией, второй не виден вовсе (замер стенда 2026-09-13 —

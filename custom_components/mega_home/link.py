@@ -108,6 +108,7 @@ class ManagerLink:
                     from .core.stream import Streams
 
                     self._streams = Streams(socket)
+                    self._attach_events(socket)
                     async for message in socket:
                         if message.type is aiohttp.WSMsgType.TEXT:
                             await self._handle(message.json(), socket)
@@ -138,6 +139,7 @@ class ManagerLink:
                 if self._connected:
                     LOGGER.info("Manager link closed")
                 self._connected = False
+                self._detach_events()
                 if self._streams is not None:
                     await self._streams.close_all()
                     self._streams = None
@@ -165,12 +167,16 @@ class ManagerLink:
             # адрес дома (`CANDIDATE_WINDOW_COLD`), а первый, ещё холодный к STUN
             # go2rtc отдавал одни host-кандидаты — телефон снаружи не достучался
             # бы ни с первого раза, ни со второго (живой отчёт 2026-09-10).
-            payload = await ops.run(
-                self._coordinator,
-                frame.get("op") or "",
-                frame.get("payload"),
-                remote=True,
-            )
+            # ⚠ `scope: manager` ставит КОД менеджера, когда зовёт сам (настройка
+            # устройства, кадр для push); запрос жильца снаружи едет внутри
+            # `payload` и уровня не меняет (`gateway.py`, `docs/home-gateway.md`).
+            op = frame.get("op") or ""
+            if op == "gateway" and isinstance(frame.get("payload"), dict):
+                payload = await ops.gateway_call(
+                    self._coordinator, frame["payload"], str(frame.get("scope") or "")
+                )
+            else:
+                payload = await ops.run(self._coordinator, op, frame.get("payload"), remote=True)
             reply: dict[str, Any] = {"t": "res", "id": request_id, "ok": True, "payload": payload}
         except ops.OpError as err:
             reply = {
@@ -193,6 +199,57 @@ class ManagerLink:
             await socket.send_json(reply)
         except Exception as err:  # noqa: BLE001 - the link reconnects on its own
             LOGGER.debug("Could not send the answer: %s", err)
+
+    def _attach_events(self, socket: Any) -> None:
+        """События устройств — кадрами `event` без подписки (`device_events.py`).
+
+        ⚠ Очередь и одна качалка, а не `send_json` из источника: источник зовёт
+        синхронно, а два одновременных `send_json` в один сокет aiohttp рвут кадр.
+        Не ушедший кадр возвращается в буфер концентратора — переподключение
+        отдаст его, если он ещё свеж.
+        """
+        hub = getattr(self._coordinator, "events", None)
+        if hub is None:
+            return
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=200)
+
+        def enqueue(frame: dict[str, Any]) -> bool:
+            try:
+                queue.put_nowait(frame)
+            except asyncio.QueueFull:
+                return False
+            return True
+
+        for frame in hub.attach(enqueue):
+            enqueue(frame)
+
+        async def pump() -> None:
+            while True:
+                frame = await queue.get()
+                try:
+                    await socket.send_json(frame)
+                except Exception as err:  # noqa: BLE001 — канал переподключится сам
+                    LOGGER.debug("Event frame not sent: %s", err)
+                    hub.requeue(frame)
+                    return
+
+        self._event_queue = queue
+        self._event_pump = asyncio.ensure_future(pump())
+
+    def _detach_events(self) -> None:
+        hub = getattr(self._coordinator, "events", None)
+        if hub is not None:
+            hub.detach()
+            # Не успевшее уйти — обратно в буфер: иначе обрыв посреди звонка
+            # терял бы ровно тот кадр, ради которого буфер заведён.
+            queue = getattr(self, "_event_queue", None)
+            while queue is not None and not queue.empty():
+                hub.requeue(queue.get_nowait())
+            self._event_queue = None
+        pump = getattr(self, "_event_pump", None)
+        if pump is not None:
+            pump.cancel()
+            self._event_pump = None
 
     async def _watch_op(self, socket: Any, frame: dict[str, Any]) -> None:
         """Включить или выключить живые состояния для менеджера (`watch.py`).

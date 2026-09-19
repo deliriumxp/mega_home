@@ -148,11 +148,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     if coordinator.data:
         await gateway.async_apply(coordinator.data)
 
+    # События устройств (`device_events.py`): один концентратор — менеджеру по
+    # каналу и в локальный поток приложения. Источники — описания доступов
+    # (`listeners.py`) и SIP-мост (вызов, отмена, ответ, конец).
+    from .core.device_events import EventHub
+    from .core.listeners import Listeners
+
+    coordinator.events = EventHub()
+    coordinator.event_sources = Listeners(coordinator.env, coordinator.accesses, coordinator.events)
+    entry.async_on_unload(lambda: hass.async_create_task(coordinator.event_sources.stop()))
+    if coordinator.data:
+        coordinator.event_sources.apply(coordinator.accesses.descriptors())
+
     # SIP-мост домофонии (`sip_bridge.py`): поднимается только конфигом объекта,
     # и сразу получает уже загруженный — как видеонаблюдение строкой выше.
     # ⚠ Остановка — и на выгрузке записи, и на остановке HA: осиротевший
     # Asterisk держит 5060 (правило своего go2rtc).
-    sip_bridge = SipBridge(coordinator.env)
+    sip_bridge = SipBridge(
+        coordinator.env,
+        lambda kind, data: coordinator.events.publish("intercom", "sip-bridge", kind, data),
+    )
     coordinator.sip_bridge = sip_bridge
     entry.async_on_unload(
         hass.bus.async_listen_once(

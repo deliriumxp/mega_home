@@ -17,6 +17,7 @@ from .const import (
     API_ICON,
     API_RELAY,
     API_TRASSIR,
+    API_ACCESS_SECRET,
     API_VERSION,
     ICON_SIZE,
     RELAY_TIMEOUT,
@@ -93,6 +94,19 @@ class ManagerClient:
             key: value
             for key, value in payload.items()
             if key in ("username", "password", "sdkPassword") and isinstance(value, str)
+        }
+
+    async def async_access_secret(self, access: str) -> dict[str, str]:
+        """Учётка ОДНОГО доступа: набор именованных полей (`access_secrets.py`).
+
+        ⚠ Та же граница, что у учётки Trassir: в тело конфига не кладётся, из
+        этого процесса не уходит.
+        """
+        payload = await self._get_json(f"{API_ACCESS_SECRET}/{quote(access, safe='')}")
+        return {
+            str(key): str(value)
+            for key, value in payload.items()
+            if isinstance(value, (str, int)) and not isinstance(value, bool)
         }
 
     async def async_agent(

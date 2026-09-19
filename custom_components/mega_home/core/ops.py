@@ -33,7 +33,6 @@ from .ops_video import (
     _guid_of,
     _tiles_by_guid,
     _trassir_guid,
-    gateway_call,
     lead_of,
     trassir,
     trassir_cameras,
@@ -44,6 +43,7 @@ from .ops_video import (
     trassir_thumb,
     video_id,
 )
+from .ops_door import gateway_call
 from .ops_webrtc import webrtc_candidates, webrtc_close, webrtc_offer
 
 # ⚠ Имена выше ИМПОРТИРУЮТСЯ РАДИ ЧУЖИХ ВЫЗОВОВ: и двери (`http.py`), и линк

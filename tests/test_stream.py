@@ -112,6 +112,40 @@ def test_loopback_open_only_to_sip_bridge():
     assert refuse({"host": "127.0.0.1", "port": bridge + 1})
 
 
+def test_udp_session_carries_datagrams(monkeypatch):
+    """`proto: udp` — кадр данных = одна датаграмма в каждую сторону."""
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+
+        class Echo(asyncio.DatagramProtocol):
+            def connection_made(self, transport):
+                self.transport = transport
+
+            def datagram_received(self, data, addr):
+                self.transport.sendto(b"re:" + data, addr)
+
+        transport, _ = await loop.create_datagram_endpoint(Echo, local_addr=("127.0.0.1", 0))
+        port = transport.get_extra_info("sockname")[1]
+        socket = FakeSocket()
+        streams = Streams(socket)
+        monkeypatch.setattr(Streams, "_refuse", lambda self, payload: None)
+        try:
+            await streams.handle(
+                {"t": "stream.open", "id": 4, "host": "127.0.0.1", "port": port, "proto": "udp"}
+            )
+            await streams.on_binary(frame(4, b"INVITE"))
+            await settle()
+        finally:
+            await streams.close_all()
+            transport.close()
+        return socket
+
+    socket = asyncio.run(scenario())
+    assert socket.kinds()[0] == "stream.ok"
+    assert socket.binary and socket.binary[0][HEADER.size :] == b"re:INVITE"
+
+
 def test_refused_connection_comes_back_as_error_not_silence(monkeypatch):
     """Молчание читалось бы менеджером как «дом не отвечает» — а дом-то жив.
 
