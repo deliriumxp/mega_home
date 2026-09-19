@@ -188,6 +188,27 @@ def test_у_камеры_нет_вкл_выкл():
     assert "power" not in _camera({"access_token": "t"})["state"]
 
 
+class _CamerasWithSource:
+    def cached_source(self, entity_id):  # noqa: ANN001
+        return "rtsp://user:pass@10.0.0.5/stream" if entity_id == "camera.gate" else None
+
+
+def test_с_кэшем_адрес_потока_едет_в_состоянии():
+    view = ops.entity_view(
+        {"id": "cam1", "domain": "camera", "entityId": "camera.gate", "name": "Калитка"},
+        State("idle", {"access_token": "tok"}),
+        _CamerasWithSource(),
+    )
+
+    assert view["state"]["source"] == "rtsp://user:pass@10.0.0.5/stream"
+
+
+def test_без_прогретого_кэша_поля_source_нет():
+    view = _camera({"access_token": "tok"})
+
+    assert "source" not in view["state"]
+
+
 def test_элемент_без_сущности_адресов_не_получает():
     view = ops.entity_view(
         {"id": "cam1", "domain": "camera", "entityId": None, "name": "Калитка"}, None

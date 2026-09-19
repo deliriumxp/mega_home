@@ -220,6 +220,8 @@ def test_операции_канала_и_маршруты_api_заперты() 
         "api/asset/*", "api/photo*", "api/crop*",
         # кадр сущности camera.* источника — часть B, не вендор
         "api/camera-frame/*",
+        # хранилище событий устройств — часть F
+        "api/device-events",
     }
 
     assert ops == locked_ops

@@ -54,7 +54,7 @@ def camera_entity(
         )
     return tile["entityId"]
 
-def _camera_urls(entity_id: Any, attributes: Any) -> dict[str, str]:
+def _camera_urls(entity_id: Any, attributes: Any, source: str | None = None) -> dict[str, str]:
     """Still frame and MJPEG stream - the very paths the HA frontend uses.
 
     Relative, and signed with the entity's rotating `access_token`. Absolute
@@ -66,6 +66,13 @@ def _camera_urls(entity_id: Any, attributes: Any) -> dict[str, str]:
     manager builds the same shape in smart-home-view.util.ts, and "replace
     camera_proxy with camera_proxy_stream" would drift between the two
     implementations at the first change in Home Assistant.
+
+    ⚠ `source` — адрес живого потока (обычно RTSP, с учёткой внутри строки),
+    который берёт бандл для переговоров со СВОИМ go2rtc (`docs/plan-thin-gateway.md`,
+    часть B). Он идёт из КЭША `source.Cameras.cached_source`, а не читается
+    здесь: сеть внутри опроса состояний недопустима. Нет адреса в кэше — поля
+    нет вовсе, а не пустая строка: приложение должно отличать «ещё не прогрелось»
+    от «пусто».
     """
     token = (attributes or {}).get("access_token")
     if not entity_id or not isinstance(token, str) or not token:
@@ -74,10 +81,13 @@ def _camera_urls(entity_id: Any, attributes: Any) -> dict[str, str]:
         return {"picture": "", "stream": ""}
     query = f"?token={quote(token, safe='')}"
     ident = quote(str(entity_id), safe="")
-    return {
+    urls = {
         "picture": f"/api/camera_proxy/{ident}{query}",
         "stream": f"/api/camera_proxy_stream/{ident}{query}",
     }
+    if source:
+        urls["source"] = source
+    return urls
 
 def _warm_cameras(coordinator: Any) -> None:
     """Держать наготове кадр каждой камеры, пока приложение открыто.

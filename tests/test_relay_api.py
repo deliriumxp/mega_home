@@ -265,3 +265,22 @@ def test_connect_доезжает_и_снаружи_тем_же_переносо
 
     assert calls == [{"kind": "http", "host": "192.168.1.9", "port": 80, "path": "/x"}]
     assert json_of(answer) == {"status": 200, "headers": {}, "body": "ok"}
+
+
+def test_лента_событий_устройства_доезжает_переносом(coordinator):
+    """Часть F: хранилище на диске отдаёт ленту тем же переносом, что и дома."""
+    from mega_home.core.device_store import DeviceEventStore
+
+    import time
+
+    at = round(time.time(), 3)
+    coordinator.device_events = DeviceEventStore(coordinator.env)
+    coordinator.device_events.add(
+        {"id": "e1", "at": at, "access": "dev1", "source": "cam", "event": "motion", "data": None}
+    )
+
+    answer = call(coordinator, "GET", "api/device-events?access=dev1&limit=5")
+
+    assert json_of(answer) == {
+        "events": [{"id": "e1", "at": at, "source": "cam", "event": "motion", "data": None}]
+    }

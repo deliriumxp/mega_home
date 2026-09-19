@@ -61,6 +61,17 @@ class Cameras(Protocol):
 
     async def snapshot(self, entity_id: str) -> tuple[str, bytes]: ...
 
+    async def stream_source(self, entity_id: str) -> str | None:
+        """Адрес живого потока камеры источника (у HA — `camera.stream_source()`).
+
+        ⚠ У приложения снаружи нет адреса Home Assistant, но БАНДЛ живёт внутри
+        дома и ведёт переговоры с ЕГО go2rtc сам (`docs/plan-thin-gateway.md`,
+        часть B) — ему и нужен этот адрес, обычно RTSP с учёткой внутри строки
+        (пароли — поля описания, а не отдельный секрет). Нет потока — `None`,
+        а не отказ: у камеры без потока (например, только снимки) это не ошибка.
+        """
+        ...
+
 
 class StateSource(Protocol):
     """Сущности дома: прочитать, скомандовать, подписаться."""

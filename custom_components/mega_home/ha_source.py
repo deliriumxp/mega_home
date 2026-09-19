@@ -15,16 +15,36 @@ from .core.source import CommandRejected, CommandUnknown
 
 
 class HaCameras:
-    """Камеры `camera.*` этого HA: прогрев и кадр плитки (`webrtc.py`)."""
+    """Камеры `camera.*` этого HA: прогрев, кадр плитки и адрес потока (`webrtc.py`)."""
 
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
+        # entity_id → адрес потока, наполняет `warm` фоном; `entity_view` читает
+        # синхронно (`ops_camera.cached_source`) — сети внутри опроса состояний
+        # быть не должно.
+        self._sources: dict[str, str] = {}
 
     def warm(self, entity_id: str) -> None:
         webrtc.warm(self.hass, entity_id)
+        if entity_id not in self._sources:
+            # Адрес потока камеры не меняется на лету — читаем его один раз на
+            # запуск дома, а не на каждый опрос состояний (раз в 3 с).
+            self.hass.async_create_task(self._warm_source(entity_id))
+
+    async def _warm_source(self, entity_id: str) -> None:
+        source = await self.stream_source(entity_id)
+        if source:
+            self._sources[entity_id] = source
+
+    def cached_source(self, entity_id: str) -> str | None:
+        """То, что успел прочитать фоновый прогрев — без сети, для `entity_view`."""
+        return self._sources.get(entity_id)
 
     async def snapshot(self, entity_id: str) -> tuple[str, bytes]:
         return await webrtc.snapshot(self.hass, entity_id)
+
+    async def stream_source(self, entity_id: str) -> str | None:
+        return await webrtc.stream_source(self.hass, entity_id)
 
 
 class HaSource:

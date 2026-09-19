@@ -39,12 +39,16 @@ Listener = Callable[[dict[str, Any]], None]
 class EventHub:
     """Раздаёт событие подписчикам; менеджеру — до подтверждения."""
 
-    def __init__(self) -> None:
+    def __init__(self, store: Any = None) -> None:
         self._listeners: list[Listener] = []
         self._unacked: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._sender: Callable[[dict[str, Any]], bool] | None = None
         self.recent: deque[dict[str, Any]] = deque(maxlen=20)
         self.dropped = 0
+        # Хранилище ленты устройств (`device_store.DeviceEventStore`) — часть F:
+        # опционально, чтобы демон без диска (`docs/plan-core-without-ha.md`)
+        # и тесты этого модуля обходились без него.
+        self._store = store
 
     def publish(
         self, access: str, source: str, event: str, data: Any = None, local: bool = False
@@ -52,7 +56,10 @@ class EventHub:
         """Событие устройства. `local` — можно ли показать его в локальном контуре.
 
         ⚠ Умолчание — НЕ показывать: локальный контур без аутентификации, и
-        новый источник не должен попадать туда по забывчивости.
+        новый источник не должен попадать туда по забывчивости. Ровно тот же
+        признак решает, ложится ли событие в хранилище ленты (`_store`) — как
+        до 0.4.0, история устройства видна без менеджера, а его тело наружу не
+        уходило и не уходит.
         """
         frame = {
             "t": "event",
@@ -70,6 +77,8 @@ class EventHub:
                     listener(frame)
                 except Exception:  # noqa: BLE001 — подписчик не роняет источник
                     LOGGER.warning("Событие устройства: подписчик упал", exc_info=True)
+            if self._store is not None:
+                self._store.add(frame)
         self._keep(frame)
         if self._sender is not None:
             self._sender(frame)

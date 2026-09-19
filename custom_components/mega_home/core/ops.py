@@ -47,6 +47,7 @@ __all__ = [
     "command",
     "config",
     "connect",
+    "device_events",
     "entity_view",
     "find",
     "number",
@@ -196,7 +197,11 @@ def states(coordinator: Any) -> dict[str, Any]:
     """Current states of every tile, read straight from the source of this home."""
     source: StateSource = coordinator.source
     entities = [
-        entity_view(tile, source.get(tile["entityId"]) if tile.get("entityId") else None)
+        entity_view(
+            tile,
+            source.get(tile["entityId"]) if tile.get("entityId") else None,
+            source.cameras,
+        )
         for tile in coordinator.data.get("tiles", [])
     ]
     _warm_cameras(coordinator)
@@ -213,6 +218,36 @@ def states(coordinator: Any) -> dict[str, Any]:
         "appVersion": coordinator.bundle.version if coordinator.bundle else None,
         "entities": entities,
     }
+
+DEVICE_EVENTS_MAX_LIMIT = 2000
+DEVICE_EVENTS_DEFAULT_LIMIT = 100
+
+def device_events(coordinator: Any, query: dict[str, Any]) -> dict[str, Any]:
+    """Лента устройства из хранилища на диске (часть F, `device_store.py`).
+
+    ⚠ Не операция канала, а обработчик ПУТИ (`api/device-events`), как
+    `camera_frame`: локальная дверь (`http.py`) и перенос (`relay_api.py`)
+    отвечают одним и тем же кодом. Нет хранилища у дома — пустой список, а не
+    отказ: демон без диска (`docs/plan-core-without-ha.md`) обязан оставаться
+    рабочим, просто без ленты.
+    """
+    store = getattr(coordinator, "device_events", None)
+    if store is None:
+        return {"events": []}
+    access = str(query.get("access") or "")
+    if not access:
+        raise OpError("Не указано устройство", HTTPStatus.BAD_REQUEST)
+    try:
+        limit = int(query.get("limit") or DEVICE_EVENTS_DEFAULT_LIMIT)
+    except (TypeError, ValueError):
+        limit = DEVICE_EVENTS_DEFAULT_LIMIT
+    limit = max(1, min(limit, DEVICE_EVENTS_MAX_LIMIT))
+    before_raw = query.get("before")
+    try:
+        before = float(before_raw) if before_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        before = None
+    return {"events": store.list(access, limit, before)}
 
 async def command(
     coordinator: Any, payload: dict[str, Any]
@@ -248,7 +283,9 @@ async def command(
     # Служба вызвана блокирующе, поэтому машина состояний уже обновлена.
     return {
         "accepted": True,
-        "entity": entity_view(tile, coordinator.source.get(tile["entityId"])),
+        "entity": entity_view(
+            tile, coordinator.source.get(tile["entityId"]), coordinator.source.cameras
+        ),
     }
 
 async def scenario(
@@ -349,7 +386,9 @@ def _public_attributes(attributes: Any) -> dict[str, Any]:
         if key not in HIDDEN_ATTRIBUTES
     }
 
-def entity_view(tile: dict[str, Any], state: EntityState | None) -> dict[str, Any]:
+def entity_view(
+    tile: dict[str, Any], state: EntityState | None, cameras: Any = None
+) -> dict[str, Any]:
     """Что дом отвечает о приборе: сырое состояние Home Assistant и атрибуты.
 
     ⚠ Проекции здесь БОЛЬШЕ НЕТ (docs/plan-thin-integration.md, фаза 1).
@@ -380,6 +419,11 @@ def entity_view(tile: dict[str, Any], state: EntityState | None) -> dict[str, An
     же, по вендорскому id канала) снята вместе с видео объекта: показ живой
     камеры теперь ведёт бандл через `connect`, а не дом, и своей сущности у неё
     для дома нет.
+
+    ⚠ `cameras` — камеры источника (`source.Cameras`), нужны только чтобы взять
+    адрес живого потока ИЗ КЭША (`cached_source`, часть B). `None` там, где его
+    нет под рукой (снимок конфига без источника) — поле `source` тогда не
+    добавляется, как и без прогретого кэша.
     """
     domain = tile["domain"]
     raw = state.state if state else None
@@ -388,7 +432,10 @@ def entity_view(tile: dict[str, Any], state: EntityState | None) -> dict[str, An
     values: dict[str, Any] = {"value": raw}
 
     if domain == "camera":
-        values.update(_camera_urls(tile.get("entityId"), attributes))
+        entity_id = tile.get("entityId")
+        cached_source = getattr(cameras, "cached_source", None)
+        source = cached_source(entity_id) if cached_source and entity_id else None
+        values.update(_camera_urls(entity_id, attributes, source))
         # Каким способом Home Assistant отдаёт живое видео: `hls` или `web_rtc`.
         # Пока не читает никто — приложение показывает MJPEG, который умеет любой
         # браузер без единой зависимости, — но от поля зависит удалённый просмотр,

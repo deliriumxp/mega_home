@@ -169,12 +169,33 @@ async def _request(
                 kind = response.content_type
     return status, kind, payload
 
+def _resetup_matches(resetup: dict[str, Any], payload: bytes) -> bool:
+    """Ответ говорит «сессия умерла» (`resetup.path` == `resetup.equals`)."""
+    try:
+        data = json.loads(payload.decode("utf-8", "ignore")) if payload else None
+    except ValueError:
+        data = None
+    found = pick(data, str(resetup.get("path", "")))
+    return found is not None and str(found) == str(resetup.get("equals"))
+
 async def poll(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[str, Any]) -> None:
     values = base_values(descriptor)
+    setup_block = spec.get("setup") if isinstance(spec.get("setup"), dict) else None
+    # ⚠ `resetup` — сессия устройства умерла (регистратор видеонаблюдения
+    # отвечает телом 200 `{"error_code":"no session"}` вечно, без 401):
+    # описание говорит, по какому полю ответа и какому значению это видно, дом
+    # входит ЗАНОВО (обновляет `carry` из `setup`) и повторяет запрос. Общая
+    # семантика опроса, не вендорский код — вендора решает менеджер строкой
+    # `path`/`equals`.
+    resetup = spec.get("resetup") if isinstance(spec.get("resetup"), dict) else None
     async with aiohttp.ClientSession() as session:
-        if isinstance(spec.get("setup"), dict):
-            _, _, payload = await _request(session, descriptor, spec["setup"], values)
-            carry(values, spec["setup"], payload)
+        async def do_setup() -> None:
+            if setup_block is None:
+                return
+            _, _, setup_payload = await _request(session, descriptor, setup_block, values)
+            carry(values, setup_block, setup_payload)
+
+        await do_setup()
         pause = seconds(spec.get("pause"), MIN_PAUSE_S, MIN_PAUSE_S)
         # ⚠ Одинаковый ответ подряд гасится только у КОРОТКОГО опроса (или по
         # `changesOnly`): у долгого два одинаковых ответа — два события (два
@@ -183,9 +204,22 @@ async def poll(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[s
         changes_only = spec.get("changesOnly", not long_poll) is True
         last: tuple[int, bytes] | None = None
         loop = asyncio.get_running_loop()
+        # Право войти сразу, если самый первый ответ уже скажет «нет сессии».
+        last_resetup = loop.time() - pause
         while True:
             started = loop.time()
             status, kind, payload = await _request(session, descriptor, spec, values)
+            if resetup is not None and setup_block is not None and _resetup_matches(resetup, payload):
+                # Отказ сессии — не событие жильцу (это состояние опроса, а не
+                # устройства), и без него самого дом просто повторит запрос.
+                if loop.time() - last_resetup >= pause:
+                    last_resetup = loop.time()
+                    await do_setup()
+                else:
+                    # Вход не чаще `pause` — защита от горячего цикла, если
+                    # устройство отвечает «нет сессии» и после входа.
+                    await asyncio.sleep(pause)
+                continue
             carry(values, spec, payload)
             if not changes_only or (status, payload) != last:
                 last = (status, payload)

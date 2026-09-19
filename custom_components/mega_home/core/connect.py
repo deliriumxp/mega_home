@@ -25,8 +25,12 @@ from .ops_base import OpError
 MAX_SEND = 64 * 1024
 MAX_READ = 4 * 1024 * 1024
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+# 200 с, не 120: бандл держит длинный опрос архива регистратора видеонаблюдения
+# 180 с (`HOME_LONG_POLL_MS`, менеджер) — доездом из описания доступа до 0.4.0
+# (`longPoll: { timeout: 180 }`). Меньший потолок срезал бы запрос и выродил
+# длинный опрос в частый.
 DEFAULT_TIMEOUT = 15.0
-MAX_TIMEOUT = 120.0
+MAX_TIMEOUT = 200.0
 MAX_WS_MESSAGES = 64
 KINDS = ("tcp", "udp", "http", "ws")
 

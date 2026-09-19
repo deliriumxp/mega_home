@@ -130,6 +130,10 @@ async def _dispatch(
         return await _asset(coordinator, unquote(path[len("api/asset/") :]), query)
     if path.startswith("api/camera-frame/") and method == "GET":
         return await _camera_frame(coordinator, unquote(path[len("api/camera-frame/") :]))
+    if path == "api/device-events" and method == "GET":
+        # Лента устройства из хранилища на диске — часть F плана, не вендор
+        # (`docs/plan-thin-gateway.md`; замок 2, `tests/test_thin_gateway.py`).
+        return _json(ops.device_events(coordinator, query))
     if path.startswith("icons/") and method == "GET":
         return await _icon(coordinator, unquote(path[len("icons/") :]))
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.NOT_FOUND)

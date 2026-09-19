@@ -141,9 +141,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # каналу и в локальный поток приложения. Источники — описания устройств
     # (`listeners.py`) и SIP-мост (вызов, отмена, ответ, конец).
     from .core.device_events import EventHub
+    from .core.device_store import DeviceEventStore
     from .core.listeners import Listeners
 
-    coordinator.events = EventHub()
+    # Лента событий устройств на диске (часть F): жильцу видна и без менеджера,
+    # как до 0.4.0 — только теперь без вендора (`docs/plan-thin-gateway.md`).
+    device_events_store = DeviceEventStore(coordinator.env)
+    await device_events_store.async_load()
+    coordinator.device_events = device_events_store
+    coordinator.events = EventHub(device_events_store)
     coordinator.event_sources = Listeners(coordinator.env, coordinator.accesses, coordinator.events)
     # ⚠ Остановка источников и двери — в `async_unload_entry` и с ожиданием: порт
     # 8189 обязан освободиться ДО того, как перезагруженная запись поднимет свой.

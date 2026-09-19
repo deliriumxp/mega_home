@@ -481,6 +481,28 @@ class MegaHomeCameraFrameView(_MegaHomeView):
         )
 
 
+class MegaHomeDeviceEventsView(_MegaHomeView):
+    """Лента событий устройства из хранилища на диске — часть F, не вендор.
+
+    ⚠ Тот же обработчик, что у переноса (`relay_api._dispatch`,
+    `ops.device_events`): приложение без менеджера обязано видеть историю
+    устройства так же, как жилец у экрана дома (`docs/plan-thin-gateway.md`).
+    """
+
+    url = f"{URL_API}/device-events"
+    name = "api:mega_home:device-events"
+
+    async def get(self, request: web.Request) -> web.Response:
+        coordinator, error = self.coordinator_or_error(request)
+        if error is not None:
+            return error
+        assert coordinator is not None
+        try:
+            return self.json(ops.device_events(coordinator, dict(request.query)))
+        except ops.OpError as err:
+            return self.json_message(err.message, err.status)
+
+
 class MegaHomeRelayView(_MegaHomeView):
     """Ask the MANAGER something on behalf of the app, and return the answer.
 
@@ -662,6 +684,7 @@ VIEWS: tuple[type[HomeAssistantView], ...] = (
     MegaHomeCropView,
     MegaHomeAssetView,
     MegaHomeCameraFrameView,
+    MegaHomeDeviceEventsView,
     MegaHomeRelayView,
     MegaHomeServiceWorkerView,
     MegaHomeAppRootView,
