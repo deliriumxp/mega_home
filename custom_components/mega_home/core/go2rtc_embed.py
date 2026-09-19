@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 
+from . import services
 from .const import LOGGER
 from .host import Host
 
@@ -86,6 +87,7 @@ async def async_start(env: Host) -> bool:
     if await _api_alive(env):
         _ready = True
         _why = ""
+        services.register("go2rtc", API_PORT)
         LOGGER.info(
             "Усыновлён go2rtc прошлого запуска (%s): порты его, конфиг наш — "
             "переговоры идут через него",
@@ -133,6 +135,7 @@ async def async_start(env: Host) -> bool:
         await async_stop()
         return False
     _why = ""
+    services.register("go2rtc", API_PORT)
     LOGGER.info("mega_home go2rtc готов: %s, медиа :%s", URL, WEBRTC_PORT)
     return True
 
@@ -147,6 +150,7 @@ async def async_stop() -> None:
     global _proc, _tmp, _drain, _ready
 
     _ready = False
+    services.unregister("go2rtc")
     drain, _drain = _drain, None
     if drain is not None:
         drain.cancel()

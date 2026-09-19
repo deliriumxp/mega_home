@@ -21,12 +21,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from hashlib import sha1
+from hashlib import blake2b
 from pathlib import Path
 from typing import Any
 
 # {"x": 0.123, "y": 0.456, "w": 0.789} weighs well under a hundred bytes; this
-# leaves headroom without opening the door to an arbitrary-size upload.
+# leaves headroom without allowing an arbitrary-size upload.
 MAX_CROP_BYTES = 1024
 _FIELDS = ("x", "y", "w")
 
@@ -38,7 +38,7 @@ class CropStore:
         self._dir = directory
 
     def path(self, tile_id: str) -> Path:
-        return self._dir / f"{sha1(tile_id.encode('utf-8')).hexdigest()}.json"
+        return self._dir / f"{blake2b(tile_id.encode('utf-8'), digest_size=20).hexdigest()}.json"
 
     def all(self, tile_ids: Iterable[str]) -> dict[str, dict[str, float]]:
         """Tile id -> crop, for the tiles that actually have one stored."""

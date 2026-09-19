@@ -31,7 +31,6 @@ from .core.const import (
     SERVICE_SYNC,
 )
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
-from .core.trassir import TrassirGateway
 from .http import VIEWS as HTTP_VIEWS, async_register_http
 from .core.agent import AgentRunner
 from .link import ManagerLink
@@ -115,12 +114,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # запуск слушатель уже не поднимет: снаружи камеры молча перестают
     # открываться, а лечится это только ребутом машины.
     try:
-        from .core import go2rtc_session as _go2rtc_session
         from .core.go2rtc_embed import async_start as _go2rtc_start
         from .core.go2rtc_embed import async_stop as _go2rtc_stop
 
         async def _shutdown(_event: Any = None) -> None:
-            await _go2rtc_session.async_shutdown()
             await _go2rtc_stop()
 
         await _go2rtc_start(coordinator.env)
@@ -131,37 +128,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     except Exception as err:  # noqa: BLE001
         LOGGER.debug("go2rtc not started: %s", err)
 
-    # Видеонаблюдение объекта, если оно у него есть. Заводится ДО живого канала
-    # и сразу получает уже загруженный конфиг: адрес регистратора приезжает
-    # обычной синхронизацией, и ждать следующего тика опроса (15 минут) ради
-    # первой ленты событий незачем.
-    # ⚠ Универсальная дверь принадлежит ДОМУ, а не драйверу вендора
-    # (`docs/home-gateway.md`): учётки, MQTT и события всех вендоров живут в ней,
-    # драйвер Trassir только регистрирует свою живую сессию для СВОЕГО доступа.
-    from .core.access_secrets import STORE_KEY as SECRETS_STORE
-    from .core.gateway import AccessGateway
+    # Устройства объекта (`devices.py`): описания для слушателей событий.
+    # Заводится ДО живого канала и сразу получает уже загруженный конфиг.
+    from .core.devices import DeviceRegistry
 
-    door = AccessGateway(
-        secrets_fetch=client.async_access_secret,
-        store=coordinator.env.store(SECRETS_STORE, 1),
-    )
-    coordinator.accesses = door
+    registry = DeviceRegistry()
+    coordinator.accesses = registry
     if coordinator.data:
-        door.apply(coordinator.data.get("accesses"))
-    gateway = TrassirGateway(
-        coordinator.env,
-        client,
-        coordinator.env.session(entry.data.get(CONF_VERIFY_SSL, True)),
-        door=door,
-    )
-    await gateway.async_load()
-    coordinator.trassir = gateway
-    entry.async_on_unload(lambda: hass.async_create_task(gateway.async_stop()))
-    if coordinator.data:
-        await gateway.async_apply(coordinator.data)
+        registry.apply(coordinator.data.get("accesses"))
 
     # События устройств (`device_events.py`): один концентратор — менеджеру по
-    # каналу и в локальный поток приложения. Источники — описания доступов
+    # каналу и в локальный поток приложения. Источники — описания устройств
     # (`listeners.py`) и SIP-мост (вызов, отмена, ответ, конец).
     from .core.device_events import EventHub
     from .core.listeners import Listeners
@@ -179,6 +156,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # Asterisk держит 5060 (правило своего go2rtc).
     sip_bridge = SipBridge(
         coordinator.env,
+        coordinator.assets,
         # `local=True`: звонок в дверь обязана увидеть и настенная панель без интернета.
         lambda kind, data: coordinator.events.publish("intercom", "sip-bridge", kind, data, local=True),
     )
@@ -223,16 +201,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) ->
         await hass.config_entries.async_unload_platforms(entry, PLATFORMS) if PLATFORMS else True
     )
     coordinator = getattr(entry, "runtime_data", None)
-    # ⚠ Порядок и ожидание обязательны (ревью 2026-09-19): сначала источники
-    # событий — они зовут дверь и держат порт 8189, — и только потом дверь. Задачи
-    # «в фоне без ожидания» оставляли порт занятым для перезагруженной записи и
-    # создавали новую HTTP-сессию уже закрытой двери.
+    # ⚠ С ожиданием: порт 8189 обязан освободиться ДО того, как перезагруженная
+    # запись поднимет свой (ревью 2026-09-19).
     sources = getattr(coordinator, "event_sources", None)
     if sources is not None:
         await sources.stop()
-    door = getattr(coordinator, "accesses", None)
-    if door is not None:
-        await door.async_close()
     return unloaded
 
 

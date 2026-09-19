@@ -164,21 +164,11 @@ class ManagerLink:
             return
         try:
             # ⚠ `remote=True` — дверь линка и ЕСТЬ «снаружи»: по ней приходят
-            # запросы менеджера (жилец не дома / макет инсталлятора). Без этого
-            # признака переговоры WebRTC считались домашними и не ждали внешний
-            # адрес дома (`CANDIDATE_WINDOW_COLD`), а первый, ещё холодный к STUN
-            # go2rtc отдавал одни host-кандидаты — телефон снаружи не достучался
-            # бы ни с первого раза, ни со второго (живой отчёт 2026-09-10).
-            # ⚠ `scope: manager` ставит КОД менеджера, когда зовёт сам (настройка
-            # устройства, кадр для push); запрос жильца снаружи едет внутри
-            # `payload` и уровня не меняет (`gateway.py`, `docs/home-gateway.md`).
+            # запросы менеджера (жилец не дома / макет инсталлятора). Ответы не
+            # меняются: разница «дома/снаружи» живёт в адресе базы, не в наборе
+            # операций (`ops.py`).
             op = frame.get("op") or ""
-            if op == "gateway" and isinstance(frame.get("payload"), dict):
-                payload = await ops.gateway_call(
-                    self._coordinator, frame["payload"], str(frame.get("scope") or "")
-                )
-            else:
-                payload = await ops.run(self._coordinator, op, frame.get("payload"), remote=True)
+            payload = await ops.run(self._coordinator, op, frame.get("payload"), remote=True)
             reply: dict[str, Any] = {"t": "res", "id": request_id, "ok": True, "payload": payload}
         except ops.OpError as err:
             reply = {
@@ -332,7 +322,8 @@ class ManagerLink:
             if hub is not None:
                 hub.ack(payload.get("id"))
             return
-        if kind == "req" and payload.get("op") == "watch":
+        op = payload.get("op") or ""
+        if kind == "req" and op == "watch":
             # Подписка — сеанс КАНАЛА, а не чтение ресурса: ей нужен сокет, а
             # `ops.run` про сокеты не знает и знать не должен (`watch.py`).
             await self._watch_op(socket, payload)

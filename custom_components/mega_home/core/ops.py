@@ -1,4 +1,4 @@
-"""The four operations the resident app needs, independent of transport.
+"""The operations the resident app and the manager need, independent of transport.
 
 They are reached two ways and must answer identically:
 
@@ -15,66 +15,44 @@ that silently drifts apart.
 Answers are plain data; refusals are `OpError`, which each transport renders in
 its own way (an HTTP status here, a frame field there) with the SAME wording:
 the resident must read the same sentence whether they are home or away.
+
+⚠ Состав операций ЗАПЕРТ (`docs/plan-thin-gateway.md`, замок 2): дом — транспорт,
+процессы и хранилище, новая операция — только с доказательством, что это одно
+из них. Раньше здесь были именованные операции почти на каждую возможность
+(`webrtc`, `gateway`, глаголы регистратора видео) — они снесены вместе с вендорским кодом:
+переговоры WebRTC ведёт бандл сам через `connect` к go2rtc, а «универсальная
+дверь» и есть теперь `connect` — один код на всё, а не глагол на класс.
 """
 
 from __future__ import annotations
 
 from http import HTTPStatus
 from typing import Any
-from urllib.parse import quote
 
+from . import connect as connect_mod
 from .const import LOGGER
-from .ops_base import OpError, _int, find, number
+from .ops_base import OpError, find, number
 from .probe import run as run_probe
 from .scan import run as run_scan
 from .source import CommandRejected, CommandUnknown, EntityState, StateSource
-from .ops_camera import _camera_urls, _warm_cameras, camera_entity, camera_frame
-from .ops_video import (
-    _guid_of,
-    _tiles_by_guid,
-    _trassir_guid,
-    lead_of,
-    trassir,
-    trassir_cameras,
-    trassir_clip_at,
-    trassir_events,
-    trassir_preview,
-    trassir_ready,
-    trassir_thumb,
-    video_id,
-)
-from .ops_door import gateway_call
-from .ops_webrtc import webrtc_candidates, webrtc_close, webrtc_offer
+from .ops_camera import _camera_urls, _warm_cameras, camera_frame
 
 # ⚠ Имена выше ИМПОРТИРУЮТСЯ РАДИ ЧУЖИХ ВЫЗОВОВ: и двери (`http.py`), и линк
 # (`link.py`), и тесты зовут их как `ops.<имя>`. Это фасад модуля — тот же
-# приём, что у `trassir.ts` в бандле: части читаются порознь, а точка входа
-# остаётся одна.
+# приём, что у клиента видеонаблюдения бандла (снятого): части читаются порознь, а точка
+# входа остаётся одна.
 __all__ = [
     "OpError",
-    "camera_entity",
     "camera_frame",
     "command",
     "config",
+    "connect",
     "entity_view",
     "find",
-    "gateway_call",
-    "lead_of",
     "number",
     "run",
     "scenario",
     "states",
-    "trassir",
-    "trassir_cameras",
-    "trassir_clip_at",
-    "trassir_events",
-    "trassir_preview",
-    "trassir_ready",
-    "trassir_thumb",
-    "video_id",
-    "webrtc_candidates",
-    "webrtc_close",
-    "webrtc_offer",
 ]
 
 async def run(
@@ -103,26 +81,20 @@ async def run(
         return await command(coordinator, data)
     if op == "scenario":
         return await scenario(coordinator, data)
-    if op == "webrtc":
-        return await webrtc_offer(coordinator, data, remote)
-    if op == "webrtc-close":
-        return webrtc_close(coordinator, data)
-    if op == "webrtc-candidates":
-        # ⚠ Именованная операция тут — исключение, а не привычка: сигналинг
-        # WebRTC не ресурс HTTP, через перенос (`http`) он не едет. Trickle —
-        # часть ТОГО ЖЕ обмена, что `webrtc`, поэтому и дверь та же.
-        return await webrtc_candidates(data)
+    if op == "connect":
+        # Единственный контракт транспорта наружу (`connect.py`): один код для
+        # операции канала и для локального маршрута `api/connect`
+        # (`relay_api.py`), ответы одинаковые. Заменил собой именованные
+        # операции по видам (`webrtc`, `gateway`) — глагол по классу
+        # устройства был перечнем, а перечень и есть адаптер.
+        return await connect(data)
     if op == "http":
-        # Перенос ОБЫЧНОГО запроса к API этого дома: жилец снаружи должен уметь
-        # ровно то же, что дома, и теми же путями (`relay_api.py`).
-        #
-        # ⚠ Именованные операции выше остаются ради уже работающих домов и
-        # менеджеров. НОВЫХ сюда добавлять не надо: каждая такая операция — это
-        # функция, которой снаружи нет, пока её не написали в трёх местах и не
-        # раскатали релизом на каждый объект. Для этого и есть перенос.
-        #
-        # ⚠ Импорт ЛОКАЛЬНЫЙ: `relay_api` зовёт этот модуль, и на уровне файла
-        # это был бы цикл.
+        # Перенос ОБЫЧНОГО запроса к API ЭТОГО дома (`relay_api.py`): жилец
+        # снаружи должен уметь ровно то же, что дома, и теми же путями (фото,
+        # кропы, файлы, `api/connect`). Это транспорт до своего API (часть A
+        # плана), а не перечень: именованных операций ради путей не заводят.
+        # ⚠ Импорт локальный: `relay_api` зовёт этот модуль, на уровне файла —
+        # цикл.
         from .relay_api import handle
 
         return await handle(coordinator, data)
@@ -147,6 +119,15 @@ async def run(
         return await updater()
     raise OpError("Неизвестная операция", HTTPStatus.NOT_FOUND)
 
+async def connect(payload: dict[str, Any]) -> dict[str, Any]:
+    """Единственный контракт транспорта наружу (`docs/plan-thin-gateway.md`).
+
+    Один примитив на TCP, UDP, HTTP и WebSocket вместо глагола на каждый класс
+    устройства — исполнение живёт в `connect.py`, здесь только точка входа,
+    общая с локальным маршрутом `api/connect` (`relay_api.py`).
+    """
+    return await connect_mod.perform(payload)
+
 def config(coordinator: Any) -> dict[str, Any]:
     """Состав дома из кэша — плюс ПАСПОРТ САМОГО ДОМА.
 
@@ -168,11 +149,10 @@ def config(coordinator: Any) -> dict[str, Any]:
     Заодно это единственный честный способ спросить дом «а ты это умеешь?» — по
     версии судить нельзя, версия говорит лишь о намерении.
 
-    ⚠ `accesses` — что дом умеет ДОСТАТЬ снаружи: имя доступа, его ВИД и вендор
-    за ним. Без этого бандл вынужден гадать по версии, а версия говорит лишь о
-    намерении (урок 2026-09-14 с дверью превью, объявленной и не
-    зарегистрированной). Здесь ровно то, что приехало конфигом и было ПРИНЯТО:
-    описание с пустым хостом дом молча отбрасывает, и увидеть это иначе нельзя.
+    ⚠ `devices` — устройства, чьё описание дом ПРИНЯЛ (`devices.py`). Раньше
+    здесь были ещё вид и вендор доступа — их дом больше не разбирает: авторизация
+    и адрес устройства уходят в запрос `connect` целиком, дому нужен только
+    факт, что устройство знает (это `id`), без описания «как туда ходить».
 
     ⚠ Ни адресов, ни портов, ни учёток: тело `config` уходит браузеру жильца
     как есть. Паспорт отвечает «что есть», а не «как туда ходить».
@@ -198,25 +178,17 @@ def config(coordinator: Any) -> dict[str, Any]:
             "version": INTEGRATION_VERSION,
             "appVersion": coordinator.bundle.version if coordinator.bundle else None,
             "routes": list(getattr(coordinator, "routes", [])),
-            "accesses": _accesses(coordinator),
+            "devices": _devices(coordinator),
             "go2rtc": media,
         },
     }
 
-def _accesses(coordinator: Any) -> list[dict[str, str]]:
-    """Доступы, которые дом ПРИНЯЛ: имя, вид, вендор. Двери нет — пустой список."""
-    door = getattr(coordinator, "accesses", None)
-    if door is None:
+def _devices(coordinator: Any) -> list[dict[str, str]]:
+    """Устройства, чьё описание дом ПРИНЯЛ: только id. Реестра нет — пустой список."""
+    registry = getattr(coordinator, "accesses", None)
+    if registry is None:
         return []
-    out: list[dict[str, str]] = []
-    for access in door.ids():
-        descriptor = door.descriptor(access)
-        if descriptor is None:
-            continue
-        out.append(
-            {"id": descriptor.id, "kind": descriptor.kind, "vendor": descriptor.vendor}
-        )
-    return out
+    return [{"id": device_id} for device_id in registry.ids()]
 
 def states(coordinator: Any) -> dict[str, Any]:
     """Current states of every tile, read straight from the source of this home."""
@@ -401,6 +373,11 @@ def entity_view(tile: dict[str, Any], state: EntityState | None) -> dict[str, An
     ОСТАЮТСЯ, и это не рассинхрон: его ответ читает ещё и превью в карточке
     объекта (`ManagerHomeBackend`), а оно склейку с конфигом не делает — там
     конфига нет вовсе.
+
+    ⚠ Доступность камеры видеонаблюдения БЕЗ сущности Home Assistant (было тут
+    же, по вендорскому id канала) снята вместе с видео объекта: показ живой
+    камеры теперь ведёт бандл через `connect`, а не дом, и своей сущности у неё
+    для дома нет.
     """
     domain = tile["domain"]
     raw = state.state if state else None
@@ -416,10 +393,7 @@ def entity_view(tile: dict[str, Any], state: EntityState | None) -> dict[str, An
         # и узнать его задним числом неоткуда.
         values["streamType"] = attributes.get("frontend_stream_type")
 
-    # ⚠ Камера видеонаблюдения ДОСТУПНА без сущности Home Assistant: её показывает
-    # сам дом, забирая поток у регистратора. Считать её недоступной значило бы
-    # написать жильцу «Нет данных» поверх работающей камеры.
-    available = bool(video_id(tile)) or (state is not None and not unavailable)
+    available = state is not None and not unavailable
 
     return {
         "id": tile["id"],

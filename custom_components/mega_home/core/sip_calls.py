@@ -31,7 +31,12 @@ from typing import Any
 import aiohttp
 
 from .const import LOGGER
-from .sip_config import ARI_APP, ARI_USER
+
+# Имя приложения Stasis и пользователь ARI — константы ЗДЕСЬ, не в
+# `sip_bridge.py`: тот пишет `ari.conf` и импортирует их отсюда, а не
+# наоборот, иначе модули замкнулись бы друг на друга импортом.
+ARI_APP = "mega_home"
+ARI_USER = "mega_home"
 
 # Пауза переподключения к событиям ARI. Asterisk свой и локальный: связь рвётся
 # только когда он перезапускается, и тогда он встаёт за секунды.

@@ -15,7 +15,7 @@ invalidate.
 
 from __future__ import annotations
 
-from hashlib import sha1
+from hashlib import blake2b
 from pathlib import Path
 
 
@@ -30,7 +30,7 @@ class AssetStore:
         return self._dir
 
     def path(self, key: str, version: str) -> Path:
-        name = sha1(key.encode("utf-8")).hexdigest()
+        name = blake2b(key.encode("utf-8"), digest_size=20).hexdigest()
         return self._dir / f"{name}_{_safe(version)}.bin"
 
     def has(self, key: str, version: str) -> bool:

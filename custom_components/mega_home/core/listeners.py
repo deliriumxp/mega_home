@@ -1,6 +1,6 @@
 """Источники событий устройств: то, что дом слушает сам, без жильца у экрана.
 
-Виды — данные описания доступа (`events[]`, `docs/home-gateway.md`):
+Виды — данные описания устройства (`events[]`, `docs/plan-thin-gateway.md`):
   * `webhook`   — устройство само зовёт дом по HTTP (Action URL, вебхук, alarm
     server). Путь `/hook/<доступ>/<источник>` или ЛЮБОЙ путь (`anyPath`) —
     тогда источник опознаётся по адресу устройства. Ответ — `reply` описания;
@@ -28,7 +28,7 @@ from typing import Any
 from aiohttp import web
 
 from . import listeners_out as out
-from .access import AccessDescriptor
+from .devices import DeviceDescriptor
 from .const import LOGGER
 from .device_events import EventHub
 
@@ -53,23 +53,23 @@ def _host_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
 class Listeners:
     """Все источники событий объекта; пересобираются по смене описаний."""
 
-    def __init__(self, env: Any, door: Any, hub: EventHub) -> None:
+    def __init__(self, env: Any, registry: Any, hub: EventHub) -> None:
         self._env = env
-        self.door = door
+        self._registry = registry
         self._hub = hub
         self._signature = ""
         self._lock = asyncio.Lock()
         self._restarting: asyncio.Task[None] | None = None
         self._tasks: list[Any] = []
-        self._hooks: dict[tuple[str, str], tuple[AccessDescriptor, dict[str, Any]]] = {}
-        self._any_path: dict[str, tuple[AccessDescriptor, dict[str, Any]]] = {}
+        self._hooks: dict[tuple[str, str], tuple[DeviceDescriptor, dict[str, Any]]] = {}
+        self._any_path: dict[str, tuple[DeviceDescriptor, dict[str, Any]]] = {}
         self._runner: web.AppRunner | None = None
         self._servers: list[Any] = []
         self._stopped = False
         self.why = ""
 
-    def apply(self, descriptors: list[AccessDescriptor]) -> None:
-        # Подпись — ВСЁ описание: `deny`, сроки и авторизация тоже меняют работу
+    def apply(self, descriptors: list[DeviceDescriptor]) -> None:
+        # Подпись — ВСЁ описание: сроки и авторизация тоже меняют работу
         # источника, а держать устаревшее описание он не должен.
         signature = repr(descriptors)
         if signature == self._signature or self._stopped:
@@ -82,7 +82,7 @@ class Listeners:
             previous.cancel()
         self._restarting = self._env.spawn(self._restart(descriptors), "mega_home listeners")
 
-    async def _restart(self, descriptors: list[AccessDescriptor]) -> None:
+    async def _restart(self, descriptors: list[DeviceDescriptor]) -> None:
         async with self._lock:
             await self._stop_all()
             if self._stopped:
@@ -94,7 +94,7 @@ class Listeners:
             if self._hooks or self._any_path:
                 self._run(self._hook_server(), "hooks")
 
-    def _start_source(self, descriptor: AccessDescriptor, spec: dict[str, Any]) -> None:
+    def _start_source(self, descriptor: DeviceDescriptor, spec: dict[str, Any]) -> None:
         kind = str(spec.get("type") or "")
         source = str(spec.get("id") or kind)
         name = f"{descriptor.id}/{source}"
@@ -126,7 +126,7 @@ class Listeners:
     def _run(self, coro: Any, name: str) -> None:
         self._tasks.append(self._env.spawn(coro, f"mega_home events {name}"))
 
-    def emit(self, descriptor: AccessDescriptor, source: str, spec: dict[str, Any], event: str, data: Any) -> None:
+    def emit(self, descriptor: DeviceDescriptor, source: str, spec: dict[str, Any], event: str, data: Any) -> None:
         self._hub.publish(descriptor.id, source, event, data, local=spec.get("local") is True)
 
     async def stop(self) -> None:
@@ -159,7 +159,7 @@ class Listeners:
             "why": self.why,
         }
 
-    async def _forever(self, worker: Any, descriptor: AccessDescriptor, source: str, spec: dict[str, Any], name: str) -> None:
+    async def _forever(self, worker: Any, descriptor: DeviceDescriptor, source: str, spec: dict[str, Any], name: str) -> None:
         """Источник живёт, пока жив конфиг: отказ — повтор с растущей паузой."""
         delay = RETRY_FIRST_S
         while True:
@@ -216,7 +216,7 @@ class Listeners:
             return web.Response(status=404)
         return await self._accept(request, found, str(found[1].get("id") or "webhook"))
 
-    async def _accept(self, request: web.Request, found: tuple[AccessDescriptor, dict[str, Any]], source: str) -> web.Response:
+    async def _accept(self, request: web.Request, found: tuple[DeviceDescriptor, dict[str, Any]], source: str) -> web.Response:
         raw = await request.read()
         data = {"method": request.method, "path": request.path, "query": dict(request.query), **body_of(raw)}
         self.emit(found[0], source, found[1], "hook", data)
@@ -247,7 +247,7 @@ def _port(spec: dict[str, Any]) -> int | None:
     return port if 0 < port < 65536 else None
 
 
-async def _tcp_server(ctx: Listeners, descriptor: AccessDescriptor, source: str, spec: dict[str, Any]) -> None:
+async def _tcp_server(ctx: Listeners, descriptor: DeviceDescriptor, source: str, spec: dict[str, Any]) -> None:
     sep = out.delimiter(spec, b"\n")
     allowed = _host_ip(descriptor.host)
     idle = out.seconds(spec.get("idle"), out.IDLE_S, 5.0)
@@ -270,7 +270,7 @@ async def _tcp_server(ctx: Listeners, descriptor: AccessDescriptor, source: str,
         await server.serve_forever()
 
 
-async def _udp(ctx: Listeners, descriptor: AccessDescriptor, source: str, spec: dict[str, Any]) -> None:
+async def _udp(ctx: Listeners, descriptor: DeviceDescriptor, source: str, spec: dict[str, Any]) -> None:
     group = str(spec.get("group") or "")
     allowed = _host_ip(descriptor.host)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

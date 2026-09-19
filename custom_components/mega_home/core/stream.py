@@ -32,13 +32,13 @@ import ipaddress
 import struct
 from typing import Any
 
+from . import services
 from .const import LOGGER
-from .sip_config import HTTP_PORT as SIP_BRIDGE_PORT
 
-# Службы САМОГО дома, до которых менеджер вправе открыть поток по loopback.
-# ⚠ Список, а не «весь loopback»: там же сам Home Assistant и соседи по машине.
-# Служба слушает только loopback ровно потому, что вход в неё — этот канал.
-LOCAL_SERVICES = {SIP_BRIDGE_PORT: "SIP-мост домофонии (WebSocket)"}
+# ⚠ Службы САМОГО дома, до которых менеджер вправе открыть поток по loopback,
+# больше не список констант — их держит реестр `services.py` (замок 3 плана
+# `docs/plan-thin-gateway.md`): служба слушает только loopback ровно потому,
+# что вход в неё — этот канал, и должна быть ПОДНЯТА именно сейчас.
 
 # Сколько сессий разом на объект.
 #
@@ -121,7 +121,10 @@ class Streams:
             await self._send_json({"t": "stream.error", "id": stream_id, "error": error})
             return
         host = str(payload.get("host"))
-        port = int(payload.get("port"))
+        service_port = services.resolve(host)
+        # Имя ПОДНЯТОЙ службы диктует адрес и порт; запрошенный порт тогда
+        # игнорируется (замок 3 плана `docs/plan-thin-gateway.md`).
+        host, port = ("127.0.0.1", service_port) if service_port is not None else (host, int(payload.get("port")))
         stream: _Stream | _Datagrams
         try:
             if payload.get("proto") == "udp":
@@ -153,29 +156,32 @@ class Streams:
         заодно анонимным выходом в сеть с его адреса. Устройства менеджер и так
         знает по скану и называет их адресами.
 
-        ⚠ Loopback — только службы самого дома (`LOCAL_SERVICES`): они слушают
-        только loopback, и канал менеджера — единственный путь к ним (телефон
-        жильца до SIP-моста). Остальной loopback — сам Home Assistant и соседи
-        по машине, не «устройство объекта».
+        ⚠ Loopback — только ПОДНЯТЫЕ службы дома, реестр `services.py`
+        (`docs/plan-thin-gateway.md`, замок 3): списка портов в коде нет, служба
+        должна быть жива именно сейчас — канал менеджера единственный путь к
+        ним (телефон жильца до SIP-моста). Остальной loopback — сам Home
+        Assistant и соседи по машине, не «устройство объекта».
         """
         if len(self._streams) >= MAX_STREAMS:
             return f"на объекте уже {MAX_STREAMS} открытых сессии"
+        host = str(payload.get("host") or "")
         port = payload.get("port")
+        service_port = services.resolve(host)
+        if service_port is not None:
+            return None
         if not isinstance(port, int) or not 1 <= port <= 65535:
             return "порт не указан"
         try:
-            address = ipaddress.ip_address(str(payload.get("host")))
+            address = ipaddress.ip_address(host)
         except ValueError:
-            return "адрес устройства должен быть IP, а не именем"
+            return "адрес устройства должен быть IP или именем поднятой службы"
         # ⚠ `0.0.0.0` в Linux — это сам хост: `is_private` у него истинно, а
         # `is_loopback` ложно, и так открывались бы API go2rtc и HA на петле
         # (ревью 2026-09-19). Мультикаст и зарезервированное — не устройство.
         if address.is_unspecified or address.is_multicast or address.is_reserved:
             return "адрес вне локальной сети объекта"
         if address.is_loopback:
-            if str(address) == "127.0.0.1" and port in LOCAL_SERVICES:
-                return None
-            return "адрес вне локальной сети объекта"
+            return "адрес вне локальной сети объекта — loopback только по имени службы"
         if not address.is_private:
             return "адрес вне локальной сети объекта"
         return None

@@ -31,19 +31,14 @@ from pathlib import Path
 
 MODULES = Path(__file__).resolve().parent.parent / "custom_components" / "mega_home" / "core"
 
-# Файлы, которые говорят с регистратором. Толкование ищем только здесь: в
+# Файлы, которые говорили с регистратором. Толкование ищем только здесь: в
 # остальном доме даты — своё дело Home Assistant.
-# ⚠ `trassir_archive.py` в списке С САМОГО ПОЯВЛЕНИЯ: это отрезанная часть
-# `trassir_clip.py` (метки, пауза, `play`), то есть ровно то место, куда
-# толкование дат и приезжает. Замок, не переехавший вместе с кодом, — это
-# замок, снятый молча.
-SCANNED = (
-    "trassir.py",
-    "trassir_client.py",
-    "trassir_clip.py",
-    "trassir_archive.py",
-    "gateway.py",
-)
+# ⚠ ПУСТО, и пусто должно остаться. Модули, которые здесь стояли
+# (`trassir*.py`, `gateway.py`), снесены тонким шлюзом целиком
+# (`docs/plan-thin-gateway.md`, «Что сносится из дома»): видео объекта теперь
+# идёт транспортом `connect` в бандл, дом ответы регистратора не разбирает
+# вовсе. Возвращать сюда имя файла — значит возвращать в дом вендорский модуль.
+SCANNED: tuple[str, ...] = ()
 
 # Что считать толкованием: разбор и счёт дат/шкалы регистратора.
 FORBIDDEN = (
@@ -130,10 +125,11 @@ FORBIDDEN_WORDS = (
 
 
 def test_ядро_без_вендорских_слов() -> None:
-    """Замок 1 плана. Исключение — `sip_*.py`: там законны `panel`/`call`."""
+    """Замок 1 плана. Исключения — `sip_*.py` (`panel`/`call`) и `digest.py`
+    (стандарт HTTP RFC 7616, не вендор: `md5`/`sha256`/`nonce` там законны)."""
     offences: list[str] = []
     for path in CORE_MODULES:
-        if path.name.startswith("sip_"):
+        if path.name.startswith("sip_") or path.name == "digest.py":
             continue
         text = path.read_text("utf-8").lower()
         for word in FORBIDDEN_WORDS:
@@ -157,14 +153,34 @@ def _string_eq_rhs(node: ast.Compare, name_left: str) -> str | None:
     return None
 
 
+def _startswith_arg(node: ast.Call) -> str | None:
+    """Строка из вызова `op.startswith("...")`/`kind.startswith("...")` — так
+    диспетчеризуется `stream.*` (`link.py`), а не сравнением `==`."""
+    if (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "startswith"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in ("op", "kind")
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    ):
+        return node.args[0].value
+    return None
+
+
 def _ops_from(path: Path) -> set[str]:
-    """`op == "..."` из кода — не список из головы."""
+    """`op == "..."` и `op.startswith("...")` из кода — не список из головы."""
     found: set[str] = set()
     for node in ast.walk(ast.parse(path.read_text("utf-8"))):
         if isinstance(node, ast.Compare):
             value = _string_eq_rhs(node, "op")
             if value is not None:
                 found.add(value)
+        elif isinstance(node, ast.Call):
+            value = _startswith_arg(node)
+            if value is not None:
+                found.add(value + "*")
     return found
 
 
@@ -191,12 +207,14 @@ def test_операции_канала_и_маршруты_api_заперты() 
     routes = _routes_from(CORE / "relay_api.py")
 
     locked_ops = {
-        "config", "states", "command", "scenario", "connect", "probe", "scan",
-        "self-update", "watch",
+        "config", "states", "command", "scenario", "connect", "http", "probe", "scan",
+        "self-update", "watch", "stream.*",
     }
     locked_routes = {
         "api/config", "api/states", "api/command", "api/scenario", "api/connect",
         "api/asset/*", "api/photo*", "api/crop*",
+        # кадр сущности camera.* источника — часть B, не вендор
+        "api/camera-frame/*",
     }
 
     assert ops == locked_ops
@@ -224,6 +242,13 @@ def test_шаблоны_без_вычисления_входа() -> None:
 
 
 def test_размер_ядра_не_растёт_прикладной_логикой() -> None:
-    """Замок 5 плана: `core/*.py` ≤ 5 500 строк суммарно."""
-    total = sum(len(path.read_text("utf-8").splitlines()) for path in CORE_MODULES)
-    assert total <= 5500
+    """Замок 5 плана: КОД `core/*.py` ≤ 4 800 строк суммарно.
+
+    ⚠ Считается только код (`_code`: без докстрингов, комментариев и пустых
+    строк). Замок на полный объём заставил однажды вырезать из нетронутых
+    модулей причины решений ради лимита — комментарий у строки и есть место,
+    где живёт «почему» (`CLAUDE.md` менеджера), резать его нельзя. Планка —
+    состав A–H после сноса (4 404 строки на 2026-09-19) плюс запас на транспорт.
+    """
+    total = sum(len([l for l in _code(path).splitlines() if l.strip()]) for path in CORE_MODULES)
+    assert total <= 4800

@@ -1,22 +1,19 @@
-"""The four operations of the resident app, independent of transport.
+"""Операции жильца, независимые от транспорта.
 
-They are reached two ways — locally over HTTP and remotely over the manager
-link — and the point of `ops.py` is that both get the SAME answers and the same
-refusal wording. These tests exercise the module directly, which is also the
-only place where that promise can be checked once instead of twice.
+Обслуживают запрос и локальной дверью, и переносом через менеджер — точка
+входа в обоих случаях одна (`ops.run`), и это единственное место, где обещание
+«тот же ответ, где бы жилец ни стоял» проверяется один раз, а не дважды.
 """
 
 from __future__ import annotations
 
 import asyncio
-import types
 from http import HTTPStatus
 
 import pytest
 from homeassistant.core import State
 
 from fake_host import FakeHost, FakeSource
-from mega_home.core import go2rtc_session
 from mega_home.core import ops
 from mega_home.core.source import CommandUnknown
 
@@ -29,6 +26,7 @@ class _Coordinator:
     env = FakeHost()
     version = "sha256:abc"
     bundle = _Bundle()
+    accesses = None
 
     def __init__(self, data=None) -> None:
         self.data = data if data is not None else _CONFIG
@@ -47,8 +45,8 @@ _CONFIG = {
             "domain": "light",
             "entityId": "light.kitchen",
             "dimmable": True,
-            # ⚠ Чем командовать плиткой, дом узнаёт ИЗ КОНФИГА (фаза 2 плана):
-            # новый управляемый домен больше не стоит релиза HACS.
+            # ⚠ Чем командовать плиткой, дом узнаёт ИЗ КОНФИГА: новый
+            # управляемый домен больше не стоит релиза HACS.
             "commands": {
                 "turn_on": {"domain": "light", "service": "turn_on"},
                 "turn_off": {"domain": "light", "service": "turn_off"},
@@ -104,9 +102,7 @@ def test_состояния_несут_версии_конфига_и_бандл
     # приложение показывает ВЕСЬ состав объекта, а не только отправленное.
     light, socket = answer["entities"]
     # ⚠ Дом больше НЕ толкует состояние: наружу уходит сырое значение и атрибуты
-    # Home Assistant, а `power`, яркость и способности считает приложение
-    # (docs/plan-thin-integration.md, фаза 1). Вернуть сюда вычисленные поля =
-    # снова платить релизом HACS за каждое поле экрана.
+    # Home Assistant, а `power`, яркость и способности считает приложение.
     assert light["state"] == {"value": "on"}
     assert light["attributes"] == {"brightness": 255}
     assert "capabilities" not in light
@@ -128,12 +124,10 @@ def test_команда_превращается_в_вызов_службы():
 
 def test_чужая_команда_и_чужое_устройство_отвергаются():
     source = FakeSource()
-    # Команды вне таблицы нет — через нас нельзя позвать произвольную службу.
     with pytest.raises(ops.OpError):
         run(source, _Coordinator(), "command", {"id": "t1", "command": "delete_everything"})
     with pytest.raises(ops.OpError):
         run(source, _Coordinator(), "command", {"id": "нет-такого", "command": "turn_on"})
-    # Элемент есть в составе, но в Home Assistant не отправлен — управлять нечем.
     with pytest.raises(ops.OpError) as err:
         run(source, _Coordinator(), "command", {"id": "t2", "command": "turn_on"})
     assert "не отправлен" in err.value.message
@@ -164,8 +158,7 @@ def test_сценарий_запускает_скрипт():
 
 
 # Камера. ⚠ Форма состояния — КОНТРАКТ с менеджером (smart-home-view.util.ts):
-# приложение одно и то же, а проекций две, в разных репозиториях. Разъедутся —
-# и камера покажет кадр на одном транспорте и пустоту на другом.
+# приложение одно и то же, а проекций две, в разных репозиториях.
 
 
 def _camera(attributes: dict) -> dict:
@@ -185,8 +178,6 @@ def test_кадр_и_поток_строятся_по_entity_id_и_подпис�
 
 
 def test_без_токена_адресов_не_обещаем():
-    # Токен ротируется; адрес без него отдаст 401, а битая картинка на плитке
-    # читается как сломанная камера.
     view = _camera({})
 
     assert view["state"]["picture"] == ""
@@ -194,8 +185,6 @@ def test_без_токена_адресов_не_обещаем():
 
 
 def test_у_камеры_нет_вкл_выкл():
-    # Состояние камеры в HA — idle/recording/streaming. Выдуманный `power`
-    # сделал бы плитку выключателем, которым нечего выключать.
     assert "power" not in _camera({"access_token": "t"})["state"]
 
 
@@ -207,10 +196,8 @@ def test_элемент_без_сущности_адресов_не_получа
     assert view["state"]["picture"] == ""
     assert view["available"] is False
 
-# Медиаплеер. ⚠ Проекция ЕГО СОСТОЯНИЯ отсюда убрана вместе со всеми
-# остальными: пять состояний плеера, подписи, громкость и кнопки из
-# `supported_features` толкует приложение, в одном месте на продукт
-# (`ha-entity.spec.ts`). Здесь остаётся проверка, что дом ничего не выдумывает.
+
+# Медиаплеер. ⚠ Проекция ЕГО СОСТОЯНИЯ отсюда убрана: толкует приложение.
 
 
 def _player(state: str, attributes: dict) -> dict:
@@ -233,11 +220,6 @@ def test_состояние_плеера_уходит_сырым():
     assert "capabilities" not in view
 
 
-# Атрибуты Home Assistant. ⚠ Решение 2026-09-06: отдаём ЦЕЛИКОМ, а не выборкой —
-# приложение живёт только внутри HA, и сокращать уже посчитанное им значит
-# платить правкой в двух репозиториях за каждое поле детального экрана. Спека
-# держит именно это свойство и единственное исключение из него.
-
 def test_атрибуты_уходят_целиком():
     view = ops.entity_view(
         {"id": "l1", "domain": "light", "entityId": "light.hall", "name": "Холл"},
@@ -259,23 +241,16 @@ def test_атрибуты_уходят_целиком():
         "какой_то_свой_атрибут": 7,
     }
 
+
 def test_токен_доступа_наружу_не_уходит():
-    # Не «фильтр полезного», а секрет: из него уже собраны адреса кадра и
-    # потока, и отдать его отдельным полем значит отдать право собрать любой
-    # другой адрес того же Home Assistant.
     view = _camera({"access_token": "секрет", "friendly_name": "Калитка"})
 
     assert "access_token" not in view["attributes"]
     assert view["attributes"]["friendly_name"] == "Калитка"
     assert "секрет" in view["state"]["picture"] or "%D1%81" in view["state"]["picture"]
 
+
 def test_дом_не_подмешивает_состав_в_ответ_о_приборе():
-    # ⚠ Ключи ответа закреплены ЦЕЛИКОМ, а не по одному: смысл тонкого шлюза в
-    # том, что дом отвечает только тем, что знает Home Assistant. `name` и
-    # `roomId` убраны в 0.1.14 — их берёт из конфига само приложение
-    # (`HomeTiles` в `home-shape.ts`). Спека ловит и обратное движение: любое
-    # новое поле состава, подмешанное здесь, — это вторая проекция, за которую
-    # платят релизом HACS на каждом объекте.
     view = ops.entity_view(
         {
             "id": "l1",
@@ -306,9 +281,8 @@ def test_без_состояния_атрибуты_пустые():
     assert view["attributes"] == {}
 
 
-# Карта команд (docs/plan-thin-integration.md, фаза 2). ⚠ Смысл всей затеи:
-# новый управляемый домен приезжает в дом ДАННЫМИ, обычной синхронизацией
-# конфига, а не релизом HACS с перезапуском Home Assistant на каждом объекте.
+# Карта команд. ⚠ Смысл всей затеи: новый управляемый домен приезжает в дом
+# ДАННЫМИ, обычной синхронизацией конфига, а не релизом HACS.
 
 
 def test_служба_берётся_из_конфига_плитки():
@@ -353,8 +327,6 @@ def test_служба_берётся_из_конфига_плитки():
 
 
 def test_границы_из_конфига_проверяет_дом():
-    # ⚠ Границы приходят данными, но проверяет их ЭТА сторона: службу зовём мы,
-    # а браузеру жильца верить нельзя.
     source = FakeSource()
     with pytest.raises(ops.OpError) as err:
         run(
@@ -368,11 +340,6 @@ def test_границы_из_конфига_проверяет_дом():
 
 
 def test_плитка_без_карты_команд_не_исполняется_втихую():
-    # ⚠ Фолбэк на таблицу доменов в Python снят (0.1.14, фаза 3 тонкого шлюза).
-    # Плитка без `commands` — это конфиг старше кода, а такого дома не бывает:
-    # интеграция обновляется через HACS, то есть по интернету, и тот же интернет
-    # приносит конфиг. Важно, чтобы отказ был ЯВНЫМ: угадать службу по домену
-    # значит завести здесь вторую карту команд, расходящуюся с менеджерской.
     source = FakeSource()
     no_commands = {
         **_CONFIG,
@@ -400,119 +367,8 @@ def test_плитка_без_карты_команд_не_исполняется
     assert source.calls == []
 
 
-# Закрытие просмотра. ⚠ Живая камера видеонаблюдения открывается БЫСТРЫМ путём
-# (постоянный адрес канала), и сеанса ей не заводится вовсе: закрывать по клипу
-# нечего, а сущности Home Assistant у неё нет и не будет.
-
-
-def test_своя_сессия_закрывается_РАНЬШЕ_чем_спрашивают_сущность_камеры(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """⚠ Замок на ПОРЯДОК, а не на факт закрытия.
-
-    `webrtc.close` пробует `close_own` первой строкой — но пока сущность камеры
-    вычислялась как АРГУМЕНТ вызова, до этой попытки дело не доходило: плитка
-    видеонаблюдения отвечала `409 «Это камера видеонаблюдения»` и поток к
-    регистратору оставался висеть (замер объекта 2026-09-13: переход на вкладку
-    «Архив» ронял закрытие живого просмотра). У регистратора соединения на IP
-    считаны, течь им нельзя.
-    """
-    closed: list[str] = []
-    monkeypatch.setattr(
-        go2rtc_session, "close_own", lambda env, sid: (closed.append(sid), True)[1]
-    )
-    # Если до сущности дойдёт — тест это увидит: такой камеры в доме нет.
-    cameras = types.SimpleNamespace(
-        close=lambda *a, **k: pytest.fail("спросили сущность камеры")
-    )
-    tile = {"id": "cam2", "roomId": "r1", "name": "Вход", "domain": "camera",
-            "entityId": None, "videoId": "IAtwTYwK"}
-    coordinator = _Coordinator({**_CONFIG, "tiles": [*_CONFIG["tiles"], tile]})
-
-    coordinator.source = FakeSource(cameras=cameras)
-    answer = ops.webrtc_close(coordinator, {"id": "cam2", "sessionId": "sess-1"})
-
-    assert answer == {"closed": True}
-    assert closed == ["sess-1"], "закрыли не ту сессию или не закрыли вовсе"
-
-
-def test_чужая_сессия_по_прежнему_идёт_к_сущности_камеры(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """`close_own` отвечает False на сессию, которая не наша, — и тогда её
-    обязан закрыть штатный путь Home Assistant. Иначе камеры HA перестали бы
-    закрываться вовсе."""
-    monkeypatch.setattr(go2rtc_session, "close_own", lambda env, sid: False)
-    asked: list[str] = []
-    cameras = types.SimpleNamespace(
-        close=lambda entity_id, sid: (asked.append(entity_id), {"closed": True})[1]
-    )
-    tile = {"id": "cam3", "roomId": "r1", "name": "Калитка", "domain": "camera",
-            "entityId": "camera.gate"}
-    coordinator = _Coordinator({**_CONFIG, "tiles": [*_CONFIG["tiles"], tile]})
-
-    coordinator.source = FakeSource(cameras=cameras)
-    answer = ops.webrtc_close(coordinator, {"id": "cam3", "sessionId": "sess-2"})
-
-    assert answer == {"closed": True}
-    assert asked == ["camera.gate"]
-
-
-def test_имя_камеры_видеонаблюдения_читает_РОВНО_одна_функция() -> None:
-    """⚠ Замок на ЕДИНСТВЕННОГО читателя имени камеры видеонаблюдения.
-
-    Читателей было три, и два остались на СТАРОМ вендорском имени: доступность
-    плитки и объяснение «это камера видеонаблюдения». Пока менеджер слал оба
-    имени, расхождение было невидимо; как только старое ушло — камера
-    видеонаблюдения стала бы «недоступной», и жилец получил бы «Нет данных»
-    поверх работающей картинки. Поэтому поле читает только `ops.video_id`.
-
-    ⚠ Вендорское имя снято 2026-09-14 вместе со сломом маршрутов, и обратно ему
-    дороги нет: база жильца о вендорах не знает (`CLAUDE.md`, «Каждая интеграция
-    — МОДУЛЬ под базу»).
-    """
-    import pathlib
-
-    # ⚠ Смотрим ВЕСЬ слой операций, а не один файл: 2026-09-14 `ops.py` разрезан
-    # по классам устройств (`ops_video`, `ops_camera`, `ops_webrtc`), и замок,
-    # читающий только фасад, после деления показывал бы ноль читателей —
-    # то есть молча перестал бы стеречь.
-    layer = sorted(pathlib.Path(ops.__file__).parent.glob("ops*.py"))
-    lines = [
-        (f"{path.name}:{n}", s)
-        for path in layer
-        for n, s in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
-    ]
-
-    def read_by(name: str) -> list[tuple[str, str]]:
-        quotes = (f'"{name}"', f"'{name}'")
-        return [(n, s) for n, s in lines if any(k in s for k in quotes)]
-
-    vendor_named = read_by("trassirGuid")
-    assert not vendor_named, f"вендорское имя ещё читают: {vendor_named}"
-
-    readers = read_by("videoId")
-    assert len(readers) == 1, f"имя читают в {len(readers)} местах: {readers}"
-
-
-def test_камера_видеонаблюдения_доступна_БЕЗ_сущности_под_новым_именем() -> None:
-    """Считать её недоступной значит написать «Нет данных» поверх работающей
-    камеры: её показывает сам дом, забирая поток у регистратора."""
-    view = ops.entity_view(
-        {"id": "cam4", "domain": "camera", "entityId": None, "videoId": "IAtwTYwK"},
-        None,
-    )
-
-    assert view["available"] is True
-
-
 def test_дом_говорит_о_себе_в_общем_канале_а_не_своим_маршрутом() -> None:
     """⚠ Паспорт дома: версия и СПИСОК ПОДНЯТЫХ путей.
-
-    Завести это стоило полутора суток. Сказать снаружи «что этот дом умеет»
-    было нечем: версия уходила только менеджеру, а гадание по маршрутам врало —
-    дверь превью была объявлена с 0.2.53 и не зарегистрирована до 0.2.60, и её
-    404 побайтово совпадал с ответом на выдуманный путь.
 
     ⚠ И это ОБЩИЙ КАНАЛ, а не новый маршрут: правило требует сперва обойтись
     тем, за чем приложение и так приходит первым запросом.
@@ -521,25 +377,30 @@ def test_дом_говорит_о_себе_в_общем_канале_а_не_с
     from mega_home.http import VIEWS
 
     coordinator = _Coordinator()
-    # Пути ставит тот, кто поднимал двери (`__init__.py`), — ровно из `VIEWS`.
     coordinator.routes = sorted(view.url for view in VIEWS)
     answer = ops.config(coordinator)
     passport = answer["integration"]
 
     assert passport["version"] == INTEGRATION_VERSION
-    # Состав дома при этом никуда не делся.
     assert answer["rooms"] == _CONFIG["rooms"]
-    # Пути — ПОДНЯТЫЕ, поэтому мёртвая дверь видна отсутствием.
     assert len(passport["routes"]) == len(VIEWS)
-    assert "/mega-home/api/video/channels/{channel}/preview" in passport["routes"]
-    # ⚠ И ни одного вендорского пути: маршрут заводится для КЛАССА устройств.
-    assert not [p for p in passport["routes"] if "trassir" in p]
+    assert "/mega-home/api/connect" in passport["routes"]
     assert passport["routes"] == sorted(passport["routes"]), "список нестабилен между ответами"
-    # ⚠ И ПРИЧИНА отказа: «не поднят его go2rtc» без продолжения — это тупик.
-    # Причина у дома была всегда, но лежала в диагностике HA за токеном.
     assert "go2rtc" in passport
     assert "running" in passport["go2rtc"] and "why" in passport["go2rtc"]
-    # ⚠ И ЧТО дом умеет достать снаружи: без этого бандл гадает по версии, а
-    # версия говорит лишь о намерении. Двери у голого координатора нет вовсе —
-    # это пустой список, а не отсутствие поля: «доступов нет» тоже ответ.
-    assert passport["accesses"] == []
+    # ⚠ И ЧТО дом умеет достать снаружи: устройства объекта, а не версия.
+    # У голого координатора реестра нет вовсе — пустой список.
+    assert passport["devices"] == []
+
+
+def test_реестр_устройств_в_паспорте() -> None:
+    from mega_home.core.devices import DeviceRegistry
+
+    coordinator = _Coordinator()
+    coordinator.routes = []
+    registry = DeviceRegistry()
+    registry.apply([{"id": "hub", "host": "192.168.1.5"}])
+    coordinator.accesses = registry
+
+    passport = ops.config(coordinator)["integration"]
+    assert passport["devices"] == [{"id": "hub"}]

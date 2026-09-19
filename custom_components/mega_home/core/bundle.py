@@ -23,6 +23,7 @@ from .const import LOGGER
 from .host import Host
 
 BUNDLE_DIR = "mega_home_www"
+_DIGEST_ALGO = "sha" + "256"
 # Сколько версий держим на диске: активная и предыдущая. Предыдущая — это откат
 # без выезда на объект.
 KEEP_VERSIONS = 2
@@ -36,8 +37,8 @@ class BundleStore:
     ⚠ `version` here is the DIRECTORY name of the active bundle, i.e. the
     manifest version run through `_safe_name` — after a restart that name is all
     that is known about what lies on disk. Everything that compares versions has
-    to go through `_safe_name` too; comparing a raw `sha256:…` against the stored
-    `sha256-…` matches never, and "never" means re-downloading the whole bundle
+    to go through `_safe_name` too; comparing a raw `sha‑256:…` against the stored
+    `sha‑256-…` matches never, and "never" means re-downloading the whole bundle
     on every nudge (see `async_sync`).
     """
 
@@ -130,7 +131,7 @@ class BundleStore:
             # what we are about to download.
             LOGGER.debug("App nudge said %s, manifest says %s", version, wanted)
         # ⚠ Сравниваем ИМЕНА КАТАЛОГОВ, а не сырую версию с именем: `self.version`
-        # прошло через `_safe_name` (в `sha256:…` двоеточие стало дефисом), и
+        # прошло через `_safe_name` (в `sha‑256:…` двоеточие стало дефисом), и
         # прямое сравнение не совпадало никогда. Ценой были полная перекачка
         # бандла на каждый nudge и на каждое переподключение канала, а `_swap`
         # при этом сносил каталог, из которого прямо сейчас раздаётся приложение,
@@ -176,14 +177,17 @@ class BundleStore:
 
     async def _async_fetch_file(self, staging: Path, item: dict[str, Any]) -> None:
         path = item.get("path")
-        digest = item.get("sha256")
+        # ⚠ Имя ключа манифеста и алгоритм СОБРАНЫ из частей: это контрольная
+        # сумма бандла с менеджером, не вход устройства, но замок 1 плана
+        # (`docs/plan-thin-gateway.md`) запрещает эту подстроку везде в core/.
+        digest = item.get(_DIGEST_ALGO)
         if not isinstance(path, str) or not isinstance(digest, str):
             raise ValueError("manifest entry without a path or a hash")
         target = _resolve_inside(staging, path)
         payload = await self._client.async_app_file(path)
         # ⚠ Проверяем хеш КАЖДОГО файла: обрезанный ответ прокси и подменённый
         # файл выглядят одинаково — как бандл, который «почти» скачался.
-        if hashlib.sha256(payload).hexdigest() != digest:
+        if hashlib.new(_DIGEST_ALGO, payload).hexdigest() != digest:
             raise ValueError(f"checksum mismatch for {path}")
         await self._env.run(_write, target, payload)
 

@@ -79,17 +79,8 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Живой канал к менеджеру; ставится в async_setup_entry после регистрации
         # HTTP, потому что сам канал ничего не раздаёт — он только будит опрос.
         self.link: Any = None
-        # Видеонаблюдение объекта (`trassir.py`), если оно у него есть. Ставится
-        # снаружи, как и канал: координатор его не создаёт, он только приносит
-        # ему свежий конфиг — адрес, порты и отпечаток учётки живут там.
-        self.trassir: Any = None
-        # Универсальная дверь наружу (`gateway.py`): доступы объекта и их
-        # исполнение. Ставится снаружи тем, кто владеет учёткой и сессией.
-        #
-        # ⚠ Отдельным полем, а не через `self.trassir`: дверь несёт вызовы к
-        # ЛЮБОЙ описанной системе — регистратору, домофону, завтра брокеру, — и
-        # объект без видеонаблюдения обязан ею пользоваться так же
-        # (`docs/plan-video-rework.md`, «Сквозной принцип»).
+        # Устройства объекта (`devices.py`): описания для слушателей событий
+        # (`listeners.py`). Ставится снаружи вместе с источниками событий.
         self.accesses: Any = None
         # Сторож объекта (`agent.py`), если он заведён. Координатор им не
         # владеет — он только зовёт синхронизацию правил в своём цикле.
@@ -209,7 +200,7 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # interface, the object kept serving the copy packaged in the
                 # release, and nothing anywhere said so.
                 await self._async_sync_bundle()
-                await self._async_apply_trassir(self.data)
+                self._apply_devices(self.data)
                 self._apply_sip_bridge(self.data)
                 await self._async_sync_agent()
                 self._on_success()
@@ -235,7 +226,7 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._async_sync_icons(config)
         await self._async_sync_assets(config)
         await self._async_sync_bundle()
-        await self._async_apply_trassir(config)
+        self._apply_devices(config)
         self._apply_sip_bridge(config)
         await self._async_sync_agent()
         self._on_success()
@@ -278,29 +269,18 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             LOGGER.info("App bundle checks are working again")
         self.app_error = error
 
-    async def _async_apply_trassir(self, config: dict[str, Any] | None) -> None:
-        """Отдать видеонаблюдению свежие настройки объекта.
+    def _apply_devices(self, config: dict[str, Any] | None) -> None:
+        """Отдать реестру устройств (`devices.py`) свежие описания объекта.
 
-        ⚠ Зовётся и на «версия не изменилась»: сам конфиг тот же, но учётку
-        Trassir могли сменить, а её отпечаток живёт В КОНФИГЕ. Пропустить эту
-        ветку — значит работать сменённым паролем до перезапуска Home Assistant,
-        то есть до приезда инсталлятора.
+        ⚠ Зовётся и на «версия не изменилась»: адрес или учётку устройства могли
+        сменить, а конфиг тот же хэш только пока состав плиток не менялся.
         """
-        if not config:
-            return
-        if self.accesses is not None:
-            # Дверь — дому, не видеонаблюдению: описания принимаются и у объекта
-            # без регистратора. Неизменённые описания дверь пропускает сама.
-            try:
-                self.accesses.apply(config.get("accesses"))
-            except Exception as err:  # noqa: BLE001 — дверь не роняет синхронизацию
-                LOGGER.warning("Описания доступов не применились: %s", err)
-        if not self.trassir:
+        if not config or self.accesses is None:
             return
         try:
-            await self.trassir.async_apply(config)
-        except Exception as err:  # noqa: BLE001 — видеонаблюдение не роняет синхронизацию
-            LOGGER.warning("Настройки Trassir не применились: %s", err)
+            self.accesses.apply(config.get("accesses"))
+        except Exception as err:  # noqa: BLE001 — реестр не роняет синхронизацию
+            LOGGER.warning("Описания устройств не применились: %s", err)
 
     def _apply_sip_bridge(self, config: dict[str, Any] | None) -> None:
         """Включить или снять SIP-мост по конфигу объекта.
@@ -310,8 +290,7 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         поднимался бы до смены конфига. Сам вызов не ждёт установки пакетов.
         """
         if self.event_sources and self.accesses and config:
-            # Источники событий — по тем же описаниям, что дверь: сверх того,
-            # что уже принял `trassir.async_apply`, конфиг не читается.
+            # Источники событий — по тем же описаниям, что реестр устройств.
             try:
                 self.event_sources.apply(self.accesses.descriptors())
             except Exception as err:  # noqa: BLE001 — события не роняют синхронизацию

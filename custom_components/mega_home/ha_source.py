@@ -15,27 +15,16 @@ from .core.source import CommandRejected, CommandUnknown
 
 
 class HaCameras:
-    """Камеры `camera.*` этого HA (`webrtc.py`)."""
+    """Камеры `camera.*` этого HA: прогрев и кадр плитки (`webrtc.py`)."""
 
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
 
-    async def negotiate(
-        self, entity_id: str, sdp: str, remote: bool, trickle: bool
-    ) -> dict[str, Any]:
-        return await webrtc.negotiate(self.hass, entity_id, sdp, remote, trickle)
-
-    def close(self, entity_id: str, session_id: str) -> dict[str, Any]:
-        return webrtc.close(self.hass, entity_id, session_id)
-
-    async def snapshot(self, entity_id: str) -> tuple[str, bytes]:
-        return await webrtc.snapshot(self.hass, entity_id)
-
     def warm(self, entity_id: str) -> None:
         webrtc.warm(self.hass, entity_id)
 
-    async def stream_source(self, entity_id: str) -> str | None:
-        return await webrtc._camera(self.hass, entity_id).stream_source()  # noqa: SLF001
+    async def snapshot(self, entity_id: str) -> tuple[str, bytes]:
+        return await webrtc.snapshot(self.hass, entity_id)
 
 
 class HaSource:

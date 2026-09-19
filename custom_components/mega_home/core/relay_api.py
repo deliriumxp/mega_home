@@ -14,6 +14,10 @@ HTTP, а не именованные функции, следующая возм
 одной кнопкой, — например поставить фотографию комнаты: она оседала в браузере
 телефона и не доезжала никуда.
 
+⚠ Список путей ЗАПЕРТ (`docs/plan-thin-gateway.md`, замок 2): дом — транспорт,
+процессы и хранилище, новый маршрут — только с доказательством, что это одно
+из них.
+
 ⚠ Границы у переноса свои, и они не в путях, а в размере и в наборе методов:
 менеджер уже проверил сессию жильца и выбрал объект по ней, дом же обязан не
 дать превратить канал в загрузку чего угодно. Отсюда потолки на запрос и ответ
@@ -49,7 +53,6 @@ JPEG_TYPE = "image/jpeg"
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 IMMUTABLE = "public, max-age=31536000, immutable"
 
-
 async def handle(
     coordinator: Any,
     payload: dict[str, Any],
@@ -80,7 +83,6 @@ async def handle(
         answer["cacheControl"] = cache
     return answer
 
-
 async def _dispatch(
     coordinator: Any,
     method: str,
@@ -98,112 +100,39 @@ async def _dispatch(
         return _json(await ops.command(coordinator, _json_body(body)))
     if path == "api/scenario" and method == "POST":
         return _json(await ops.scenario(coordinator, _json_body(body)))
-    if path == "api/photos" and method == "GET":
-        versions = await coordinator.env.run(
-            coordinator.photos.versions, photo_keys(coordinator.data)
-        )
-        # `imaging` — тот же флаг, что у локальной двери (`http.py`).
-        return _json({"photos": versions, "imaging": True})
-    if path.startswith("api/photo/"):
-        key = unquote(path[len("api/photo/") :])
-        return await _photo(coordinator, method, key, body, query)
-    if path == "api/crops" and method == "GET":
-        crops = await coordinator.env.run(
-            coordinator.crops.all, crop_keys(coordinator.data)
-        )
-        return _json({"crops": crops})
-    if path.startswith("api/crop/"):
-        return await _crop(coordinator, method, unquote(path[len("api/crop/") :]), body)
-    if path.startswith("api/camera-frame/") and method == "GET":
-        # Постер камеры: один кадр на открытие просмотра. ⚠ Не поток — кадр на
-        # ПЛИТКЕ обновляется по таймеру, и снаружи его нет вовсе
-        # (remote-access.md у менеджера).
-        #
-        # ⚠ `ops.camera_frame` отдаёт СЫРЫЕ байты (2026-09-08), не base64:
-        # раньше кадр кодировался в `webrtc.snapshot`, тут же декодировался,
-        # а `handle()` ниже кодировал ОБРАТНО — два лишних прохода по кадру
-        # до 400 КБ на каждое открытие камеры. base64 — форма ОТВЕТА этой
-        # двери, и кодируется он один раз, в `handle()`.
-        content_type, raw = await ops.camera_frame(
-            coordinator, {"id": unquote(path[len("api/camera-frame/") :])}
-        )
-        return (
-            HTTPStatus.OK,
-            content_type,
-            raw,
-            # Кадр живой: закешированный постер показывал бы вчерашний двор.
-            "no-store",
-        )
-    if path == "api/video/cameras" and method == "GET":
-        return _json(await ops.trassir_cameras(coordinator))
-    if path == "api/video/events" and method == "GET":
-        # ⚠ Именно здесь query и понадобился впервые: без него жилец СНАРУЖИ
-        # получал бы всю ленту вместо одной камеры — то есть другое поведение
-        # той же кнопки. Разница «дома/снаружи» обязана оставаться только в
-        # адресе базы.
-        return _json(ops.trassir_events(coordinator, query))
-    if path == "api/gateway/call" and method == "POST":
-        # ⚠ Универсальная дверь — ОБЕИМИ дверями приложения, как и всё
-        # остальное: снаружи новая функция архива обязана работать так же, как
-        # дома. Границы двери (адресат из конфига, запрет входа и настроек,
-        # потолок ответа) — в `gateway.py`, они одни на оба транспорта.
-        payload = _json_body(body)
-        if not isinstance(payload, dict):
-            raise ops.OpError("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
-        return _json(await ops.gateway_call(coordinator, payload))
-    if path.startswith("api/video/channels/") and path.endswith("/preview") and method == "GET":
-        # Превью под пальцем — снаружи тем же одним запросом, что и дома.
-        channel = unquote(path[len("api/video/channels/") : -len("/preview")])
-        kind, frame = await ops.trassir_preview(coordinator, channel, query.get("at"))
-        return {"status": 200, "contentType": kind, "body": frame}
-    if path.startswith("api/video/channels/") and path.endswith("/clip") and method == "POST":
-        # Открытие архива канала по метке — та же дверь, что и всё остальное:
-        # снаружи «что было вчера в 21:40» обязано работать так же, как дома.
-        channel = unquote(path[len("api/video/channels/") : -len("/clip")])
-        body_json = _json_body(body)
-        if not isinstance(body_json, dict):
-            raise ops.OpError("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
-        return _json(
-            await ops.trassir_clip_at(
-                coordinator,
-                channel,
-                body_json.get("timestampUs"),
-                body_json.get("cameraName"),
-                quality=body_json.get("quality"),
-                window_start_us=body_json.get("windowStartUs"),
-                window_stop_us=body_json.get("windowStopUs"),
+    if path == "api/connect" and method == "POST":
+        # Единственный контракт транспорта наружу — тот же код, что у операции
+        # канала (`ops.py`, `op == "connect"`): ответы не должны разъезжаться.
+        return _json(await ops.connect(_json_body(body)))
+    if path.startswith("api/photo"):
+        # `api/photos` (список) и `api/photo/<ключ>` (файл) — ОДИН префикс:
+        # два разных `startswith` заперлись бы замком маршрутов как две
+        # записи вместо одной (`docs/plan-thin-gateway.md`, замок 2).
+        rest = path[len("api/photo") :]
+        if rest in ("", "s") and method == "GET":
+            versions = await coordinator.env.run(
+                coordinator.photos.versions, photo_keys(coordinator.data)
             )
-        )
-    if path.startswith("api/video/clips/") and path.endswith("/ready") and method == "POST":
-        # Готовность телефона — команда старта архива. Той же дверью, что
-        # открытие: это команда дому, а не данные для конфига.
-        clip = unquote(path[len("api/video/clips/") : -len("/ready")])
-        ready_body = _json_body(body)
-        if not isinstance(ready_body, dict):
-            ready_body = {}
-        return _json(
-            await ops.trassir_ready(
-                coordinator,
-                clip,
-                ready_body.get("positionUs"),
-                ready_body.get("windowStartUs"),
-                ready_body.get("windowStopUs"),
+            # `imaging` — тот же флаг, что у локальной двери (`http.py`).
+            return _json({"photos": versions, "imaging": True})
+        if rest.startswith("/"):
+            return await _photo(coordinator, method, unquote(rest[1:]), body, query)
+    if path.startswith("api/crop"):
+        rest = path[len("api/crop") :]
+        if rest in ("", "s") and method == "GET":
+            crops = await coordinator.env.run(
+                coordinator.crops.all, crop_keys(coordinator.data)
             )
-        )
-    if path.startswith("api/video/events/") and path.endswith("/thumb") and method == "GET":
-        event = unquote(path[len("api/video/events/") : -len("/thumb")])
-        content_type, raw = await ops.trassir_thumb(
-            coordinator, event, ops.lead_of(query.get("lead"))
-        )
-        # Кадр за прошедшую секунду больше не изменится — пусть телефон держит
-        # его у себя, лента листается вверх-вниз.
-        return HTTPStatus.OK, content_type, raw, IMMUTABLE
+            return _json({"crops": crops})
+        if rest.startswith("/"):
+            return await _crop(coordinator, method, unquote(rest[1:]), body)
     if path.startswith("api/asset/") and method == "GET":
         return await _asset(coordinator, unquote(path[len("api/asset/") :]), query)
+    if path.startswith("api/camera-frame/") and method == "GET":
+        return await _camera_frame(coordinator, unquote(path[len("api/camera-frame/") :]))
     if path.startswith("icons/") and method == "GET":
         return await _icon(coordinator, unquote(path[len("icons/") :]))
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.NOT_FOUND)
-
 
 async def _photo(
     coordinator: Any,
@@ -243,7 +172,6 @@ async def _photo(
         return _json({"accepted": True})
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.METHOD_NOT_ALLOWED)
 
-
 async def _crop(
     coordinator: Any,
     method: str,
@@ -270,7 +198,6 @@ async def _crop(
         return _json({"accepted": True})
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.METHOD_NOT_ALLOWED)
 
-
 async def _asset(
     coordinator: Any,
     key: str,
@@ -283,6 +210,15 @@ async def _asset(
     target, content_type = found
     return (HTTPStatus.OK, content_type, await _read(coordinator.env, target), IMMUTABLE)
 
+async def _camera_frame(coordinator: Any, tile: str) -> tuple[int, str, bytes, str]:
+    """Кадр камеры источника плитки (`ops.camera_frame`) — часть B, не вендор.
+
+    ⚠ Снаружи у приложения нет ни одного адреса Home Assistant
+    (`state.picture` недостижим), и без этого пути плитка камеры вне дома
+    остаётся без картинки (`docs/plan-thin-gateway.md`).
+    """
+    content_type, body = await ops.camera_frame(coordinator, {"id": tile})
+    return (HTTPStatus.OK, content_type, body, "private, max-age=3")
 
 async def _icon(
     coordinator: Any, name: str
@@ -299,14 +235,11 @@ async def _icon(
         raise ops.OpError("Иконка не найдена", HTTPStatus.NOT_FOUND)
     return (HTTPStatus.OK, "image/png", await _read(coordinator.env, target), IMMUTABLE)
 
-
 async def _read(env: Host, target: Path) -> bytes:
     return await env.run(target.read_bytes)
 
-
 def _json(payload: Any) -> tuple[int, str, bytes, str]:
     return (HTTPStatus.OK, JSON_TYPE, json.dumps(payload).encode("utf-8"), "")
-
 
 def _json_body(body: bytes) -> dict[str, Any]:
     if not body:
@@ -318,7 +251,6 @@ def _json_body(body: bytes) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ops.OpError("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
     return parsed
-
 
 def _path(value: Any) -> tuple[str, dict[str, str]]:
     """Путь и РАЗОБРАННЫЙ query запроса, без выхода за пределы своего API.
@@ -337,7 +269,6 @@ def _path(value: Any) -> tuple[str, dict[str, str]]:
     query = dict(parse_qsl(raw.split("?", 1)[1])) if "?" in raw else {}
     return path, query
 
-
 def _body(value: Any) -> bytes:
     if not value:
         return b""
@@ -345,4 +276,3 @@ def _body(value: Any) -> bytes:
         return base64.b64decode(str(value), validate=True)
     except (ValueError, TypeError) as err:
         raise ops.OpError("Повреждённое тело запроса", HTTPStatus.BAD_REQUEST) from err
-

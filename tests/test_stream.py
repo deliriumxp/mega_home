@@ -102,14 +102,21 @@ def test_open_refuses_loopback():
     assert "вне локальной сети" in asyncio.run(scenario()).last_error()
 
 
-def test_loopback_open_only_to_sip_bridge():
-    """⚠ Телефон жильца доходит до моста только каналом менеджера — и больше никуда."""
+def test_loopback_open_only_by_service_name():
+    """⚠ loopback открывается только по имени ПОДНЯТОЙ службы (`services.py`)."""
+    from mega_home.core import services
+
     refuse = Streams(FakeSocket())._refuse
-    bridge = stream_mod.SIP_BRIDGE_PORT
-    assert refuse({"host": "127.0.0.1", "port": bridge}) is None
-    assert refuse({"host": "127.0.0.2", "port": bridge})
-    assert refuse({"host": "::1", "port": bridge})
-    assert refuse({"host": "127.0.0.1", "port": bridge + 1})
+    services.register("asterisk", 8188)
+    try:
+        assert refuse({"host": "asterisk"}) is None
+        # Литеральный loopback-адрес — отказ, даже на тот же порт: имя службы
+        # обязательно, реестра портов в коде нет.
+        assert refuse({"host": "127.0.0.1", "port": 8188})
+        assert refuse({"host": "нет-такой-службы"})
+    finally:
+        services.unregister("asterisk")
+    assert refuse({"host": "asterisk"})
 
 
 def test_udp_session_carries_datagrams(monkeypatch):

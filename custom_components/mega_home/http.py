@@ -12,10 +12,7 @@ this on a customer object in this state.
 
 from __future__ import annotations
 
-import base64
-import json
 from http import HTTPStatus
-from typing import Any
 
 from aiohttp import web
 
@@ -23,10 +20,8 @@ from homeassistant.components.http import HomeAssistantView, StaticPathConfig
 from homeassistant.core import HomeAssistant
 
 from .core.const import (
-    TRASSIR_TILE_CACHE,
     DOMAIN,
     LOGGER,
-    TILE_PHOTO_PREFIX,
     URL_API,
     URL_ICONS,
     URL_PREFIX,
@@ -189,7 +184,6 @@ class MegaHomeEventsView(_MegaHomeView):
         if error is not None:
             return error
         assert coordinator is not None
-        hass: HomeAssistant = request.app["hass"]
         return await StateStream(coordinator).run(request)
 
 
@@ -211,6 +205,20 @@ class MegaHomeScenarioView(_MegaHomeView):
 
     async def post(self, request: web.Request) -> web.Response:
         return await self.run_async(request, "scenario")
+
+
+class MegaHomeConnectView(_MegaHomeView):
+    """Единственный контракт транспорта наружу (`connect.py`, `ops.py`).
+
+    ⚠ Тот же код, что у операции канала: локальная дверь и перенос через
+    менеджера обязаны отвечать одинаково (`docs/plan-thin-gateway.md`).
+    """
+
+    url = f"{URL_API}/connect"
+    name = "api:mega_home:connect"
+
+    async def post(self, request: web.Request) -> web.Response:
+        return await self.run_async(request, "connect")
 
 
 class MegaHomePhotosView(_MegaHomeView):
@@ -269,7 +277,6 @@ class MegaHomePhotoView(_MegaHomeView):
         if error is not None:
             return error
         assert coordinator is not None
-        hass: HomeAssistant = request.app["hass"]
         # Query может просить готовый вариант (`?w=1080&blur=14`, `imaging.py`).
         target = await photo_file(coordinator.env, coordinator, room, request.query)
         if target is None:
@@ -423,7 +430,6 @@ class MegaHomeAssetView(_MegaHomeView):
         if error is not None:
             return error
         assert coordinator is not None
-        hass: HomeAssistant = request.app["hass"]
         found = await asset_file(coordinator.env, coordinator, key, request.query)
         if found is None:
             return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
@@ -438,12 +444,14 @@ class MegaHomeAssetView(_MegaHomeView):
 
 
 class MegaHomeCameraFrameView(_MegaHomeView):
-    """One still frame of a camera — the poster shown while a stream starts.
+    """Один кадр камеры источника плитки — часть B (источник состояний), не вендор.
 
     ⚠ Есть и здесь, хотя ДОМА приложение берёт кадр напрямую у Home Assistant
     (`/api/camera_proxy/...`, тот же origin, дешевле на один поход к камере).
-    Путь один и тот же с обеих сторон намеренно: расхождение поверхностей — та
-    самая болезнь, ради лечения которой заведён перенос (`relay_api.py`).
+    Путь один и тот же с обеих сторон намеренно: расхождение поверхностей —
+    та самая болезнь, ради лечения которой заведён перенос (`relay_api.py`).
+    Снаружи у приложения нет ни одного адреса Home Assistant, поэтому без этой
+    двери плитка камеры вне дома остаётся без картинки.
     """
 
     url = f"{URL_API}/camera-frame/{{tile}}"
@@ -454,288 +462,23 @@ class MegaHomeCameraFrameView(_MegaHomeView):
         if error is not None:
             return error
         assert coordinator is not None
-        hass: HomeAssistant = request.app["hass"]
         try:
             content_type, body = await ops.camera_frame(coordinator, {"id": tile})
         except ops.OpError as err:
             return web.Response(status=err.status, text=err.message)
 
         # ⚠ Байты как есть, без base64: `ops.camera_frame` отдаёт их уже
-        # сырыми (2026-09-08) — эта дверь не переносит запрос по каналу
-        # менеджера, кодировать здесь было бы работой ради самой себя.
+        # сырыми — эта дверь не переносит запрос по каналу менеджера,
+        # кодировать здесь было бы работой ради самой себя.
         return web.Response(
             body=body,
-            # Кадр живой: закешированный постер показывал бы вчерашний двор.
             headers={
                 "Content-Type": content_type,
-                # ⚠ КЭШИРУЕМ на период обновления плитки. Было `no-store`, и
-                # это значило: каждый переход между комнатами — заново все
-                # кадры, хотя их только что показывали. Теперь браузер держит
-                # кадр ровно столько, сколько плитка живёт до обновления, и
-                # переход в соседнюю комнату не начинает дозагрузок
-                # (решение заказчика 2026-09-13).
-                "Cache-Control": f"private, max-age={TRASSIR_TILE_CACHE}",
+                # Кадр живой и короткий: закешированный постер показывал бы
+                # прошлую минуту, но плитка обновляется опросом раз в 3 с.
+                "Cache-Control": "private, max-age=3",
             },
         )
-
-
-class MegaHomeVideoCamerasView(_MegaHomeView):
-    """Камеры регистратора — чтобы плитку дома можно было связать с событиями."""
-
-    url = f"{URL_API}/video/cameras"
-    name = "api:mega_home:video-cameras"
-
-    async def get(self, request: web.Request) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        try:
-            return self.json(
-                await ops.trassir_cameras(request.app["hass"], coordinator)
-            )
-        except ops.OpError as err:
-            return self.json_message(err.message, err.status)
-
-
-class MegaHomeVideoEventsView(_MegaHomeView):
-    """Лента событий: `?guid=` — одна камера, `?before=` — страница постарше."""
-
-    url = f"{URL_API}/video/events"
-    name = "api:mega_home:video-events"
-
-    async def get(self, request: web.Request) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        try:
-            return self.json(ops.trassir_events(coordinator, dict(request.query)))
-        except ops.OpError as err:
-            return self.json_message(err.message, err.status)
-
-
-class MegaHomeVideoPreviewView(_MegaHomeView):
-    """Кадр архива канала НА МЕТКЕ — превью под пальцем при перемотке.
-
-    ⚠ Почему это маршрут дома, а не описанный вызов через дверь. За кадром
-    стоят ТРИ шага: выдача токена субпотока, позиционирование и чтение с
-    МЕДИАПОРТА. Медиапорт двери недоступен вовсе (она знает только SDK-порт), а
-    токен — это жизнь сессии, и она домашняя по тому же правилу, что у клипа.
-    Снаружи это ещё и разница между одним походом через менеджер и тремя.
-
-    ⚠ Почему субпоток и `jpeg` с качеством: замер стенда 2026-09-13 —
-    `screenshot?timestamp=` это 0.4–1.0 с и 375–400 КБ (и субпоток он
-    игнорирует), а `archive_sub` + `container=jpeg&quality=20` — 0.04–0.31 с и
-    9–10 КБ. Превью, отстающее на секунду, заказчик отклонил справедливо.
-    """
-
-    url = f"{URL_API}/video/channels/{{channel}}/preview"
-    name = "api:mega_home:video-preview"
-
-    async def get(self, request: web.Request, channel: str) -> web.StreamResponse:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        try:
-            content_type, body = await ops.trassir_preview(
-                coordinator, channel, request.query.get("at")
-            )
-        except ops.OpError as err:
-            return web.Response(status=err.status, text=err.message)
-        return web.Response(
-            body=body,
-            headers={
-                # Кадр прошедшей секунды не изменится никогда — пусть телефон
-                # держит его у себя: на драге к одной метке возвращаются.
-                "Cache-Control": "private, max-age=600",
-            },
-            content_type=content_type,
-        )
-
-
-class MegaHomeVideoThumbView(_MegaHomeView):
-    """Кадр архива на секунду события — уже ужатый (`trassir.py`)."""
-
-    url = f"{URL_API}/video/events/{{event}}/thumb"
-    name = "api:mega_home:video-thumb"
-
-    async def get(self, request: web.Request, event: str) -> web.StreamResponse:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        try:
-            # ⚠ Сдвиг кадра — решение приложения, а не дома (см. `ops.trassir_thumb`).
-            content_type, body = await ops.trassir_thumb(
-                coordinator, event, ops.lead_of(request.query.get("lead"))
-            )
-        except ops.OpError as err:
-            return web.Response(status=err.status, text=err.message)
-        return web.Response(
-            body=body,
-            # Кадр архива за прошедшую секунду больше не изменится никогда —
-            # пусть телефон держит его у себя, лента листается вверх-вниз.
-            headers={
-                "Content-Type": content_type,
-                "Cache-Control": "public, max-age=31536000, immutable",
-            },
-        )
-
-
-class MegaHomeVideoClipView(_MegaHomeView):
-    """Открыть архив КАНАЛА на метке — классический просмотр по дню и времени.
-
-    ⚠ Отдельно от `events/{event}/play`: запись открывают не только по событию,
-    а «что было вчера в 21:40» события не имеет вовсе. Метки нет — последняя
-    запись (метку в шкале Trassir считает дом: у приложения там нет своих часов).
-    """
-
-    url = f"{URL_API}/video/channels/{{channel}}/clip"
-    name = "api:mega_home:video-clip"
-
-    async def post(self, request: web.Request, channel: str) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        try:
-            payload = await request.json()
-        except ValueError:
-            payload = {}
-        if not isinstance(payload, dict):
-            return self.json_message("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
-        try:
-            return self.json(
-                await ops.trassir_clip_at(
-                    coordinator,
-                    channel,
-                    payload.get("timestampUs"),
-                    payload.get("cameraName"),
-                    quality=payload.get("quality"),
-                    # ⚠ Окно считает приложение и присылает готовым: шкала — его
-                    # дело. Дом хранит присланное.
-                    window_start_us=payload.get("windowStartUs"),
-                    window_stop_us=payload.get("windowStopUs"),
-                )
-            )
-        except ops.OpError as err:
-            return self.json_message(err.message, err.status)
-
-
-class MegaHomeVideoClipReadyView(_MegaHomeView):
-    """Телефон собрал тракт: отдать архиву единственную команду старта.
-
-    ⚠ Старт по готовности, а не по переговорам: часы архива идут в реальном
-    времени с команды, и команда, ушедшая раньше готовности, — это пропуск
-    начала (живой факт). Команда же, ушедшая повтором по готовому потоку, —
-    это вставшие данные (факт стенда). Поэтому команда одна и по готовности.
-    """
-
-    url = f"{URL_API}/video/clips/{{clip}}/ready"
-    name = "api:mega_home:video-ready"
-
-    async def post(self, request: web.Request, clip: str) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        # ⚠ Тела может не быть вовсе: сборки до этой правки шлют пустой POST, и
-        # отказывать им нельзя — окно у них уже задано при открытии.
-        try:
-            payload = await request.json()
-        except ValueError:
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
-        try:
-            return self.json(
-                await ops.trassir_ready(
-                    coordinator,
-                    clip,
-                    payload.get("positionUs"),
-                    payload.get("windowStartUs"),
-                    payload.get("windowStopUs"),
-                )
-            )
-        except ops.OpError as err:
-            return self.json_message(err.message, err.status)
-
-
-class MegaHomeGatewayCallView(_MegaHomeView):
-    """Универсальная дверь наружу: дом ИСПОЛНЯЕТ вызов, составленный бандлом.
-
-    ⚠ Ни словаря команд, ни разбора ответов здесь нет и не будет: дом выполняет
-    вызов, описанный в конфиге объекта, и отдаёт ответ КАК ЕСТЬ. Что значат
-    поля, где тут дни и шкала — решает бандл, который обновляется сам
-    (`gateway.py`, `docs/plan-thin-integration.md`).
-
-    ⚠ Адресат — ДОСТУП (`access` в теле), а не «регистратор»: одна и та же
-    дверь несёт вызовы к регистратору, к домофону и завтра к брокеру, меняются
-    только глаголы (`docs/plan-video-rework.md`, «Сквозной принцип»).
-
-    ⚠ Поэтому новая функция архива и новый вендор не стоят релиза: первая —
-    правка бандла, второй — описание в конфиге (его собирает менеджер).
-
-    Ответ: JSON как есть, если та система ответила JSON со статусом до 400; иначе конверт
-    `{status, contentType, body}` с base64 — так же, как носит файлы реле.
-    """
-
-    url = f"{URL_API}/gateway/call"
-    name = "api:mega_home:gateway-call"
-
-    async def post(self, request: web.Request) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        try:
-            payload = await request.json()
-        except ValueError:
-            payload = {}
-        if not isinstance(payload, dict):
-            return self.json_message("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
-        # ⚠ Работа живёт в `ops.py`, а не здесь: тот же код обслуживает жильца,
-        # пришедшего СНАРУЖИ через менеджер (`relay_api.py`). Копия правил двери
-        # на каждый транспорт разъехалась бы.
-        try:
-            return self.json(await ops.gateway_call(coordinator, payload))
-        except ops.OpError as err:
-            return self.json_message(err.message, err.status)
-
-
-class MegaHomeWebRtcView(_MegaHomeView):
-    """WebRTC locally — то же что снаружи, но без канала до менеджера.
-
-    ⚠ Унификация 2026-09-08: внутри дома был MJPEG (`/api/camera_proxy_stream`),
-    снаружи — WebRTC. В локалке MJPEG лагает и мылит, а WebRTC уже настроен
-    (свой go2rtc с UDP). Разница была только адресом базы — теперь и поток один.
-    """
-
-    url = f"{URL_API}/webrtc"
-    name = "api:mega_home:webrtc"
-
-    async def post(self, request: web.Request) -> web.Response:
-        return await self.run_async(request, "webrtc")
-
-
-class MegaHomeWebRtcCandidatesView(_MegaHomeView):
-    """Досыл ICE-кандидатов (trickle) внутри дома — пара к `webrtc`."""
-
-    url = f"{URL_API}/webrtc/candidates"
-    name = "api:mega_home:webrtc_candidates"
-
-    async def post(self, request: web.Request) -> web.Response:
-        return await self.run_async(request, "webrtc-candidates")
-
-
-class MegaHomeWebRtcCloseView(_MegaHomeView):
-    url = f"{URL_API}/webrtc/close"
-    name = "api:mega_home:webrtc_close"
-
-    async def post(self, request: web.Request) -> web.Response:
-        return await self.run_async(request, "webrtc-close")
 
 
 class MegaHomeRelayView(_MegaHomeView):
@@ -746,11 +489,6 @@ class MegaHomeRelayView(_MegaHomeView):
     integration, so without a route like this every future request/response
     feature (the resident's AI chat first of all) would cost a release of this
     integration and an update on every object.
-
-    ⚠ The bound is the manager: the token belongs to the object, the endpoint is
-    a single one (`/inbound/home-config/relay`), and what may be asked through
-    it is decided there, not here. The manager answers 501 while nothing is
-    plugged in — an honest diagnosis instead of silence.
     """
 
     url = f"{URL_API}/relay"
@@ -777,23 +515,8 @@ class MegaHomeRelayView(_MegaHomeView):
         return self.json(body if isinstance(body, dict) else {"answer": body}, status)
 
 
-
 # Наш собственный service worker. Не кэширует НИЧЕГО и не обязан: его работа —
 # ЗАНЯТЬ scope `/mega-home/`.
-#
-# ⚠ Разбор 2026-09-08, вторая итерация. Первая («адрес с версией в ?v=») не
-# сработала, и вот почему: service worker самого Home Assistant (scope `/`)
-# держит маршрут `registerRoute(/\/(\?.*)?$/, new StaleWhileRevalidate({
-# matchOptions: { ignoreSearch: true } }))` — проверено по его коду
-# (`hass_frontend/sw-modern.js`). `ignoreSearch` означает, что в кэше ищется
-# ЛЮБАЯ запись с тем же путём, а запрос с `?v=<новая>` кладётся отдельной
-# записью. То есть страница `/mega-home/` отдавалась из кэша ВСЕГДА и вечно, а
-# каждая новая версия лишь добавляла запись, которую никто не читает.
-#
-# Регистрация своего worker'а на более узком scope забирает наши страницы у
-# чужого: браузер выбирает регистрацию с самым длинным совпадающим scope. Этот
-# ничего не перехватывает — запросы идут в сеть, как будто worker'а нет вовсе, —
-# и именно этого мы и добиваемся.
 SERVICE_WORKER = (
     "self.addEventListener('install', () => self.skipWaiting());\n"
     "self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));\n"
@@ -824,23 +547,9 @@ class MegaHomeServiceWorkerView(_MegaHomeView):
 class MegaHomeAppRootView(_MegaHomeView):
     """The bare prefix: hand out the app itself — но по АДРЕСУ С ВЕРСИЕЙ В ПУТИ.
 
-    ⚠ Голый `/mega-home/` уводит на `/mega-home/v/<версия бандла>/`. Разбор
-    2026-09-08: дом раздавал новый бандл, а жилец видел старый до тех пор, пока
-    не сделает ЖЁСТКОЕ обновление страницы. Обычная перезагрузка отдавала
-    `index.html` из кэша — а его хватает, чтобы остаться на старом коде целиком:
-    имена файлов внутри хешированные, и старый `index.html` честно тянет старый
-    `main-*.js`.
-
-    ⚠ Версия именно В ПУТИ, а не в `?v=` — так было в первой попытке, и она НЕ
-    СРАБОТАЛА. Service worker Home Assistant (scope `/`) обслуживает страницы
-    маршрутом `StaleWhileRevalidate` с `matchOptions: {ignoreSearch: true}`
-    (проверено по `hass_frontend/sw-modern.js`): запрос со свежим `?v=` ищет в
-    кэше ЛЮБУЮ запись с тем же путём и находит вчерашнюю, а свой ответ кладёт
-    отдельной записью, которую потом никто не читает. Путь — другой ключ кэша,
-    и на нём этот маршрут промахивается честно.
-
-    Заголовки при этом не помогают вовсе: `no-store` управляет кэшем браузера,
-    а не кэшем чужого worker'а.
+    ⚠ Голый `/mega-home/` уводит на `/mega-home/v/<версия бандла>/` — иначе
+    браузер иногда отдаёт `index.html` из кэша чужого service worker'а, и он
+    честно тянет старый `main-*.js` по хешированным именам.
     """
 
     url = URL_PREFIX
@@ -928,11 +637,6 @@ def _serve(request: web.Request, relative: str) -> web.StreamResponse:
         return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
 
     # Хешированные бандлы неизменяемы, `index.html` НЕ ХРАНИМ вовсе.
-    #
-    # ⚠ `no-store`, а не `no-cache`: второе разрешает хранить и лишь обязывает
-    # переспросить, и этого оказалось мало — жилец оставался на старом
-    # интерфейсе до жёсткого обновления страницы (2026-09-08). Настоящий замок —
-    # адрес с версией (см. `MegaHomeAppRootView`), а это его подпорка.
     headers = (
         {"Cache-Control": "no-store"}
         if target.name == "index.html"
@@ -943,31 +647,21 @@ def _serve(request: web.Request, relative: str) -> web.StreamResponse:
 
 # ⚠ СПИСОК РЕГИСТРИРУЕМЫХ ДВЕРЕЙ — модульной константой, а не выражением внутри
 # функции, и это не стиль. Класс, ОПРЕДЕЛЁННЫЙ, но не попавший сюда, живёт в
-# коде, проходит замок маршрутов и отвечает жильцу обычным 404: ровно так
-# `MegaHomeVideoPreviewView` пролежал мёртвым с 0.2.53 по 0.2.59, и превью
-# при перемотке «не работало» на всех объектах. Теперь список читает и замок.
+# коде, проходит замок маршрутов и отвечает жильцу обычным 404. Теперь список
+# читает и замок.
 VIEWS: tuple[type[HomeAssistantView], ...] = (
     MegaHomeConfigView,
     MegaHomeStatesView,
     MegaHomeEventsView,
     MegaHomeCommandView,
     MegaHomeScenarioView,
+    MegaHomeConnectView,
     MegaHomePhotosView,
     MegaHomePhotoView,
     MegaHomeCropsView,
     MegaHomeCropView,
     MegaHomeAssetView,
     MegaHomeCameraFrameView,
-    MegaHomeVideoCamerasView,
-    MegaHomeVideoEventsView,
-    MegaHomeVideoThumbView,
-    MegaHomeVideoPreviewView,
-    MegaHomeVideoClipView,
-    MegaHomeVideoClipReadyView,
-    MegaHomeGatewayCallView,
-    MegaHomeWebRtcView,
-    MegaHomeWebRtcCandidatesView,
-    MegaHomeWebRtcCloseView,
     MegaHomeRelayView,
     MegaHomeServiceWorkerView,
     MegaHomeAppRootView,

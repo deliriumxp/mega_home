@@ -47,23 +47,19 @@ class CommandRejected(Exception):
 
 
 class Cameras(Protocol):
-    """Камеры ИСТОЧНИКА (в HA — сущности `camera.*`).
+    """Камеры ИСТОЧНИКА (в HA — сущности `camera.*`): прогрев и кадр плитки.
 
-    ⚠ Не путать со своей go2rtc (`go2rtc_session.py`): та — наш тракт видео и
-    есть у дома всегда, а камеры источника бывают не у каждого источника.
+    ⚠ Переговоров WebRTC здесь больше нет (`docs/plan-thin-gateway.md`): бандл
+    ведёт их с go2rtc сам, через `connect` к службе «go2rtc» — свой тракт видео
+    дом для этого больше не подставляет. `snapshot` остаётся: снаружи у
+    приложения нет ни одного адреса Home Assistant (`state.picture` — это
+    `/api/camera_proxy/...` самого HA, наружу недостижим), и кадр плитки едет
+    тем же переносом, что и остальной API (`api/camera-frame/<tileId>`).
     """
-
-    async def negotiate(
-        self, entity_id: str, sdp: str, remote: bool, trickle: bool
-    ) -> dict[str, Any]: ...
-
-    def close(self, entity_id: str, session_id: str) -> dict[str, Any]: ...
-
-    async def snapshot(self, entity_id: str) -> tuple[str, bytes]: ...
 
     def warm(self, entity_id: str) -> None: ...
 
-    async def stream_source(self, entity_id: str) -> str | None: ...
+    async def snapshot(self, entity_id: str) -> tuple[str, bytes]: ...
 
 
 class StateSource(Protocol):

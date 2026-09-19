@@ -16,8 +16,6 @@ from .const import (
     API_CONFIG,
     API_ICON,
     API_RELAY,
-    API_TRASSIR,
-    API_ACCESS_SECRET,
     API_VERSION,
     ICON_SIZE,
     RELAY_TIMEOUT,
@@ -80,34 +78,6 @@ class ManagerClient:
         manager decides what the key means, the home only carries the bytes.
         """
         return await self._get_bytes(f"{API_ASSET}/{quote(key, safe='')}")
-
-    async def async_trassir_credentials(self) -> dict[str, str]:
-        """Credentials for the object's TRASSIR recorder.
-
-        ⚠ A separate request instead of a field in the config, and that is the
-        security boundary, not a stylistic choice: the config body is handed to
-        the resident's browser verbatim (`ops.config`) over a local contour that
-        has no authentication yet. What travels here never leaves this process.
-        """
-        payload = await self._get_json(API_TRASSIR)
-        return {
-            key: value
-            for key, value in payload.items()
-            if key in ("username", "password", "sdkPassword") and isinstance(value, str)
-        }
-
-    async def async_access_secret(self, access: str) -> dict[str, str]:
-        """Учётка ОДНОГО доступа: набор именованных полей (`access_secrets.py`).
-
-        ⚠ Та же граница, что у учётки Trassir: в тело конфига не кладётся, из
-        этого процесса не уходит.
-        """
-        payload = await self._get_json(f"{API_ACCESS_SECRET}/{quote(access, safe='')}")
-        return {
-            str(key): str(value)
-            for key, value in payload.items()
-            if isinstance(value, (str, int)) and not isinstance(value, bool)
-        }
 
     async def async_agent(
         self, version: str | None, reports: list[dict[str, Any]]

@@ -1,11 +1,8 @@
-"""Перенос обычного HTTP-запроса к API дома по каналу менеджера.
+"""Перенос обычного HTTP-запроса к API дома по каналу менеджера (`relay_api.py`).
 
 ⚠ Смысл этих тестов один: **жилец снаружи должен уметь ровно то же, что дома, и
-теми же путями**. Раньше канал переносил четыре именованные операции, поэтому
-фотография комнаты, поставленная не из дома, оседала в браузере телефона и не
-доезжала никуда — а выглядело это как «в приложении снаружи чего-то не хватает».
-Проверяем поэтому не «работает ли фотография», а что перенос отвечает тем же,
-чем локальная дверь, и что границы у него на месте.
+теми же путями**. Проверяем поэтому не «работает ли фотография», а что перенос
+отвечает тем же, чем локальная дверь, и что границы у него на месте.
 """
 
 from __future__ import annotations
@@ -13,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import types
 from http import HTTPStatus
 from pathlib import Path
 
@@ -25,6 +21,7 @@ from mega_home.core import ops
 from mega_home.core.crops import CropStore
 from mega_home.core.imaging import LookStore
 from mega_home.core.photos import PhotoStore
+from mega_home.core.relay_api import handle
 
 JPEG = b"\xff\xd8\xff\xe0" + b"0" * 32
 
@@ -71,6 +68,7 @@ class _Bundle:
 class _Coordinator:
     version = "sha256:abc"
     bundle = _Bundle()
+    accesses = None
 
     def __init__(self, tmp: Path) -> None:
         self.data = CONFIG
@@ -89,7 +87,7 @@ def call(coordinator, method: str, path: str, body: bytes | None = None):
     payload = {"method": method, "path": path}
     if body is not None:
         payload["body"] = base64.b64encode(body).decode("ascii")
-    return asyncio.run(ops.run(coordinator, "http", payload))
+    return asyncio.run(handle(coordinator, payload))
 
 
 def body_of(answer) -> bytes:
@@ -140,7 +138,7 @@ def test_фон_плитки_снаружи_тоже_ложится_в_дом(co
 
 
 # Кадр камеры, подправленный СНАРУЖИ, — та же дисциплина, что у фото: ложится в
-# дом, а не остаётся у менеджера или в браузере телефона (2026-09-15).
+# дом, а не остаётся у менеджера или в браузере телефона.
 def test_кадр_камеры_снаружи_тоже_ложится_в_дом(coordinator):
     crop = {"x": 0.5, "y": 0.4, "w": 0.3}
     posted = call(coordinator, "POST", "api/crop/crop-cam", json.dumps(crop).encode())
@@ -181,9 +179,6 @@ def test_чужой_ключ_и_не_jpeg_отвергаются(coordinator):
 
 
 def test_файл_общего_канала_отдаётся_тем_же_переносом(coordinator):
-    # ⚠ Своего маршрута заготовок (`api/stock-photo/`) БОЛЬШЕ НЕТ (0.2.40): он
-    # появился раньше общего канала и делал ровно то же — фоны едут ключами
-    # `photo/room/*` и `photo/tile/*` манифеста, приложение просит их оттуда.
     coordinator.assets.path("photo/tile/t1", "a1").write_bytes(JPEG)
     answer = call(coordinator, "GET", "api/asset/photo/tile/t1")
     assert answer["contentType"] == "image/jpeg"
@@ -221,39 +216,6 @@ def test_иконка_сценария_не_выпускает_за_свой_к�
         assert err.value.status == HTTPStatus.NOT_FOUND
 
 
-def test_постер_камеры_едет_тем_же_переносом(coordinator, monkeypatch):
-    """⚠ Кадр — обработчик ПУТИ, а не новая операция канала.
-
-    Снаружи у приложения нет ни одного адреса Home Assistant, а переговоры
-    WebRTC длятся секунды: без постера просмотр открывается чёрным
-    прямоугольником. Один кадр на ОТКРЫТИЕ камеры — кадра для плитки снаружи
-    нет вовсе, он обновляется по таймеру и был бы потоком через менеджер.
-    """
-    coordinator.data = {
-        **CONFIG,
-        "tiles": [
-            *CONFIG["tiles"],
-            {"id": "cam1", "roomId": "r1", "name": "Калитка", "domain": "camera",
-             "entityId": "camera.hall"},
-        ],
-    }
-
-    async def snapshot(entity_id):
-        assert entity_id == "camera.hall"
-        # ⚠ Сырые байты, не base64: `webrtc.snapshot` отдаёт кадр как есть
-        # (2026-09-08), кодирует его в base64 только `relay_api.handle` —
-        # ровно один раз, а не дважды туда-обратно.
-        return "image/jpeg", JPEG
-
-    coordinator.source.cameras = types.SimpleNamespace(snapshot=snapshot, warm=lambda _id: None)
-    answer = call(coordinator, "GET", "api/camera-frame/cam1")
-
-    assert body_of(answer) == JPEG
-    assert answer["contentType"] == "image/jpeg"
-    # Кадр живой: закешированный постер показывал бы вчерашний двор.
-    assert answer["cacheControl"] == "no-store"
-
-
 def test_неизвестный_путь_это_отказ_а_не_догадка(coordinator):
     with pytest.raises(ops.OpError) as err:
         call(coordinator, "GET", "api/чего-нибудь")
@@ -282,75 +244,24 @@ def test_фон_снятой_из_состава_комнаты_читается
     assert err.value.status == HTTPStatus.NOT_FOUND
 
 
-def test_универсальная_дверь_доезжает_и_снаружи(coordinator, monkeypatch):
-    """⚠ Дверь обязана работать ОБЕИМИ дверями приложения.
+def test_connect_доезжает_и_снаружи_тем_же_переносом(coordinator, monkeypatch):
+    """⚠ `connect` — единственный контракт транспорта, и он ходит ОБЕИМИ дверями.
 
-    Дорога к регистратору теперь ОДНА: именованные маршруты перемотки,
-    состояния и словаря команд сняты (`docs/plan-video-rework.md`, этап 1).
-    Значит всё, что жилец делает с архивом, снаружи идёт этим переносом — и
-    если он отвалится, дома всё работает, а снаружи не работает НИЧЕГО: ни
-    перемотка, ни календарь, ни разметка суток, ни строка «поиск в архиве…».
-    Разница «дома/снаружи» обязана оставаться только в адресе базы.
+    Снаружи бандл делает то же самое, что дома, — по тому же коду
+    (`ops.connect`), не по копии правил в переносе.
     """
-    asked: list[dict] = []
+    from mega_home.core import connect as connect_mod
 
-    async def gateway_call(coordinator, payload):
-        asked.append(payload)
-        return [{"token": "tok1", "state": "4", "time": "2026-09-12 11:56:58"}]
+    calls: list[dict] = []
 
-    monkeypatch.setattr(ops, "gateway_call", gateway_call)
-    payload = json.dumps(
-        {
-            "method": "GET",
-            "path": "/archive_status",
-            "params": {"type": "state"},
-            "clip": "trassir:tok1",
-        }
-    ).encode()
-    answer = call(coordinator, "POST", "api/gateway/call", payload)
+    async def fake_perform(payload):
+        calls.append(payload)
+        return {"status": 200, "headers": {}, "body": "ok"}
 
-    # ⚠ Вызов уходит дому КАК СОСТАВЛЕН: перенос не толкует ни путь, ни params.
-    assert asked == [
-        {
-            "method": "GET",
-            "path": "/archive_status",
-            "params": {"type": "state"},
-            "clip": "trassir:tok1",
-        }
-    ]
-    assert json_of(answer)[0]["state"] == "4"
+    monkeypatch.setattr(connect_mod, "perform", fake_perform)
 
+    body = json.dumps({"kind": "http", "host": "192.168.1.9", "port": 80, "path": "/x"}).encode()
+    answer = call(coordinator, "POST", "api/connect", body)
 
-def test_архив_по_метке_доезжает_снаружи(coordinator, monkeypatch):
-    """⚠ Классический просмотр архива обязан работать ОБЕИМИ дверями.
-
-    Открытие записи по метке и выбор дня — не «домашняя» возможность: снаружи
-    жилец смотрит архив ровно так же, и разница «дома/снаружи» обязана
-    оставаться только в адресе базы.
-    """
-    opened: list[tuple] = []
-
-    async def clip_at(
-        coordinator, guid, timestamp_us, camera_name, quality=None,
-        window_start_us=None, window_stop_us=None,
-    ):
-        # ⚠ Окно присылает ПРИЛОЖЕНИЕ: шкала — его дело, дом хранит присланное.
-        opened.append((guid, timestamp_us, camera_name, quality, window_start_us, window_stop_us))
-        return {"id": "trassir:tok1", "startUs": window_start_us, "stopUs": window_stop_us}
-
-    monkeypatch.setattr(ops, "trassir_clip_at", clip_at)
-
-    body = json.dumps(
-        {
-            "timestampUs": 1788960000000000,
-            "quality": "sub",
-            "windowStartUs": 1788900000000000,
-            "windowStopUs": 1788986400000000,
-        }
-    ).encode()
-    clip = json_of(call(coordinator, "POST", "api/video/channels/cam1/clip", body))
-
-    assert opened == [
-        ("cam1", 1788960000000000, None, "sub", 1788900000000000, 1788986400000000)
-    ]
-    assert clip["startUs"] == 1788900000000000, "окно уходит дому как есть"
+    assert calls == [{"kind": "http", "host": "192.168.1.9", "port": 80, "path": "/x"}]
+    assert json_of(answer) == {"status": 200, "headers": {}, "body": "ok"}
