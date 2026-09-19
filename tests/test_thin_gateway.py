@@ -118,9 +118,14 @@ CORE_MODULES = sorted(CORE.glob("*.py"))
 # терпим в core/. `session` и `camera` намеренно НЕ здесь: HTTP-сессия
 # (`aiohttp.ClientSession`) — транспорт, `camera` — домен сущностей источника HA и
 # кропы плиток (части B, F). Вход-по-описанию ловят `login`, `challenge`.
+# ⚠ Имён хэшей (`sha1`, `sha256`, `md5`) здесь тоже НЕТ: они законны в хранилище
+# (имена файлов фонов и кропов — `sha1(id)`, сверка бандла — `sha256`). Запрет
+# `sha1` в 0.4.0 заставил агента переименовать файлы на диске через `blake2b`,
+# и все фоны комнат и кропы на объектах «пропали» (живой объект 2026-09-20).
+# Вычисления ВХОДА ловит замок 4 (`templating` без `hashlib`), а не слова.
 FORBIDDEN_WORDS = (
     "trassir", "akuvox", "hikvision", "dahua", "onvif", "door", "archive",
-    "nonce", "md5", "sha1", "sha256", "deny", "manageronly", "login", "challenge",
+    "nonce", "deny", "manageronly", "login", "challenge",
 )
 
 

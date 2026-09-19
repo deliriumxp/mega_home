@@ -21,7 +21,7 @@ authentication yet — see the module docstring in `http.py`).
 from __future__ import annotations
 
 from collections.abc import Iterable
-from hashlib import blake2b
+from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +45,7 @@ class PhotoStore:
         return self._dir
 
     def path(self, room_id: str) -> Path:
-        return self._dir / f"{blake2b(room_id.encode('utf-8'), digest_size=20).hexdigest()}.jpg"
+        return self._dir / f"{sha1(room_id.encode('utf-8')).hexdigest()}.jpg"
 
     def versions(self, room_ids: Iterable[str]) -> dict[str, str]:
         """Room id -> version for the rooms that have a photo.
@@ -84,7 +84,7 @@ class PhotoStore:
 
     @staticmethod
     def _version(path: Path) -> str:
-        digest = blake2b(digest_size=20)
+        digest = sha1()
         with path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(64 * 1024), b""):
                 digest.update(chunk)

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from hashlib import blake2b
+from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +38,7 @@ class CropStore:
         self._dir = directory
 
     def path(self, tile_id: str) -> Path:
-        return self._dir / f"{blake2b(tile_id.encode('utf-8'), digest_size=20).hexdigest()}.json"
+        return self._dir / f"{sha1(tile_id.encode('utf-8')).hexdigest()}.json"
 
     def all(self, tile_ids: Iterable[str]) -> dict[str, dict[str, float]]:
         """Tile id -> crop, for the tiles that actually have one stored."""

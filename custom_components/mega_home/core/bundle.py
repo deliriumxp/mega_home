@@ -23,7 +23,7 @@ from .const import LOGGER
 from .host import Host
 
 BUNDLE_DIR = "mega_home_www"
-_DIGEST_ALGO = "sha" + "256"
+_DIGEST_ALGO = "sha256"
 # Сколько версий держим на диске: активная и предыдущая. Предыдущая — это откат
 # без выезда на объект.
 KEEP_VERSIONS = 2
@@ -37,8 +37,8 @@ class BundleStore:
     ⚠ `version` here is the DIRECTORY name of the active bundle, i.e. the
     manifest version run through `_safe_name` — after a restart that name is all
     that is known about what lies on disk. Everything that compares versions has
-    to go through `_safe_name` too; comparing a raw `sha‑256:…` against the stored
-    `sha‑256-…` matches never, and "never" means re-downloading the whole bundle
+    to go through `_safe_name` too; comparing a raw `sha256:…` against the stored
+    `sha256-…` matches never, and "never" means re-downloading the whole bundle
     on every nudge (see `async_sync`).
     """
 
@@ -131,7 +131,7 @@ class BundleStore:
             # what we are about to download.
             LOGGER.debug("App nudge said %s, manifest says %s", version, wanted)
         # ⚠ Сравниваем ИМЕНА КАТАЛОГОВ, а не сырую версию с именем: `self.version`
-        # прошло через `_safe_name` (в `sha‑256:…` двоеточие стало дефисом), и
+        # прошло через `_safe_name` (в `sha256:…` двоеточие стало дефисом), и
         # прямое сравнение не совпадало никогда. Ценой были полная перекачка
         # бандла на каждый nudge и на каждое переподключение канала, а `_swap`
         # при этом сносил каталог, из которого прямо сейчас раздаётся приложение,
