@@ -158,7 +158,15 @@ class MqttClient:
     async def publish(self, topic: str, data: bytes, qos: int = 0, retain: bool = False) -> None:
         packet_id = self._packet_id() if qos else 0
         waiter = self._expect(packet_id) if qos else None
-        await self._send(publish_packet(topic, data, 1 if qos else 0, retain, packet_id))
+        try:
+            await self._send(publish_packet(topic, data, 1 if qos else 0, retain, packet_id))
+        except MqttError:
+            # Ожидание снято вместе с отказом отправки: иначе его исключение
+            # никто не читает («Future exception was never retrieved» в логе HA).
+            if waiter is not None:
+                self._acks.pop(packet_id, None)
+                waiter.cancel()
+            raise
         if waiter is not None:
             await self._wait(waiter, "брокер не подтвердил публикацию")
 

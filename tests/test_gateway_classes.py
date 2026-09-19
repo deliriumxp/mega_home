@@ -377,8 +377,9 @@ def test_буфер_событий_на_время_обрыва() -> None:
     hub = EventHub()
     local: list[dict[str, Any]] = []
     hub.subscribe(local.append)
-    hub.publish("intercom", "sip-bridge", "call", {"caller": "192.168.88.90"})
-    old = hub.publish("intercom", "sip-bridge", "cancel")
+    # `local=True` — как ставит SIP-мост: звонок обязана увидеть панель без интернета.
+    hub.publish("intercom", "sip-bridge", "call", {"caller": "192.168.88.90"}, local=True)
+    old = hub.publish("intercom", "sip-bridge", "cancel", local=True)
     old["at"] -= BUFFER_TTL_S + 1
     sent: list[dict[str, Any]] = []
     fresh = hub.attach(lambda frame: sent.append(frame) or True)

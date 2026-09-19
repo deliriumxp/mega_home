@@ -287,10 +287,8 @@ class HttpAccess:
         else:
             kwargs["json"] = params
         try:
-            async with (
-                client.get(url, **kwargs) if spec.method == "GET" else client.request(spec.method, url, **kwargs)
-            ) as response:
-                status, raw = response.status, await response.content.read()
+            async with client.request(spec.method, url, **kwargs) as response:
+                status, raw = response.status, await read_all(response)
                 headers = getattr(response, "headers", None) or {}
                 cookies = getattr(response, "cookies", None) or {}
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
@@ -391,12 +389,3 @@ def reason(err: Exception) -> str:
     if "url=" in text or "?" in text:
         text = ""
     return f"Система не отвечает: {text}" if text else f"Система не отвечает ({type(err).__name__})"
-
-
-def field_of(payload: bytes, name: str) -> str:
-    """Поле ответа по пути — единственный разбор, который двери позволен."""
-    try:
-        data = json.loads(payload.decode("utf-8", "ignore")) if payload else None
-    except ValueError:
-        return ""
-    return pick(data, name)

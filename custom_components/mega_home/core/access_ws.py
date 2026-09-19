@@ -19,10 +19,9 @@ import aiohttp
 
 from .access import AccessDescriptor
 from .access_http import AccessDenied, AccessUnreachable
+from .access_raw import MAX_SEND, MAX_WINDOW
 
 MAX_MESSAGES = 64
-MAX_SEND = 64 * 1024
-MAX_WINDOW = 30.0
 
 
 def outgoing(items: Any) -> list[str | bytes]:
@@ -60,13 +59,15 @@ async def ws_exchange(door: Any, descriptor: AccessDescriptor, call: dict[str, A
     path = AccessGateway.check(descriptor, "GET", path, scope)
     send = outgoing(call.get("send"))
     try:
-        want = min(max(int(call.get("receive") or 1), 0), MAX_MESSAGES)
+        # `receive: 0` — послать и не ждать (уведомление RPC без ответа).
+        want = min(max(int(1 if call.get("receive") is None else call["receive"]), 0), MAX_MESSAGES)
         window = min(max(float(call.get("timeout") or descriptor.timeout), 0.1), MAX_WINDOW)
     except (TypeError, ValueError) as err:
         raise AccessDenied("receive и timeout — числа") from err
     until = str(call.get("until") or "")
     params = call.get("params") if isinstance(call.get("params"), dict) else None
-    socket = await door.http.ws(descriptor, path, params)
+    headers = call.get("headers") if isinstance(call.get("headers"), dict) else None
+    socket = await door.http.ws(descriptor, path, params, headers)
     got: list[dict[str, Any]] = []
     try:
         for item in send:

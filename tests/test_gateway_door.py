@@ -152,12 +152,11 @@ def test_сессия_подставляется_домом(monkeypatch: pytest.
         closed = False
 
         def request(self, method: str, url: str, **kwargs: Any) -> Answer:
+            if url.endswith("/login"):
+                seen.append({"вход": url, "params": kwargs.get("params")})
+                return Answer(b'{"sid": "abc"}')
             seen.append({"метод": method, "url": url, "params": kwargs.get("params")})
             return Answer(b'{"success": 1}')
-
-        def get(self, url: str, **kwargs: Any) -> Answer:
-            seen.append({"вход": url, "params": kwargs.get("params")})
-            return Answer(b'{"sid": "abc"}')
 
     call._http._clients[False] = Client()  # noqa: SLF001 — шов HTTP-стороны двери
     asyncio.run(call.call(None, "GET", "/archive_status", {"type": "timeline"}))
@@ -253,7 +252,7 @@ def test_ошибка_связи_это_НЕДОСТУПНОСТЬ_а_не_от�
     class Broken:
         closed = False
 
-        def get(self, *_: Any, **__: Any) -> Any:
+        def request(self, *_: Any, **__: Any) -> Any:
             raise aiohttp.ClientConnectionError("Server disconnected")
 
     call._http._clients[False] = Broken()  # noqa: SLF001 — шов HTTP-стороны двери
@@ -281,9 +280,6 @@ def test_недоступность_регистратора_отдаётся_50
 
     class Broken:
         closed = False
-
-        def get(self, *_: Any, **__: Any) -> Any:
-            raise aiohttp.ClientConnectionError("Server disconnected")
 
         def request(self, *_: Any, **__: Any) -> Any:
             raise aiohttp.ClientConnectionError("Server disconnected")
@@ -323,7 +319,7 @@ def test_сертификат_регистратора_не_проверяетс
     регистратора — иначе дверь замолчит на всех объектах сразу.
     """
     call = door()
-    session = asyncio.run(call._client())
+    session = asyncio.run(call.http._client(False))  # noqa: SLF001 — шов HTTP-стороны двери
 
     assert session.connector._ssl is False  # noqa: SLF001 — замок на решение
     asyncio.run(call.async_close())
@@ -420,12 +416,11 @@ def test_дверь_говорит_сессией_драйвера() -> None:
         closed = False
 
         def request(self, method: str, url: str, **kwargs: Any) -> Answer:
+            if url.endswith("/login"):
+                seen.append({"вход": url})
+                return Answer('{"sid": "своя"}'.encode("utf-8"))
             seen.append({"метод": method, "params": kwargs.get("params")})
             return Answer(b"[]")
-
-        def get(self, url: str, **kwargs: Any) -> Answer:
-            seen.append({"вход": url})
-            return Answer('{"sid": "своя"}'.encode("utf-8"))
 
     call._http._clients[False] = Client()  # noqa: SLF001 — шов HTTP-стороны двери
     asyncio.run(call.call(None, "GET", "/archive_status", {"type": "calendar"}))
@@ -597,18 +592,19 @@ def test_ответ_читается_ЦЕЛИКОМ_а_не_первым_кус�
     class Body:
         """Поток, отдающий тело КУСКАМИ, — как настоящий aiohttp."""
 
-        async def read(self) -> bytes:
-            # Вход читается до конца — это другой путь, не предмет спеки.
-            return b'{"sid":"door"}'
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
 
         async def iter_chunked(self, _size: int) -> Any:
-            for at in range(0, len(whole), 8):
-                yield whole[at : at + 8]
+            for at in range(0, len(self._payload), 8):
+                yield self._payload[at : at + 8]
 
     class Answer:
         status = 200
         content_type = "application/json"
-        content = Body()
+
+        def __init__(self, payload: bytes) -> None:
+            self.content = Body(payload)
 
         async def __aenter__(self) -> "Answer":
             return self
@@ -619,11 +615,9 @@ def test_ответ_читается_ЦЕЛИКОМ_а_не_первым_кус�
     class Client:
         closed = False
 
-        def request(self, *_: Any, **__: Any) -> Answer:
-            return Answer()
-
-        def get(self, *_: Any, **__: Any) -> Answer:
-            return Answer()
+        def request(self, _method: str, url: str, **__: Any) -> Answer:
+            # Вход тоже читается кусками — тем же `read_all`, что и вызов.
+            return Answer(b'{"sid":"door"}' if url.endswith("/login") else whole)
 
     call._http._clients[False] = Client()  # noqa: SLF001 — шов HTTP-стороны двери
     _, _, payload = asyncio.run(call.call(None, "GET", "/archive_status", {"type": "calendar"}))
@@ -680,22 +674,22 @@ def test_длинный_опрос_держится_дольше_обычног�
     пустотой. Оборвав его обычными тридцатью, дверь теряет ровно то, что
     регистратор собирался прислать, и документированная ПОДПИСКА вырождается в
     частый опрос. Тот же урок уже стоил ленты событий (`/events`: 7 потерянных
-    событий из 8 за минуту).
+    событий из 8 за минуту). Прежнее описание (без `auth`) получает эти пути и
+    срок как данные (`access.py`).
     """
-    from mega_home.core.gateway import CALL_TIMEOUT, LONG_POLL_TIMEOUT, _call_timeout
+    from mega_home.core.access import CALL_TIMEOUT, descriptor_of
 
-    assert _call_timeout("/archive_events") == LONG_POLL_TIMEOUT
-    assert _call_timeout("/events") == LONG_POLL_TIMEOUT
+    d = descriptor_of({"host": "10.0.0.5"})
+    assert d.is_long_poll("/archive_events") and d.is_long_poll("/events")
     # ⚠ С запасом к измеренным 60 с: срок держит РЕГИСТРАТОР, и его потолок
     # нам не обещан.
-    assert LONG_POLL_TIMEOUT >= 120
+    assert d.long_poll_timeout >= 120 > CALL_TIMEOUT
 
     # Обычный вызов длинным сроком не становится: повисший снимок держал бы
     # жест жильца без ответа.
-    assert _call_timeout("/archive_status") == CALL_TIMEOUT
-    assert _call_timeout("/get_video") == CALL_TIMEOUT
+    assert not d.is_long_poll("/archive_status") and not d.is_long_poll("/get_video")
     # Запрос с параметрами разбирается по пути, а не по строке целиком.
-    assert _call_timeout("/archive_events?token=abc") == LONG_POLL_TIMEOUT
+    assert d.is_long_poll("/archive_events?token=abc")
 
 
 # --- вид доступа и паспорт (2026-09-14) -------------------------------------

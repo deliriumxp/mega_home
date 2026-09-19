@@ -13,7 +13,7 @@ UsernameToken) — `base64(sha1(nonce + created + password))`. Посчитат�
   `{=[a]:[b]:[c]|ф}`      склейка значений и текста, затем фильтры.
 Фильтры: `url`, `md5`, `sha1`, `sha256` (дают БАЙТЫ), `base64`, `hex`, `upper`,
 `lower`. Хэш-фильтры работают над байтами, чтобы `sha1(nonce + …)` брал СЫРОЙ
-nonce, как требует WS-Security.
+nonce, как требует WS-Security. Байты на выходе шаблона — всегда hex.
 Живые значения на один рендер: `nonce` (16 случайных байт), `created` (UTC,
 ISO 8601 с `Z`), `ts` (секунды эпохи), `tsMs`.
 
@@ -52,12 +52,10 @@ def _bytes(value: Any) -> bytes:
 
 
 def _text(value: Any) -> str:
-    if isinstance(value, bytes):
-        try:
-            return value.decode("utf-8")
-        except UnicodeDecodeError:
-            return value.hex()
-    return str(value)
+    # ⚠ Байты (nonce, хэш) — ВСЕГДА hex, а не «UTF-8, если декодируется»: 16
+    # случайных байт раз в десятки тысяч входов складывались в допустимый UTF-8,
+    # и вход в устройство не проходил «иногда» (ревью 2026-09-19).
+    return value.hex() if isinstance(value, bytes) else str(value)
 
 
 def _apply(value: Any, name: str) -> Any:

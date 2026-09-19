@@ -27,7 +27,8 @@ from typing import Any
 
 from .access import AccessDescriptor
 from .access_secrets import template_values
-from .templating import pick, render
+from .const import LOGGER
+from .templating import live_values, pick, render
 
 MIN_PAUSE_S = 1.0
 IDLE_S = 120.0
@@ -72,13 +73,13 @@ def carry(values: dict[str, Any], spec: dict[str, Any], payload: bytes) -> None:
             values[f"carry.{name}"] = found
 
 
-def _render_obj(value: Any, values: dict[str, Any]) -> Any:
+def _render_obj(value: Any, values: dict[str, Any], live: dict[str, Any] | None = None) -> Any:
     if isinstance(value, str):
-        return render(value, values)
+        return render(value, values, live)
     if isinstance(value, dict):
-        return {str(k): _render_obj(v, values) for k, v in value.items()}
+        return {str(k): _render_obj(v, values, live) for k, v in value.items()}
     if isinstance(value, list):
-        return [_render_obj(v, values) for v in value]
+        return [_render_obj(v, values, live) for v in value]
     return value
 
 
@@ -111,20 +112,23 @@ async def split(reader: Any, sep: bytes, emit: Any, idle: float) -> None:
 async def _request(door: Any, descriptor: AccessDescriptor, block: dict[str, Any], values: dict[str, Any]) -> tuple[int, str, bytes]:
     from .gateway import SCOPE_MANAGER
 
+    # ⚠ Один набор живых значений на ЗАПРОС: nonce в заголовке и digest в теле
+    # иначе считались бы от разных nonce (WS-Security).
+    live = live_values()
     body = block.get("body")
     raw = None
     if isinstance(body, (dict, list)):
-        raw = json.dumps(_render_obj(body, values)).encode()
+        raw = json.dumps(_render_obj(body, values, live)).encode()
     elif isinstance(body, str) and body:
-        raw = render(body, values).encode()
+        raw = render(body, values, live).encode()
     params = block.get("params")
     status, kind, payload, _ = await door.call_full(
         descriptor.id,
         str(block.get("method") or "GET"),
-        render(str(block.get("path") or "/"), values),
-        _render_obj(params, values) if isinstance(params, dict) else None,
+        render(str(block.get("path") or "/"), values, live),
+        _render_obj(params, values, live) if isinstance(params, dict) else None,
         raw,
-        headers=_render_obj(block["headers"], values) if isinstance(block.get("headers"), dict) else None,
+        headers=_render_obj(block["headers"], values, live) if isinstance(block.get("headers"), dict) else None,
         scope=SCOPE_MANAGER,
     )
     return status, kind, payload
@@ -142,13 +146,20 @@ async def poll(ctx: Any, descriptor: AccessDescriptor, source: str, spec: dict[s
     long_poll = descriptor.is_long_poll(str(spec.get("path") or "/")) or spec.get("longPoll") is True
     changes_only = spec.get("changesOnly", not long_poll) is True
     last: tuple[int, bytes] | None = None
+    loop = asyncio.get_running_loop()
     while True:
+        started = loop.time()
         status, kind, payload = await _request(ctx.door, descriptor, spec, values)
         carry(values, spec, payload)
         if not changes_only or (status, payload) != last:
             last = (status, payload)
             ctx.emit(descriptor, source, spec, "response", {"status": status, "contentType": kind, **body_of(payload)})
-        await asyncio.sleep(0 if long_poll else pause)
+        # ⚠ Долгий опрос без паузы — только пока устройство ДЕРЖИТ запрос. Ответ
+        # быстрее секунды или отказ (401 после смены пароля, 404) без паузы
+        # превращался в горячий цикл: дом долбил устройство и слал событие на
+        # каждый ответ (ревью 2026-09-19).
+        quick = loop.time() - started < MIN_PAUSE_S
+        await asyncio.sleep(pause if not long_poll or quick or status >= 400 else 0)
 
 
 async def stream(ctx: Any, descriptor: AccessDescriptor, source: str, spec: dict[str, Any]) -> None:
@@ -191,9 +202,12 @@ async def _keepalive(send: Any, spec: dict[str, Any], values: dict[str, Any]) ->
     if not isinstance(block, dict) or not block.get("send"):
         return
     every = seconds(block.get("every"), 30.0, 1.0)
-    while True:
-        await asyncio.sleep(every)
-        await send(render(str(block["send"]), values))
+    try:
+        while True:
+            await asyncio.sleep(every)
+            await send(render(str(block["send"]), values))
+    except Exception as err:  # noqa: BLE001 — сокет уже закрыт: обрыв заметит чтение
+        LOGGER.debug("keepalive источника остановлен: %s", type(err).__name__)
 
 
 async def ws(ctx: Any, descriptor: AccessDescriptor, source: str, spec: dict[str, Any]) -> None:
@@ -202,7 +216,14 @@ async def ws(ctx: Any, descriptor: AccessDescriptor, source: str, spec: dict[str
     from .access_ws import incoming
 
     values = await base_values(ctx.door, descriptor)
-    socket = await ctx.door.http.ws(descriptor, render(str(spec.get("path") or "/"), values))
+    # `params` и `headers` описания — как у `stream`: часть устройств просит
+    # ключ в query или свой заголовок уже на рукопожатии.
+    socket = await ctx.door.http.ws(
+        descriptor,
+        render(str(spec.get("path") or "/"), values),
+        _render_obj(spec["params"], values) if isinstance(spec.get("params"), dict) else None,
+        _render_obj(spec["headers"], values) if isinstance(spec.get("headers"), dict) else None,
+    )
     idle = seconds(spec.get("idle"), IDLE_S, 5.0)
 
     async def receive() -> str:

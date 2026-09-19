@@ -75,6 +75,11 @@ class Listeners:
         if signature == self._signature or self._stopped:
             return
         self._signature = signature
+        # Прежний перезапуск, не успевший взять замок, снимается: иначе сначала
+        # поднялись бы устаревшие источники, и только потом свежие.
+        previous = self._restarting
+        if isinstance(previous, asyncio.Future) and not previous.done():
+            previous.cancel()
         self._restarting = self._env.spawn(self._restart(descriptors), "mega_home listeners")
 
     async def _restart(self, descriptors: list[AccessDescriptor]) -> None:
@@ -104,11 +109,17 @@ class Listeners:
             return
         workers = {
             "poll": out.poll, "stream": out.stream, "ws": out.ws, "mqtt": out.mqtt, "tcp": out.tcp,
-            "tcpServer": self._tcp_server, "udp": self._udp,
+            "tcpServer": _tcp_server, "udp": _udp,
         }
         worker = workers.get(kind)
         if worker is None:
             LOGGER.warning("Источник событий «%s» дом пока не умеет", kind)
+            return
+        if kind in ("tcpServer", "udp") and _port(spec) is None:
+            # ⚠ Словами в `why`, а не вечный повтор с KeyError на уровне debug:
+            # инсталлятор видел «источник есть», а он мёртв (ревью 2026-09-19).
+            self.why = f"{name}: у источника «{kind}» не задан порт"
+            LOGGER.warning("События устройств: %s", self.why)
             return
         self._run(self._forever(worker, descriptor, source, spec, name), name)
 
@@ -154,10 +165,7 @@ class Listeners:
         while True:
             started = monotonic()
             try:
-                if worker in (self._tcp_server, self._udp):
-                    await worker(descriptor, source, spec)
-                else:
-                    await worker(self, descriptor, source, spec)
+                await worker(self, descriptor, source, spec)
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001 — источник не роняет дом
@@ -224,63 +232,75 @@ class Listeners:
             content_type=str(reply.get("contentType") or "text/plain"),
         )
 
-    # --- входящий TCP и UDP ---------------------------------------------------
 
-    async def _tcp_server(self, descriptor: AccessDescriptor, source: str, spec: dict[str, Any]) -> None:
-        sep = out.delimiter(spec, b"\n")
-        allowed = _host_ip(descriptor.host)
-        idle = out.seconds(spec.get("idle"), out.IDLE_S, 5.0)
 
-        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            peer = writer.get_extra_info("peername")
-            if allowed is None or not peer or _host_ip(peer[0]) != allowed:
-                writer.close()
-                return
-            try:
-                await out.split(reader, sep, lambda item: self.emit(descriptor, source, spec, "data", body_of(item)), idle)
-            except (ConnectionError, OSError):
-                pass
-            finally:
-                writer.close()
+# --- входящий TCP и UDP -------------------------------------------------------
+# Та же сигнатура, что у исходящих источников (`listeners_out.py`): таблица
+# `workers` в `_start_source` — единственное место, где виды различаются.
 
-        server = await asyncio.start_server(handle, "0.0.0.0", int(spec["port"]))
-        self._servers.append(server)
-        async with server:
-            await server.serve_forever()
 
-    async def _udp(self, descriptor: AccessDescriptor, source: str, spec: dict[str, Any]) -> None:
-        port = int(spec["port"])
-        group = str(spec.get("group") or "")
-        allowed = _host_ip(descriptor.host)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def _port(spec: dict[str, Any]) -> int | None:
+    try:
+        port = int(spec.get("port") or 0)
+    except (TypeError, ValueError):
+        return None
+    return port if 0 < port < 65536 else None
+
+
+async def _tcp_server(ctx: Listeners, descriptor: AccessDescriptor, source: str, spec: dict[str, Any]) -> None:
+    sep = out.delimiter(spec, b"\n")
+    allowed = _host_ip(descriptor.host)
+    idle = out.seconds(spec.get("idle"), out.IDLE_S, 5.0)
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        peer = writer.get_extra_info("peername")
+        if allowed is None or not peer or _host_ip(peer[0]) != allowed:
+            writer.close()
+            return
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("0.0.0.0", port))
-            if group:
-                membership = socket.inet_aton(group) + socket.inet_aton("0.0.0.0")
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
-        except OSError:
-            sock.close()
-            raise
-        emit = self.emit
-
-        class Receiver(asyncio.DatagramProtocol):
-            def datagram_received(self, data: bytes, addr: Any) -> None:
-                sender = _host_ip(addr[0])
-                # Мультикаст шлют многие — тогда адрес доступа и есть группа, и
-                # принимается любой отправитель из частной сети.
-                if group and allowed is not None and allowed.is_multicast:
-                    if sender is None or not sender.is_private:
-                        return
-                elif sender != allowed:
-                    return
-                emit(descriptor, source, spec, "datagram", {"from": addr[0], **body_of(data)})
-
-        transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(Receiver, sock=sock)
-        try:
-            await asyncio.Event().wait()
+            await out.split(reader, sep, lambda item: ctx.emit(descriptor, source, spec, "data", body_of(item)), idle)
+        except (ConnectionError, OSError):
+            pass
         finally:
-            transport.close()
+            writer.close()
+
+    server = await asyncio.start_server(handle, "0.0.0.0", _port(spec))
+    ctx._servers.append(server)  # noqa: SLF001 — сервер закрывает владелец при остановке
+    async with server:
+        await server.serve_forever()
+
+
+async def _udp(ctx: Listeners, descriptor: AccessDescriptor, source: str, spec: dict[str, Any]) -> None:
+    group = str(spec.get("group") or "")
+    allowed = _host_ip(descriptor.host)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", _port(spec)))
+        if group:
+            membership = socket.inet_aton(group) + socket.inet_aton("0.0.0.0")
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+    except OSError:
+        sock.close()
+        raise
+
+    class Receiver(asyncio.DatagramProtocol):
+        def datagram_received(self, data: bytes, addr: Any) -> None:
+            sender = _host_ip(addr[0])
+            # Мультикаст шлют многие — тогда адрес доступа и есть группа, и
+            # принимается любой отправитель из частной сети.
+            if group and allowed is not None and allowed.is_multicast:
+                if sender is None or not sender.is_private:
+                    return
+            elif sender != allowed:
+                return
+            ctx.emit(descriptor, source, spec, "datagram", {"from": addr[0], **body_of(data)})
+
+    transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(Receiver, sock=sock)
+    try:
+        await asyncio.Event().wait()
+    finally:
+        transport.close()
 
 
 def _same_host(remote: str | None, host: str) -> bool:

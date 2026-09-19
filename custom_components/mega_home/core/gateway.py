@@ -25,15 +25,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from .access import (
-    CALL_TIMEOUT,
-    KINDS,
-    LEGACY_LONG_POLL,
-    LEGACY_LONG_POLL_TIMEOUT,
-    AccessDescriptor,
-    descriptor_of,
-    fill,
-)
+from .access import CALL_TIMEOUT, KINDS, AccessDescriptor, descriptor_of, fill
 from .access_http import (
     MAX_RESPONSE_BYTES,
     AccessDenied,
@@ -46,21 +38,14 @@ from .const import LOGGER
 
 __all__ = [
     "AccessDenied", "AccessDescriptor", "AccessGateway", "AccessUnreachable",
-    "CALL_TIMEOUT", "LONG_POLL_TIMEOUT", "MAX_RESPONSE_BYTES", "descriptor_of",
+    "CALL_TIMEOUT", "MAX_RESPONSE_BYTES", "descriptor_of",
     "SCOPE_MANAGER", "SCOPE_RESIDENT", "_read_all",
 ]
 
-LONG_POLL_TIMEOUT = LEGACY_LONG_POLL_TIMEOUT
 # Уровни вызова. ⚠ «Менеджер» ставит только код менеджера в кадре канала
 # (`link.py`); запрос жильца снаружи едет внутри `payload` и уровня не меняет.
 SCOPE_RESIDENT = "resident"
 SCOPE_MANAGER = "manager"
-
-
-def _call_timeout(path: str) -> float:
-    """Срок прежнего описания Trassir: длинный опрос держат, обычный вызов — нет."""
-    start = path.split("?", 1)[0].rstrip("/")
-    return LONG_POLL_TIMEOUT if start in LEGACY_LONG_POLL else CALL_TIMEOUT
 
 
 class AccessGateway:
@@ -283,10 +268,6 @@ class AccessGateway:
             # успевшая умереть к выгрузке, создавала бы сессию, которую никто не
             # закроет (ревью 2026-09-19).
             raise AccessUnreachable("Дом перезапускает интеграцию — повторите запрос")
-
-    async def _client(self, verify: bool = False) -> Any:
-        """Соединение HTTP-стороны (замок на решение о сертификате — в спеке)."""
-        return await self._http._client(verify)  # noqa: SLF001
 
     def _known(self, access: str | None) -> AccessDescriptor:
         self._check_open()

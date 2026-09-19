@@ -393,3 +393,86 @@ def test_вход_внутри_websocket_шагами() -> None:
 
     got = json.loads(asyncio.run(scenario())[0])["got"]
     assert got == ["hello", hashlib.sha256(b"N1pw").hexdigest()]
+
+
+# --- ревью 2026-09-19 (второе): горячий цикл, hex, конверт ошибки, порт -----------
+
+
+def test_долгий_опрос_с_быстрым_отказом_держит_паузу() -> None:
+    """⚠ Замок на горячий цикл: 401 мгновенно — пауза, а не долбёжка устройства."""
+    from mega_home.core import listeners_out
+    from mega_home.core.listeners import Listeners
+
+    from fake_host import FakeHost
+
+    async def scenario() -> int:
+        hits = 0
+
+        async def handler(_request: web.Request) -> web.Response:
+            nonlocal hits
+            hits += 1
+            return web.Response(status=401, text="denied")
+
+        port, runner = await _server(handler)
+        door = _door(port, {"auth": {"type": "none"}, "longPoll": {"paths": ["/events"]}})
+        spec = {"type": "poll", "id": "p", "path": "/events"}
+        sources = Listeners(FakeHost(), door, EventHub())
+        try:
+            await asyncio.wait_for(listeners_out.poll(sources, door.descriptor("dev"), "p", spec), 1.5)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            await door.async_close()
+            await runner.cleanup()
+        return hits
+
+    assert asyncio.run(scenario()) <= 3
+
+
+def test_байты_шаблона_всегда_hex() -> None:
+    """⚠ Случайно допустимый UTF-8 не должен менять вид результата."""
+    values: dict[str, Any] = {}
+    ascii_live = {"nonce": b"abcd", "created": "c", "ts": "1", "tsMs": "1"}
+    assert render("{nonce}", values, ascii_live) == "61626364"
+    assert render("{=[nonce]|md5}", values, ascii_live) == hashlib.md5(b"abcd").hexdigest()
+
+
+def test_json_ошибка_устройства_идёт_конвертом() -> None:
+    from mega_home.core.ops_door import gateway_call
+
+    class Coordinator:
+        accesses: Any = None
+        trassir: Any = None
+
+    async def scenario() -> tuple[Any, Any]:
+        async def handler(request: web.Request) -> web.Response:
+            status = 401 if request.path == "/deny" else 200
+            return web.json_response({"error": "no"}, status=status)
+
+        port, runner = await _server(handler)
+        coordinator = Coordinator()
+        coordinator.accesses = _door(port, {"auth": {"type": "none"}})
+        try:
+            ok = await gateway_call(coordinator, {"access": "dev", "path": "/ok"})
+            denied = await gateway_call(coordinator, {"access": "dev", "path": "/deny"})
+        finally:
+            await coordinator.accesses.async_close()
+            await runner.cleanup()
+        return ok, denied
+
+    ok, denied = asyncio.run(scenario())
+    assert ok == {"error": "no"}
+    assert denied["status"] == 401 and json.loads(base64.b64decode(denied["body"])) == {"error": "no"}
+
+
+def test_источник_без_порта_объясняется_словами() -> None:
+    from mega_home.core.listeners import Listeners
+
+    from fake_host import FakeHost
+
+    door = AccessGateway()
+    door.apply([{"id": "dev", "host": "10.0.0.5", "auth": {"type": "none"},
+                 "events": [{"type": "udp", "id": "u"}]}])
+    sources = Listeners(FakeHost(), door, EventHub())
+    asyncio.run(sources._restart(door.descriptors()))  # noqa: SLF001 — шов
+    assert "порт" in sources.why and sources.state()["sources"] == 0

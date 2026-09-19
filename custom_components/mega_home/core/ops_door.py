@@ -93,7 +93,9 @@ async def _http(coordinator: Any, door: Any, payload: dict[str, Any], scope: str
         headers if isinstance(headers, dict) else None,
         scope,
     )
-    envelope = payload.get("envelope") is True
+    # ⚠ Ошибка устройства (≥ 400) — всегда конвертом: JSON-тело отказа «как есть»
+    # теряло статус, и бандл не отличал 401 от данных (ревью 2026-09-19).
+    envelope = payload.get("envelope") is True or status >= 400
     if "json" in (content_type or "") and not payload.get("binary") and not envelope:
         try:
             return json.loads(answer.decode("utf-8", "ignore"))

@@ -67,6 +67,8 @@ class ManagerLink:
         # Живые состояния для жильца снаружи (`watch.py`) — тоже внутри одного
         # подключения: оборвался канал, менеджер попросит заново.
         self._watch: Any = None
+        # Качалка кадров `event` в сокет; живёт ровно одно подключение (`_attach_events`).
+        self._event_pump: asyncio.Task[None] | None = None
 
     @property
     def connected(self) -> bool:
@@ -235,9 +237,8 @@ class ManagerLink:
         hub = getattr(self._coordinator, "events", None)
         if hub is not None:
             hub.detach()
-        pump = getattr(self, "_event_pump", None)
-        if pump is not None:
-            pump.cancel()
+        if self._event_pump is not None:
+            self._event_pump.cancel()
             self._event_pump = None
 
     async def _watch_op(self, socket: Any, frame: dict[str, Any]) -> None:

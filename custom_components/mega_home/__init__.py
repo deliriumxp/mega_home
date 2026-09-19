@@ -179,7 +179,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # Asterisk держит 5060 (правило своего go2rtc).
     sip_bridge = SipBridge(
         coordinator.env,
-        lambda kind, data: coordinator.events.publish("intercom", "sip-bridge", kind, data),
+        # `local=True`: звонок в дверь обязана увидеть и настенная панель без интернета.
+        lambda kind, data: coordinator.events.publish("intercom", "sip-bridge", kind, data, local=True),
     )
     coordinator.sip_bridge = sip_bridge
     entry.async_on_unload(

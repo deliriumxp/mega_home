@@ -40,6 +40,8 @@ class SecretBook:
             self._legacy[legacy_access or "*"] = legacy
         self._cache: dict[str, tuple[str, dict[str, str]]] = {}
         self._loaded = False
+        # Доступы, которые есть в конфиге, — на случай `forget` ДО чтения диска.
+        self._keep: set[str] | None = None
 
     def bind_legacy(self, access: str, legacy: Legacy) -> None:
         self._legacy[access] = legacy
@@ -79,8 +81,10 @@ class SecretBook:
         """Снять учётки доступов, которых в конфиге больше нет — и с диска тоже.
 
         ⚠ Без записи учётка снятого доступа жила бы в `.storage` и в бэкапах HA
-        до следующего чужого обновления.
+        до следующего чужого обновления. Первый `forget` приходит ДО чтения
+        диска (кэш пуст) — тогда список запоминается и применяется при чтении.
         """
+        self._keep = set(keep)
         gone = [a for a in self._cache if a not in keep]
         for access in gone:
             del self._cache[access]
@@ -99,6 +103,8 @@ class SecretBook:
         for access, item in stored.items() if isinstance(stored, dict) else []:
             if isinstance(item, dict) and isinstance(item.get("fields"), dict):
                 self._cache[access] = (str(item.get("fingerprint") or ""), item["fields"])
+        if self._keep is not None:
+            self.forget(self._keep)
 
     async def _save(self) -> None:
         if self._store is None:

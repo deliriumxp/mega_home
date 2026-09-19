@@ -47,9 +47,13 @@ class EventHub:
         self.dropped = 0
 
     def publish(
-        self, access: str, source: str, event: str, data: Any = None, local: bool = True
+        self, access: str, source: str, event: str, data: Any = None, local: bool = False
     ) -> dict[str, Any]:
-        """Событие устройства. `local` — можно ли показать его в локальном контуре."""
+        """Событие устройства. `local` — можно ли показать его в локальном контуре.
+
+        ⚠ Умолчание — НЕ показывать: локальный контур без аутентификации, и
+        новый источник не должен попадать туда по забывчивости.
+        """
         frame = {
             "t": "event",
             "id": uuid4().hex,
