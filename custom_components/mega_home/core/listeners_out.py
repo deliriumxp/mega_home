@@ -93,6 +93,18 @@ def base_values(descriptor: DeviceDescriptor) -> dict[str, Any]:
         "pass": descriptor.auth.password,
     }
 
+def _session(descriptor: DeviceDescriptor) -> aiohttp.ClientSession:
+    """Сессия к устройству: `tls` — без проверки сертификата, как у `connect.py`.
+
+    ⚠ Без этого источник к устройству с самоподписанным сертификатом (регистратор
+    видеонаблюдения, 8080/https) падал на первом же `setup` и молча перезапускался
+    — объект остался без ленты событий (живой объект 2026-09-20). Проверять
+    сертификат нечем: адресаты — только частные адреса объекта.
+    """
+    connector = aiohttp.TCPConnector(ssl=False) if descriptor.tls else None
+    return aiohttp.ClientSession(connector=connector)
+
+
 def _auth_kwargs(descriptor: DeviceDescriptor) -> dict[str, Any]:
     """Только `basic`: `digest` идёт вторым кругом в `_request` (RFC 7616, `digest.py`)."""
     if descriptor.auth.type == "basic":
@@ -188,7 +200,7 @@ async def poll(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[s
     # семантика опроса, не вендорский код — вендора решает менеджер строкой
     # `path`/`equals`.
     resetup = spec.get("resetup") if isinstance(spec.get("resetup"), dict) else None
-    async with aiohttp.ClientSession() as session:
+    async with _session(descriptor) as session:
         async def do_setup() -> None:
             if setup_block is None:
                 return
@@ -240,7 +252,7 @@ async def stream(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict
     params = _render_obj(spec["params"], values) if isinstance(spec.get("params"), dict) else None
     idle = seconds(spec.get("idle"), IDLE_S, 5.0)
     scheme = "https" if descriptor.tls else "http"
-    async with aiohttp.ClientSession() as session:
+    async with _session(descriptor) as session:
         async with session.request(
             method,
             _url(descriptor, path, scheme),
@@ -291,7 +303,7 @@ async def ws(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[str
     params = _render_obj(spec["params"], values) if isinstance(spec.get("params"), dict) else None
     headers = _render_obj(spec["headers"], values) if isinstance(spec.get("headers"), dict) else None
     idle = seconds(spec.get("idle"), IDLE_S, 5.0)
-    async with aiohttp.ClientSession() as session:
+    async with _session(descriptor) as session:
         socket_ = await session.ws_connect(
             _url(descriptor, path, scheme), params=params, headers=headers, heartbeat=30
         )

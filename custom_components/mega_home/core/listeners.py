@@ -162,6 +162,7 @@ class Listeners:
     async def _forever(self, worker: Any, descriptor: DeviceDescriptor, source: str, spec: dict[str, Any], name: str) -> None:
         """Источник живёт, пока жив конфиг: отказ — повтор с растущей паузой."""
         delay = RETRY_FIRST_S
+        told = False
         while True:
             started = monotonic()
             try:
@@ -169,7 +170,16 @@ class Listeners:
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001 — источник не роняет дом
-                LOGGER.debug("Источник событий %s: %s", name, type(err).__name__)
+                # ⚠ Первый отказ — ПРЕДУПРЕЖДЕНИЕМ, не отладкой: источник, который
+                # тихо перезапускался с растущей паузой, оставил объект без ленты
+                # событий, и причину (TLS самоподписанного сертификата) искали по
+                # коду, а не по журналу (живой объект 2026-09-20). Текст ошибки
+                # не пишем: в нём бывает адрес запроса с учёткой.
+                if not told:
+                    LOGGER.warning("Источник событий %s не запустился: %s", name, type(err).__name__)
+                    told = True
+                else:
+                    LOGGER.debug("Источник событий %s: %s", name, type(err).__name__)
             if monotonic() - started > HEALTHY_S:
                 delay = RETRY_FIRST_S
             await asyncio.sleep(delay)

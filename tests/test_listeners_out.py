@@ -110,3 +110,25 @@ def test_вход_не_чаще_pause(monkeypatch) -> None:
     assert setups == 2
     assert slept and all(delay == spec["pause"] for delay in slept)
     assert ctx.events == []
+
+
+def test_сессия_к_устройству_с_tls_без_проверки_сертификата() -> None:
+    """Регистратор на 8080/https с самоподписанным сертификатом: без `ssl=False`
+    `setup` падал на первом запросе и источник молча перезапускался
+    (живой объект 2026-09-20). Правило то же, что у `connect.py`."""
+    import asyncio
+
+    from mega_home.core.devices import DeviceDescriptor, AuthSpec
+    from mega_home.core import listeners_out as out
+
+    async def scenario() -> tuple[bool, bool]:
+        tls = out._session(DeviceDescriptor(id="d", host="192.168.1.10", port=8080, tls=True, timeout=5.0, auth=AuthSpec(type="none", user="", password="p"), events=[]))
+        plain = out._session(DeviceDescriptor(id="d", host="192.168.1.10", port=80, tls=False, timeout=5.0, auth=AuthSpec(type="none", user="", password=""), events=[]))
+        try:
+            return tls.connector._ssl is False, plain.connector._ssl is not False  # noqa: SLF001
+        finally:
+            await tls.close()
+            await plain.close()
+
+    insecure, checked = asyncio.run(scenario())
+    assert insecure and checked
