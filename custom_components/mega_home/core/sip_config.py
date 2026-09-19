@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 from pathlib import Path
 import secrets
@@ -31,18 +32,42 @@ STUN = "stun.home-assistant.io:3478"
 # Имя приложения Stasis: вызовы, которыми управляет интеграция (`sip_calls.py`).
 ARI_APP = "mega_home"
 ARI_USER = "mega_home"
-# Эндпойнт телефона жильца. ⚠ Этап проверки: одна учётка на дом с паролем,
-# который дом придумал сам. Учётки жильцов приватным путём — этап 2 плана
-# (`docs/intercom-remote.md` в менеджере).
+# Эндпойнт телефона жильца. ⚠ Учётки у него нет (решение заказчика
+# 2026-09-19): телефон доходит до моста ТОЛЬКО каналом менеджера (`stream.py`
+# пускает loopback ровно на `HTTP_PORT`), права жильца проверяет менеджер, а
+# HTTP-сервер моста слушает один loopback — из Wi-Fi объекта его не видно.
+# Опознаётся по адресу: всё, что пришло с loopback, — телефон.
 RESIDENT = "resident"
-# Откуда принимаем вызов без регистрации. ⚠ Только частные сети: мост на
-# 5060 без аутентификации. Адреса конкретных панелей приедут конфигом вместе с
-# модулем домофонии.
-PRIVATE_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+LOOPBACK = "127.0.0.1"
+
+
+def panel_addresses(block: Any) -> tuple[str, ...]:
+    """Адреса панелей из конфига объекта (`intercom.panels`): от них — без регистрации.
+
+    ⚠ Только литеральный частный IPv4, не loopback: вызов с 5060 принимается
+    без аутентификации, и loopback здесь сделал бы панелью телефон жильца.
+    Нет адресов — мост не принимает вызов ни от кого: безопасный умолчательный
+    отказ вместо прежних «все частные сети».
+    """
+    raw = block.get("panels") if isinstance(block, dict) else None
+    found: list[str] = []
+    for item in raw if isinstance(raw, list) else []:
+        try:
+            address = ipaddress.ip_address(str(item).strip())
+        except ValueError:
+            continue
+        if (
+            address.version == 4
+            and address.is_private
+            and not address.is_loopback
+            and str(address) not in found
+        ):
+            found.append(str(address))
+    return tuple(sorted(found))
 
 
 def load_secrets(root: Path) -> dict[str, str]:
-    """Пароли ARI и жильца: придуманы один раз и живут в каталоге моста.
+    """Пароль ARI: придуман один раз и живёт в каталоге моста.
 
     ⚠ Пароль не меняется от перезапуска к перезапуску: сирота прошлого запуска
     усыновляется с тем конфигом, что уже прочитал, и новый пароль ARI его бы
@@ -54,7 +79,7 @@ def load_secrets(root: Path) -> dict[str, str]:
     except (OSError, ValueError):
         stored = {}
     changed = False
-    for key in ("ari", "resident"):
+    for key in ("ari",):
         if not isinstance(stored.get(key), str) or len(stored[key]) < 16:
             stored[key] = secrets.token_urlsafe(18)
             changed = True
@@ -65,19 +90,28 @@ def load_secrets(root: Path) -> dict[str, str]:
     return stored
 
 
-def write_config(root: Path) -> dict[str, str]:
+def write_config(root: Path, panels: tuple[str, ...] = ()) -> dict[str, str]:
     """Разложить конфиг моста по своим каталогам (синхронно, в executor)."""
     for name in ("etc", "lib", "run", "log", "spool", "cache", "agi-bin"):
         (root / name).mkdir(parents=True, exist_ok=True)
     keys = load_secrets(root)
-    for name, text in render_config(root, keys).items():
+    for name, text in render_config(root, keys, panels).items():
         (root / "etc" / name).write_text(text, encoding="utf-8")
     return keys
 
 
-def render_config(root: Path, keys: dict[str, Any]) -> dict[str, str]:
+def render_config(
+    root: Path, keys: dict[str, Any], panels: tuple[str, ...] = ()
+) -> dict[str, str]:
     """Файлы конфига Asterisk. Чистая функция — её и проверяют тесты."""
-    identify = "\n".join(f"match={net}" for net in PRIVATE_NETS)
+    # Секция `identify` без `match` Asterisk не примет, поэтому без панелей
+    # её нет вовсе: вызов с 5060 ни с чем не совпадёт и будет отклонён.
+    panel_identify = (
+        "[panel]\ntype=identify\nendpoint=panel\n"
+        + "".join(f"match={address}\n" for address in panels)
+        if panels
+        else "; адресов панелей в конфиге объекта нет — вызов не примем ни от кого\n"
+    )
     return {
         "asterisk.conf": f"""[directories]
 astcachedir => {root}/cache
@@ -119,18 +153,19 @@ noload => chan_motif.so
 console => notice,warning,error,verbose
 messages => notice,warning,error,verbose
 """,
-        # ⚠ Слушаем ВСЕ адреса: WebSocket телефона приходит каналом дома
-        # (`stream.py`), а тот открывает TCP только на ЧАСТНЫЙ адрес хоста, не на
-        # loopback. TLS не нужен: снаружи шифрует WSS менеджера, внутри — LAN.
+        # ⚠ Только loopback: WebSocket телефона приходит каналом менеджера
+        # (`stream.py` пускает loopback ровно на этот порт), а учётки у телефона
+        # нет — слушай мы LAN, позвонить в дверь смог бы любой в Wi-Fi объекта.
+        # TLS не нужен: снаружи шифрует WSS менеджера, внутри — loopback.
         "http.conf": f"""[general]
 servername=mega_home
 enabled=yes
-bindaddr=0.0.0.0
+bindaddr={LOOPBACK}
 bindport={HTTP_PORT}
 """,
         # ARI открыт только loopback'у (per-user `permit`/`deny`, `ari.conf.sample`):
-        # HTTP-сервер общий с WebSocket и смотрит в LAN, а ARI — это полный
-        # контроль над вызовами.
+        # HTTP-сервер общий с WebSocket телефона, а ARI — это полный контроль
+        # над вызовами; второй замок на случай, если `bindaddr` когда-то раскроют.
         "ari.conf": f"""[general]
 enabled = yes
 
@@ -148,14 +183,14 @@ rtpend={RTP_END}
 icesupport=yes
 stunaddr={STUN}
 """,
-        # ⚠ `endpoint_identifier_order`: по умолчанию `ip,username,anonymous`
-        # (`pjsip.conf.sample`), и телефон, пришедший каналом дома с ЧАСТНОГО
-        # адреса хоста, опознался бы по IP как панель — без пароля. Имя первым:
-        # `resident` требует пароль, у панели в From номер, а не это имя.
+        # ⚠ `endpoint_identifier_order=ip` без `username` и `anonymous`: оба
+        # конца опознаются по адресу — панель по своему из конфига, телефон по
+        # loopback. По имени из From опознавать нельзя: у телефона нет пароля,
+        # и чужой вызов с именем `resident` стал бы телефоном.
         "pjsip.conf": f"""[global]
 type=global
 user_agent=mega_home-sip-bridge
-endpoint_identifier_order=username,ip
+endpoint_identifier_order=ip
 
 [transport-udp]
 type=transport
@@ -177,25 +212,19 @@ direct_media=no
 rtp_symmetric=yes
 dtmf_mode=rfc4733
 
-[panel]
-type=identify
-endpoint=panel
-{identify}
-
-[{RESIDENT}]
-type=auth
-auth_type=userpass
-username={RESIDENT}
-password={keys["resident"]}
-
+{panel_identify}
 [{RESIDENT}]
 type=endpoint
 transport=transport-ws
 context=from-resident
-auth={RESIDENT}
 webrtc=yes
 disallow=all
 allow=ulaw,alaw
+
+[{RESIDENT}]
+type=identify
+endpoint={RESIDENT}
+match={LOOPBACK}
 """,
         # Вызов панели не отвечаем: он уходит интеграции (`sip_calls.py`), та
         # звонит панели «ring» и держит её, пока жилец не наберёт `answer`.

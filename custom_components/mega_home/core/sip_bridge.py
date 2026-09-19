@@ -6,10 +6,13 @@ IP-вызов панели — обычный `INVITE` на 5060, RTSP мони�
 Asterisk; своего SIP-стека здесь нет и не будет (`docs/intercom-remote.md` в
 менеджере, Часть II).
 
-⚠ Этап ПРОВЕРКИ: мост принимает прямой IP-вызов из локальной сети и держит его
-звонящим, пока телефон по WebSocket не наберёт `answer` (`sip_calls.py`);
-`echo` — звук телефон ⇄ мост без панели. Учётка телефона одна на дом, её пароль
-— в диагностике. Конфиг Asterisk — `sip_config.py`.
+Мост принимает прямой IP-вызов панели и держит его звонящим, пока телефон по
+WebSocket не наберёт `answer` (`sip_calls.py`); `echo` — звук телефон ⇄ мост
+без панели. Конфиг Asterisk — `sip_config.py`.
+
+⚠ Вход только двумя дверями: панели — с адресов из конфига объекта
+(`intercom.panels`), телефон — с loopback, куда его пускает лишь канал
+менеджера (`stream.py`). Учётки у телефона нет, права жильца проверяет менеджер.
 
 ⚠ Включается ТОЛЬКО конфигом объекта (`intercom.sipBridge`), а не релизом:
 релиз доезжает до всех домов, а мост ставит пакеты в их контейнер.
@@ -37,7 +40,15 @@ from typing import Any
 from .const import LOGGER
 from .host import Host
 from .sip_calls import DoorCalls
-from .sip_config import HTTP_PORT, RESIDENT, RTP_END, RTP_START, SIP_PORT, write_config
+from .sip_config import (
+    HTTP_PORT,
+    LOOPBACK,
+    RTP_END,
+    RTP_START,
+    SIP_PORT,
+    panel_addresses,
+    write_config,
+)
 
 # Пакеты из репозитория Alpine, на котором собран образ Home Assistant.
 # ⚠ Контейнер пересоздаётся при КАЖДОМ обновлении HA, и установка пропадает —
@@ -64,6 +75,9 @@ class SipBridge:
         self._ready = False
         self._adopted = False
         self._wanted = False
+        # Панели из конфига объекта и те, с которыми конфиг Asterisk записан.
+        self._panels: tuple[str, ...] = ()
+        self._written: tuple[str, ...] | None = None
         self._log: deque[str] = deque(maxlen=LOG_TAIL)
         # Почему моста нет. ⚠ Причины разные и лечатся в разных местах: выключен
         # в менеджере, нечем поставить, не поставился, порт занят, не поднялся.
@@ -84,9 +98,12 @@ class SipBridge:
         """
         block = (config or {}).get("intercom")
         self._wanted = isinstance(block, dict) and block.get("sipBridge") is True
+        self._panels = panel_addresses(block)
         if self._task is not None and not self._task.done():
+            # Задача дочитает свежие `_wanted`/`_panels` сама: они уже записаны.
             return
-        if self._wanted == self.is_running():
+        running = self.is_running()
+        if self._wanted == running and not (running and self._panels != self._written):
             return
         self._task = self._env.spawn(
             self._async_reconcile(), "mega_home sip bridge"
@@ -96,9 +113,18 @@ class SipBridge:
         async with self._lock:
             if self._wanted and not self.is_running():
                 await self._async_start()
+            elif self._wanted and self._panels != self._written:
+                await self._async_write()
+                await self._async_ctl("core reload")
+                LOGGER.info("SIP-мост: панели %s", ", ".join(self._panels) or "не заданы")
             elif not self._wanted and (self._proc is not None or self._ready):
                 await self._async_stop()
                 self._why = "выключен в конфиге объекта"
+
+    async def _async_write(self) -> None:
+        panels = self._panels
+        self._keys = await self._env.run(write_config, self._root, panels)
+        self._written = panels
 
     async def async_stop(self) -> None:
         """Остановка Home Assistant или выгрузка записи."""
@@ -119,15 +145,11 @@ class SipBridge:
             "adopted": self._ready and self._adopted,
             "why": "" if self.is_running() else self._why,
             "sip_port": SIP_PORT,
-            "ws": f"ws://<хост>:{HTTP_PORT}/ws",
+            # Только каналом менеджера: слушает loopback (`sip_config.py`).
+            "ws": f"ws://{LOOPBACK}:{HTTP_PORT}/ws",
             "rtp": f"{RTP_START}-{RTP_END}",
-            # ⚠ Этап проверки: единственная учётка телефона, чтобы инсталлятор
-            # мог позвонить из тестового клиента. Уходит вместе с этапом 2.
-            "test_account": (
-                {"user": RESIDENT, "password": self._keys["resident"]}
-                if self._keys.get("resident")
-                else None
-            ),
+            # Пусто — вызов не принимается ни от кого: адресов нет в конфиге.
+            "panels": list(self._written if self._written is not None else self._panels),
             "calls": self.calls.state() if self.calls else None,
             "install_seconds": self.install_seconds,
             "log": list(self._log),
@@ -139,7 +161,7 @@ class SipBridge:
         binary = await self._async_binary()
         if not binary:
             return
-        self._keys = await self._env.run(write_config, self._root)
+        await self._async_write()
         if await self._async_ctl("core show uptime") is not None:
             # Сирота прошлого запуска: конфиг наш, перечитываем его и живём дальше.
             await self._async_ctl("core reload")

@@ -102,6 +102,16 @@ def test_open_refuses_loopback():
     assert "вне локальной сети" in asyncio.run(scenario()).last_error()
 
 
+def test_loopback_open_only_to_sip_bridge():
+    """⚠ Телефон жильца доходит до моста только каналом менеджера — и больше никуда."""
+    refuse = Streams(FakeSocket())._refuse
+    bridge = stream_mod.SIP_BRIDGE_PORT
+    assert refuse({"host": "127.0.0.1", "port": bridge}) is None
+    assert refuse({"host": "127.0.0.2", "port": bridge})
+    assert refuse({"host": "::1", "port": bridge})
+    assert refuse({"host": "127.0.0.1", "port": bridge + 1})
+
+
 def test_refused_connection_comes_back_as_error_not_silence(monkeypatch):
     """Молчание читалось бы менеджером как «дом не отвечает» — а дом-то жив.
 

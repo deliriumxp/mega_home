@@ -31,6 +31,7 @@ import struct
 from typing import Any
 
 from .const import LOGGER
+from .sip_config import HTTP_PORT as SIP_BRIDGE_PORT
 
 # Сколько сессий разом на объект.
 #
@@ -136,6 +137,11 @@ class Streams:
         резолвер дома смотрит и в интернет — так дверь в локалку объекта стала бы
         заодно анонимным выходом в сеть с его адреса. Устройства менеджер и так
         знает по скану и называет их адресами.
+
+        ⚠ Loopback — ровно одна дверь: SIP-мост домофонии (`sip_config.py`). Он
+        слушает только loopback, и канал менеджера — единственный путь к нему
+        телефона жильца. Остальной loopback — сам Home Assistant и соседи по
+        машине, не «устройство объекта».
         """
         if len(self._streams) >= MAX_STREAMS:
             return f"на объекте уже {MAX_STREAMS} открытых сессии"
@@ -146,7 +152,11 @@ class Streams:
             address = ipaddress.ip_address(str(payload.get("host")))
         except ValueError:
             return "адрес устройства должен быть IP, а не именем"
-        if not address.is_private or address.is_loopback:
+        if address.is_loopback:
+            if str(address) == "127.0.0.1" and port == SIP_BRIDGE_PORT:
+                return None
+            return "адрес вне локальной сети объекта"
+        if not address.is_private:
             return "адрес вне локальной сети объекта"
         return None
 

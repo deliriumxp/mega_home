@@ -3,7 +3,8 @@
 ⚠ Настоящий Asterisk здесь не запускается — его проверяет стенд (контейнер Home
 Assistant на объекте). Спека держит то, что ломается молча: мост не должен
 подниматься без флага, не должен ждать установки пакетов в цикле конфига и не
-должен принимать вызов из-за пределов частных сетей.
+должен принимать вызов ни от кого, кроме панелей из конфига и телефона с
+loopback.
 """
 
 from __future__ import annotations
@@ -43,30 +44,48 @@ def test_нет_ни_asterisk_ни_apk(monkeypatch) -> None:  # noqa: ANN001
     assert "поставить нечем" in bridge.state()["why"]
 
 
-KEYS = {"ari": "a" * 24, "resident": "r" * 24}
+KEYS = {"ari": "a" * 24}
+PANELS = ("192.168.88.90", "192.168.88.92")
 
 
-def test_конфиг_в_своих_каталогах_и_только_частные_сети() -> None:
+def test_конфиг_в_своих_каталогах_и_только_панели_из_конфига() -> None:
     root = Path("/config/.storage/mega_home_sip")
-    files = sc.render_config(root, KEYS)
+    files = sc.render_config(root, KEYS, PANELS)
     assert f"astetcdir => {root}/etc" in files["asterisk.conf"]
     assert f"astrundir => {root}/run" in files["asterisk.conf"]
     pjsip = files["pjsip.conf"]
     assert f"bind=0.0.0.0:{sc.SIP_PORT}" in pjsip
-    for net in sc.PRIVATE_NETS:
-        assert f"match={net}" in pjsip
+    panel = pjsip.split("endpoint=panel")[1].split("[")[0]
+    assert panel.split() == [f"match={address}" for address in PANELS]
     assert "0.0.0.0/0" not in pjsip
     assert f"rtpstart={sc.RTP_START}" in files["rtp.conf"]
 
 
-def test_телефон_опознаётся_по_имени_раньше_чем_по_адресу() -> None:
-    # Телефон приходит каналом дома с ЧАСТНОГО адреса хоста: при порядке
-    # по умолчанию (ip первым) он стал бы панелью — без пароля.
+def test_без_панелей_вызов_не_принимается_ни_от_кого() -> None:
     pjsip = sc.render_config(Path("/x"), KEYS)["pjsip.conf"]
-    assert "endpoint_identifier_order=username,ip" in pjsip
-    assert f"password={KEYS['resident']}" in pjsip
+    assert "endpoint=panel" not in pjsip
+    assert "192.168." not in pjsip
+
+
+def test_адреса_панелей_только_частные_ipv4() -> None:
+    block = {"panels": ["192.168.88.92", " 10.0.0.5", "192.168.88.92", "127.0.0.1",
+                        "8.8.8.8", "panel.local", "fd00::1", 5]}
+    assert sc.panel_addresses(block) == ("10.0.0.5", "192.168.88.92")
+    assert sc.panel_addresses({"panels": "192.168.88.90"}) == ()
+    assert sc.panel_addresses(None) == ()
+
+
+def test_телефон_только_с_loopback_и_мост_виден_только_там() -> None:
+    # ⚠ Учётки у телефона нет: его пускает только канал менеджера на loopback.
+    files = sc.render_config(Path("/x"), KEYS, PANELS)
+    pjsip = files["pjsip.conf"]
+    assert "endpoint_identifier_order=ip\n" in pjsip
+    assert "type=auth" not in pjsip
+    resident = pjsip.split(f"endpoint={sc.RESIDENT}")[1]
+    assert resident.split() == ["match=127.0.0.1"]
     assert "webrtc=yes" in pjsip
     assert "protocol=ws" in pjsip
+    assert "bindaddr=127.0.0.1" in files["http.conf"]
 
 
 def test_ari_только_с_loopback() -> None:
@@ -91,4 +110,15 @@ def test_конфиг_раскладывается_на_диск_и_пароли
     assert (tmp_path / "run").is_dir()
     # Сирота усыновляется со старым конфигом — новый пароль ARI запер бы его.
     assert sc.write_config(tmp_path) == first
-    assert len(first["ari"]) >= 16 and first["ari"] != first["resident"]
+    assert len(first["ari"]) >= 16 and set(first) == {"ari"}
+
+
+def test_смена_панелей_у_работающего_моста_перечитывает_конфиг() -> None:
+    host = FakeHost()
+    bridge = sb.SipBridge(host)
+    bridge._ready, bridge._written = True, ("192.168.88.90",)
+    bridge.apply({"intercom": {"sipBridge": True, "panels": ["192.168.88.90"]}})
+    assert host.spawned == []
+    bridge.apply({"intercom": {"sipBridge": True, "panels": ["192.168.88.92"]}})
+    assert host.spawned == ["mega_home sip bridge"]
+    assert bridge.state()["panels"] == ["192.168.88.90"]
