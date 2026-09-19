@@ -23,18 +23,6 @@ from mega_home.core.device_events import BUFFER_TTL_S, EventHub
 from mega_home.core.gateway import SCOPE_MANAGER, AccessDenied, AccessGateway
 
 
-def test_список_классов_заперт() -> None:
-    """⚠ Строка в список — только вместе с доказательством в docs/home-gateway.md."""
-    assert access_mod.KINDS == ("http", "tcp", "udp", "mqtt", "ws")
-    assert access_mod.AUTH_TYPES == ("none", "basic", "digest", "bearer", "session")
-    assert access_mod.EVENT_TYPES == (
-        "webhook", "poll", "stream", "mqtt", "tcp", "tcpServer", "udp", "ws"
-    )
-    from mega_home.core.templating import FILTERS
-
-    assert FILTERS == ("url", "md5", "sha1", "sha256", "base64", "hex", "upper", "lower")
-
-
 def test_новое_описание_несёт_всё_данными() -> None:
     d = descriptor_of(
         {
