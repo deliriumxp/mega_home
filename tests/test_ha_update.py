@@ -60,6 +60,9 @@ class _Hass:
         self.tasks.append(name)
         coro.close()
 
+    async def async_add_executor_job(self, func, *args):  # noqa: ANN001, ANN201
+        return func(*args)
+
 
 def _ours(installed: str, latest: str) -> _Entity:
     return _Entity(
@@ -88,12 +91,22 @@ def test_ставит_свежий_релиз_и_перезапускает_по
     assert answer["installing"] is True and answer["latest"] == "0.2.73"
 
 
-def test_нечего_ставить_но_перезапуск_всё_равно() -> None:
+def test_на_диске_новее_чем_в_памяти_перезапуск(monkeypatch) -> None:
     """Файлы уже на диске, в памяти старый код — лечится ровно перезапуском."""
+    monkeypatch.setattr(ha_update, "disk_version", lambda: "9.9.9")
     hass = _Hass([_ours("0.2.73", "0.2.73")])
     answer = asyncio.run(ha_update.async_self_update(hass))
     assert ("update", "install") not in hass.calls
-    assert hass.tasks and answer["restarting"] is True
+    assert hass.tasks and answer["restarting"] is True and answer["onDisk"] == "9.9.9"
+
+
+def test_нечего_ставить_и_на_диске_то_же_перезапуска_нет(monkeypatch) -> None:
+    """Живой объект 2026-09-20: «новой версии не нашёл — перезагружается» — минута
+    без дома ни за что. Нет ни установки, ни новых файлов — нет перезапуска."""
+    monkeypatch.setattr(ha_update, "disk_version", lambda: ha_update.INTEGRATION_VERSION)
+    hass = _Hass([_ours("0.2.73", "0.2.73")])
+    answer = asyncio.run(ha_update.async_self_update(hass))
+    assert hass.tasks == [] and answer["restarting"] is False
 
 
 def test_версию_менеджера_ставит_даже_если_hacs_о_ней_не_знает() -> None:
@@ -107,10 +120,11 @@ def test_версию_менеджера_ставит_даже_если_hacs_о_
     assert answer["installing"] is True and answer["target"] == "0.4.1"
 
 
-def test_версия_менеджера_уже_стоит_ставить_нечего() -> None:
+def test_версия_менеджера_уже_стоит_ставить_нечего(monkeypatch) -> None:
+    monkeypatch.setattr(ha_update, "disk_version", lambda: ha_update.INTEGRATION_VERSION)
     hass = _Hass([_ours("0.4.1", "0.4.0")])
     answer = asyncio.run(ha_update.async_self_update(hass, "0.4.1"))
-    assert ("update", "install") not in hass.calls and answer["restarting"] is True
+    assert ("update", "install") not in hass.calls and answer["restarting"] is False
 
 
 def test_без_hacs_отказ_понятный_и_без_перезапуска() -> None:

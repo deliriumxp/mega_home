@@ -26,6 +26,7 @@ from homeassistant.exceptions import HomeAssistantError
 
 from .core.const import DOMAIN, INTEGRATION_VERSION, LOGGER
 from .core.ops_base import OpError
+from .link import _disk_version as disk_version
 
 # Сколько ждём, пока HACS скачает и разложит релиз. Архив — сотни килобайт; запас
 # для медленного канала объекта, а не норма.
@@ -100,14 +101,23 @@ async def async_self_update(hass: HomeAssistant, wanted: str | None = None) -> d
                 f"HACS не поставил обновление: {err}", HTTPStatus.BAD_GATEWAY
             ) from err
 
-    hass.async_create_background_task(_restart_later(hass), "mega_home self-update restart")
+    # ⚠ Перезапуск — ТОЛЬКО когда есть что загрузить: поставили релиз сейчас или
+    # на диске уже лежит версия новее загруженной (HACS положил, HA не
+    # перезапускали). Перезапуск «на всякий случай» ронял дом на минуту без
+    # единой причины (живой объект 2026-09-20: «HACS новой версии не нашёл —
+    # Home Assistant перезагружается»).
+    on_disk = await hass.async_add_executor_job(disk_version)
+    restarting = installing or bool(on_disk and on_disk != INTEGRATION_VERSION)
+    if restarting:
+        hass.async_create_background_task(_restart_later(hass), "mega_home self-update restart")
     return {
         "loaded": INTEGRATION_VERSION,
+        "onDisk": on_disk or None,
         "installed": installed,
         "latest": latest,
         "target": target,
         "installing": installing,
-        "restarting": True,
+        "restarting": restarting,
     }
 
 
