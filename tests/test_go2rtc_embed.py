@@ -157,3 +157,62 @@ def test_сирота_усыновляется_а_не_уступает_чужо
 
     assert asyncio.run(embed.async_start(FakeHost())) is True
     assert embed.is_running() is True
+
+
+def test_проба_порта_не_спотыкается_о_time_wait():
+    """⚠ Живой факт 2026-09-19: после перезапуска HA на 127.0.0.1:1985 минуту висели
+    сокеты TIME_WAIT прежнего go2rtc, проба без SO_REUSEADDR считала порт занятым,
+    и объект жил без своего go2rtc до ребута. Слушатель, закрывшийся штатно, — не
+    занятость; живой слушатель — занятость.
+    """
+    from mega_home.core import services
+
+    probes = ((socket.SOCK_STREAM, embed.API_PORT, f"TCP {embed.API_PORT}"),)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("0.0.0.0", embed.API_PORT))
+        listener.listen(1)
+        assert services.port_busy(probes) == f"TCP {embed.API_PORT}"
+    # Слушатель закрыт: порт свободен, что бы ни осталось от его соединений.
+    assert services.port_busy(probes) == ""
+
+
+def test_занятый_порт_повторяет_старт_а_не_сдаётся(monkeypatch):
+    """Одна попытка на весь аптайм оставила объект без go2rtc (0.4.0): помеха ушла
+    через минуту, а отказ жил до ребута. Повтор в фоне поднимает его сам."""
+    busy = ["TCP 1985"]
+    monkeypatch.setattr(embed.shutil, "which", lambda _name: "/usr/bin/go2rtc")
+    monkeypatch.setattr(embed, "_ports_busy", lambda: busy[0])
+    monkeypatch.setattr(embed, "_write_config", lambda: "/tmp/x.yaml")
+    monkeypatch.setattr(embed, "_start_drain", lambda: None)
+
+    async def launched(*_args, **_kwargs):
+        return _Proc()
+
+    async def api_ok(_env):
+        return True
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", launched)
+    monkeypatch.setattr(embed, "_await_api", api_ok)
+
+    async def alive_no(_env):
+        return False
+
+    monkeypatch.setattr(embed, "_api_alive", alive_no)
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        busy[0] = ""
+
+    monkeypatch.setattr(embed.asyncio, "sleep", fake_sleep)
+
+    async def scenario() -> None:
+        env = FakeHost()
+        assert await embed.async_start(env) is False
+        assert env.spawned == ["mega_home go2rtc: повтор старта"]
+        assert await embed._retry_start(env, attempts=3) is True
+        assert embed.is_running() is True
+
+    asyncio.run(scenario())
+    assert sleeps == [embed.RETRY_EVERY]

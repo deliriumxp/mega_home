@@ -469,14 +469,10 @@ async def _run(argv: list[str], timeout: float) -> tuple[int, str]:
     return proc.returncode or 0, output.decode(errors="ignore")
 
 def _port_busy() -> str:
-    for kind, name, port in (
-        (socket.SOCK_DGRAM, "UDP", SIP_PORT),
-        (socket.SOCK_STREAM, "TCP", HTTP_PORT),
-    ):
-        with socket.socket(socket.AF_INET, kind) as probe:
-            # Без SO_REUSEADDR: нужен честный ответ «занят», а не место рядом.
-            try:
-                probe.bind(("0.0.0.0", port))
-            except OSError:
-                return f"{name} {port}"
-    return ""
+    """Занят ли порт живым слушателем (`services.port_busy`: TIME_WAIT не в счёт)."""
+    return services.port_busy(
+        (
+            (socket.SOCK_DGRAM, SIP_PORT, f"UDP {SIP_PORT}"),
+            (socket.SOCK_STREAM, HTTP_PORT, f"TCP {HTTP_PORT}"),
+        )
+    )

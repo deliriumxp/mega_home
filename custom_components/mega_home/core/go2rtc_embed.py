@@ -66,8 +66,15 @@ webrtc:
 
 URL = f"http://127.0.0.1:{API_PORT}"
 
+# Повторы старта, когда порт занят или API не ответил. ⚠ Одна попытка на весь
+# аптайм — то, что оставило объект без своего go2rtc после обновления 0.4.0:
+# помеха длилась минуту (TIME_WAIT прежнего запуска), а отказ жил до ребута.
+RETRY_EVERY = 20.0
+RETRY_ATTEMPTS = 15
+
 _proc: asyncio.subprocess.Process | None = None
 _drain: asyncio.Task[None] | None = None
+_retry: asyncio.Task[None] | None = None
 _tmp: str | None = None
 _ready = False
 _log: deque[str] = deque(maxlen=LOG_TAIL)
@@ -103,8 +110,10 @@ async def async_start(env: Host) -> bool:
     if busy:
         # ⚠ Не поднимаемся и НЕ жалуемся громко: чужой go2rtc на этом порту —
         # это, как правило, правильно настроенный аддон. Пусть работает он.
+        # Но и не сдаёмся навсегда: помеха бывает временной (`_schedule_retry`).
         _why = f"порт {busy} занят чужим go2rtc или аддоном — свой не поднимаем"
         LOGGER.info("%s (%s)", _why, URL)
+        _schedule_retry(env)
         return False
 
     _tmp = await env.run(_write_config)
@@ -131,13 +140,37 @@ async def async_start(env: Host) -> bool:
             f"go2rtc не ответил по {URL} за {READY_TIMEOUT:.0f} с. "
             f"Его лог: {' | '.join(_log) or 'пусто'}"
         )
-        LOGGER.warning("%s — WebRTC пойдёт штатным путём HA", _why)
+        LOGGER.warning("%s", _why)
         await async_stop()
+        _schedule_retry(env)
         return False
     _why = ""
     services.register("go2rtc", API_PORT)
     LOGGER.info("mega_home go2rtc готов: %s, медиа :%s", URL, WEBRTC_PORT)
     return True
+
+
+def _schedule_retry(env: Host) -> None:
+    """Повторять старт в фоне, пока помеха не уйдёт или не кончатся попытки."""
+    global _retry
+
+    if _retry is not None and not _retry.done():
+        return
+    _retry = env.spawn(_retry_start(env), "mega_home go2rtc: повтор старта")
+
+
+async def _retry_start(env: Host, attempts: int = RETRY_ATTEMPTS) -> bool:
+    """Цикл повторов: каждая попытка — обычный `async_start`, без своей логики.
+
+    ⚠ Неудачный `async_start` снова зовёт `_schedule_retry`, тот видит живую
+    задачу (эту) и второй цикл не заводит — повторы не размножаются.
+    """
+    for _ in range(attempts):
+        await asyncio.sleep(RETRY_EVERY)
+        if is_running() or await async_start(env):
+            return True
+    LOGGER.warning("go2rtc так и не поднялся за %d попыток: %s", attempts, _why)
+    return False
 
 
 async def async_stop() -> None:
@@ -147,13 +180,20 @@ async def async_stop() -> None:
     него не имеем. Он переживёт выгрузку, продолжит держать медиа-порт и
     будет усыновлён следующим стартом: камеры при перезапуске HA не мигают.
     """
-    global _proc, _tmp, _drain, _ready
+    global _proc, _tmp, _drain, _ready, _retry
 
     _ready = False
     services.unregister("go2rtc")
     drain, _drain = _drain, None
     if drain is not None:
         drain.cancel()
+    # ⚠ Повторы снимаются только снаружи (выгрузка, остановка HA): изнутри
+    # `async_start` зовёт `async_stop` при неответившем API, и снять ими самого
+    # себя нельзя — цикл повторов оборвался бы на первой же неудаче.
+    if _retry is not None and _retry is not asyncio.current_task():
+        if not _retry.done():
+            _retry.cancel()
+        _retry = None
     proc, _proc = _proc, None
     if proc is not None and proc.returncode is None:
         try:
@@ -217,21 +257,14 @@ def state() -> dict[str, Any]:
 
 
 def _ports_busy() -> str:
-    """Занят ли нужный порт. Возвращает описание занятого или ''."""
-    probes = (
-        (socket.SOCK_DGRAM, WEBRTC_PORT, f"UDP {WEBRTC_PORT}"),
-        (socket.SOCK_STREAM, WEBRTC_PORT, f"TCP {WEBRTC_PORT}"),
-        (socket.SOCK_STREAM, API_PORT, f"TCP {API_PORT}"),
+    """Занят ли нужный порт живым слушателем (`services.port_busy`: TIME_WAIT не в счёт)."""
+    return services.port_busy(
+        (
+            (socket.SOCK_DGRAM, WEBRTC_PORT, f"UDP {WEBRTC_PORT}"),
+            (socket.SOCK_STREAM, WEBRTC_PORT, f"TCP {WEBRTC_PORT}"),
+            (socket.SOCK_STREAM, API_PORT, f"TCP {API_PORT}"),
+        )
     )
-    for kind, port, name in probes:
-        with socket.socket(socket.AF_INET, kind) as probe:
-            # Без SO_REUSEADDR: нам нужен честный ответ «порт занят», а не
-            # возможность встать рядом с чужим слушателем.
-            try:
-                probe.bind(("0.0.0.0", port))
-            except OSError:
-                return name
-    return ""
 
 
 def _write_config() -> str:
