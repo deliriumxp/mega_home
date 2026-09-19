@@ -2,3 +2,19 @@ sync:
   # Manual "fetch now". The coordinator polls on its own; this is for the
   # installer standing in the flat who has just changed the project in the
   # manager and does not want to wait for the next poll.
+
+calibrate_position:
+  # A pulse-relay blind has no position feedback: tell it where it really is,
+  # without moving it (`cover.py`).
+  target:
+    entity:
+      integration: mega_home
+      domain: cover
+  fields:
+    position:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          unit_of_measurement: "%"

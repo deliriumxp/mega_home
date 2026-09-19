@@ -40,6 +40,16 @@
     "sync": {
       "name": "Synchronise now",
       "description": "Fetch the home configuration from Mega Manager without waiting for the next poll."
+    },
+    "calibrate_position": {
+      "name": "Calibrate blind position",
+      "description": "Tell a pulse-relay blind where it actually is, without moving it.",
+      "fields": {
+        "position": {
+          "name": "Position",
+          "description": "Actual position, 0 is closed and 100 is open."
+        }
+      }
     }
   }
 }

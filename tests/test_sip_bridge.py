@@ -99,7 +99,8 @@ def test_панель_не_отвечаем_в_диалплане() -> None:
     # Ответ гасит мониторы: вызов панели уходит в Stasis звонящим.
     dialplan = sc.render_config(Path("/x"), KEYS)["extensions.conf"]
     panel = dialplan.split("[from-panel]")[1].split("[from-resident]")[0]
-    assert f"Stasis({sc.ARI_APP},panel)" in panel
+    # Второй аргумент — СЕТЕВОЙ адрес отправителя: номер звонящего выбирает INVITE.
+    assert f"Stasis({sc.ARI_APP},panel,${{CHANNEL(pjsip,remote_addr)}})" in panel
     assert "Answer" not in panel
 
 

@@ -75,21 +75,37 @@ async def frame(env: Any, url: str) -> bytes:
     base = _require_go2rtc()
     name = stream_name(url)
     session = env.session()
+    added = False
     try:
         rest = Go2RtcRestClient(session, base)
         streams = await rest.streams.list()
         if name not in streams:
             await rest.streams.add(name, [url])
+            added = True
         async with session.get(
             f"{base}/api/frame.jpeg", params={"src": name}, timeout=aiohttp.ClientTimeout(total=FRAME_TIMEOUT)
         ) as response:
             if response.status != 200:
                 raise AccessUnreachable(f"Источник не отдал кадр (HTTP {response.status})")
-            data = await response.content.read(MAX_FRAME_BYTES + 1)
+            data = b""
+            async for chunk in response.content.iter_chunked(64 * 1024):
+                data += chunk
+                if len(data) > MAX_FRAME_BYTES:
+                    break
     except AccessUnreachable:
         raise
     except Exception as err:  # noqa: BLE001 — go2rtc и источник падают по-разному
-        raise AccessUnreachable(f"Источник не отдал кадр: {err}") from err
+        # ⚠ Текст исключения go2rtc не отдаём: в нём URL источника вместе с
+        # учёткой (`src=rtsp://user:pass@…`), а ответ видит локальный контур.
+        raise AccessUnreachable(f"Источник не отдал кадр ({type(err).__name__})") from err
+    finally:
+        # Поток под кадр — разовый: иначе таблица go2rtc росла бы с каждым
+        # новым набором значений шаблона.
+        if added:
+            try:
+                await session.delete(f"{base}/api/streams", params={"src": name})
+            except Exception:  # noqa: BLE001 — уборка не роняет ответ
+                pass
     if len(data) > MAX_FRAME_BYTES or not data.startswith(b"\xff\xd8"):
         raise AccessUnreachable("Источник отдал не кадр JPEG")
     return data

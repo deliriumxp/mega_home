@@ -1,24 +1,27 @@
 """События устройств: один концентратор, два получателя.
 
-Источники — SIP-мост (вызов, отмена, ответ, конец), входящие вызовы устройств
-(webhook, Action URL), долгий опрос, подписки MQTT, строки TCP (`listeners.py`).
-Дом их НЕ толкует: несёт как есть, с именем источника (`docs/home-gateway.md`).
+Источники — SIP-мост (вызов, отмена, ответ, конец), входящие вызовы устройств,
+долгий опрос, поток, подписки MQTT, WebSocket, TCP, UDP (`listeners.py`). Дом их
+НЕ толкует: несёт как есть, с именем доступа и источника (`docs/home-gateway.md`).
 
-⚠ Получателей два, и оба обязательны:
+⚠ Получателей два:
   * менеджер — кадр `event` по живому каналу БЕЗ подписки: звонок в дверь
-    приходит, когда жилец ничего не смотрит, а `watch` живёт, только пока он
-    смотрит; из события менеджер делает push;
+    приходит, когда жилец ничего не смотрит; из события менеджер делает push;
   * локальный поток приложения (`events.py`) — настенная панель без интернета
-    обязана узнать о звонке в дверь.
+    обязана узнать о звонке в дверь. ⚠ Туда идёт ТОЛЬКО событие с `local`:
+    локальный контур без аутентификации, а тело опроса уровня менеджера или
+    токен в запросе вебхука не должны становиться видны любому в Wi-Fi.
 
-⚠ Буфер на время обрыва: канал переподключается секундами, а событие, потерянное
-в эту секунду, — пропущенный звонок. Буфер короткий по числу и по сроку: событие
-старше минуты для push бесполезно, а память Home Assistant не склад.
+⚠ Доставка менеджеру — С ПОДТВЕРЖДЕНИЕМ (`event-ack {id}`). Отправка в сокет
+не значит доставку: кадр ложится в буфер TCP мёртвого соединения до срабатывания
+heartbeat и пропадает. Поэтому кадр живёт здесь до подтверждения и повторяется
+после переподключения В ИСХОДНОМ ПОРЯДКЕ; менеджер отбрасывает повторы по `id`.
+Срок и число ограничены: событие старше минуты для push бесполезно.
 """
 
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from time import time
 from typing import Any
@@ -34,16 +37,19 @@ Listener = Callable[[dict[str, Any]], None]
 
 
 class EventHub:
-    """Раздаёт событие всем подписчикам; менеджеру — через буфер."""
+    """Раздаёт событие подписчикам; менеджеру — до подтверждения."""
 
     def __init__(self) -> None:
         self._listeners: list[Listener] = []
-        self._pending: deque[dict[str, Any]] = deque(maxlen=BUFFER)
+        self._unacked: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._sender: Callable[[dict[str, Any]], bool] | None = None
         self.recent: deque[dict[str, Any]] = deque(maxlen=20)
+        self.dropped = 0
 
-    def publish(self, access: str, source: str, event: str, data: Any = None) -> dict[str, Any]:
-        """Событие устройства. `access` — доступ (или служба дома), `source` — его источник."""
+    def publish(
+        self, access: str, source: str, event: str, data: Any = None, local: bool = True
+    ) -> dict[str, Any]:
+        """Событие устройства. `local` — можно ли показать его в локальном контуре."""
         frame = {
             "t": "event",
             "id": uuid4().hex,
@@ -54,13 +60,15 @@ class EventHub:
             "data": _bounded(data),
         }
         self.recent.append({k: frame[k] for k in ("at", "access", "source", "event")})
-        for listener in list(self._listeners):
-            try:
-                listener(frame)
-            except Exception:  # noqa: BLE001 — подписчик не роняет источник
-                LOGGER.warning("Событие устройства: подписчик упал", exc_info=True)
-        if self._sender is None or not self._sender(frame):
-            self._pending.append(frame)
+        if local:
+            for listener in list(self._listeners):
+                try:
+                    listener(frame)
+                except Exception:  # noqa: BLE001 — подписчик не роняет источник
+                    LOGGER.warning("Событие устройства: подписчик упал", exc_info=True)
+        self._keep(frame)
+        if self._sender is not None:
+            self._sender(frame)
         return frame
 
     def subscribe(self, listener: Listener) -> Callable[[], None]:
@@ -73,24 +81,32 @@ class EventHub:
         return unsubscribe
 
     def attach(self, sender: Callable[[dict[str, Any]], bool]) -> list[dict[str, Any]]:
-        """Канал к менеджеру поднялся: отдать отложенное свежее, дальше слать сразу.
-
-        `sender` возвращает False, если кадр не ушёл — тогда он ляжет в буфер.
-        """
+        """Канал поднялся: вернуть неподтверждённое свежее (в порядке событий)."""
         self._sender = sender
-        now = time()
-        fresh = [f for f in self._pending if now - f["at"] <= BUFFER_TTL_S]
-        self._pending.clear()
-        return fresh
+        self._expire()
+        return list(self._unacked.values())
 
     def detach(self) -> None:
         self._sender = None
 
-    def requeue(self, frame: dict[str, Any]) -> None:
-        self._pending.append(frame)
+    def ack(self, frame_id: Any) -> None:
+        self._unacked.pop(str(frame_id), None)
 
     def state(self) -> dict[str, Any]:
-        return {"pending": len(self._pending), "recent": list(self.recent)}
+        return {"unacked": len(self._unacked), "dropped": self.dropped, "recent": list(self.recent)}
+
+    def _keep(self, frame: dict[str, Any]) -> None:
+        self._expire()
+        self._unacked[frame["id"]] = frame
+        while len(self._unacked) > BUFFER:
+            self._unacked.popitem(last=False)
+            self.dropped += 1
+            LOGGER.warning("События устройств: буфер полон, старейшее не доставлено менеджеру")
+
+    def _expire(self) -> None:
+        now = time()
+        for frame_id in [i for i, f in self._unacked.items() if now - f["at"] > BUFFER_TTL_S]:
+            del self._unacked[frame_id]
 
 
 def _bounded(data: Any) -> Any:

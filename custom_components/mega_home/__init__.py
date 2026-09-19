@@ -38,7 +38,9 @@ from .link import ManagerLink
 from .ha_update import async_self_update
 from .core.sip_bridge import SipBridge
 
-PLATFORMS: list[Platform] = []
+# Шторы на импульсных реле (`cover.py`) — единственные сущности интеграции: их
+# логика живёт в доме, потому что без обратной связи положение знает только он.
+PLATFORMS: list[Platform] = [Platform.COVER]
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -133,17 +135,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # и сразу получает уже загруженный конфиг: адрес регистратора приезжает
     # обычной синхронизацией, и ждать следующего тика опроса (15 минут) ради
     # первой ленты событий незачем.
+    # ⚠ Универсальная дверь принадлежит ДОМУ, а не драйверу вендора
+    # (`docs/home-gateway.md`): учётки, MQTT и события всех вендоров живут в ней,
+    # драйвер Trassir только регистрирует свою живую сессию для СВОЕГО доступа.
+    from .core.access_secrets import STORE_KEY as SECRETS_STORE
+    from .core.gateway import AccessGateway
+
+    door = AccessGateway(
+        secrets_fetch=client.async_access_secret,
+        store=coordinator.env.store(SECRETS_STORE, 1),
+    )
+    coordinator.accesses = door
+    if coordinator.data:
+        door.apply(coordinator.data.get("accesses"))
     gateway = TrassirGateway(
         coordinator.env,
         client,
         coordinator.env.session(entry.data.get(CONF_VERIFY_SSL, True)),
+        door=door,
     )
     await gateway.async_load()
     coordinator.trassir = gateway
-    # ⚠ Дверь читается ОТСЮДА, а не из драйвера: она не принадлежит
-    # видеонаблюдению (`gateway.py`). Живёт она пока у драйвера только потому,
-    # что учётку и живую сессию держит он.
-    coordinator.accesses = gateway.accesses
     entry.async_on_unload(lambda: hass.async_create_task(gateway.async_stop()))
     if coordinator.data:
         await gateway.async_apply(coordinator.data)
@@ -156,7 +168,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
 
     coordinator.events = EventHub()
     coordinator.event_sources = Listeners(coordinator.env, coordinator.accesses, coordinator.events)
-    entry.async_on_unload(lambda: hass.async_create_task(coordinator.event_sources.stop()))
+    # ⚠ Остановка источников и двери — в `async_unload_entry` и с ожиданием: порт
+    # 8189 обязан освободиться ДО того, как перезагруженная запись поднимет свой.
     if coordinator.data:
         coordinator.event_sources.apply(coordinator.accesses.descriptors())
 
@@ -205,9 +218,21 @@ async def async_unload_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) ->
     no way to remove them, and they resolve the coordinator per request anyway,
     so an unloaded entry simply makes them answer "not synchronised yet".
     """
-    if PLATFORMS:
-        return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    return True
+    unloaded = (
+        await hass.config_entries.async_unload_platforms(entry, PLATFORMS) if PLATFORMS else True
+    )
+    coordinator = getattr(entry, "runtime_data", None)
+    # ⚠ Порядок и ожидание обязательны (ревью 2026-09-19): сначала источники
+    # событий — они зовут дверь и держат порт 8189, — и только потом дверь. Задачи
+    # «в фоне без ожидания» оставляли порт занятым для перезагруженной записи и
+    # создавали новую HTTP-сессию уже закрытой двери.
+    sources = getattr(coordinator, "event_sources", None)
+    if sources is not None:
+        await sources.stop()
+    door = getattr(coordinator, "accesses", None)
+    if door is not None:
+        await door.async_close()
+    return unloaded
 
 
 @callback

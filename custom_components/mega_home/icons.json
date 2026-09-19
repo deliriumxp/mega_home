@@ -1,5 +1,6 @@
 {
   "services": {
-    "sync": "mdi:sync"
+    "sync": "mdi:sync",
+    "calibrate_position": "mdi:ruler"
   }
 }

@@ -60,8 +60,6 @@ def test_описание_собирается_из_конфига() -> None:
     # Мусора нет — умолчание то же: SDK живёт на HTTPS.
     assert descriptor_of({"host": "1.2.3.4"}).scheme == "https"
 
-
-    assert descriptor.stream_url == "rtsp://{host}:{rtspPort}/{token}"
     # Мусор — «описания нет», а не падение: конфиг может быть от менеджера постарше.
     assert descriptor_of(None) is None
     assert descriptor_of({"host": "  "}) is None

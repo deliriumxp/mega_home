@@ -1,46 +1,53 @@
 """Источники событий устройств: то, что дом слушает сам, без жильца у экрана.
 
 Виды — данные описания доступа (`events[]`, `docs/home-gateway.md`):
-  * `webhook` — устройство само зовёт дом по HTTP (Action URL домофона,
-    вебхук). Свой порт интеграции, а не HTTP-сервер Home Assistant: слушатель
-    переедет в ядро без HA без переделки (`docs/plan-core-without-ha.md`);
-  * `poll`   — подписка «держи запрос, пока есть что сказать» через дверь.
-    ⚠ Только если у вендора нет push-подписки (`docs/vendor-integrations.md`);
-  * `mqtt`   — подписка на топики брокера доступа;
-  * `tcp`    — постоянное соединение, события — куски между разделителями.
+  * `webhook`   — устройство само зовёт дом по HTTP (Action URL, вебхук, alarm
+    server). Путь `/hook/<доступ>/<источник>` или ЛЮБОЙ путь (`anyPath`) —
+    тогда источник опознаётся по адресу устройства. Ответ — `reply` описания;
+  * `tcpServer` — устройство само подключается к дому по TCP (сырые события);
+  * `udp`       — датаграммы на порт дома, в том числе мультикаст (`group`);
+  * исходящие `poll`, `stream`, `ws`, `mqtt`, `tcp` — `listeners_out.py`.
+⚠ Опрос и поток — только если у вендора нет push-подписки (`docs/vendor-integrations.md`).
 
-Дом ничего не толкует: событие уходит в концентратор (`device_events.py`) как
-есть, с именем доступа и источника. Что оно значит, решают бандл и менеджер.
+⚠ Входящие — только с адреса устройства из конфига: порты смотрят в LAN без
+аутентификации. Порты — свои у интеграции, а не HTTP-сервер HA: слушатели
+переедут в ядро без HA без переделки.
+
+Событие уходит в концентратор (`device_events.py`) как есть. В локальный поток
+приложения — только с `local: true` в описании источника.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import ipaddress
-import json
+import socket
+from time import monotonic
 from typing import Any
 
 from aiohttp import web
 
+from . import listeners_out as out
 from .access import AccessDescriptor
 from .const import LOGGER
 from .device_events import EventHub
 
-# Порт входящих вызовов устройств. ⚠ Меняется только вместе с менеджером: адрес
-# этого порта менеджер прописывает в устройства при их настройке.
+# Порт входящих HTTP-вызовов устройств. ⚠ Меняется только вместе с менеджером:
+# адрес этого порта менеджер прописывает в устройства при их настройке.
 HOOK_PORT = 8189
-MAX_HOOK_BODY = 64 * 1024
+MAX_CHUNK = out.MAX_CHUNK
 RETRY_FIRST_S = 2.0
 RETRY_MAX_S = 60.0
-POLL_PAUSE_S = 1.0
+# Проработал дольше — значит был здоров: следующий сбой снова с короткой паузы.
+HEALTHY_S = 60.0
+body_of = out.body_of
 
 
-def _body(raw: bytes) -> dict[str, Any]:
+def _host_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     try:
-        return {"text": raw.decode("utf-8")}
-    except UnicodeDecodeError:
-        return {"base64": base64.b64encode(raw).decode("ascii")}
+        return ipaddress.ip_address(host)
+    except ValueError:
+        return None
 
 
 class Listeners:
@@ -48,200 +55,234 @@ class Listeners:
 
     def __init__(self, env: Any, door: Any, hub: EventHub) -> None:
         self._env = env
-        self._door = door
+        self.door = door
         self._hub = hub
         self._signature = ""
-        self._tasks: list[asyncio.Task[None]] = []
-        self._hooks: dict[tuple[str, str], AccessDescriptor] = {}
+        self._lock = asyncio.Lock()
+        self._restarting: asyncio.Task[None] | None = None
+        self._tasks: list[Any] = []
+        self._hooks: dict[tuple[str, str], tuple[AccessDescriptor, dict[str, Any]]] = {}
+        self._any_path: dict[str, tuple[AccessDescriptor, dict[str, Any]]] = {}
         self._runner: web.AppRunner | None = None
+        self._servers: list[Any] = []
+        self._stopped = False
         self.why = ""
 
     def apply(self, descriptors: list[AccessDescriptor]) -> None:
-        signature = json.dumps(
-            [[d.id, d.host, d.port, d.secret, d.events] for d in descriptors], sort_keys=True, default=str
-        )
-        if signature == self._signature:
+        # Подпись — ВСЁ описание: `deny`, сроки и авторизация тоже меняют работу
+        # источника, а держать устаревшее описание он не должен.
+        signature = repr(descriptors)
+        if signature == self._signature or self._stopped:
             return
         self._signature = signature
-        self._env.spawn(self._restart(descriptors), "mega_home listeners")
+        self._restarting = self._env.spawn(self._restart(descriptors), "mega_home listeners")
 
     async def _restart(self, descriptors: list[AccessDescriptor]) -> None:
-        await self._stop_sources()
-        self._hooks = {}
-        for descriptor in descriptors:
-            for spec in descriptor.events:
-                kind, source = str(spec.get("type") or ""), str(spec.get("id") or spec.get("type") or "")
-                if kind == "webhook":
-                    self._hooks[(descriptor.id, source)] = descriptor
-                elif kind == "poll":
-                    self._run(self._poll(descriptor, source, spec), f"poll {descriptor.id}/{source}")
-                elif kind == "mqtt":
-                    self._run(self._mqtt(descriptor, source, spec), f"mqtt {descriptor.id}/{source}")
-                elif kind == "tcp":
-                    self._run(self._tcp(descriptor, source, spec), f"tcp {descriptor.id}/{source}")
-                else:
-                    LOGGER.warning("Источник событий «%s» дом пока не умеет", kind)
-        if self._hooks:
-            await self._start_hooks()
-        else:
-            await self._stop_hooks()
+        async with self._lock:
+            await self._stop_all()
+            if self._stopped:
+                return
+            self._hooks, self._any_path, self.why = {}, {}, ""
+            for descriptor in descriptors:
+                for spec in descriptor.events:
+                    self._start_source(descriptor, spec)
+            if self._hooks or self._any_path:
+                self._run(self._hook_server(), "hooks")
+
+    def _start_source(self, descriptor: AccessDescriptor, spec: dict[str, Any]) -> None:
+        kind = str(spec.get("type") or "")
+        source = str(spec.get("id") or kind)
+        name = f"{descriptor.id}/{source}"
+        if kind == "webhook":
+            if _host_ip(descriptor.host) is None:
+                self.why = f"{name}: вебхук принимается только с IP-адреса, а в описании имя"
+                LOGGER.warning("События устройств: %s", self.why)
+            elif spec.get("anyPath") is True:
+                self._any_path[str(_host_ip(descriptor.host))] = (descriptor, spec)
+            else:
+                self._hooks[(descriptor.id, source)] = (descriptor, spec)
+            return
+        workers = {
+            "poll": out.poll, "stream": out.stream, "ws": out.ws, "mqtt": out.mqtt, "tcp": out.tcp,
+            "tcpServer": self._tcp_server, "udp": self._udp,
+        }
+        worker = workers.get(kind)
+        if worker is None:
+            LOGGER.warning("Источник событий «%s» дом пока не умеет", kind)
+            return
+        self._run(self._forever(worker, descriptor, source, spec, name), name)
 
     def _run(self, coro: Any, name: str) -> None:
         self._tasks.append(self._env.spawn(coro, f"mega_home events {name}"))
 
-    async def stop(self) -> None:
-        await self._stop_sources()
-        await self._stop_hooks()
+    def emit(self, descriptor: AccessDescriptor, source: str, spec: dict[str, Any], event: str, data: Any) -> None:
+        self._hub.publish(descriptor.id, source, event, data, local=spec.get("local") is True)
 
-    async def _stop_sources(self) -> None:
-        for task in self._tasks:
+    async def stop(self) -> None:
+        """Остановить всё и ДОЖДАТЬСЯ: порт 8189 обязан освободиться до новой записи."""
+        self._stopped = True
+        restarting = self._restarting
+        if isinstance(restarting, asyncio.Future) and not restarting.done():
+            restarting.cancel()
+            await asyncio.gather(restarting, return_exceptions=True)
+        async with self._lock:
+            await self._stop_all()
+
+    async def _stop_all(self) -> None:
+        tasks, self._tasks = self._tasks, []
+        for task in tasks:
             task.cancel()
-        self._tasks = []
+        await asyncio.gather(*[t for t in tasks if isinstance(t, asyncio.Future)], return_exceptions=True)
+        runner, self._runner = self._runner, None
+        if runner is not None:
+            await runner.cleanup()
+        for server in self._servers:
+            server.close()
+        self._servers = []
 
     def state(self) -> dict[str, Any]:
         return {
-            "hooks": [f"/hook/{a}/{s}" for a, s in self._hooks],
+            "hooks": [f"/hook/{a}/{s}" for a, s in self._hooks] + [f"* от {ip}" for ip in self._any_path],
             "hook_port": HOOK_PORT if self._runner else None,
             "sources": len(self._tasks),
             "why": self.why,
         }
 
+    async def _forever(self, worker: Any, descriptor: AccessDescriptor, source: str, spec: dict[str, Any], name: str) -> None:
+        """Источник живёт, пока жив конфиг: отказ — повтор с растущей паузой."""
+        delay = RETRY_FIRST_S
+        while True:
+            started = monotonic()
+            try:
+                if worker in (self._tcp_server, self._udp):
+                    await worker(descriptor, source, spec)
+                else:
+                    await worker(self, descriptor, source, spec)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 — источник не роняет дом
+                LOGGER.debug("Источник событий %s: %s", name, type(err).__name__)
+            if monotonic() - started > HEALTHY_S:
+                delay = RETRY_FIRST_S
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, RETRY_MAX_S)
+
     # --- входящий HTTP -----------------------------------------------------
 
-    async def _start_hooks(self) -> None:
-        if self._runner is not None:
-            return
-        app = web.Application(client_max_size=MAX_HOOK_BODY)
+    async def _hook_server(self) -> None:
+        app = web.Application(client_max_size=MAX_CHUNK)
         app.router.add_route("*", "/hook/{access}/{source}", self._hook)
-        runner = web.AppRunner(app, access_log=None)
-        await runner.setup()
-        try:
-            await web.TCPSite(runner, "0.0.0.0", HOOK_PORT).start()
-        except OSError as err:
-            await runner.cleanup()
-            self.why = f"порт {HOOK_PORT} занят — входящие события не слушаем: {err}"
-            LOGGER.warning("События устройств: %s", self.why)
-            return
-        self._runner, self.why = runner, ""
-
-    async def _stop_hooks(self) -> None:
-        runner, self._runner = self._runner, None
-        if runner is not None:
-            await runner.cleanup()
-
-    async def _hook(self, request: web.Request) -> web.Response:
-        access, source = request.match_info["access"], request.match_info["source"]
-        descriptor = self._hooks.get((access, source))
-        # ⚠ Вызов принимается ТОЛЬКО с адреса устройства из конфига: порт смотрит
-        # в LAN без аутентификации (панель её не умеет), и без этой проверки
-        # «звонок в дверь» мог бы прислать кто угодно из Wi-Fi объекта.
-        if descriptor is None or not _same_host(request.remote, descriptor.host):
-            return web.Response(status=404)
-        raw = await request.read()
-        self._hub.publish(
-            access,
-            source,
-            "hook",
-            {"method": request.method, "path": request.path, "query": dict(request.query), **_body(raw)},
-        )
-        return web.Response(text="OK")
-
-    # --- долгий опрос через дверь -------------------------------------------
-
-    async def _poll(self, descriptor: AccessDescriptor, source: str, spec: dict[str, Any]) -> None:
-        from .gateway import SCOPE_MANAGER
-
+        app.router.add_route("*", "/{tail:.*}", self._hook_any)
         delay = RETRY_FIRST_S
-        pause = float(spec.get("pause") or POLL_PAUSE_S)
         while True:
+            runner = web.AppRunner(app, access_log=None)
+            await runner.setup()
             try:
-                status, kind, payload, _ = await self._door.call_full(
-                    descriptor.id,
-                    str(spec.get("method") or "GET"),
-                    str(spec.get("path") or "/"),
-                    spec.get("params") if isinstance(spec.get("params"), dict) else None,
-                    json.dumps(spec["body"]).encode() if isinstance(spec.get("body"), (dict, list)) else None,
-                    scope=SCOPE_MANAGER,
-                )
-                self._hub.publish(descriptor.id, source, "response", {"status": status, "contentType": kind, **_body(payload)})
-                delay = RETRY_FIRST_S
-                await asyncio.sleep(pause)
-            except asyncio.CancelledError:
-                raise
-            except Exception as err:  # noqa: BLE001 — источник живёт, пока жив конфиг
-                LOGGER.debug("Опрос %s/%s: %s", descriptor.id, source, err)
+                await web.TCPSite(runner, "0.0.0.0", HOOK_PORT).start()
+            except OSError as err:
+                await runner.cleanup()
+                # ⚠ Порт мог ещё держать прошлый запуск записи — повторяем, а не
+                # сдаёмся: иначе Action URL домофона молча не принимался бы.
+                self.why = f"порт {HOOK_PORT} занят — повторю через {delay:.0f} с: {err.strerror}"
+                LOGGER.warning("События устройств: %s", self.why)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, RETRY_MAX_S)
-
-    # --- MQTT ------------------------------------------------------------------
-
-    async def _mqtt(self, descriptor: AccessDescriptor, source: str, spec: dict[str, Any]) -> None:
-        topics = [str(t) for t in spec.get("topics") or [] if str(t)]
-        delay = RETRY_FIRST_S
-
-        def on_message(topic: str, data: bytes) -> None:
-            self._hub.publish(descriptor.id, source, "message", {"topic": topic, **_body(data)})
-
-        while True:
-            client = None
-            try:
-                client = await self._door.mqtt_client(descriptor, on_message)
-                await client.subscribe(topics)
-                delay = RETRY_FIRST_S
-                await client.closed.wait()
-            except asyncio.CancelledError:
-                if client is not None:
-                    await client.close()
+                continue
+            except BaseException:
+                # Отмена посреди старта — порт не должен остаться занятым.
+                await runner.cleanup()
                 raise
-            except Exception as err:  # noqa: BLE001
-                LOGGER.debug("MQTT %s/%s: %s", descriptor.id, source, err)
-            if client is not None:
-                await client.close()
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, RETRY_MAX_S)
+            self._runner, self.why = runner, ""
+            return
 
-    # --- TCP -------------------------------------------------------------------
+    async def _hook(self, request: web.Request) -> web.Response:
+        found = self._hooks.get((request.match_info["access"], request.match_info["source"]))
+        if found is None or not _same_host(request.remote, found[0].host):
+            return await self._hook_any(request)
+        return await self._accept(request, found, request.match_info["source"])
 
-    async def _tcp(self, descriptor: AccessDescriptor, source: str, spec: dict[str, Any]) -> None:
-        delimiter = base64.b64decode(spec["until"]) if spec.get("until") else b"\n"
-        greeting = base64.b64decode(spec["send"]) if spec.get("send") else b""
-        port = int(spec.get("port") or descriptor.port)
-        delay = RETRY_FIRST_S
-        while True:
-            writer = None
-            try:
-                reader, writer = await asyncio.wait_for(asyncio.open_connection(descriptor.host, port), 10)
-                if greeting:
-                    writer.write(greeting)
-                    await writer.drain()
-                delay = RETRY_FIRST_S
-                buffer = b""
-                while True:
-                    chunk = await reader.read(64 * 1024)
-                    if not chunk:
-                        break
-                    buffer += chunk
-                    while delimiter in buffer:
-                        item, buffer = buffer.split(delimiter, 1)
-                        if item:
-                            self._hub.publish(descriptor.id, source, "data", _body(item))
-                    if len(buffer) > MAX_HOOK_BODY:
-                        self._hub.publish(descriptor.id, source, "data", _body(buffer))
-                        buffer = b""
-            except asyncio.CancelledError:
-                if writer is not None:
-                    writer.close()
-                raise
-            except (OSError, asyncio.TimeoutError) as err:
-                LOGGER.debug("TCP %s/%s: %s", descriptor.id, source, err)
-            if writer is not None:
+    async def _hook_any(self, request: web.Request) -> web.Response:
+        remote = _host_ip(request.remote or "")
+        found = self._any_path.get(str(remote)) if remote else None
+        if found is None:
+            return web.Response(status=404)
+        return await self._accept(request, found, str(found[1].get("id") or "webhook"))
+
+    async def _accept(self, request: web.Request, found: tuple[AccessDescriptor, dict[str, Any]], source: str) -> web.Response:
+        raw = await request.read()
+        data = {"method": request.method, "path": request.path, "query": dict(request.query), **body_of(raw)}
+        self.emit(found[0], source, found[1], "hook", data)
+        # Ответ — данные описания: часть устройств ждёт своего тела или кода и
+        # иначе повторяет вызов (дубли событий).
+        reply = found[1].get("reply") if isinstance(found[1].get("reply"), dict) else {}
+        try:
+            status = int(reply.get("status") or 200)
+        except (TypeError, ValueError):
+            status = 200
+        return web.Response(
+            status=status, text=str(reply.get("body") if reply.get("body") is not None else "OK"),
+            content_type=str(reply.get("contentType") or "text/plain"),
+        )
+
+    # --- входящий TCP и UDP ---------------------------------------------------
+
+    async def _tcp_server(self, descriptor: AccessDescriptor, source: str, spec: dict[str, Any]) -> None:
+        sep = out.delimiter(spec, b"\n")
+        allowed = _host_ip(descriptor.host)
+        idle = out.seconds(spec.get("idle"), out.IDLE_S, 5.0)
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            peer = writer.get_extra_info("peername")
+            if allowed is None or not peer or _host_ip(peer[0]) != allowed:
                 writer.close()
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, RETRY_MAX_S)
+                return
+            try:
+                await out.split(reader, sep, lambda item: self.emit(descriptor, source, spec, "data", body_of(item)), idle)
+            except (ConnectionError, OSError):
+                pass
+            finally:
+                writer.close()
+
+        server = await asyncio.start_server(handle, "0.0.0.0", int(spec["port"]))
+        self._servers.append(server)
+        async with server:
+            await server.serve_forever()
+
+    async def _udp(self, descriptor: AccessDescriptor, source: str, spec: dict[str, Any]) -> None:
+        port = int(spec["port"])
+        group = str(spec.get("group") or "")
+        allowed = _host_ip(descriptor.host)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", port))
+            if group:
+                membership = socket.inet_aton(group) + socket.inet_aton("0.0.0.0")
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+        except OSError:
+            sock.close()
+            raise
+        emit = self.emit
+
+        class Receiver(asyncio.DatagramProtocol):
+            def datagram_received(self, data: bytes, addr: Any) -> None:
+                sender = _host_ip(addr[0])
+                # Мультикаст шлют многие — тогда адрес доступа и есть группа, и
+                # принимается любой отправитель из частной сети.
+                if group and allowed is not None and allowed.is_multicast:
+                    if sender is None or not sender.is_private:
+                        return
+                elif sender != allowed:
+                    return
+                emit(descriptor, source, spec, "datagram", {"from": addr[0], **body_of(data)})
+
+        transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(Receiver, sock=sock)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            transport.close()
 
 
 def _same_host(remote: str | None, host: str) -> bool:
-    try:
-        return ipaddress.ip_address(remote or "") == ipaddress.ip_address(host)
-    except ValueError:
-        return False
+    left, right = _host_ip(remote or ""), _host_ip(host)
+    return left is not None and left == right

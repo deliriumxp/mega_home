@@ -236,11 +236,13 @@ writeprotect=yes
 
 [from-panel]
 exten => _[0-9a-zA-Z].,1,NoOp(SIP-мост: вызов от ${{CALLERID(all)}} на ${{EXTEN}})
- same => n,Stasis({ARI_APP},panel)
+ same => n,Stasis({ARI_APP},panel,${{CHANNEL(pjsip,remote_addr)}})
  same => n,Hangup()
 
 [from-resident]
 exten => answer,1,Stasis({ARI_APP},answer)
+ same => n,Hangup()
+exten => _answer-.,1,Stasis({ARI_APP},answer,${{EXTEN:7}})
  same => n,Hangup()
 exten => echo,1,Answer()
  same => n,Echo()

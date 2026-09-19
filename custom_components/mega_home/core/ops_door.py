@@ -74,7 +74,10 @@ async def _http(coordinator: Any, door: Any, payload: dict[str, Any], scope: str
     body = payload.get("body")
     # ⚠ Тело строкой — это base64 (им же носит файлы реле); объект — это JSON.
     if isinstance(body, str) and body:
-        raw = base64.b64decode(body)
+        try:
+            raw = base64.b64decode(body, validate=True)
+        except ValueError as err:
+            raise AccessDenied("Тело вызова строкой — это base64") from err
     elif isinstance(body, (dict, list)):
         raw = json.dumps(body).encode("utf-8")
     else:
@@ -92,7 +95,11 @@ async def _http(coordinator: Any, door: Any, payload: dict[str, Any], scope: str
     )
     envelope = payload.get("envelope") is True
     if "json" in (content_type or "") and not payload.get("binary") and not envelope:
-        return json.loads(answer.decode("utf-8", "ignore"))
+        try:
+            return json.loads(answer.decode("utf-8", "ignore"))
+        except ValueError:
+            # Пустой 204 или HTML-ошибка с типом JSON — отдаём конвертом, а не 500.
+            envelope = True
     out: dict[str, Any] = {
         "status": status,
         "contentType": content_type or "",

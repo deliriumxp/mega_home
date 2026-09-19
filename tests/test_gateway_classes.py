@@ -25,9 +25,14 @@ from mega_home.core.gateway import SCOPE_MANAGER, AccessDenied, AccessGateway
 
 def test_список_классов_заперт() -> None:
     """⚠ Строка в список — только вместе с доказательством в docs/home-gateway.md."""
-    assert access_mod.KINDS == ("http", "tcp", "udp", "mqtt")
+    assert access_mod.KINDS == ("http", "tcp", "udp", "mqtt", "ws")
     assert access_mod.AUTH_TYPES == ("none", "basic", "digest", "bearer", "session")
-    assert access_mod.EVENT_TYPES == ("webhook", "poll", "mqtt", "tcp")
+    assert access_mod.EVENT_TYPES == (
+        "webhook", "poll", "stream", "mqtt", "tcp", "tcpServer", "udp", "ws"
+    )
+    from mega_home.core.templating import FILTERS
+
+    assert FILTERS == ("url", "md5", "sha1", "sha256", "base64", "hex", "upper", "lower")
 
 
 def test_новое_описание_несёт_всё_данными() -> None:
@@ -401,11 +406,12 @@ def test_вебхук_только_с_адреса_устройства(monkeypa
         hub.subscribe(got.append)
         door = AccessGateway()
         door.apply([
-            {"id": "panel", "host": "127.0.0.1", "events": [{"type": "webhook", "id": "action"}]},
+            {"id": "panel", "host": "127.0.0.1", "events": [{"type": "webhook", "id": "action", "local": True}]},
             {"id": "other", "host": "10.9.9.9", "events": [{"type": "webhook", "id": "action"}]},
         ])
         sources = Listeners(FakeHost(), door, hub)
         await sources._restart(door.descriptors())  # noqa: SLF001 — FakeHost задачи не запускает
+        await sources._hook_server()  # noqa: SLF001
         async with aiohttp.ClientSession() as http:
             async with http.post(f"http://127.0.0.1:{port}/hook/panel/action?code=1", data=b"ring") as ok:
                 good = ok.status

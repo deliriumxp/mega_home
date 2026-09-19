@@ -141,12 +141,18 @@ class MqttClient:
             self._writer.write(connect_packet(self._client_id, self._username, self._password, KEEPALIVE))
             await self._writer.drain()
             kind, body = await asyncio.wait_for(read_packet(self._reader), timeout)
-        except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError) as err:
+            if kind & 0xF0 != CONNACK or len(body) < 2:
+                raise MqttError("брокер ответил не CONNACK")
+            if body[1]:
+                raise MqttError(REFUSALS.get(body[1], f"брокер отказал (код {body[1]})"))
+        except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, MqttError) as err:
+            # ⚠ Сокет закрывается на ЛЮБОМ отказе: подписчик повторяет вход раз в
+            # минуту, и с неверным паролем дескрипторы копились бы без конца.
+            await self.close()
+            if isinstance(err, MqttError):
+                raise
             raise MqttError(f"брокер недоступен: {err or 'таймаут'}") from err
-        if kind & 0xF0 != CONNACK or len(body) < 2:
-            raise MqttError("брокер ответил не CONNACK")
-        if body[1]:
-            raise MqttError(REFUSALS.get(body[1], f"брокер отказал (код {body[1]})"))
+        self._pong = asyncio.Event()
         self._tasks = [asyncio.ensure_future(self._read_loop()), asyncio.ensure_future(self._ping_loop())]
 
     async def publish(self, topic: str, data: bytes, qos: int = 0, retain: bool = False) -> None:
@@ -168,13 +174,22 @@ class MqttClient:
 
     async def close(self) -> None:
         for task in self._tasks:
-            task.cancel()
+            if task is not asyncio.current_task():
+                task.cancel()
         if self._writer is not None:
             try:
                 self._writer.write(packet(DISCONNECT, b""))
                 self._writer.close()
-            except OSError:
+            except (OSError, RuntimeError):
                 pass
+        self._mark_closed()
+
+    def _mark_closed(self) -> None:
+        # Ожидающие подтверждения проваливаются СРАЗУ, а не по своим 10 с.
+        for future in self._acks.values():
+            if not future.done():
+                future.set_exception(MqttError("подключение к брокеру закрыто"))
+        self._acks.clear()
         self.closed.set()
 
     def _packet_id(self) -> int:
@@ -199,7 +214,7 @@ class MqttClient:
             self._writer.write(data)
             await self._writer.drain()
         except OSError as err:
-            self.closed.set()
+            self._mark_closed()
             raise MqttError(f"подключение к брокеру порвалось: {err}") from err
 
     async def _read_loop(self) -> None:
@@ -219,25 +234,41 @@ class MqttClient:
                     future = self._acks.pop(packet_id, None)
                     if future is not None and not future.done():
                         future.set_result(body[2:])
+                elif kind == PINGRESP:
+                    self._pong.set()
         except asyncio.CancelledError:
             raise
-        except (OSError, asyncio.IncompleteReadError, MqttError, struct.error) as err:
+        except (OSError, asyncio.IncompleteReadError, MqttError, struct.error, UnicodeError) as err:
             LOGGER.debug("MQTT %s:%s: чтение остановлено: %s", self._host, self._port, err)
         finally:
-            self.closed.set()
+            self._mark_closed()
 
     async def _ping_loop(self) -> None:
         # ⚠ Не таймер вокруг чужой системы, а требование протокола (3.1.2.10):
-        # без пакета за `keepalive` брокер сам разрывает подключение.
+        # без пакета за `keepalive` брокер сам разрывает подключение. Ответ
+        # PINGRESP ЖДЁМ: брокер, пропавший без FIN, иначе обнаружился бы только
+        # через минуты ретрансмитов ядра — всё это время события терялись бы.
         try:
             while not self.closed.is_set():
                 await asyncio.sleep(KEEPALIVE / 2)
+                self._pong.clear()
                 await self._send(packet(PINGREQ, b""))
+                try:
+                    await asyncio.wait_for(self._pong.wait(), KEEPALIVE / 2)
+                except asyncio.TimeoutError:
+                    LOGGER.debug("MQTT %s:%s: брокер не ответил на PING", self._host, self._port)
+                    await self.close()
+                    return
         except (asyncio.CancelledError, MqttError):
             pass
 
 
-def as_bytes(value: Any) -> bytes:
+def as_bytes(value: Any, raw_base64: Any = None) -> bytes:
+    """Полезная нагрузка: объект — JSON, строка — UTF-8, `payloadBase64` — байты как есть."""
+    if raw_base64:
+        import base64
+
+        return base64.b64decode(str(raw_base64), validate=True)
     if isinstance(value, (dict, list)):
         import json
 

@@ -234,7 +234,8 @@ async def negotiate_source(
             ):
                 await rest.streams.add(identifier, [stream_source])
     except Exception as err:  # noqa: BLE001
-        LOGGER.debug("own go2rtc add stream failed: %s", err)
+        # ⚠ Только тип: текст ошибки go2rtc несёт URL источника с учёткой.
+        LOGGER.debug("own go2rtc add stream failed: %s", type(err).__name__)
         raise OpError(_cannot_stream(what), HTTPStatus.BAD_GATEWAY) from err
 
     session_id = token_hex(8)

@@ -50,7 +50,15 @@ def test_панель_звонит_и_не_отвечена_до_телефон�
     calls = _Calls()
     _run(calls, _start("p1", "panel", "192.168.88.90"))
     assert calls.sent == [("POST", "/channels/p1/ring", None)]
-    assert calls.events == [("call", {"caller": "192.168.88.90"})]
+    assert calls.events == [("call", {"caller": "192.168.88.90", "call": "p1"})]
+
+
+def test_второй_вызов_той_же_панели_сбрасывается() -> None:
+    """⚠ Адрес панели по UDP подделывается: у панели один вызов разом."""
+    calls = _Calls()
+    _run(calls, _start("p1", "panel", "192.168.88.90"), _start("p2", "panel", "192.168.88.90"))
+    assert ("DELETE", "/channels/p2", {"reason": "busy"}) in calls.sent
+    assert [e for e, _ in calls.events] == ["call"]
 
 
 def test_ответ_телефона_соединяет_с_панелью() -> None:

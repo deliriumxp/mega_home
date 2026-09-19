@@ -49,7 +49,10 @@ def _window(value: Any, default: float) -> float:
 async def tcp_exchange(descriptor: AccessDescriptor, call: dict[str, Any]) -> dict[str, Any]:
     send = _bytes(call.get("send"), "send")
     until = _bytes(call.get("until"), "until")
-    want = int(call.get("bytes") or 0)
+    try:
+        want = max(int(call.get("bytes") or 0), 0)
+    except (TypeError, ValueError) as err:
+        raise AccessDenied("bytes: ожидается число") from err
     window = _window(call.get("timeout"), descriptor.timeout)
     try:
         reader, writer = await asyncio.wait_for(
@@ -103,11 +106,16 @@ async def udp_exchange(descriptor: AccessDescriptor, call: dict[str, Any]) -> di
     window = 0.0 if call.get("timeout") == 0 else _window(call.get("timeout"), 2.0)
     loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # ⚠ Широковещание — только если АДРЕС ДОСТУПА широковещательный: его задаёт
-    # конфиг объекта, а не запрос приложения.
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.bind(("0.0.0.0", 0))
-    transport, protocol = await loop.create_datagram_endpoint(_Collector, sock=sock)
+    try:
+        # Разрешение широковещания на сокете ставится всегда: по какому адресу
+        # уйдёт датаграмма, решает АДРЕС ДОСТУПА из конфига объекта, а не запрос
+        # приложения; угадывать «широковещательный ли он» по маске не беремся.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.bind(("0.0.0.0", 0))
+        transport, protocol = await loop.create_datagram_endpoint(_Collector, sock=sock)
+    except OSError as err:
+        sock.close()
+        raise AccessUnreachable(f"Датаграмма не ушла: {err}") from err
     try:
         transport.sendto(send, (descriptor.host, descriptor.port))
         if window:

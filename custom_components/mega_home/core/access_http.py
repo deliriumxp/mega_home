@@ -1,7 +1,8 @@
 """HTTP-доступ: исполнение описанного вызова с авторизацией, которую ставит дом.
 
 Виды авторизации — данные описания (`access.AuthSpec`): `none`, `basic`,
-`digest`, `bearer`, `session`. Телефон жильца знает пути, но не пароли.
+`digest`, `bearer`, `session`, плюс заголовки, параметры и обёртка тела
+шаблонами описания на каждый вызов. Телефон жильца знает пути, но не пароли.
 
 ⚠ Ответ отдаётся КАК ЕСТЬ — разбор живёт в бандле (`gateway.py`).
 """
@@ -11,19 +12,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from contextlib import asynccontextmanager
 from time import monotonic
-from typing import Any, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 import aiohttp
 
-from .access import AccessDescriptor, fill
+from .access import AccessDescriptor, RequestSpec
 from .access_secrets import SecretBook, template_values
 from .const import LOGGER
+from .templating import live_values, pick, render
 
 # Потолок ответа. Кадр полного размера — ~390 КБ, конфиг регистратора — сотни
 # килобайт; восемь мегабайт ловят ошибку «просим не то», а не ограничивают работу.
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
-# Сколько байт ответа смотрим на маркер протухшей сессии.
 MAX_MARKER_BYTES = 4096
 # Заголовки, которые бандл НЕ задаёт: авторизацию и куки ставит дом, адресата
 # берёт из описания, остальное — дело соединения.
@@ -31,7 +33,6 @@ HEADERS_DENIED = {
     "authorization", "proxy-authorization", "cookie", "host", "connection",
     "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "content-length",
 }
-# Заголовки ответа, которые уезжают бандлу (прочие — служебные для соединения).
 HEADERS_SHOWN = {
     "content-type", "content-disposition", "location", "etag", "last-modified",
     "www-authenticate", "retry-after", "x-total-count",
@@ -57,73 +58,44 @@ class HttpAccess:
         self._secrets = secrets
         # ⚠ ЖИВАЯ сессия драйвера вендора (Trassir): дверь обязана говорить ТОЙ ЖЕ
         # сессией, что открыла поток — вторая сессия того же пользователя чужой
-        # поток не видит (замер стенда 2026-09-13). Привязана к ОДНОМУ доступу
-        # (`provider_access`): второй доступ с сессией получил бы чужую. Без
-        # привязки — прежнее поведение: любой доступ без своей учётки.
-        self._sid_provider = sid_provider
-        self._provider_access = provider_access
+        # поток не видит (замер стенда 2026-09-13). Привязана к СВОЕМУ доступу;
+        # ключ `*` — прежнее поведение без привязки (спеки).
+        self._providers: dict[str, SidProvider] = {}
+        if sid_provider is not None:
+            self._providers[provider_access or "*"] = sid_provider
         self._clients: dict[bool, aiohttp.ClientSession] = {}
         self._sids: dict[str, tuple[str, float]] = {}
+        # ⚠ Замок на вход по доступу: N вызовов с протухшей сессией не делают N
+        # входов (у регистраторов предел сессий и бан адреса за частый вход).
+        self._login_locks: dict[str, asyncio.Lock] = {}
+        self._closed = False
+
+    def bind(self, access: str, provider: SidProvider) -> None:
+        self._providers[access] = provider
 
     def reset(self) -> None:
         self._sids.clear()
+
+    # --- вызов ------------------------------------------------------------
 
     async def request(
         self,
         descriptor: AccessDescriptor,
         method: str,
         path: str,
-        params: dict[str, Any] | None,
+        params: Any,
         body: bytes | None,
         session: dict[str, str] | None = None,
-        headers: dict[str, str] | None = None,
+        headers: Any = None,
     ) -> tuple[int, str, bytes, dict[str, str]]:
-        url = f"{descriptor.scheme}://{descriptor.host}:{descriptor.port}{path}"
-        client = await self._client(descriptor.tls_verify)
         timeout = descriptor.long_poll_timeout if descriptor.is_long_poll(path) else descriptor.timeout
-        sent_headers = {
-            str(k): str(v) for k, v in (headers or {}).items() if str(k).lower() not in HEADERS_DENIED
-        }
-        auth = descriptor.auth
-        # ⚠ Два захода: второй — со СВЕЖЕЙ сессией, если система сказала, что
-        # прежняя умерла (у Trassir это обычный 200 с телом «no session»).
         for attempt in (1, 2):
-            query = {str(key): str(value) for key, value in (params or {}).items()}
-            cookies: dict[str, str] = {}
-            extra = dict(sent_headers)
-            middlewares: tuple[Any, ...] = ()
-            if auth.type == "session" and auth.session and path.split("?")[0] != auth.session.path:
-                sid = await self._sid(descriptor, attempt == 2)
-                if sid:
-                    _place(auth.session.place, auth.session.name, sid, query, extra, cookies)
-            elif auth.type in ("basic", "digest", "bearer"):
-                secret = await self._secret(descriptor)
-                if auth.type == "bearer":
-                    extra["Authorization"] = f"Bearer {secret.get(auth.token_field, '')}"
-                elif auth.type == "basic":
-                    # Заголовком, а не `aiohttp.BasicAuth`: тот объявлен устаревшим,
-                    # а замены нет во всех поддерживаемых aiohttp (как в `sip_calls.py`).
-                    pair = f"{secret.get(auth.user_field, '')}:{secret.get(auth.pass_field, '')}"
-                    extra["Authorization"] = "Basic " + base64.b64encode(pair.encode()).decode()
-                else:
-                    middlewares = (_digest(secret.get(auth.user_field, ""), secret.get(auth.pass_field, "")),)
-            query.update(session or {})
-            try:
-                async with client.request(
-                    method,
-                    url,
-                    params=query,
-                    data=body,
-                    headers=extra or None,
-                    cookies=cookies or None,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
-                    **({"middlewares": middlewares} if middlewares else {}),
-                ) as response:
-                    payload = await read_all(response)
-                    shown = {k.lower(): v for k, v in (getattr(response, "headers", None) or {}).items() if k.lower() in HEADERS_SHOWN}
-                    status, kind = response.status, response.content_type
-            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-                raise AccessUnreachable(reason(err)) from err
+            async with self._send(descriptor, method, path, params, body, session, headers, attempt == 2, timeout) as response:
+                payload = await read_all(response)
+                shown = {k.lower(): v for k, v in (getattr(response, "headers", None) or {}).items() if k.lower() in HEADERS_SHOWN}
+                status, kind = response.status, response.content_type
+            # ⚠ Второй заход — со СВЕЖЕЙ сессией, если система сказала, что прежняя
+            # умерла (у Trassir это обычный 200 с телом «no session»).
             if attempt == 1 and self._expired(descriptor, payload):
                 LOGGER.debug("Доступ %s не признал сессию — входим заново", descriptor.id)
                 self._sids.pop(descriptor.id, None)
@@ -131,21 +103,128 @@ class HttpAccess:
             return status, kind, payload, shown
         raise AccessUnreachable("Система не признала сессию дважды подряд")
 
-    async def token_stream(self, descriptor: AccessDescriptor, camera: str, quality: str) -> str:
-        """Адрес потока по токену (прежняя форма Trassir): дом идёт за токеном сам."""
-        values = {"camera": camera, "quality": quality}
-        params = {key: fill(value, values) for key, value in descriptor.stream_params.items()}
-        status, _, payload, _ = await self.request(descriptor, "GET", descriptor.stream_path, params, None)
-        token = field_of(payload, descriptor.stream_field)
-        if status != 200 or not token:
-            raise AccessUnreachable("Система не выдала поток")
-        return fill(descriptor.stream_url, {"host": descriptor.host, "rtspPort": str(descriptor.rtsp_port), "token": token})
+    @asynccontextmanager
+    async def stream(
+        self, descriptor: AccessDescriptor, method: str, path: str, params: Any, body: bytes | None
+    ) -> AsyncIterator[Any]:
+        """Бесконечный ответ (multipart, chunked, SSE) — для источника событий `stream`."""
+        async with self._send(descriptor, method, path, params, body, None, None, False, None) as response:
+            yield response
+
+    @asynccontextmanager
+    async def _send(
+        self,
+        descriptor: AccessDescriptor,
+        method: str,
+        path: str,
+        params: Any,
+        body: bytes | None,
+        session: dict[str, str] | None,
+        headers: Any,
+        fresh: bool,
+        timeout: float | None,
+    ) -> AsyncIterator[Any]:
+        if params is not None and not isinstance(params, dict):
+            raise AccessDenied("Параметры вызова — объект «имя: значение»")
+        if headers is not None and not isinstance(headers, dict):
+            raise AccessDenied("Заголовки вызова — объект «имя: значение»")
+        client = await self._client(descriptor.tls_verify)
+        url = f"{descriptor.scheme}://{descriptor.host}:{descriptor.port}{path}"
+        query, extra, cookies, middlewares, body = await self.authorize(descriptor, path, params, headers, body, fresh)
+        query.update(session or {})
+        kwargs: dict[str, Any] = {
+            "params": query,
+            "data": body,
+            "headers": extra or None,
+            "cookies": cookies or None,
+            # ⚠ Без редиректов: устройство увело бы запрос на любой адрес вместе с
+            # сессией в query, а бандлу нужен сам ответ с `Location`.
+            "allow_redirects": False,
+            "timeout": aiohttp.ClientTimeout(total=timeout, sock_connect=descriptor.timeout),
+        }
+        if middlewares:
+            kwargs["middlewares"] = middlewares
+        try:
+            async with client.request(method, url, **kwargs) as response:
+                yield response
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise AccessUnreachable(reason(err)) from err
+
+    async def authorize(
+        self,
+        descriptor: AccessDescriptor,
+        path: str,
+        params: Any,
+        headers: Any,
+        body: bytes | None,
+        fresh: bool = False,
+    ) -> tuple[dict[str, str], dict[str, str], dict[str, str], tuple[Any, ...], bytes | None]:
+        """Авторизация по описанию: параметры, заголовки, куки, middleware, тело.
+
+        Одна на HTTP-вызов, поток событий и WebSocket — второй копии вида входа нет.
+        """
+        query = {str(k): str(v) for k, v in (params or {}).items()}
+        extra = {str(k): str(v) for k, v in (headers or {}).items() if str(k).lower() not in HEADERS_DENIED}
+        cookies: dict[str, str] = {}
+        middlewares: tuple[Any, ...] = ()
+        auth = descriptor.auth
+        secret = await self._secret(descriptor)
+        live = live_values()
+        values: dict[str, Any] = template_values(descriptor, secret)
+        if auth.type == "session" and auth.session and path.split("?")[0] != auth.session.path:
+            sid = await self._sid(descriptor, fresh)
+            if sid:
+                values["sid"] = sid
+                value = render(auth.session.template, values, live)
+                _place(auth.session.place, auth.session.name, value, query, extra, cookies)
+        elif auth.type == "bearer":
+            extra["Authorization"] = f"Bearer {secret.get(auth.token_field, '')}"
+        elif auth.type == "basic":
+            # Заголовком, а не `aiohttp.BasicAuth`: тот объявлен устаревшим, а замены
+            # нет во всех поддерживаемых aiohttp (как в `sip_calls.py`).
+            pair = f"{secret.get(auth.user_field, '')}:{secret.get(auth.pass_field, '')}"
+            extra["Authorization"] = "Basic " + base64.b64encode(pair.encode()).decode()
+        elif auth.type == "digest":
+            middlewares = (_digest(secret.get(auth.user_field, ""), secret.get(auth.pass_field, "")),)
+        # Сверх вида — шаблоны ОПИСАНИЯ на каждый вызов (свои заголовки ключа,
+        # подпись, WS-Security). Бандл их не задаёт и учётки в них не видит.
+        for name, template in auth.headers.items():
+            extra[name] = render(template, values, live)
+        for name, template in auth.query.items():
+            query[name] = render(template, values, live)
+        if auth.wrap:
+            text = (body or b"").decode("utf-8", "replace")
+            body = render(auth.wrap, {**values, "body": text}, live).encode("utf-8")
+        return query, extra, cookies, middlewares, body
+
+    async def ws(self, descriptor: AccessDescriptor, path: str, params: Any = None, headers: Any = None) -> Any:
+        """WebSocket к устройству с той же авторизацией (Digest у WebSocket не бывает)."""
+        client = await self._client(descriptor.tls_verify)
+        scheme = "wss" if descriptor.scheme in ("https", "wss") or descriptor.tls else "ws"
+        query, extra, cookies, _, _ = await self.authorize(descriptor, path, params, headers, None)
+        if cookies:
+            extra["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        try:
+            return await client.ws_connect(
+                f"{scheme}://{descriptor.host}:{descriptor.port}{path}",
+                params=query,
+                headers=extra or None,
+                heartbeat=30,
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise AccessUnreachable(reason(err)) from err
+
+    # --- учётка и сессия --------------------------------------------------
 
     async def _secret(self, descriptor: AccessDescriptor) -> dict[str, str]:
+        if not descriptor.secret and self._secrets.legacy_for(descriptor.id) is None:
+            return {}
+        if descriptor.auth.type == "none" and not (descriptor.auth.headers or descriptor.auth.query or descriptor.auth.wrap):
+            return {}
         try:
             return await self._secrets.get(descriptor.id, descriptor.secret)
-        except Exception as err:  # noqa: BLE001 — нет учётки = отказ, а не 500
-            raise AccessDenied(f"Учётка доступа недоступна: {err}") from err
+        except Exception as err:  # noqa: BLE001 — менеджер недоступен и кэша нет
+            raise AccessUnreachable(f"Учётка доступа недоступна: {err}") from err
 
     def _expired(self, descriptor: AccessDescriptor, payload: bytes) -> bool:
         marker = descriptor.session_expired
@@ -155,48 +234,92 @@ class HttpAccess:
         spec = descriptor.auth.session
         if spec is None:
             return ""
-        owned = (
-            descriptor.id == self._provider_access
-            if self._provider_access is not None
-            else not descriptor.secret
+        provider = self._providers.get(descriptor.id) or (
+            self._providers.get("*") if not descriptor.secret else None
         )
-        if self._sid_provider is not None and owned:
+        if provider is not None:
             # ⚠ Провайдер — ЧУЖОЙ код (драйвер) и падает своими исключениями;
             # беда регистратора обязана оставаться вердиктом двери, а не 500.
             try:
-                sid = await self._sid_provider(fresh)
+                sid = await provider(fresh)
             except Exception as err:  # noqa: BLE001
                 raise AccessUnreachable(reason(err)) from err
             if sid:
                 return str(sid)
-        cached = self._sids.get(descriptor.id)
-        if cached and cached[1] > monotonic() and not fresh:
-            return cached[0]
-        secret = await self._secret(descriptor)
-        values = template_values(descriptor, secret)
-        params = {key: fill(value, values) for key, value in spec.params.items()}
+        lock = self._login_locks.setdefault(descriptor.id, asyncio.Lock())
+        async with lock:
+            cached = self._sids.get(descriptor.id)
+            if cached and cached[1] > monotonic() and not fresh:
+                return cached[0]
+            values: dict[str, Any] = template_values(descriptor, await self._secret(descriptor))
+            if spec.challenge is not None:
+                got = await self._exchange(descriptor, spec.challenge, values)
+                values.update({f"challenge.{k}": v for k, v in got.items()})
+            got = await self._exchange(descriptor, spec, values, default_field=spec.field)
+            sid = got.get("sid", "")
+            if not sid:
+                # ⚠ Отказ ВХОДА — беда той системы (или учётки), а не политики двери.
+                raise AccessUnreachable("Система не пустила дом в сессию")
+            self._sids[descriptor.id] = (sid, monotonic() + spec.ttl)
+            return sid
+
+    async def _exchange(
+        self, descriptor: AccessDescriptor, spec: RequestSpec, values: dict[str, Any], default_field: str = ""
+    ) -> dict[str, str]:
+        """Запрос, который дом делает сам (вход, шаг до входа), и поля его ответа."""
+        live = live_values()
         client = await self._client(descriptor.tls_verify)
         url = f"{descriptor.scheme}://{descriptor.host}:{descriptor.port}{spec.path}"
-        timeout = aiohttp.ClientTimeout(total=descriptor.timeout)
+        params = {k: render(v, values, live) for k, v in spec.params.items()}
+        kwargs: dict[str, Any] = {
+            "timeout": aiohttp.ClientTimeout(total=descriptor.timeout),
+            "allow_redirects": False,
+        }
+        if spec.body:
+            kwargs["params"] = params
+            kwargs["data"] = render(spec.body, values, live).encode("utf-8")
+            if spec.content_type:
+                kwargs["headers"] = {"Content-Type": spec.content_type}
+        elif spec.method == "GET" or spec.format == "query":
+            kwargs["params"] = params
+        elif spec.format == "form":
+            kwargs["data"] = params
+        else:
+            kwargs["json"] = params
         try:
             async with (
-                client.get(url, params=params, timeout=timeout)
-                if spec.method == "GET"
-                else client.post(url, json=params, timeout=timeout)
+                client.get(url, **kwargs) if spec.method == "GET" else client.request(spec.method, url, **kwargs)
             ) as response:
-                status, payload = response.status, await response.content.read()
-                header_sid = (getattr(response, "headers", None) or {}).get(spec.field, "") if spec.place == "header" else ""
-                cookie = (getattr(response, "cookies", None) or {}).get(spec.field)
+                status, raw = response.status, await response.content.read()
+                headers = getattr(response, "headers", None) or {}
+                cookies = getattr(response, "cookies", None) or {}
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             raise AccessUnreachable(reason(err)) from err
-        sid = field_of(payload, spec.field) or header_sid or (cookie.value if cookie else "")
-        if status != 200 or not sid:
-            # ⚠ Отказ ВХОДА — беда той системы (или учётки), а не политики двери.
-            raise AccessUnreachable("Система не пустила дом в сессию")
-        self._sids[descriptor.id] = (sid, monotonic() + spec.ttl)
-        return sid
+        if status >= 400:
+            raise AccessUnreachable(f"Система отказала во входе (HTTP {status})")
+        try:
+            data: Any = json.loads(raw.decode("utf-8", "ignore")) if raw else None
+        except ValueError:
+            data = None
+        wanted = dict(spec.fields)
+        if default_field and "sid" not in wanted:
+            wanted["sid"] = default_field
+        out: dict[str, str] = {}
+        for name, where in wanted.items():
+            if where.startswith("header:"):
+                out[name] = str(headers.get(where[7:], ""))
+            elif where.startswith("cookie:"):
+                cookie = cookies.get(where[7:])
+                out[name] = cookie.value if cookie is not None else ""
+            elif where == "text":
+                out[name] = raw.decode("utf-8", "ignore").strip()
+            else:
+                out[name] = pick(data, where)
+        return out
 
     async def _client(self, verify: bool) -> aiohttp.ClientSession:
+        if self._closed:
+            raise AccessUnreachable("Дом перезапускает интеграцию — повторите запрос")
         client = self._clients.get(verify)
         if client is None or client.closed:
             # ⚠ Сертификат устройства в LAN обычно САМОПОДПИСАННЫЙ: доверие держится
@@ -207,6 +330,7 @@ class HttpAccess:
         return client
 
     async def close(self) -> None:
+        self._closed = True
         for client in self._clients.values():
             if not client.closed:
                 await client.close()
@@ -249,20 +373,30 @@ async def read_all(response: Any) -> bytes:
 
 
 def reason(err: Exception) -> str:
-    """Причина отказа словами — у сетевых ошибок сообщение часто пустое."""
-    text = str(err).strip()
-    return f"Система не отвечает: {text}" if text else "Система не отвечает"
+    """Причина отказа словами — БЕЗ адреса запроса.
+
+    ⚠ `str()` ошибок aiohttp несёт URL с query, а там уже подставлены учётка из
+    `auth.query` и `sid` сессии; ответ видит локальный контур без аутентификации
+    (повторное ревью 2026-09-19). Поэтому — тип, код и причина ОС, но не адрес.
+    """
+    import re
+
+    status = getattr(err, "status", None)
+    if status:
+        return f"Система ответила ошибкой (HTTP {status})"
+    if isinstance(err, asyncio.TimeoutError):
+        return "Система не отвечает: таймаут"
+    # Причина словами остаётся («Server disconnected»), адреса — вырезаются.
+    text = re.sub(r"\b[a-z][a-z0-9+.-]*://\S+", "<адрес>", str(err)).strip()
+    if "url=" in text or "?" in text:
+        text = ""
+    return f"Система не отвечает: {text}" if text else f"Система не отвечает ({type(err).__name__})"
 
 
 def field_of(payload: bytes, name: str) -> str:
-    """Поле ответа по имени — единственный разбор, который двери позволен."""
-    if not name or not payload:
-        return ""
+    """Поле ответа по пути — единственный разбор, который двери позволен."""
     try:
-        data = json.loads(payload.decode("utf-8", "ignore"))
+        data = json.loads(payload.decode("utf-8", "ignore")) if payload else None
     except ValueError:
         return ""
-    if isinstance(data, dict):
-        value = data.get(name)
-        return str(value) if isinstance(value, (str, int)) else ""
-    return ""
+    return pick(data, name)

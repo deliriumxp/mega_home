@@ -167,6 +167,11 @@ class Streams:
             address = ipaddress.ip_address(str(payload.get("host")))
         except ValueError:
             return "адрес устройства должен быть IP, а не именем"
+        # ⚠ `0.0.0.0` в Linux — это сам хост: `is_private` у него истинно, а
+        # `is_loopback` ложно, и так открывались бы API go2rtc и HA на петле
+        # (ревью 2026-09-19). Мультикаст и зарезервированное — не устройство.
+        if address.is_unspecified or address.is_multicast or address.is_reserved:
+            return "адрес вне локальной сети объекта"
         if address.is_loopback:
             if str(address) == "127.0.0.1" and port in LOCAL_SERVICES:
                 return None
@@ -317,10 +322,15 @@ class _Datagrams:
         self._stopping = False
         self._tasks: list[asyncio.Task[None]] = []
         self._idle: asyncio.TimerHandle | None = None
+        # ⚠ Одна очередь и одна качалка к менеджеру, как у TCP: задача на каждую
+        # датаграмму копила бы сотни тысяч объектов на потоке RTP и слала бы в
+        # один сокет параллельно (ревью 2026-09-19). Полная очередь — датаграмма
+        # теряется: для UDP это норма, для памяти HA — защита.
+        self._outgoing: asyncio.Queue[bytes] = asyncio.Queue(QUEUE_DEPTH)
         protocol.owner = self
 
     def start(self) -> None:
-        self._tasks = [asyncio.ensure_future(self._deadline())]
+        self._tasks = [asyncio.ensure_future(self._deadline()), asyncio.ensure_future(self._pump())]
         self._touch()
 
     async def to_device(self, chunk: bytes) -> None:
@@ -329,12 +339,24 @@ class _Datagrams:
             self._touch()
 
     def received(self, data: bytes) -> None:
+        if self._stopping:
+            return
         self._bytes += len(data)
         self._touch()
         if self._bytes > MAX_BYTES:
-            self._later(self._done("превышен потолок трафика сессии"))
+            # Флаг сразу: иначе каждая следующая датаграмма заводила бы ещё `_done`.
+            self._stopping = True
+            self._later(self._finish("превышен потолок трафика сессии"))
             return
-        self._later(self._owner._send_bytes(frame(self.id, data)))
+        try:
+            self._outgoing.put_nowait(data)
+        except asyncio.QueueFull:
+            pass
+
+    async def _pump(self) -> None:
+        while True:
+            data = await self._outgoing.get()
+            await self._owner._send_bytes(frame(self.id, data))
 
     def failed(self, exc: Exception) -> None:
         self._later(self._done(_describe(exc)))
@@ -360,8 +382,10 @@ class _Datagrams:
         self._idle = loop.call_later(IDLE_TIMEOUT_S, lambda: self._later(self._done("тишина в сессии")))
 
     def _later(self, coro: Any) -> None:
+        # Только для редких событий (срок, отказ): задача живёт до своего конца.
         task = asyncio.ensure_future(coro)
         self._tasks.append(task)
+        task.add_done_callback(lambda done: done in self._tasks and self._tasks.remove(done))
 
     async def _deadline(self) -> None:
         await asyncio.sleep(MAX_LIFETIME_S)
@@ -370,6 +394,17 @@ class _Datagrams:
     async def _done(self, error: str | None) -> None:
         await self._owner._finished(self.id, error)
         await self.stop(error)
+
+    async def _finish(self, error: str) -> None:
+        """Закрытие по потолку: флаг уже стоит, `stop` его бы не пропустил."""
+        await self._owner._finished(self.id, error)
+        for task in self._tasks:
+            if task is not asyncio.current_task():
+                task.cancel()
+        if self._idle is not None:
+            self._idle.cancel()
+        self._transport.close()
+        LOGGER.info("Сессия %s закрыта: %s", self.id, error)
 
 
 def _describe(err: Exception) -> str:

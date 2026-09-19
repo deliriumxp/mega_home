@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from .access import (
@@ -79,18 +80,46 @@ class AccessGateway:
         # (его называет сам драйвер, дверь вендоров не знает).
         self._http = HttpAccess(self.secrets, sid_provider, provider_access)
         self._mqtt: dict[str, Any] = {}
+        self._mqtt_lock = asyncio.Lock()
+        self._closed = False
+
+    @property
+    def http(self) -> HttpAccess:
+        """HTTP-сторона двери — её авторизацией ходят поток событий и WebSocket."""
+        return self._http
+
+    def bind_session(self, access: str, sid_provider: Any, credentials: Any) -> None:
+        """Драйвер вендора отдаёт двери свою ЖИВУЮ сессию и учётку — для СВОЕГО доступа.
+
+        ⚠ Имя доступа называет драйвер, а не дверь: дверь вендоров не знает.
+        """
+        self._http.bind(access, sid_provider)
+        self.secrets.bind_legacy(access, credentials)
 
     # --- описание -------------------------------------------------------
 
     def apply(self, blocks: Any) -> None:
-        """Принять описания из конфига объекта (список блоков `accesses`)."""
-        self._descriptors = {}
-        self._http.reset()
+        """Принять описания из конфига объекта (список блоков `accesses`).
+
+        ⚠ Неизменённые описания пропускаются: конфиг приходит и без правок (опрос,
+        канал), и сброс сессий каждый раз стоил бы лишних входов в устройства.
+        """
+        fresh: dict[str, AccessDescriptor] = {}
         for block in blocks if isinstance(blocks, list) else []:
             descriptor = descriptor_of(block)
             if descriptor is not None:
-                self._descriptors[descriptor.id] = descriptor
-        self.secrets.forget(set(self._descriptors))
+                fresh[descriptor.id] = descriptor
+        if fresh == self._descriptors:
+            return
+        # Подключения к брокерам, чьё описание сменилось или пропало, снимаются:
+        # иначе публикации шли бы в прежний брокер прежней учёткой.
+        for access in [a for a, d in self._descriptors.items() if fresh.get(a) != d]:
+            client = self._mqtt.pop(access, None)
+            if client is not None:
+                asyncio.ensure_future(client.close())
+        self._descriptors = fresh
+        self._http.reset()
+        self.secrets.forget(set(fresh))
 
     def ids(self) -> list[str]:
         return list(self._descriptors)
@@ -124,7 +153,7 @@ class AccessGateway:
         if not path.startswith("/"):
             raise AccessDenied("Путь начинается с «/»")
         clean = _normalized(path)
-        _deny(descriptor, clean.split("?")[0], scope)
+        deny_target(descriptor, clean.split("?")[0], scope)
         return clean
 
     # --- исполнение -----------------------------------------------------
@@ -177,46 +206,65 @@ class AccessGateway:
         if descriptor.kind == "udp":
             return await udp_exchange(descriptor, call)
         if descriptor.kind == "mqtt":
-            topic = str(call.get("topic") or "")
-            if not topic:
-                raise AccessDenied("Топик не указан")
-            _deny(descriptor, topic, scope)
-            from .mqtt import MqttError, as_bytes
+            from .mqtt_calls import mqtt_call
 
-            client = await self.mqtt_client(descriptor)
-            try:
-                await client.publish(
-                    topic, as_bytes(call.get("payload")), 1 if call.get("qos") == 1 else 0, call.get("retain") is True
-                )
-            except MqttError as err:
-                raise AccessUnreachable(f"Брокер: {err}") from err
-            return {"published": True}
+            return await mqtt_call(self, descriptor, call, scope)
+        if descriptor.kind == "ws":
+            from .access_ws import ws_exchange
+
+            return await ws_exchange(self, descriptor, call, scope)
         raise AccessDenied(f"Вызов вида «{descriptor.kind}» идёт другой дорогой")
 
+    async def secret_of(self, descriptor: AccessDescriptor) -> dict[str, str]:
+        """Учётка доступа; менеджер недоступен и кэша нет — НЕДОСТУПНОСТЬ, а не отказ."""
+        if not descriptor.secret and self.secrets.legacy_for(descriptor.id) is None:
+            return {}
+        try:
+            return await self.secrets.get(descriptor.id, descriptor.secret)
+        except Exception as err:  # noqa: BLE001 — любая беда менеджера
+            raise AccessUnreachable(f"Учётка доступа недоступна: {err}") from err
+
     async def mqtt_client(self, descriptor: AccessDescriptor, on_message: Any = None) -> Any:
-        """Подключение к брокеру доступа: одно на доступ, поднимается по надобности."""
+        """Подключение к брокеру доступа.
+
+        Без `on_message` — ОБЩЕЕ подключение публикаций (одно на доступ, под
+        замком: два одновременных вызова не заводят двух клиентов). С
+        `on_message` — СВОЁ подключение подписчика.
+
+        ⚠ Идентификатор клиента уникален (случайный хвост): по MQTT 3.1.1
+        (3.1.4-2) брокер рвёт прежнее подключение с тем же id, и два источника
+        одного доступа выбивали бы друг друга по кругу.
+        """
+        from secrets import token_hex
+
         from .mqtt import MqttClient, MqttError
 
-        client = self._mqtt.get(descriptor.id)
-        if client is not None and not client.closed.is_set() and on_message is None:
+        async def connect(role: str) -> Any:
+            secret = await self.secret_of(descriptor)
+            client = MqttClient(
+                descriptor.host,
+                descriptor.port,
+                secret.get(descriptor.auth.user_field, ""),
+                secret.get(descriptor.auth.pass_field, ""),
+                tls=descriptor.tls or descriptor.scheme in ("mqtts", "ssl", "tls"),
+                client_id=f"mega_home-{descriptor.id}-{role}-{token_hex(4)}",
+                on_message=on_message,
+            )
+            try:
+                await client.connect()
+            except MqttError as err:
+                raise AccessUnreachable(f"Брокер: {err}") from err
             return client
-        secret = await self.secrets.get(descriptor.id, descriptor.secret) if descriptor.secret else {}
-        client = MqttClient(
-            descriptor.host,
-            descriptor.port,
-            secret.get(descriptor.auth.user_field, ""),
-            secret.get(descriptor.auth.pass_field, ""),
-            tls=descriptor.scheme in ("mqtts", "ssl", "tls"),
-            client_id=f"mega_home-{descriptor.id}{'-sub' if on_message else ''}",
-            on_message=on_message,
-        )
-        try:
-            await client.connect()
-        except MqttError as err:
-            raise AccessUnreachable(f"Брокер: {err}") from err
-        if on_message is None:
-            self._mqtt[descriptor.id] = client
-        return client
+
+        if on_message is not None:
+            return await connect("sub")
+        async with self._mqtt_lock:
+            self._check_open()
+            client = self._mqtt.get(descriptor.id)
+            if client is None or client.closed.is_set():
+                client = await connect("pub")
+                self._mqtt[descriptor.id] = client
+            return client
 
     async def media_url(
         self, access: str | None, source: str, values: dict[str, str] | None = None
@@ -226,22 +274,22 @@ class AccessGateway:
         template = descriptor.media.get(source)
         if not template:
             raise AccessDenied(f"У доступа нет медиа «{source}»")
-        secret = await self.secrets.get(descriptor.id, descriptor.secret) if descriptor.secret else {}
-        clean = {k: str(v) for k, v in (values or {}).items() if not str(k).startswith("secret.")}
-        return fill(template, template_values(descriptor, secret, clean))
+        secret = await self.secret_of(descriptor)
+        return fill(template, template_values(descriptor, secret, values))
 
-    async def stream_url(self, camera: str, quality: str) -> str:
-        """Поток по токену (прежняя форма Trassir)."""
-        descriptor = self.descriptor(None)
-        if descriptor is None or not descriptor.stream_path:
-            raise AccessDenied("Доступ к потоку у объекта не описан")
-        return await self._http.token_stream(descriptor, camera, quality)
+    def _check_open(self) -> None:
+        if self._closed:
+            # ⚠ Закрытая дверь новых соединений не заводит: иначе задача, не
+            # успевшая умереть к выгрузке, создавала бы сессию, которую никто не
+            # закроет (ревью 2026-09-19).
+            raise AccessUnreachable("Дом перезапускает интеграцию — повторите запрос")
 
     async def _client(self, verify: bool = False) -> Any:
         """Соединение HTTP-стороны (замок на решение о сертификате — в спеке)."""
         return await self._http._client(verify)  # noqa: SLF001
 
     def _known(self, access: str | None) -> AccessDescriptor:
+        self._check_open()
         descriptor = self.descriptor(access)
         if descriptor is None:
             raise AccessDenied("Такого доступа у объекта нет")
@@ -257,19 +305,24 @@ class AccessGateway:
         return descriptor
 
     async def async_close(self) -> None:
+        self._closed = True
         await self._http.close()
         for client in list(self._mqtt.values()):
             await client.close()
         self._mqtt.clear()
 
 
-def _deny(descriptor: AccessDescriptor, target: str, scope: str) -> None:
+def deny_target(descriptor: AccessDescriptor, target: str, scope: str) -> None:
+    """Запреты описания для пути, топика или сообщения — одни на все виды доступа."""
+    # ⚠ Без учёта регистра: часть устройств отвечает на `/Settings` так же, как на
+    # `/settings`, и запрет не должен обходиться заглавной буквой.
+    folded = target.lower()
     for prefix in descriptor.deny:
-        if target.startswith(prefix):
+        if folded.startswith(prefix.lower()):
             raise AccessDenied(f"{prefix}* через дверь не ходит")
     if scope != SCOPE_MANAGER:
         for prefix in descriptor.manager_only:
-            if target.startswith(prefix):
+            if folded.startswith(prefix.lower()):
                 LOGGER.debug("Дверь: %s только для менеджера", prefix)
                 raise AccessDenied(f"{prefix}* — только для менеджера")
 
@@ -281,10 +334,21 @@ def _normalized(path: str) -> str:
     `/%2e%2e/settings/` проедет мимо (проверено на стенде). Схлопываем и
     повторные «/»: запрет по префиксу иначе обходится лишним слэшем.
     """
+    import re
     from urllib.parse import unquote
 
-    raw = unquote(path)
-    head, sep, tail = raw.partition("?")
+    # Раскрывается только ПУТЬ: строка запроса уходит как есть, иначе законный
+    # `?q=a%26b` менял бы смысл на `?q=a&b` (повторное ревью 2026-09-19).
+    encoded, sep, tail = path.partition("?")
+    head = unquote(encoded)
+    if "?" in head or "#" in head:
+        raise AccessDenied("В пути закодирован «?» или «#» — через дверь не ходит")
+    # ⚠ После ОДНОГО раскрытия процентов в пути их быть не должно. Ревью
+    # 2026-09-19: `/a/%252e%252e/settings/` проходил проверку как `%2e%2e`, а
+    # yarl раскрывал его ещё раз и схлопывал точки — в сеть уходил `/settings/`.
+    # Законному вызову двойное кодирование пути не нужно, поэтому это отказ.
+    if re.search(r"%[0-9A-Fa-f]{2}", head):
+        raise AccessDenied("Путь закодирован дважды — через дверь не ходит")
     out: list[str] = []
     for part in head.split("/"):
         if part in ("", "."):

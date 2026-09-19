@@ -146,7 +146,10 @@ class SipBridge:
             "enabled": self._wanted,
             "running": self.is_running(),
             "adopted": self._ready and self._adopted,
-            "why": "" if self.is_running() else self._why,
+            # ⚠ Мост без адресов панелей работает, но вызов не принимает ни от кого
+            # (прежнее «все частные сети» снято) — это видно здесь, а не молчанием.
+            "why": (self._why if not self.is_running() else "")
+            or ("" if not self._wanted or self._panels else "панели не заданы — вызов не примем ни от кого"),
             "sip_port": SIP_PORT,
             # Только каналом менеджера: слушает loopback (`sip_config.py`).
             "ws": f"ws://{LOOPBACK}:{HTTP_PORT}/ws",

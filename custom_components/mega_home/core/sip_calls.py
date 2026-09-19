@@ -37,6 +37,12 @@ from .sip_config import ARI_APP, ARI_USER
 # только когда он перезапускается, и тогда он встаёт за секунды.
 RECONNECT_S = 2.0
 HISTORY = 20
+# ⚠ Панель опознаётся только по адресу, а адрес по UDP в той же сети подделать
+# легко (ревью 2026-09-19): чужой INVITE «от панели» разослал бы push о звонке
+# всем жильцам. Поэтому у панели один вызов разом и не чаще раза в этот срок.
+CALL_COOLDOWN_S = 5.0
+# Вызовов разом на дом: панелей у квартиры единицы.
+MAX_CALLS = 4
 
 
 @dataclass
@@ -48,6 +54,8 @@ class DoorCall:
     started: float = field(default_factory=time)
     talk: str = ""
     bridge: str = ""
+    # Сетевой адрес отправителя — по нему пауза и «один вызов разом».
+    peer: str = ""
 
 
 class DoorCalls:
@@ -68,6 +76,7 @@ class DoorCalls:
         self._auth = {"Authorization": f"Basic {token}"}
         self._on_event = on_event
         self._calls: dict[str, DoorCall] = {}
+        self._last_call: dict[str, float] = {}
         self._task: asyncio.Task[None] | None = None
         self.connected = False
         self.history: deque[dict[str, Any]] = deque(maxlen=HISTORY)
@@ -129,24 +138,44 @@ class DoorCalls:
         if kind == "StasisStart":
             role = (event.get("args") or [""])[0]
             if role == "panel":
-                await self._ringing(channel_id, channel)
+                # Второй аргумент — СЕТЕВОЙ адрес отправителя (`CHANNEL(pjsip,
+                # remote_addr)`, «ip:порт»): номер звонящего выбирает сам INVITE.
+                args = event.get("args") or []
+                peer = str(args[1]).rsplit(":", 1)[0] if len(args) > 1 and args[1] else ""
+                await self._ringing(channel_id, channel, peer)
             elif role == "answer":
-                await self._answer(channel_id)
+                # Второй аргумент — id вызова, которому отвечают (`answer-<id>`);
+                # пусто — последний звонящий.
+                args = event.get("args") or []
+                await self._answer(channel_id, str(args[1]) if len(args) > 1 else "")
             else:
                 await self._hangup(channel_id, "unallocated")
         elif kind == "StasisEnd":
             await self._ended(channel_id)
 
-    async def _ringing(self, channel_id: str, channel: dict[str, Any]) -> None:
+    async def _ringing(self, channel_id: str, channel: dict[str, Any], peer: str = "") -> None:
         caller = str((channel.get("caller") or {}).get("number") or "")
-        self._calls[channel_id] = DoorCall(channel_id, caller)
+        # ⚠ Ограничения — по СЕТЕВОМУ адресу, а не по номеру: номер (CALLERID)
+        # выбирает отправитель, и, меняя его, подделка проходила бы паузу каждый
+        # раз (повторное ревью 2026-09-19). Сверх того — общий потолок на дом.
+        key = peer or caller
+        now = time()
+        busy = any(c.peer == key for c in self._calls.values())
+        crowded = len(self._calls) >= MAX_CALLS
+        if busy or crowded or now - self._last_call.get(key, 0.0) < CALL_COOLDOWN_S:
+            await self._hangup(channel_id, "busy")
+            return
+        self._last_call[key] = now
+        self._calls[channel_id] = DoorCall(channel_id, caller, peer=key)
         # ⚠ Не `answer`: панель считает вызов принятым и гасит мониторы.
         await self._request("POST", f"/channels/{channel_id}/ring")
-        self._emit("call", {"caller": caller})
+        # `call` — id вызова: им телефон отвечает именно этой панели, им же
+        # менеджер сводит `call` и `cancel` при нескольких панелях.
+        self._emit("call", {"caller": caller, "call": channel_id})
 
-    async def _answer(self, phone: str) -> None:
-        """Телефон набрал `answer`: соединяем с последним вызовом, что ещё звонит."""
-        waiting = [c for c in self._calls.values() if not c.talk]
+    async def _answer(self, phone: str, target: str = "") -> None:
+        """Телефон набрал `answer[-<id>]`: соединяем с этим вызовом или последним звонящим."""
+        waiting = [c for c in self._calls.values() if not c.talk and (not target or c.panel == target)]
         if not waiting:
             # Гость ушёл, пока жилец открывал приложение, или трубку взял другой.
             await self._hangup(phone, "normal")
@@ -166,18 +195,18 @@ class DoorCalls:
             f"/bridges/{call.bridge}/addChannel",
             {"channel": f"{call.panel},{phone}"},
         )
-        self._emit("answered", {"caller": call.caller})
+        self._emit("answered", {"caller": call.caller, "call": call.panel})
 
     async def _ended(self, channel_id: str) -> None:
         call = self._calls.get(channel_id)
         if call is not None:
-            self._emit("ended" if call.talk else "cancel", {"caller": call.caller})
+            self._emit("ended" if call.talk else "cancel", {"caller": call.caller, "call": call.panel})
             await self._finish(call, "normal")
             return
         for call in list(self._calls.values()):
             if call.talk == channel_id:
                 # Жилец положил трубку — разговор окончен и для гостя.
-                self._emit("ended", {"caller": call.caller})
+                self._emit("ended", {"caller": call.caller, "call": call.panel})
                 await self._finish(call, "normal")
                 return
 

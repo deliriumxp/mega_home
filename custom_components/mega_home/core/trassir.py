@@ -58,7 +58,9 @@ DEFAULT_CLIP_SECONDS = 60
 class TrassirGateway:
     """Everything this home does with its recorder, and nothing it does not."""
 
-    def __init__(self, env: Host, manager: ManagerClient, session: Any) -> None:
+    def __init__(
+        self, env: Host, manager: ManagerClient, session: Any, door: AccessGateway | None = None
+    ) -> None:
         self._env = env
         self._manager = manager
         self._session = session
@@ -79,28 +81,16 @@ class TrassirGateway:
         # Открытые записи: свой модуль, потому что это ДРУГАЯ тема — сеанс
         # просмотра, а не лента (`trassir_clip.py`).
         self.clips = ClipSessions(self)
-        # Универсальная дверь наружу: исполнение ОПИСАННЫХ вызовов
-        # (`gateway.py`). Дом при этом не знает ни одного вендора — описание
-        # приезжает конфигом, а ответы уходят наружу как есть.
-        #
-        # ⚠ Живёт ЗДЕСЬ только потому, что учётку и живую сессию держит этот
-        # драйвер. Читают её НЕ отсюда: `coordinator.accesses` — дверь не
-        # принадлежит видеонаблюдению и обязана работать у объекта, где его нет
-        # вовсе (`docs/plan-video-rework.md`, «Сквозной принцип»).
-        self.accesses = AccessGateway(
-            # ⚠ Учётка СВОЯ у каждого доступа — маршрутом менеджера по отпечатку
-            # (`access_secrets.py`); учётка Trassir ниже — только для описаний
-            # прежней формы, без отпечатка.
-            secrets_fetch=getattr(manager, "async_access_secret", None),
-            # Живая сессия драйвера — только своему доступу: id `trassir` ему
-            # даёт менеджер (`accessConfigs`), второй доступ с сессией её не получит.
-            provider_access="trassir",
-            store=env.store("mega_home_access_secrets", 1),
-            credentials=self._manager_trassir_credentials,
-            # ⚠ Дверь говорит ЖИВОЙ сессией драйвера, а не своей: поток, открытый
-            # одной сессией, второй не виден вовсе (замер стенда 2026-09-13 —
-            # `archive_status` пустой, `archive_events` без календаря и шкалы).
-            sid_provider=self._driver_sid,
+        # Универсальная дверь принадлежит ДОМУ (`__init__.py`); драйвер лишь
+        # регистрирует в ней свою сессию. Без двери снаружи (спеки) — своя.
+        self._owns_door = door is None
+        self.accesses = door or AccessGateway()
+        # ⚠ Дверь говорит ЖИВОЙ сессией драйвера, а не своей: поток, открытый
+        # одной сессией, второй не виден вовсе (замер стенда 2026-09-13 —
+        # `archive_status` пустой, `archive_events` без календаря и шкалы).
+        # Только своему доступу: id `trassir` ему даёт менеджер (`accessConfigs`).
+        self.accesses.bind_session(
+            "trassir", self._driver_sid, self._manager_trassir_credentials
         )
         # Одна строка в журнал на СМЕНУ состояния, а не на каждую неудачу: опрос
         # идёт каждые пять секунд, и объект без связи с регистратором иначе
@@ -149,9 +139,10 @@ class TrassirGateway:
 
     async def async_apply(self, config: dict[str, Any]) -> None:
         """Take the `trassir` block of a freshly synchronised config."""
-        # ⚠ Описания доступов принимаются ВСЕГДА, и до блока `trassir`: дверь
-        # работает и там, где драйвер объекта ещё не настроен.
-        self.accesses.apply(config.get("accesses"))
+        # Описания доступов принимает ВЛАДЕЛЕЦ двери (координатор); своя дверь
+        # (спеки) — здесь.
+        if self._owns_door:
+            self.accesses.apply(config.get("accesses"))
         block = config.get("trassir")
         if not isinstance(block, dict) or not block.get("host"):
             await self.async_stop()
@@ -211,12 +202,13 @@ class TrassirGateway:
         if self._task:
             self._task.cancel()
             self._task = None
-        # ⚠ У двери своё соединение с регистратором, и закрыть его больше
-        # некому: без этого перезагрузка записи конфигурации оставляет за собой
-        # открытую сессию aiohttp (Home Assistant пишет об этом в журнал), а на
-        # объекте они копятся — у регистратора предел подключений с адреса
-        # (`sdk-session.md`: не более 99).
-        await self.accesses.async_close()
+        # ⚠ Дверь закрывает её ВЛАДЕЛЕЦ (`async_unload_entry`), а не драйвер: этот
+        # метод зовётся и на каждом конфиге объекта без регистратора, и закрытая
+        # здесь общая дверь оставила бы без учёток и событий всех вендоров. Своя
+        # дверь (спеки) — закрывается здесь: у регистратора предел подключений с
+        # адреса (`sdk-session.md`: не более 99), копить сессии нельзя.
+        if self._owns_door:
+            await self.accesses.async_close()
 
     # --- чтение (этап D спрашивает отсюда) ------------------------------
 
