@@ -104,8 +104,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # поднимал двери.
     coordinator.routes = sorted(getattr(view, "url", "") for view in HTTP_VIEWS)
     # Обновление по кнопке менеджера (`ha_update.py`): ядро зовёт его операцией
-    # `self-update`, не зная про HACS.
-    coordinator.self_update = partial(async_self_update, hass)
+    # `self-update`; файлы качает тот же клиент менеджера, что и бандл.
+    coordinator.self_update = partial(async_self_update, hass, coordinator.client)
 
     # Свой go2rtc :8555 stun:8555 без патча HA core — одна схема.
     #

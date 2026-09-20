@@ -26,7 +26,7 @@ LOGGER = logging.getLogger((__package__ or "").removesuffix(".core"))
 #
 # ⚠ Держится в паре с `manifest.json`, их сверяет `tests/test_version.py`:
 # поднимать ОБА, одним релизом.
-INTEGRATION_VERSION = "0.4.9"
+INTEGRATION_VERSION = "0.5.0"
 
 CONF_MANAGER_URL = "manager_url"
 CONF_TOKEN = "token"
@@ -47,6 +47,10 @@ TILE_PHOTO_PREFIX = "tile:"
 API_AGENT = "/inbound/home-config/agent"
 API_APP_MANIFEST = "/inbound/home-config/app/manifest"
 API_APP_FILE = "/inbound/home-config/app/file"
+# Код САМОЙ интеграции — с менеджера, тем же манифестом, что и бандл
+# (`ha_update.py`). HACS остаётся вторым, ручным путём (решение 2026-09-20).
+API_INTEGRATION_MANIFEST = "/inbound/home-config/integration/manifest"
+API_INTEGRATION_FILE = "/inbound/home-config/integration/file"
 
 # Polling. The manager is asked for a cheap version hash; the body is only
 # fetched when that hash moved. An unreachable manager is a normal state on a

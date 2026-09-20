@@ -15,6 +15,8 @@ from .const import (
     API_APP_MANIFEST,
     API_CONFIG,
     API_ICON,
+    API_INTEGRATION_FILE,
+    API_INTEGRATION_MANIFEST,
     API_RELAY,
     API_VERSION,
     ICON_SIZE,
@@ -150,6 +152,14 @@ class ManagerClient:
     async def async_app_file(self, path: str) -> bytes:
         """Return one file of the bundle, as bytes."""
         return await self._get_bytes(f"{API_APP_FILE}?path={quote(path)}")
+
+    async def async_integration_manifest(self) -> dict[str, Any]:
+        """Manifest of the integration code the manager serves (`ha_update.py`)."""
+        return await self._get_json(API_INTEGRATION_MANIFEST)
+
+    async def async_integration_file(self, path: str) -> bytes:
+        """One file of the integration code, as bytes."""
+        return await self._get_bytes(f"{API_INTEGRATION_FILE}?path={quote(path)}")
 
     async def _get_json(self, path: str) -> dict[str, Any]:
         try:

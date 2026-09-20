@@ -5,9 +5,9 @@ Shipping it inside the integration would mean a HACS release and a Home
 Assistant restart for every change of a tile — with the bundle downloaded here,
 a new interface reaches an object on its own.
 
-Only static files travel this way (js/css/fonts/images), served to the browser
-by our own origin. Python never does: a compromised manager must not be able to
-execute anything on an object.
+Since 0.5.0 the integration's own code travels the same way on the installer's
+command (`ha_update.py`): the manager serves it with the same kind of manifest,
+and HACS is the second, manual path. Downloading here stays about the bundle.
 """
 
 from __future__ import annotations
