@@ -313,8 +313,12 @@ class ManagerLink:
         # Кадры сессии первыми: их больше всех, и они не имеют отношения ни к
         # запросам жильца, ни к конфигу.
         if isinstance(kind, str) and kind.startswith("stream."):
+            # ⚠ `dispatch`, не `handle`: открытие сессии ждёт TCP до устройства
+            # (до 10 с) и в цикле чтения канала стояло бы поперёк всех кадров —
+            # жилец получал бы «дом не на связи» из-за сеанса инженера к
+            # молчащей камере (`stream.py`).
             if self._streams is not None:
-                await self._streams.handle(payload)
+                await self._streams.dispatch(payload)
             return
         if kind == "event-ack":
             # Менеджер получил событие устройства — дальше дом его не держит.

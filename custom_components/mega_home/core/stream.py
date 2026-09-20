@@ -138,7 +138,7 @@ async def serve(socket: Any) -> None:
     try:
         async for message in socket:
             if message.type is aiohttp.WSMsgType.TEXT:
-                await streams.handle(message.json())
+                await streams.dispatch(message.json())
             elif message.type is aiohttp.WSMsgType.BINARY:
                 await streams.on_binary(message.data)
             elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
@@ -160,9 +160,42 @@ class Streams:
     def __init__(self, socket: Any) -> None:
         self._socket = socket
         self._streams: dict[int, _Stream] = {}
+        # Открытия, которые ещё идут (см. `dispatch`), и номера тех из них,
+        # которые вызывающий успел закрыть, не дождавшись соединения.
+        self._opening_tasks: set[asyncio.Task[None]] = set()
+        self._opening_ids: set[int] = set()
+        self._abandoned: set[int] = set()
+
+    async def dispatch(self, payload: dict[str, Any]) -> bool:
+        """Управляющий кадр ИЗ ЦИКЛА ЧТЕНИЯ сокета. `True` — кадр наш.
+
+        ⚠ `stream.open` соединяется с устройством, и до адреса за упавшим
+        коммутатором TCP молчит все 10 с срока. Ждать это в цикле чтения канала
+        значит не читать ни одного кадра: запросы жильца отваливаются по
+        трёхсекундному сроку менеджера, и «инженер открыл сеанс к мёртвой
+        камере» превращается в «дом не на связи» для всех остальных. Поэтому
+        открытие уходит отдельной задачей — тем же приёмом, что ответы на
+        запросы (`link.py::_handle`). Остальные кадры быстрые и идут по месту;
+        закрытие, обогнавшее открытие, помнит `_close` (см. `_abandoned`).
+        """
+        if payload.get("t") == "stream.open":
+            # Номер помечаем ЗДЕСЬ, синхронно: задача стартует на следующем
+            # обороте цикла, а закрытие тем же кадром может прийти раньше.
+            stream_id = payload.get("id")
+            if isinstance(stream_id, int):
+                self._opening_ids.add(stream_id)
+            task = asyncio.ensure_future(self._open(payload))
+            self._opening_tasks.add(task)
+            task.add_done_callback(self._opening_tasks.discard)
+            return True
+        return await self.handle(payload)
 
     async def handle(self, payload: dict[str, Any]) -> bool:
-        """Управляющий кадр. `True` — кадр наш и обработан."""
+        """Управляющий кадр. `True` — кадр наш и обработан.
+
+        Открытие здесь ЖДЁТСЯ — форма для того, кому нужен результат по месту
+        (тесты); цикл чтения сокета зовёт `dispatch`.
+        """
         kind = payload.get("t")
         if kind == "stream.open":
             await self._open(payload)
@@ -194,6 +227,15 @@ class Streams:
 
     async def close_all(self) -> None:
         global _open_total
+        # Сначала — незаконченные открытия: соединение, поднявшееся после
+        # уборки, некому было бы закрыть. Между установкой соединения и записью
+        # в реестр (`_connect`) нет ни одного `await`, поэтому отмена не
+        # оставляет полуоткрытого сокета.
+        for task in list(self._opening_tasks):
+            task.cancel()
+        self._opening_tasks.clear()
+        self._opening_ids.clear()
+        self._abandoned.clear()
         for stream in list(self._streams.values()):
             await stream.stop(None)
         _open_total -= len(self._streams)
@@ -203,6 +245,14 @@ class Streams:
         stream_id = payload.get("id")
         if not isinstance(stream_id, int):
             return
+        self._opening_ids.add(stream_id)
+        try:
+            await self._connect(stream_id, payload)
+        finally:
+            self._opening_ids.discard(stream_id)
+            self._abandoned.discard(stream_id)
+
+    async def _connect(self, stream_id: int, payload: dict[str, Any]) -> None:
         req = payload.get("req")
         if not isinstance(req, dict):
             await self._fail(stream_id, "описание сессии — объект req (ConnectRequest)")
@@ -249,6 +299,13 @@ class Streams:
         except (asyncio.TimeoutError, OSError) as err:
             await self._fail(stream_id, _describe(err))
             return
+        if stream_id in self._abandoned:
+            # Менеджер закрыл сессию, не дождавшись соединения (браузер ушёл,
+            # срок открытия у менеджера вышел). Подтверждать нечего — он её уже
+            # забыл; соединение гасим сразу, иначе оно жило бы до срока
+            # молчания, занимая место в потолке.
+            await stream.stop(None)
+            return
         global _open_total
         self._streams[stream_id] = stream
         _open_total += 1
@@ -270,7 +327,9 @@ class Streams:
         несколько (канал менеджера и вкладки жильца), и первый второй не
         заменяет.
         """
-        if len(self._streams) >= MAX_STREAMS:
+        # Идущие открытия — тоже в счёт: они идут задачами (`dispatch`), и без
+        # этого шесть одновременных запросов браузера обходили бы потолок.
+        if len(self._streams) + len(self._opening_ids) > MAX_STREAMS:
             return f"на объекте уже {MAX_STREAMS} открытых сессии"
         if _total() >= TOTAL_STREAMS:
             return f"дом держит уже {TOTAL_STREAMS} соединений"
@@ -284,6 +343,10 @@ class Streams:
         if stream is not None:
             _open_total -= 1
             await stream.stop(None)
+        elif stream_id in self._opening_ids:
+            # Закрытие обогнало открытие (оно идёт задачей, см. `dispatch`):
+            # соединение ещё поднимается, и погасить его сможет только `_connect`.
+            self._abandoned.add(stream_id)
 
     async def _send_json(self, payload: dict[str, Any]) -> None:
         try:
@@ -309,7 +372,24 @@ class Streams:
         await self._send_json(payload)
 
 
-class _Stream:
+class _SessionBase:
+    """Общее у всех видов сессии: срок жизни и конец с уведомлением владельца.
+
+    Наследник задаёт `id`, `_owner` и `stop(error)`.
+    """
+
+    async def _deadline(self) -> None:
+        await asyncio.sleep(MAX_LIFETIME_S)
+        await self._done("истёк срок сессии")
+
+    async def _done(self, error: str | None) -> None:
+        # ⚠ Сообщаем ВЛАДЕЛЬЦУ, а не закрываемся сами: реестр знает только он, и
+        # забытая в нём сессия занимала бы место до конца связи.
+        await self._owner._finished(self.id, error)
+        await self.stop(error)
+
+
+class _Stream(_SessionBase):
     """Одно TCP-соединение и две его качалки."""
 
     def __init__(
@@ -398,18 +478,8 @@ class _Stream:
         except OSError as err:
             await self._done(_describe(err))
 
-    async def _deadline(self) -> None:
-        await asyncio.sleep(MAX_LIFETIME_S)
-        await self._done("истёк срок сессии")
 
-    async def _done(self, error: str | None) -> None:
-        # ⚠ Сообщаем ВЛАДЕЛЬЦУ, а не закрываемся сами: реестр знает только он, и
-        # забытая в нём сессия занимала бы место до конца связи.
-        await self._owner._finished(self.id, error)
-        await self.stop(error)
-
-
-class _WsStream:
+class _WsStream(_SessionBase):
     """Сессия WebSocket к устройству: рукопожатие ведёт ДОМ, смысл — вызывающий.
 
     ⚠ Ради этого вида ось и закрывалась именно удержанием, а не потоковым
@@ -510,16 +580,8 @@ class _WsStream:
                 await self._done(_describe(err))
                 return
 
-    async def _deadline(self) -> None:
-        await asyncio.sleep(MAX_LIFETIME_S)
-        await self._done("истёк срок сессии")
 
-    async def _done(self, error: str | None) -> None:
-        await self._owner._finished(self.id, error)
-        await self.stop(error)
-
-
-class _HttpStream:
+class _HttpStream(_SessionBase):
     """HTTP-ответ, который ЧИТАЕТСЯ ПО МЕРЕ ПРИХОДА, а не целиком.
 
     ⚠ Ради длинного опроса и потоковых ответов вендора: одиночный `connect`
@@ -631,14 +693,6 @@ class _HttpStream:
                 )
         return response
 
-    async def _deadline(self) -> None:
-        await asyncio.sleep(MAX_LIFETIME_S)
-        await self._done("истёк срок сессии")
-
-    async def _done(self, error: str | None) -> None:
-        await self._owner._finished(self.id, error)
-        await self.stop(error)
-
 
 class _DatagramProtocol(asyncio.DatagramProtocol):
     def __init__(self) -> None:
@@ -653,7 +707,7 @@ class _DatagramProtocol(asyncio.DatagramProtocol):
             self.owner.failed(exc)
 
 
-class _Datagrams:
+class _Datagrams(_SessionBase):
     """UDP-сессия: кадр данных = одна датаграмма. Те же сроки и потолок, что у TCP."""
 
     def __init__(
@@ -670,6 +724,7 @@ class _Datagrams:
         self._idle_s = idle
         self._bytes = 0
         self._stopping = False
+        self._overflow = False
         self._tasks: list[asyncio.Task[None]] = []
         self._idle: asyncio.TimerHandle | None = None
         # ⚠ Одна очередь и одна качалка к менеджеру, как у TCP: задача на каждую
@@ -699,8 +754,9 @@ class _Datagrams:
         self._touch()
         if self._bytes > MAX_BYTES:
             # Флаг сразу: иначе каждая следующая датаграмма заводила бы ещё `_done`.
-            self._stopping = True
-            self._later(self._finish("превышен потолок трафика сессии"))
+            if not self._overflow:
+                self._overflow = True
+                self._later(self._done("превышен потолок трафика сессии"))
             return
         try:
             self._outgoing.put_nowait(data)
@@ -720,7 +776,10 @@ class _Datagrams:
             return
         self._stopping = True
         for task in self._tasks:
-            task.cancel()
+            # ⚠ Не свою: закрытие по потолку приходит из задачи, живущей в этом
+            # же списке (`_later`), и отменить себя значило бы не дойти до конца.
+            if task is not asyncio.current_task():
+                task.cancel()
         if self._idle is not None:
             self._idle.cancel()
         self._transport.close()
@@ -740,26 +799,6 @@ class _Datagrams:
         task = asyncio.ensure_future(coro)
         self._tasks.append(task)
         task.add_done_callback(lambda done: done in self._tasks and self._tasks.remove(done))
-
-    async def _deadline(self) -> None:
-        await asyncio.sleep(MAX_LIFETIME_S)
-        await self._done("истёк срок сессии")
-
-    async def _done(self, error: str | None) -> None:
-        await self._owner._finished(self.id, error)
-        await self.stop(error)
-
-    async def _finish(self, error: str) -> None:
-        """Закрытие по потолку: флаг уже стоит, `stop` его бы не пропустил."""
-        await self._owner._finished(self.id, error)
-        for task in self._tasks:
-            if task is not asyncio.current_task():
-                task.cancel()
-        if self._idle is not None:
-            self._idle.cancel()
-        self._transport.close()
-        LOGGER.info("Сессия %s закрыта: %s", self.id, error)
-
 
 def _describe(err: Exception) -> str:
     """Сетевая ошибка по-русски — её читает инженер, а не разработчик."""
