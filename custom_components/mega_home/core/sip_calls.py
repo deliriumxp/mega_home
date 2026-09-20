@@ -176,7 +176,14 @@ class DoorCalls:
         await self._request("POST", f"/channels/{channel_id}/ring")
         # `call` — id вызова: им телефон отвечает именно этой панели, им же
         # менеджер сводит `call` и `cancel` при нескольких панелях.
-        self._emit("call", {"caller": caller, "call": channel_id})
+        #
+        # ⚠ `peer` — СЕТЕВОЙ адрес отправителя, и только по нему снаружи можно
+        # узнать, КАКАЯ панель звонит: по опознанной панели жилец открывает
+        # дверь, а номер (`caller`) выбирает сам отправитель — потому он и не
+        # годится нам для ограничений выше. Менеджер и приложение сверяют
+        # именно его (`intercom-call-push.service.ts`, `intercom-incoming.ts`),
+        # `caller` остаётся подписью в уведомлении.
+        self._emit("call", {"caller": caller, "call": channel_id, "peer": peer})
 
     async def _answer(self, phone: str, target: str = "") -> None:
         """Телефон набрал `answer[-<id>]`: соединяем с этим вызовом или последним звонящим."""
@@ -200,18 +207,21 @@ class DoorCalls:
             f"/bridges/{call.bridge}/addChannel",
             {"channel": f"{call.panel},{phone}"},
         )
-        self._emit("answered", {"caller": call.caller, "call": call.panel})
+        self._emit("answered", {"caller": call.caller, "call": call.panel, "peer": call.peer})
 
     async def _ended(self, channel_id: str) -> None:
         call = self._calls.get(channel_id)
         if call is not None:
-            self._emit("ended" if call.talk else "cancel", {"caller": call.caller, "call": call.panel})
+            self._emit(
+                "ended" if call.talk else "cancel",
+                {"caller": call.caller, "call": call.panel, "peer": call.peer},
+            )
             await self._finish(call, "normal")
             return
         for call in list(self._calls.values()):
             if call.talk == channel_id:
                 # Жилец положил трубку — разговор окончен и для гостя.
-                self._emit("ended", {"caller": call.caller, "call": call.panel})
+                self._emit("ended", {"caller": call.caller, "call": call.panel, "peer": call.peer})
                 await self._finish(call, "normal")
                 return
 

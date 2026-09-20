@@ -26,10 +26,11 @@ class _Calls(DoorCalls):
         return {}
 
 
-def _start(channel: str, role: str, number: str = "") -> dict[str, Any]:
+def _start(channel: str, role: str, number: str = "", peer: str = "") -> dict[str, Any]:
+    # Второй аргумент диалплана — СЕТЕВОЙ адрес отправителя («ip:порт»).
     return {
         "type": "StasisStart",
-        "args": [role],
+        "args": [role, f"{peer}:5060"] if peer else [role],
         "channel": {"id": channel, "caller": {"number": number}},
     }
 
@@ -48,9 +49,29 @@ def _run(calls: _Calls, *events: dict[str, Any]) -> None:
 
 def test_панель_звонит_и_не_отвечена_до_телефона() -> None:
     calls = _Calls()
-    _run(calls, _start("p1", "panel", "192.168.88.90"))
+    _run(calls, _start("p1", "panel", "192.168.88.90", peer="192.168.88.90"))
     assert calls.sent == [("POST", "/channels/p1/ring", None)]
-    assert calls.events == [("call", {"caller": "192.168.88.90", "call": "p1"})]
+    assert calls.events == [
+        ("call", {"caller": "192.168.88.90", "call": "p1", "peer": "192.168.88.90"})
+    ]
+
+
+def test_в_событии_уезжает_адрес_а_не_только_номер() -> None:
+    """⚠ Номер выбирает сам отправитель, а по опознанной панели жилец ОТКРЫВАЕТ ДВЕРЬ.
+
+    Поэтому снаружи (менеджер, приложение) панель ищут по `peer`, и он обязан
+    быть в каждом событии вызова — и в отмене тоже.
+    """
+    calls = _Calls()
+    _run(calls, _start("p1", "panel", "999222", peer="192.168.88.91"), _end("p1"))
+    assert calls.events[0] == (
+        "call",
+        {"caller": "999222", "call": "p1", "peer": "192.168.88.91"},
+    )
+    assert calls.events[-1] == (
+        "cancel",
+        {"caller": "999222", "call": "p1", "peer": "192.168.88.91"},
+    )
 
 
 def test_второй_вызов_той_же_панели_сбрасывается() -> None:
