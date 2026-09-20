@@ -26,7 +26,7 @@ LOGGER = logging.getLogger((__package__ or "").removesuffix(".core"))
 #
 # ⚠ Держится в паре с `manifest.json`, их сверяет `tests/test_version.py`:
 # поднимать ОБА, одним релизом.
-INTEGRATION_VERSION = "0.4.7"
+INTEGRATION_VERSION = "0.4.8"
 
 CONF_MANAGER_URL = "manager_url"
 CONF_TOKEN = "token"

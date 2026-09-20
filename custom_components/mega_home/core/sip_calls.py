@@ -209,6 +209,32 @@ class DoorCalls:
         )
         self._emit("answered", {"caller": call.caller, "call": call.panel, "peer": call.peer})
 
+    async def reject(self, call_id: str) -> bool:
+        """Жилец отказался: гасим НАШЕ плечо вызова, не трогая остальные.
+
+        ⚠ Именно плечо, а не вызов у панели: групповой вызов — это отдельные
+        приглашения каждому адресату, и мониторы в квартире обязаны звонить
+        дальше (решение заказчика: локальная домофония Akuvox остаётся как
+        есть). Поэтому `/api/call/hangup` самой панели здесь не годится — он
+        снял бы вызов целиком.
+
+        ⚠ Причина `busy` → панель получает по нашему INVITE отказ 486. Что она
+        сделает с остальными адресатами, решает ЕЁ настройка группового вызова
+        («End This Call Only» против «End All Calls»,
+        `docs/docs-akuvox/kb-group-call.md`): при «End All Calls» отказ на
+        телефоне погасит и мониторы — это настройка объекта, не наш код.
+
+        `False` — такого вызова уже нет (гость ушёл сам): для жильца это тот же
+        исход, а не ошибка.
+        """
+        call = self._calls.get(call_id)
+        if call is None:
+            return False
+        # Событие «отмена» и уборку даст `StasisEnd` этого же канала — второй
+        # источник того же события разошёлся бы с первым.
+        await self._hangup(call.panel, "busy")
+        return True
+
     async def _ended(self, channel_id: str) -> None:
         call = self._calls.get(channel_id)
         if call is not None:

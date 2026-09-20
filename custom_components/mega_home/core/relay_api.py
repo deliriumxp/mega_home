@@ -100,10 +100,20 @@ async def _dispatch(
         return _json(await ops.command(coordinator, _json_body(body)))
     if path == "api/scenario" and method == "POST":
         return _json(await ops.scenario(coordinator, _json_body(body)))
+    if path == "api/intercom" and method == "POST":
+        # Отбой идущего вызова домофонии: тот же код, что у локальной двери
+        # (`http.py`) и у операции канала — ответы не должны разъезжаться.
+        return _json(await ops.intercom(coordinator, _json_body(body)))
     if path == "api/connect" and method == "POST":
         # Единственный контракт транспорта наружу — тот же код, что у операции
         # канала (`ops.py`, `op == "connect"`): ответы не должны разъезжаться.
         return _json(await ops.connect(_json_body(body)))
+    if path == "api/connect" and method == "GET":
+        # ⚠ ТОТ ЖЕ путь и тот же контракт, другой способ ПОТРЕБИТЬ ответ: тело
+        # адресата уезжает как есть, с его типом, — кадр и файл браузер берёт
+        # сам одной ходкой (`docs/home-gateway.md`, «Полнота двери»). Не новый
+        # маршрут: замок 2 считает пути, а не методы.
+        return await ops.connect_resource(_resource_request(query))
     if path.startswith("api/photo"):
         # `api/photos` (список) и `api/photo/<ключ>` (файл) — ОДИН префикс:
         # два разных `startswith` заперлись бы замком маршрутов как две
@@ -244,6 +254,26 @@ async def _read(env: Host, target: Path) -> bytes:
 
 def _json(payload: Any) -> tuple[int, str, bytes, str]:
     return (HTTPStatus.OK, JSON_TYPE, json.dumps(payload).encode("utf-8"), "")
+
+def _resource_request(query: dict[str, str]) -> dict[str, Any]:
+    """Описание вызова из параметра `req` — base64url от JSON.
+
+    ⚠ Одним параметром, а не россыпью `host`/`port`/`path`: описание составляет
+    БАНДЛ и оно должно доехать без толкования по дороге. Разбирать его на поля
+    в адресе значило бы завести второй формат запроса рядом с `ConnectRequest`,
+    который разойдётся с ним на первой же правке.
+    """
+    raw = query.get("req") or ""
+    if not raw:
+        raise ops.OpError("Нет описания вызова (req)", HTTPStatus.BAD_REQUEST)
+    try:
+        padded = raw + "=" * (-len(raw) % 4)
+        parsed = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError) as err:
+        raise ops.OpError("Описание вызова повреждено", HTTPStatus.BAD_REQUEST) from err
+    if not isinstance(parsed, dict):
+        raise ops.OpError("Описание вызова — объект JSON", HTTPStatus.BAD_REQUEST)
+    return parsed
 
 def _json_body(body: bytes) -> dict[str, Any]:
     if not body:

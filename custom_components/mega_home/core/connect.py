@@ -1,9 +1,15 @@
 """Единственный контракт транспорта наружу — `connect` (`docs/plan-thin-gateway.md`).
 
-⚠ `stream: true` в этом модуле НЕ обслуживается: держать соединение и слать
-кадры — работа `stream.py` (сессии `stream.open/close`, те же лимиты
-`MAX_STREAMS`/`IDLE_TIMEOUT_S`/`MAX_BYTES`), которая ходит тем же реестром
-служб. Не переизобретаем вторую сессионную машину поверх этого контракта.
+У него ТРИ формы потребления ответа, и все три — один и тот же разбор описания:
+- данные коду: `POST api/connect` → тело в JSON (`perform`);
+- ресурс браузеру: `GET api/connect?req=…` → тело как есть (`resource`);
+- удержание: `GET api/connect` с `Upgrade: websocket` → кадры `stream.*`
+  (`stream.py`, исполняет ту же форму `ConnectRequest`).
+
+⚠ `stream: true` ФЛАГОМ не обслуживается и не будет: односторонняя форма не даёт
+послать в открытую сессию то, что вызывающий посчитал сам (одноразовая метка,
+подпись, кадр бинарного протокола), а браузер потоковое тело запроса не умеет
+вовсе. Держать соединение — это третья форма выше, а не поле у одиночного вызова.
 """
 
 from __future__ import annotations
@@ -33,6 +39,10 @@ DEFAULT_TIMEOUT = 15.0
 MAX_TIMEOUT = 200.0
 MAX_WS_MESSAGES = 64
 KINDS = ("tcp", "udp", "http", "ws")
+# Кадр камеры живёт ровно период обновления плитки (`TILE_REFRESH_MS` бандла):
+# столько же браузеру позволено не ходить за ним второй раз. `private` —
+# ответ принадлежит этому жильцу, общим кэшам по пути в нём делать нечего.
+RESOURCE_CACHE = "private, max-age=30"
 
 async def perform(payload: dict[str, Any]) -> dict[str, Any]:
     """Выполнить один вызов `connect`; ошибка и статус ≥ 400 — `OpError`."""
@@ -40,7 +50,7 @@ async def perform(payload: dict[str, Any]) -> dict[str, Any]:
         raise OpError("Ожидается объект запроса")
     if payload.get("stream") is True:
         raise OpError(
-            "Держать соединение — служебные кадры stream.*, а не connect", 501
+            "Держать соединение — форма Upgrade того же api/connect, а не флаг", 501
         )
     kind = str(payload.get("kind") or "")
     if kind == "http":
@@ -52,6 +62,52 @@ async def perform(payload: dict[str, Any]) -> dict[str, Any]:
     if kind == "ws":
         return await _ws(payload)
     raise OpError(f"Вид «{kind}» connect не умеет — {', '.join(KINDS)}")
+
+async def resource(payload: dict[str, Any]) -> tuple[int, str, bytes, str]:
+    """Тот же вызов, но ответ — РЕСУРС для браузера: `(статус, тип, байты, кэш)`.
+
+    ⚠ Ось «потребление ответа» (`docs/home-gateway.md`, «Полнота двери»). У
+    `perform` ответ приходит данными КОДУ — JSON с телом в base64, — и `<img>`,
+    `<video>` или ссылка на файл взять его не могут. Кадр плитки из-за этого шёл
+    тремя ходками через `api/connect` вместо одной, а дом обзавёлся маршрутом
+    `api/camera-frame/<id>` в обход собственной двери. Здесь тот же `connect`
+    отдаёт тело КАК ЕСТЬ, с типом от адресата, — и адрес снова можно просто
+    подставить в тег.
+
+    ⚠ БЕЗ УЧЁТКИ и только `GET`. Описание вызова едет параметром адреса, а
+    адреса попадают в журналы (HA, менеджер, прокси на пути) — пароль в них
+    попасть не должен. Это не ограничение «на всякий случай», а граница класса:
+    ресурс браузера — то, что вендор и так отдаёт по ссылке (кадр по токену,
+    `frame.jpeg` у go2rtc). Нужна учётка — это не ресурс, иди обычным `POST`.
+    """
+    if not isinstance(payload, dict):
+        raise OpError("Ожидается объект запроса")
+    kind = str(payload.get("kind") or "http")
+    if kind != "http":
+        raise OpError("Ресурсом отдаётся только http", 501)
+    if payload.get("auth"):
+        raise OpError("Ресурс не носит учётку — этот вызов идёт POST", 400)
+    if payload.get("body") or payload.get("bodyBase64"):
+        raise OpError("У ресурса нет тела запроса", 400)
+    method = str(payload.get("method") or "GET").upper()
+    if method != "GET":
+        raise OpError("Ресурс берётся только GET", 405)
+    answer = await _http({**payload, "method": "GET"})
+    raw = (
+        base64.b64decode(answer["bodyBase64"])
+        if answer.get("bodyBase64") is not None
+        else str(answer.get("body") or "").encode("utf-8")
+    )
+    headers = answer.get("headers") or {}
+    content_type = next(
+        (str(v) for k, v in headers.items() if str(k).lower() == "content-type"),
+        "application/octet-stream",
+    )
+    # ⚠ Метка кэша — НАША и короткая, а не адресата: за дверью живёт кадр
+    # «сейчас», и чужой `max-age` (у go2rtc его нет вовсе, у регистратора он
+    # про статику) либо заморозил бы картинку, либо не дал бы браузеру не
+    # ходить второй раз в тот же период обновления плитки.
+    return int(answer.get("status") or 200), content_type, raw, RESOURCE_CACHE
 
 def resolve_address(payload: dict[str, Any]) -> tuple[str, int]:
     """`host` — частный IPv4 объекта или имя ПОДНЯТОЙ службы дома."""
@@ -82,7 +138,15 @@ def resolve_address(payload: dict[str, Any]) -> tuple[str, int]:
         raise OpError("port не указан")
     return str(address), port
 
-async def _http(payload: dict[str, Any]) -> dict[str, Any]:
+def prepare_http(payload: dict[str, Any]) -> dict[str, Any]:
+    """Разобрать описание HTTP-вызова: адрес, заголовки, тело, учётка, срок.
+
+    ⚠ ОДИН разбор на обе формы `connect`: одиночный вызов (`_http`) и удержание
+    (`stream.py`, сессия вида `http`). Второй разбор разошёлся бы с первым на
+    первой же правке, а расходиться здесь значит «Digest работает в вызове и не
+    работает в сессии» — ровно тот класс дефекта, ради которого у транспорта
+    один контракт.
+    """
     host, port = resolve_address(payload)
     method = str(payload.get("method") or "GET").upper()
     path = str(payload.get("path") or "/")
@@ -90,10 +154,6 @@ async def _http(payload: dict[str, Any]) -> dict[str, Any]:
         raise OpError("path начинается с «/»")
     _refuse_double_encoded(path)
     tls = payload.get("tls") is True
-    url = f"{'https' if tls else 'http'}://{host}:{port}{path}"
-    headers = dict(payload.get("headers")) if isinstance(payload.get("headers"), dict) else {}
-    body = _body_of(payload)
-    timeout = _timeout(payload)
     basic: aiohttp.BasicAuth | None = None
     digest_creds: tuple[str, str] | None = None
     auth = payload.get("auth") if isinstance(payload.get("auth"), dict) else None
@@ -106,7 +166,26 @@ async def _http(payload: dict[str, Any]) -> dict[str, Any]:
             digest_creds = (user, secret)
         elif auth_type and auth_type != "none":
             raise OpError("auth.type — basic или digest")
-    connector = aiohttp.TCPConnector(ssl=False) if tls else None
+    return {
+        "method": method,
+        "path": path,
+        "url": f"{'https' if tls else 'http'}://{host}:{port}{path}",
+        "headers": dict(payload.get("headers")) if isinstance(payload.get("headers"), dict) else {},
+        "body": _body_of(payload),
+        "timeout": _timeout(payload),
+        "basic": basic,
+        "digest": digest_creds,
+        # ⚠ Сертификат устройства объекта самоподписанный, проверять его нечем:
+        # `resolve_address` пускает только частные адреса (та же причина, что у
+        # ветки `ws` ниже).
+        "connector": aiohttp.TCPConnector(ssl=False) if tls else None,
+    }
+
+async def _http(payload: dict[str, Any]) -> dict[str, Any]:
+    call = prepare_http(payload)
+    method, path, url = call["method"], call["path"], call["url"]
+    headers, body, timeout = call["headers"], call["body"], call["timeout"]
+    basic, digest_creds, connector = call["basic"], call["digest"], call["connector"]
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
             status, out_headers, raw = await _request_once(

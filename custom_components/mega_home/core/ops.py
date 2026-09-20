@@ -47,9 +47,11 @@ __all__ = [
     "command",
     "config",
     "connect",
+    "connect_resource",
     "device_events",
     "entity_view",
     "find",
+    "intercom",
     "number",
     "run",
     "scenario",
@@ -99,6 +101,12 @@ async def run(
         from .relay_api import handle
 
         return await handle(coordinator, data)
+    if op == "intercom":
+        # Действие жильца над ИДУЩИМ вызовом домофонии — сегодня одно:
+        # «отклонить». Отдельной операцией, а не описанным вызовом: гасить нужно
+        # плечо МОСТА, а он управляется по ARI с петли, куда `connect` снаружи
+        # не дотянется — и не должен, это полный контроль над вызовами.
+        return await intercom(coordinator, data)
     if op == "probe":
         # Проба устройства объекта по заданию МЕНЕДЖЕРА (`probe.py`): мониторинг
         # больше не ходит в LAN объекта по WG-туннелю, которого у части парка
@@ -130,6 +138,37 @@ async def connect(payload: dict[str, Any]) -> dict[str, Any]:
     общая с локальным маршрутом `api/connect` (`relay_api.py`).
     """
     return await connect_mod.perform(payload)
+
+async def connect_resource(payload: dict[str, Any]) -> tuple[int, str, bytes, str]:
+    """Тот же `connect`, но ответ — РЕСУРС для браузера (`connect.resource`).
+
+    Точка входа общая для обеих дверей: локального маршрута `GET api/connect`
+    (`http.py`) и перенесённого через менеджера (`relay_api.py`). Разъехаться им
+    нельзя — это один и тот же запрос жильца, отличается только адрес базы.
+    """
+    return await connect_mod.resource(payload)
+
+
+async def intercom(coordinator: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    """Действие жильца над идущим вызовом домофонии.
+
+    ⚠ Класс устройства, а не вендор: мост — «домофония по SIP», и вторая панель
+    другого производителя придёт сюда же. Сегодня действие одно — `reject`:
+    жилец отказался говорить, наше плечо вызова гасится, а мониторы в квартире
+    звонят дальше (`sip_calls.py: reject`).
+    """
+    action = str(payload.get("action") or "")
+    if action != "reject":
+        raise OpError("Дом не знает такого действия домофонии", HTTPStatus.NOT_FOUND)
+    call_id = str(payload.get("call") or "")
+    if not call_id:
+        raise OpError("Не указан вызов")
+    calls = getattr(getattr(coordinator, "sip_bridge", None), "calls", None)
+    if calls is None:
+        raise OpError("SIP-мост домофонии не запущен", HTTPStatus.SERVICE_UNAVAILABLE)
+    # `False` — вызова уже нет (гость ушёл сам): для жильца тот же исход.
+    return {"rejected": await calls.reject(call_id)}
+
 
 def config(coordinator: Any) -> dict[str, Any]:
     """Состав дома из кэша — плюс ПАСПОРТ САМОГО ДОМА.

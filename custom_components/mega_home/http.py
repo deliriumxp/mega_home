@@ -12,6 +12,8 @@ this on a customer object in this state.
 
 from __future__ import annotations
 
+import base64
+import json
 from http import HTTPStatus
 
 from aiohttp import web
@@ -207,6 +209,39 @@ class MegaHomeScenarioView(_MegaHomeView):
         return await self.run_async(request, "scenario")
 
 
+class MegaHomeIntercomView(_MegaHomeView):
+    """Действие жильца над идущим вызовом домофонии (сегодня — «отклонить»).
+
+    ⚠ Тот же код, что у операции канала и у перенесённого запроса: жилец дома и
+    снаружи отказывается от вызова одинаково.
+    """
+
+    url = f"{URL_API}/intercom"
+    name = "api:mega_home:intercom"
+
+    async def post(self, request: web.Request) -> web.Response:
+        return await self.run_async(request, "intercom")
+
+
+def _resource_request(raw: str | None) -> dict | None:
+    """Описание вызова из параметра `req` — base64url от JSON; `None` — битое.
+
+    ⚠ Одним параметром, а не россыпью полей в адресе: описание составляет БАНДЛ
+    и обязано доехать без толкования по дороге. Разобрать его на `host`/`port`/
+    `path` значило бы завести второй формат запроса рядом с `ConnectRequest`,
+    который разойдётся с ним на первой же правке. Разбор тот же, что у
+    перенесённой двери (`relay_api._resource_request`).
+    """
+    if not raw:
+        return None
+    try:
+        padded = raw + "=" * (-len(raw) % 4)
+        parsed = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 class MegaHomeConnectView(_MegaHomeView):
     """Единственный контракт транспорта наружу (`connect.py`, `ops.py`).
 
@@ -219,6 +254,31 @@ class MegaHomeConnectView(_MegaHomeView):
 
     async def post(self, request: web.Request) -> web.Response:
         return await self.run_async(request, "connect")
+
+    async def get(self, request: web.Request) -> web.StreamResponse:
+        """Тот же вызов, ответ — РЕСУРС: браузер берёт его сам, одной ходкой.
+
+        ⚠ Ради этого метода дом не заводит по маршруту на каждую картинку:
+        `<img src>` умеет только адрес, а тело в JSON-конверте адресом не
+        подставить — кадр плитки из-за этого шёл тремя ходками, а сам дом обзавёлся
+        `api/camera-frame/<id>` в обход двери (`docs/home-gateway.md`, «Полнота
+        двери»). Описание вызова едет параметром `req` (base64url от
+        `ConnectRequest`); учётки в нём не бывает — см. `connect.resource`.
+        """
+        payload = _resource_request(request.query.get("req"))
+        if payload is None:
+            return web.Response(
+                status=HTTPStatus.BAD_REQUEST, text="Описание вызова повреждено"
+            )
+        try:
+            status, content_type, body, cache = await ops.connect_resource(payload)
+        except ops.OpError as err:
+            return web.Response(status=err.status, text=err.message)
+        return web.Response(
+            status=status,
+            body=body,
+            headers={"Content-Type": content_type, "Cache-Control": cache},
+        )
 
 
 class MegaHomePhotosView(_MegaHomeView):
@@ -677,6 +737,7 @@ VIEWS: tuple[type[HomeAssistantView], ...] = (
     MegaHomeEventsView,
     MegaHomeCommandView,
     MegaHomeScenarioView,
+    MegaHomeIntercomView,
     MegaHomeConnectView,
     MegaHomePhotosView,
     MegaHomePhotoView,

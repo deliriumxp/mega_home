@@ -110,6 +110,31 @@ def test_гость_ушёл_до_ответа_это_отмена() -> None:
     assert calls.state()["calls"] == []
 
 
+def test_отклонение_гасит_только_наше_плечо() -> None:
+    """«Отклонить» у жильца — это отказ 486 по НАШЕМУ приглашению.
+
+    ⚠ Вызов у панели целиком не снимаем (`/api/call/hangup` панели тут не при
+    чём): групповой вызов — отдельные приглашения каждому адресату, и мониторы
+    в квартире обязаны звонить дальше.
+    """
+    calls = _Calls()
+    _run(calls, _start("p1", "panel", peer="192.168.88.90"))
+    rejected = asyncio.run(calls.reject("p1"))
+    assert rejected is True
+    assert ("DELETE", "/channels/p1", {"reason": "busy"}) in calls.sent
+    # Событие «отмена» даст `StasisEnd` этого же канала, а не сам отказ:
+    # второй источник того же события разошёлся бы с первым.
+    assert [kind for kind, _ in calls.events] == ["call"]
+    _run(calls, _end("p1"))
+    assert calls.events[-1][0] == "cancel"
+
+
+def test_отклонение_ушедшего_вызова_не_ошибка() -> None:
+    calls = _Calls()
+    assert asyncio.run(calls.reject("нет такого")) is False
+    assert calls.sent == []
+
+
 def test_жилец_положил_трубку_гасит_панель() -> None:
     calls = _Calls()
     _run(calls, _start("p1", "panel"), _start("t1", "answer"), _end("t1"))

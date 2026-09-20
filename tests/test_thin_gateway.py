@@ -214,6 +214,12 @@ def test_операции_канала_и_маршруты_api_заперты() 
     locked_ops = {
         "config", "states", "command", "scenario", "connect", "http", "probe", "scan",
         "self-update", "watch", "stream.*",
+        # ⚠ `intercom` — ПРОЦЕСС дома, а не перечень умений: вызовами своего
+        # Asterisk дом управляет по ARI с петли, паролем, который сам и
+        # сгенерировал. Ни `connect`, ни описанный вызов туда не дотянутся — и
+        # не должны: ARI это полный контроль над вызовами. Действие ровно одно
+        # («отклонить»), и второе сюда не попадёт без такого же доказательства.
+        "intercom",
     }
     locked_routes = {
         "api/config", "api/states", "api/command", "api/scenario", "api/connect",
@@ -222,6 +228,8 @@ def test_операции_канала_и_маршруты_api_заперты() 
         "api/camera-frame/*",
         # хранилище событий устройств — часть F
         "api/device-events",
+        # отбой идущего вызова домофонии — процесс дома (см. `locked_ops`)
+        "api/intercom",
     }
 
     assert ops == locked_ops

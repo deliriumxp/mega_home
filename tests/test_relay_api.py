@@ -267,6 +267,68 @@ def test_connect_доезжает_и_снаружи_тем_же_переносо
     assert json_of(answer) == {"status": 200, "headers": {}, "body": "ok"}
 
 
+def test_connect_отдаёт_ресурс_браузеру_тем_же_путём(coordinator, monkeypatch):
+    """⚠ Ось «потребление ответа»: `GET api/connect` отдаёт тело КАК ЕСТЬ.
+
+    Ради этого форма и заведена: `<img src>` умеет только адрес, а ответ в
+    JSON-конверте адресом не подставить — кадр плитки шёл тремя ходками, и дом
+    обзавёлся маршрутом в обход собственной двери (`docs/home-gateway.md`,
+    «Полнота двери»). Путь ТОТ ЖЕ, отличается метод: замок считает пути.
+    """
+    from mega_home.core import connect as connect_mod
+
+    seen: list[dict] = []
+
+    async def fake_http(payload):
+        seen.append(payload)
+        return {
+            "status": 200,
+            "headers": {"Content-Type": "image/jpeg"},
+            "bodyBase64": base64.b64encode(JPEG).decode("ascii"),
+        }
+
+    monkeypatch.setattr(connect_mod, "_http", fake_http)
+
+    req = (
+        base64.urlsafe_b64encode(
+            json.dumps(
+                {"kind": "http", "host": "192.168.1.9", "port": 8080, "path": "/token"}
+            ).encode()
+        )
+        .decode()
+        .rstrip("=")
+    )
+    answer = call(coordinator, "GET", f"api/connect?req={req}")
+
+    assert body_of(answer) == JPEG
+    assert answer["contentType"] == "image/jpeg"
+    assert answer["cacheControl"] == connect_mod.RESOURCE_CACHE
+    assert seen[0]["path"] == "/token"
+
+
+def test_ресурс_не_носит_учётку_и_не_бывает_записью(coordinator):
+    """⚠ Описание едет В АДРЕСЕ, а адреса попадают в журналы — пароля там быть
+    не может. И это граница класса: ресурс браузера — то, что вендор и так
+    отдаёт по ссылке, а не вызов с телом или методом записи.
+    """
+
+    def ask(payload: dict):
+        req = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+        return call(coordinator, "GET", f"api/connect?req={req}")
+
+    base = {"kind": "http", "host": "192.168.1.9", "port": 8080, "path": "/x"}
+    for payload in (
+        {**base, "auth": {"type": "digest", "user": "a", "pass": "b"}},
+        {**base, "method": "POST"},
+        {**base, "body": "что-то"},
+        {**base, "kind": "tcp"},
+    ):
+        with pytest.raises(ops.OpError):
+            ask(payload)
+    with pytest.raises(ops.OpError):
+        call(coordinator, "GET", "api/connect?req=не-base64")
+
+
 def test_лента_событий_устройства_доезжает_переносом(coordinator):
     """Часть F: хранилище на диске отдаёт ленту тем же переносом, что и дома."""
     from mega_home.core.device_store import DeviceEventStore
