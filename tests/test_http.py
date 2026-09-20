@@ -202,3 +202,52 @@ def test_кадр_можно_завести_только_у_камеры() -> No
     assert not _crop_key_known(CROP_CONFIG, "light.kitchen_main")
     assert not _crop_key_known(CROP_CONFIG, "camera.unknown")
 
+
+
+# ⚠ Удержание соединения — ТРЕТЬЯ форма того же пути `api/connect` (ось «время
+# жизни», `docs/home-gateway.md` менеджера). Ради этого замка форма и выбрана
+# такой: маршрутов в доме не прибавляется, прибавляется способ потребить ответ.
+def test_upgrade_на_connect_поднимает_сессию_а_не_ресурс(monkeypatch) -> None:
+    import asyncio as _asyncio
+
+    from mega_home import http as http_mod
+    from mega_home.core import stream as stream_mod
+
+    served: list[Any] = []
+
+    class FakeSocketResponse:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        async def prepare(self, _request: Any) -> None:
+            self.prepared = True
+
+    async def fake_serve(socket: Any) -> None:
+        served.append(socket)
+
+    monkeypatch.setattr(http_mod.web, "WebSocketResponse", FakeSocketResponse)
+    monkeypatch.setattr(stream_mod, "serve", fake_serve)
+
+    request = FakeRequest(None)
+    request.headers = {"Upgrade": "WebSocket"}
+    answer = _asyncio.run(http_mod.MegaHomeConnectView().get(request))
+
+    assert isinstance(answer, FakeSocketResponse)
+    assert served == [answer]
+    # Сторож уснувшего телефона обязателен: иначе сессии к устройствам живут
+    # до своего часа после того, как вкладку свернули.
+    assert answer.kwargs["heartbeat"] == http_mod.WS_HEARTBEAT_S
+
+
+def test_без_upgrade_тот_же_путь_отдаёт_ресурс() -> None:
+    import asyncio as _asyncio
+
+    from mega_home import http as http_mod
+
+    request = FakeRequest(None)
+    request.headers = {}
+    request.query = {}
+    answer = _asyncio.run(http_mod.MegaHomeConnectView().get(request))
+
+    # Описания вызова нет — отказ запроса, а не сессия и не падение.
+    assert answer.status == 400

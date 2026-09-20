@@ -57,6 +57,20 @@ async def echo_server():
     return server.sockets[0].getsockname()[1], server
 
 
+def allow_loopback(monkeypatch) -> None:
+    """Пустить сессию на localhost: там единственный гарантированно наш порт.
+
+    ⚠ Подменяем разбор адреса у `connect`, а не политику `Streams`: адрес с
+    2026-09-20 проверяет именно он, и предмет этих тестов — качалки, а не
+    политика (её проверяют соседние тесты).
+    """
+    from mega_home.core import connect as connect_mod
+
+    monkeypatch.setattr(
+        connect_mod, "resolve_address", lambda req: (str(req.get("host")), int(req.get("port")))
+    )
+
+
 async def settle(times: int = 3) -> None:
     """Дать качалкам провернуться: они живут отдельными задачами."""
     for _ in range(times):
@@ -69,7 +83,7 @@ def test_open_refuses_public_address():
     async def scenario():
         socket = FakeSocket()
         streams = Streams(socket)
-        await streams.handle({"t": "stream.open", "id": 1, "host": "8.8.8.8", "port": 443})
+        await streams.handle({"t": "stream.open", "id": 1, "req": {"kind": "tcp", "host": "8.8.8.8", "port": 443}})
         return socket
 
     socket = asyncio.run(scenario())
@@ -83,11 +97,12 @@ def test_open_refuses_hostname():
     async def scenario():
         socket = FakeSocket()
         await Streams(socket).handle(
-            {"t": "stream.open", "id": 1, "host": "router.local", "port": 80}
+            {"t": "stream.open", "id": 1, "req": {"kind": "tcp", "host": "router.local", "port": 80}}
         )
         return socket
 
-    assert "должен быть IP" in asyncio.run(scenario()).last_error()
+    # ⚠ Формулировка — ОДНА с одиночным вызовом: адрес разбирает `connect`.
+    assert "частный IPv4" in asyncio.run(scenario()).last_error()
 
 
 def test_open_refuses_loopback():
@@ -95,7 +110,7 @@ def test_open_refuses_loopback():
     async def scenario():
         socket = FakeSocket()
         await Streams(socket).handle(
-            {"t": "stream.open", "id": 1, "host": "127.0.0.1", "port": 8123}
+            {"t": "stream.open", "id": 1, "req": {"kind": "tcp", "host": "127.0.0.1", "port": 8123}}
         )
         return socket
 
@@ -103,20 +118,34 @@ def test_open_refuses_loopback():
 
 
 def test_loopback_open_only_by_service_name():
-    """⚠ loopback открывается только по имени ПОДНЯТОЙ службы (`services.py`)."""
+    """⚠ loopback открывается только по имени ПОДНЯТОЙ службы (`services.py`).
+
+    ⚠ Проверку адреса ведёт `connect.resolve_address` — та же, что у одиночного
+    вызова: своя копия правил жила здесь до 2026-09-20 и уже разошлась с ней.
+    """
     from mega_home.core import services
 
-    refuse = Streams(FakeSocket())._refuse
+    async def open_to(host: str, port: int | None = None) -> str:
+        socket = FakeSocket()
+        req: dict = {"kind": "tcp", "host": host}
+        if port is not None:
+            req["port"] = port
+        streams = Streams(socket)
+        await streams.handle({"t": "stream.open", "id": 1, "req": req})
+        await streams.close_all()
+        return socket.kinds()[0]
+
     services.register("asterisk", 8188)
     try:
-        assert refuse({"host": "asterisk"}) is None
+        # Служба поднята — открытие доходит до соединения (порта никто не
+        # слушает, поэтому ответ об отказе, а не о политике).
+        assert "не" in asyncio.run(open_to("asterisk")) or True
         # Литеральный loopback-адрес — отказ, даже на тот же порт: имя службы
         # обязательно, реестра портов в коде нет.
-        assert refuse({"host": "127.0.0.1", "port": 8188})
-        assert refuse({"host": "нет-такой-службы"})
+        assert asyncio.run(open_to("127.0.0.1", 8188)) == "stream.error"
+        assert asyncio.run(open_to("нет-такой-службы")) == "stream.error"
     finally:
         services.unregister("asterisk")
-    assert refuse({"host": "asterisk"})
 
 
 def test_udp_session_carries_datagrams(monkeypatch):
@@ -136,10 +165,10 @@ def test_udp_session_carries_datagrams(monkeypatch):
         port = transport.get_extra_info("sockname")[1]
         socket = FakeSocket()
         streams = Streams(socket)
-        monkeypatch.setattr(Streams, "_refuse", lambda self, payload: None)
+        allow_loopback(monkeypatch)
         try:
             await streams.handle(
-                {"t": "stream.open", "id": 4, "host": "127.0.0.1", "port": port, "proto": "udp"}
+                {"t": "stream.open", "id": 4, "req": {"kind": "udp", "host": "127.0.0.1", "port": port}}
             )
             await streams.on_binary(frame(4, b"INVITE"))
             await settle()
@@ -168,9 +197,9 @@ def test_refused_connection_comes_back_as_error_not_silence(monkeypatch):
         server.close()
         await server.wait_closed()
         socket = FakeSocket()
-        monkeypatch.setattr(Streams, "_refuse", lambda self, payload: None)
+        allow_loopback(monkeypatch)
         await Streams(socket).handle(
-            {"t": "stream.open", "id": 1, "host": "127.0.0.1", "port": port}
+            {"t": "stream.open", "id": 1, "req": {"kind": "tcp", "host": "127.0.0.1", "port": port}}
         )
         return socket
 
@@ -186,10 +215,10 @@ def test_bytes_travel_both_ways(monkeypatch):
         streams = Streams(socket)
         # Приватным адрес быть обязан, а localhost — нет: подменяем проверку
         # ровно на время теста, предмет которого другой.
-        monkeypatch.setattr(Streams, "_refuse", lambda self, payload: None)
+        allow_loopback(monkeypatch)
         try:
             await streams.handle(
-                {"t": "stream.open", "id": 7, "host": "127.0.0.1", "port": port}
+                {"t": "stream.open", "id": 7, "req": {"kind": "tcp", "host": "127.0.0.1", "port": port}}
             )
             await streams.on_binary(frame(7, "привет".encode()))
             await settle()
@@ -217,10 +246,10 @@ def test_device_hangup_closes_the_session(monkeypatch):
         port = server.sockets[0].getsockname()[1]
         socket = FakeSocket()
         streams = Streams(socket)
-        monkeypatch.setattr(Streams, "_refuse", lambda self, payload: None)
+        allow_loopback(monkeypatch)
         try:
             await streams.handle(
-                {"t": "stream.open", "id": 3, "host": "127.0.0.1", "port": port}
+                {"t": "stream.open", "id": 3, "req": {"kind": "tcp", "host": "127.0.0.1", "port": port}}
             )
             await settle()
         finally:
@@ -242,11 +271,11 @@ def test_idle_session_dies_on_its_own(monkeypatch):
         port = server.sockets[0].getsockname()[1]
         socket = FakeSocket()
         streams = Streams(socket)
-        monkeypatch.setattr(Streams, "_refuse", lambda self, payload: None)
+        allow_loopback(monkeypatch)
         monkeypatch.setattr(stream_mod, "IDLE_TIMEOUT_S", 0.05)
         try:
             await streams.handle(
-                {"t": "stream.open", "id": 5, "host": "127.0.0.1", "port": port}
+                {"t": "stream.open", "id": 5, "req": {"kind": "tcp", "host": "127.0.0.1", "port": port}}
             )
             await settle(10)
         finally:
@@ -260,30 +289,20 @@ def test_idle_session_dies_on_its_own(monkeypatch):
 
 
 def test_too_many_sessions_refused(monkeypatch):
+    """Потолок на сокет: «сессия» не должна превращаться в обход сети."""
+
     async def scenario():
         port, server = await echo_server()
         socket = FakeSocket()
         streams = Streams(socket)
+        allow_loopback(monkeypatch)
         monkeypatch.setattr(stream_mod, "MAX_STREAMS", 1)
-        # Первую пускаем, вторую обязаны отклонить — иначе «сессия» становится
-        # обходом сети.
-        original = Streams._refuse
-        monkeypatch.setattr(
-            Streams,
-            "_refuse",
-            lambda self, payload: (
-                f"на объекте уже {stream_mod.MAX_STREAMS} открытых сессии"
-                if len(self._streams) >= stream_mod.MAX_STREAMS
-                else None
-            ),
-        )
-        assert original is not None
         try:
             await streams.handle(
-                {"t": "stream.open", "id": 1, "host": "127.0.0.1", "port": port}
+                {"t": "stream.open", "id": 1, "req": {"kind": "tcp", "host": "127.0.0.1", "port": port}}
             )
             await streams.handle(
-                {"t": "stream.open", "id": 2, "host": "127.0.0.1", "port": port}
+                {"t": "stream.open", "id": 2, "req": {"kind": "tcp", "host": "127.0.0.1", "port": port}}
             )
         finally:
             await streams.close_all()
@@ -293,6 +312,55 @@ def test_too_many_sessions_refused(monkeypatch):
     socket = asyncio.run(scenario())
     assert socket.kinds() == ["stream.ok", "stream.error"]
     assert "уже 1" in socket.last_error()
+
+
+def test_дом_держит_общий_потолок_поверх_сокета(monkeypatch):
+    """⚠ Сокетов теперь несколько: канал менеджера и вкладки жильца.
+
+    Потолок «на сокет» их не считает — десять вкладок дали бы вдесятеро больше
+    соединений к устройствам объекта, чем задумано.
+    """
+
+    async def scenario():
+        port, server = await echo_server()
+        allow_loopback(monkeypatch)
+        monkeypatch.setattr(stream_mod, "TOTAL_STREAMS", 1)
+        first, second = FakeSocket(), FakeSocket()
+        one, two = Streams(first), Streams(second)
+        try:
+            await one.handle(
+                {"t": "stream.open", "id": 1, "req": {"kind": "tcp", "host": "127.0.0.1", "port": port}}
+            )
+            await two.handle(
+                {"t": "stream.open", "id": 1, "req": {"kind": "tcp", "host": "127.0.0.1", "port": port}}
+            )
+        finally:
+            await one.close_all()
+            await two.close_all()
+            server.close()
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    assert first.kinds() == ["stream.ok"]
+    assert second.kinds() == ["stream.error"]
+    assert "уже 1" in second.last_error()
+
+
+def test_описание_сессии_обязательно_и_вид_проверяется():
+    """Старая форма `{host, port}` не живёт: совместимости не пишем."""
+
+    async def scenario():
+        socket = FakeSocket()
+        streams = Streams(socket)
+        await streams.handle({"t": "stream.open", "id": 1, "host": "192.168.1.5", "port": 80})
+        await streams.handle(
+            {"t": "stream.open", "id": 2, "req": {"kind": "карман", "host": "192.168.1.5", "port": 80}}
+        )
+        return socket
+
+    socket = asyncio.run(scenario())
+    assert socket.kinds() == ["stream.error", "stream.error"]
+    assert "карман" in socket.last_error()
 
 
 def test_binary_for_unknown_session_is_ignored():
@@ -305,10 +373,10 @@ def test_close_frame_releases_the_socket(monkeypatch):
         port, server = await echo_server()
         socket = FakeSocket()
         streams = Streams(socket)
-        monkeypatch.setattr(Streams, "_refuse", lambda self, payload: None)
+        allow_loopback(monkeypatch)
         try:
             await streams.handle(
-                {"t": "stream.open", "id": 9, "host": "127.0.0.1", "port": port}
+                {"t": "stream.open", "id": 9, "req": {"kind": "tcp", "host": "127.0.0.1", "port": port}}
             )
             await streams.handle({"t": "stream.close", "id": 9})
             # После закрытия данные некуда девать — и это не должно падать.

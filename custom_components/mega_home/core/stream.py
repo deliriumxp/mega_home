@@ -10,30 +10,45 @@
 деплоем — иначе каждая новая железка на объекте стоила бы релиза HACS с
 перезапуском Home Assistant (docs/plan-thin-integration.md в менеджере).
 
-⚠ Кто зовёт: ТОЛЬКО менеджер живым каналом, где объект опознан своим токеном.
-Локальной HTTP-двери у этого нет и быть не должно — контур дома без
-аутентификации, и такая дверь стала бы проходным двором в LAN объекта для
-любого, кто в его Wi-Fi.
+⚠ Кто зовёт: менеджер живым каналом (объект опознан своим токеном) И приложение
+жильца — формой Upgrade того же `api/connect` (`http.py`). Снаружи она идёт
+переносом менеджера и закрыта сессией жильца, внутри дома — без аутентификации,
+как и всё в локальном контуре (решение заказчика 2026-09-20).
+
+⚠ Здесь стояло «локальной двери у этого нет и быть не должно — она стала бы
+проходным двором в LAN объекта». Довод УСТАРЕЛ с приходом `connect`: локальный
+`POST api/connect` уже ходит без аутентификации на любой частный адрес объекта,
+то есть досягаемость у локального контура ровно та же. Удержание добавляет
+длительность, а не досягаемость, и ограничивают её потолки ниже
+(`MAX_STREAMS`/`TOTAL_STREAMS`/`MAX_BYTES`/сроки), а не отсутствие двери.
 
 Кадры канала:
-  управление — JSON: `stream.open` {id, host, port, proto?} → `stream.ok` |
-  `stream.error`, `stream.close` {id, error?} в обе стороны;
+  управление — JSON: `stream.open` {id, req: ConnectRequest} → `stream.ok` |
+  `stream.error`, `stream.close` {id, error?} в обе стороны, `stream.data`
+  {id, text} — текстовый кадр WebSocket в обе стороны, `stream.head`
+  {id, status, headers} — заголовки ответа у вида `http`, один раз до тела;
   данные — БИНАРНЫЕ: 4 байта номера потока (big-endian) + байты как есть.
-  `proto: "udp"` — кадр данных = ОДНА датаграмма в каждую сторону (SIP по UDP,
-  опрос устройств); умолчание — TCP.
 Бинарные, а не base64 в JSON: треть лишнего объёма и лишние проходы по каждому
 килобайту веб-морды — это заметно уже на одной странице с картинками.
+
+⚠ Описание сессии — ТА ЖЕ форма `ConnectRequest`, что у одиночного вызова, и
+разбирается ТЕМ ЖЕ кодом (`connect.resolve_address`, `connect.prepare_http`).
+Свой разбор здесь разошёлся бы с ним на первой правке: «Digest работает в
+вызове и не работает в сессии».
 """
 
 from __future__ import annotations
 
 import asyncio
-import ipaddress
+import ssl
 import struct
 from typing import Any
 
-from . import services
+import aiohttp
+
+from . import connect as connect_mod, digest
 from .const import LOGGER
+from .ops_base import OpError
 
 # ⚠ Службы САМОГО дома, до которых менеджер вправе открыть поток по loopback,
 # больше не список констант — их держит реестр `services.py` (замок 3 плана
@@ -49,6 +64,20 @@ from .const import LOGGER
 # картинками: часть запросов молча вставала бы в очередь до таймаута. Шестнадцать
 # — это страница плюс запас на вторую вкладку, но всё ещё не обход сети.
 MAX_STREAMS = 16
+# Сессий на ВЕСЬ дом, поверх потолка на сокет.
+#
+# ⚠ Сокетов теперь несколько: канал менеджера и по одному на каждую открытую
+# вкладку жильца (`http.py`, форма Upgrade). Потолок «на сокет» их не считает —
+# десять вкладок дали бы 160 соединений к устройствам объекта, и это уже не
+# просмотр камеры, а обход сети силами самого дома.
+TOTAL_STREAMS = 32
+# Предел срока молчания, который вправе попросить вызывающий (`req.timeout`).
+#
+# ⚠ Умолчание (`IDLE_TIMEOUT_S`) короткое, потому что брошенная вкладка молчит
+# так же, как живая подписка. Но подписка на события регистратора законно
+# молчит минутами, и резать её своим умолчанием значит вернуть частый опрос —
+# поэтому срок берётся ИЗ ОПИСАНИЯ, а здесь только потолок.
+MAX_IDLE_S = 600.0
 # Жизнь сессии. Час — столько же, сколько даёт Domotz, и по той же причине:
 # забытая открытой вкладка не должна держать дверь в чужую квартиру сутками.
 MAX_LIFETIME_S = 3600.0
@@ -67,10 +96,57 @@ QUEUE_DEPTH = 64
 
 HEADER = struct.Struct(">I")
 
+# ⚠ Сертификат устройства объекта самоподписанный, проверять его нечем — тот же
+# довод, что у одиночного вызова (`connect.prepare_http`): адреса пускает только
+# частная сеть объекта. ⚠ Не `ssl=False`: у `open_connection` это значит «без
+# TLS вовсе», то есть `tls: true` молча ушёл бы открытым текстом.
+_TLS = ssl.create_default_context()
+_TLS.check_hostname = False
+_TLS.verify_mode = ssl.CERT_NONE
+
+# Сколько сессий открыто ВО ВСЁМ доме: сокетов несколько (канал менеджера и
+# вкладки жильца), и потолок на сокет их не считает.
+_open_total = 0
+
+
+def _total() -> int:
+    return _open_total
+
+
+def _idle_of(req: dict[str, Any]) -> float:
+    """Срок молчания сессии — из описания, с потолком дома (`MAX_IDLE_S`)."""
+    try:
+        wanted = float(req.get("timeout"))
+    except (TypeError, ValueError):
+        return IDLE_TIMEOUT_S
+    return min(max(wanted, 1.0), MAX_IDLE_S) if wanted > 0 else IDLE_TIMEOUT_S
+
 
 def frame(stream_id: int, payload: bytes) -> bytes:
     """Бинарный кадр данных: номер потока + байты."""
     return HEADER.pack(stream_id) + payload
+
+
+async def serve(socket: Any) -> None:
+    """Держать сессии одного сокета: читать кадры, пока он жив, и прибрать за ним.
+
+    ⚠ Для ЛОКАЛЬНОЙ двери (`http.py`, форма Upgrade). Канал менеджера крутит
+    свой цикл сам (`link.py`): там по тому же сокету ездят ещё и `hello`,
+    запросы жильца и события, и общий цикл пришлось бы учить чужим кадрам.
+    """
+    streams = Streams(socket)
+    try:
+        async for message in socket:
+            if message.type is aiohttp.WSMsgType.TEXT:
+                await streams.handle(message.json())
+            elif message.type is aiohttp.WSMsgType.BINARY:
+                await streams.on_binary(message.data)
+            elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                break
+    finally:
+        # Вкладку закрыли (или телефон уснул и сокет порвался по пропущенному
+        # heartbeat) — соединения к устройствам закрываются здесь же.
+        await streams.close_all()
 
 
 class Streams:
@@ -94,6 +170,15 @@ class Streams:
         if kind == "stream.close":
             await self._close(payload.get("id"))
             return True
+        if kind == "stream.data":
+            # Текстовый кадр WebSocket в сторону устройства. Бинарный ездит
+            # бинарным кадром (`on_binary`) — текст в него не заворачиваем:
+            # у WebSocket это РАЗНЫЕ типы кадров, и устройство их различает.
+            stream = self._streams.get(payload.get("id"))
+            text = payload.get("text")
+            if stream is not None and isinstance(text, str):
+                await stream.to_device_text(text)
+            return True
         return False
 
     async def on_binary(self, data: bytes) -> None:
@@ -108,89 +193,96 @@ class Streams:
         await stream.to_device(data[HEADER.size :])
 
     async def close_all(self) -> None:
+        global _open_total
         for stream in list(self._streams.values()):
             await stream.stop(None)
+        _open_total -= len(self._streams)
         self._streams.clear()
 
     async def _open(self, payload: dict[str, Any]) -> None:
         stream_id = payload.get("id")
         if not isinstance(stream_id, int):
             return
-        error = self._refuse(payload)
-        if error:
-            await self._send_json({"t": "stream.error", "id": stream_id, "error": error})
+        req = payload.get("req")
+        if not isinstance(req, dict):
+            await self._fail(stream_id, "описание сессии — объект req (ConnectRequest)")
             return
-        host = str(payload.get("host"))
-        service_port = services.resolve(host)
-        # Имя ПОДНЯТОЙ службы диктует адрес и порт; запрошенный порт тогда
-        # игнорируется (замок 3 плана `docs/plan-thin-gateway.md`).
-        host, port = ("127.0.0.1", service_port) if service_port is not None else (host, int(payload.get("port")))
-        stream: _Stream | _Datagrams
+        error = self._refuse()
+        if error:
+            await self._fail(stream_id, error)
+            return
+        # ⚠ Адрес разбирает `connect`, а не своя копия правил: частный IPv4 либо
+        # имя ПОДНЯТОЙ службы дома, loopback только по имени (замок 3 плана).
+        # Копия этих проверок жила здесь до 2026-09-20 и уже начала расходиться
+        # — у `connect` она отвергала `0.0.0.0` и зарезервированное, здесь
+        # список был свой.
         try:
-            if payload.get("proto") == "udp":
+            host, port = connect_mod.resolve_address(req)
+        except OpError as err:
+            await self._fail(stream_id, err.message)
+            return
+        kind = str(req.get("kind") or "tcp")
+        idle = _idle_of(req)
+        stream: _Session
+        try:
+            if kind == "udp":
                 loop = asyncio.get_running_loop()
                 transport, protocol = await loop.create_datagram_endpoint(
                     _DatagramProtocol, remote_addr=(host, port)
                 )
-                stream = _Datagrams(stream_id, transport, protocol, self)
-            else:
+                stream = _Datagrams(stream_id, transport, protocol, self, idle)
+            elif kind == "ws":
+                stream = _WsStream(stream_id, req, host, port, self, idle)
+            elif kind == "http":
+                stream = _HttpStream(stream_id, req, self, idle)
+            elif kind == "tcp":
                 reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port), 10
+                    asyncio.open_connection(
+                        host, port, ssl=_TLS if req.get("tls") is True else None
+                    ),
+                    10,
                 )
-                stream = _Stream(stream_id, reader, writer, self)
+                stream = _Stream(stream_id, reader, writer, self, idle)
+            else:
+                await self._fail(stream_id, f"вид «{kind}» connect не умеет")
+                return
         except (asyncio.TimeoutError, OSError) as err:
-            await self._send_json(
-                {"t": "stream.error", "id": stream_id, "error": _describe(err)}
-            )
+            await self._fail(stream_id, _describe(err))
             return
+        global _open_total
         self._streams[stream_id] = stream
+        _open_total += 1
+        # ⚠ `stream.ok` уезжает ДО старта качалок: у видов `ws` и `http`
+        # соединение поднимает сама сессия, и первый кадр от устройства не
+        # должен обогнать подтверждение открытия.
         await self._send_json({"t": "stream.ok", "id": stream_id})
         stream.start()
-        LOGGER.info("Сессия %s открыта: %s:%s", stream_id, host, port)
+        LOGGER.info("Сессия %s открыта: %s %s:%s", stream_id, kind, host, port)
 
-    def _refuse(self, payload: dict[str, Any]) -> str | None:
+    async def _fail(self, stream_id: int, error: str) -> None:
+        await self._send_json({"t": "stream.error", "id": stream_id, "error": error})
+
+    def _refuse(self) -> str | None:
         """Почему открывать нельзя. `None` — можно.
 
-        ⚠ Только литеральный ПРИВАТНЫЙ адрес. Имя пришлось бы резолвить, а
-        резолвер дома смотрит и в интернет — так дверь в локалку объекта стала бы
-        заодно анонимным выходом в сеть с его адреса. Устройства менеджер и так
-        знает по скану и называет их адресами.
-
-        ⚠ Loopback — только ПОДНЯТЫЕ службы дома, реестр `services.py`
-        (`docs/plan-thin-gateway.md`, замок 3): списка портов в коде нет, служба
-        должна быть жива именно сейчас — канал менеджера единственный путь к
-        ним (телефон жильца до SIP-моста). Остальной loopback — сам Home
-        Assistant и соседи по машине, не «устройство объекта».
+        ⚠ Остались только ПОТОЛКИ: адрес проверяет `connect.resolve_address`
+        (см. `_open`). Потолков два — на сокет и на дом: сокетов теперь
+        несколько (канал менеджера и вкладки жильца), и первый второй не
+        заменяет.
         """
         if len(self._streams) >= MAX_STREAMS:
             return f"на объекте уже {MAX_STREAMS} открытых сессии"
-        host = str(payload.get("host") or "")
-        port = payload.get("port")
-        service_port = services.resolve(host)
-        if service_port is not None:
-            return None
-        if not isinstance(port, int) or not 1 <= port <= 65535:
-            return "порт не указан"
-        try:
-            address = ipaddress.ip_address(host)
-        except ValueError:
-            return "адрес устройства должен быть IP или именем поднятой службы"
-        # ⚠ `0.0.0.0` в Linux — это сам хост: `is_private` у него истинно, а
-        # `is_loopback` ложно, и так открывались бы API go2rtc и HA на петле
-        # (ревью 2026-09-19). Мультикаст и зарезервированное — не устройство.
-        if address.is_unspecified or address.is_multicast or address.is_reserved:
-            return "адрес вне локальной сети объекта"
-        if address.is_loopback:
-            return "адрес вне локальной сети объекта — loopback только по имени службы"
-        if not address.is_private:
-            return "адрес вне локальной сети объекта"
+        if _total() >= TOTAL_STREAMS:
+            return f"дом держит уже {TOTAL_STREAMS} соединений"
         return None
 
     async def _close(self, stream_id: Any) -> None:
+        global _open_total
         stream = (
             self._streams.pop(stream_id, None) if isinstance(stream_id, int) else None
         )
         if stream is not None:
+            _open_total -= 1
             await stream.stop(None)
 
     async def _send_json(self, payload: dict[str, Any]) -> None:
@@ -206,9 +298,11 @@ class Streams:
             LOGGER.debug("Данные сессии не ушли: %s", err)
 
     async def _finished(self, stream_id: int, error: str | None) -> None:
-        """Сессия кончилась со стороны устройства — сказать менеджеру."""
+        """Сессия кончилась со стороны устройства — сказать вызывающему."""
+        global _open_total
         if self._streams.pop(stream_id, None) is None:
             return
+        _open_total -= 1
         payload: dict[str, Any] = {"t": "stream.close", "id": stream_id}
         if error:
             payload["error"] = error
@@ -224,11 +318,13 @@ class _Stream:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         owner: Streams,
+        idle: float = IDLE_TIMEOUT_S,
     ) -> None:
         self.id = stream_id
         self._reader = reader
         self._writer = writer
         self._owner = owner
+        self._idle_s = idle
         self._queue: asyncio.Queue[bytes] = asyncio.Queue(QUEUE_DEPTH)
         self._tasks: list[asyncio.Task[None]] = []
         self._bytes = 0
@@ -246,6 +342,15 @@ class _Stream:
         # устройство не успевает, и чтение канала притормаживается само.
         if not self._stopping:
             await self._queue.put(chunk)
+
+    async def to_device_text(self, text: str) -> None:
+        """Текстовый кадр — понятие WebSocket; у байтового потока его нет.
+
+        ⚠ Молча, а не отказом: вызывающий мог перепутать вид сессии, но рвать
+        из-за этого живое соединение к устройству — хуже, чем не доставить
+        кадр, которого тут быть не должно.
+        """
+        await self.to_device(text.encode("utf-8"))
 
     async def stop(self, error: str | None) -> None:
         if self._stopping:
@@ -277,7 +382,7 @@ class _Stream:
         """Устройство → менеджер."""
         try:
             while True:
-                chunk = await asyncio.wait_for(self._reader.read(CHUNK), IDLE_TIMEOUT_S)
+                chunk = await asyncio.wait_for(self._reader.read(CHUNK), self._idle_s)
                 if not chunk:
                     await self._done(None)
                     return
@@ -304,6 +409,237 @@ class _Stream:
         await self.stop(error)
 
 
+class _WsStream:
+    """Сессия WebSocket к устройству: рукопожатие ведёт ДОМ, смысл — вызывающий.
+
+    ⚠ Ради этого вида ось и закрывалась именно удержанием, а не потоковым
+    ответом: у WebSocket два направления, и подписка, где на каждый шаг надо
+    послать посчитанное вызывающим, иначе не выражается вовсе.
+    """
+
+    def __init__(
+        self,
+        stream_id: int,
+        req: dict[str, Any],
+        host: str,
+        port: int,
+        owner: Streams,
+        idle: float,
+    ) -> None:
+        self.id = stream_id
+        self._req = req
+        self._url = f"{'wss' if req.get('tls') is True else 'ws'}://{host}:{port}{req.get('path') or '/'}"
+        self._owner = owner
+        self._idle_s = idle
+        self._outgoing: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(QUEUE_DEPTH)
+        self._tasks: list[asyncio.Task[None]] = []
+        self._session: aiohttp.ClientSession | None = None
+        self._socket: Any = None
+        self._bytes = 0
+        self._stopping = False
+
+    def start(self) -> None:
+        self._tasks = [asyncio.ensure_future(self._run()), asyncio.ensure_future(self._deadline())]
+
+    async def to_device(self, chunk: bytes) -> None:
+        if not self._stopping:
+            await self._outgoing.put(("bin", chunk))
+
+    async def to_device_text(self, text: str) -> None:
+        if not self._stopping:
+            await self._outgoing.put(("text", text))
+
+    async def stop(self, error: str | None) -> None:
+        if self._stopping:
+            return
+        self._stopping = True
+        for task in self._tasks:
+            if task is not asyncio.current_task():
+                task.cancel()
+        if self._socket is not None:
+            await self._socket.close()
+        if self._session is not None:
+            await self._session.close()
+        if error:
+            LOGGER.info("Сессия %s закрыта: %s", self.id, error)
+
+    async def _run(self) -> None:
+        headers = self._req.get("headers") if isinstance(self._req.get("headers"), dict) else None
+        try:
+            connector = aiohttp.TCPConnector(ssl=False) if self._req.get("tls") is True else None
+            self._session = aiohttp.ClientSession(connector=connector)
+            self._socket = await self._session.ws_connect(self._url, headers=headers, timeout=10)
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as err:
+            await self._done(_describe(err))
+            return
+        sender = asyncio.ensure_future(self._pump_in())
+        self._tasks.append(sender)
+        try:
+            while True:
+                message = await asyncio.wait_for(self._socket.receive(), self._idle_s)
+                if message.type is aiohttp.WSMsgType.TEXT:
+                    await self._owner._send_json(
+                        {"t": "stream.data", "id": self.id, "text": message.data}
+                    )
+                elif message.type is aiohttp.WSMsgType.BINARY:
+                    self._bytes += len(message.data)
+                    if self._bytes > MAX_BYTES:
+                        await self._done("превышен потолок трафика сессии")
+                        return
+                    await self._owner._send_bytes(frame(self.id, message.data))
+                else:
+                    # Устройство закрыло сокет само — это конец, а не авария.
+                    await self._done(None)
+                    return
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            await self._done("тишина в сессии")
+        except (aiohttp.ClientError, OSError) as err:
+            await self._done(_describe(err))
+
+    async def _pump_in(self) -> None:
+        while True:
+            kind, payload = await self._outgoing.get()
+            try:
+                if kind == "text":
+                    await self._socket.send_str(payload)
+                else:
+                    await self._socket.send_bytes(payload)
+            except (aiohttp.ClientError, OSError) as err:
+                await self._done(_describe(err))
+                return
+
+    async def _deadline(self) -> None:
+        await asyncio.sleep(MAX_LIFETIME_S)
+        await self._done("истёк срок сессии")
+
+    async def _done(self, error: str | None) -> None:
+        await self._owner._finished(self.id, error)
+        await self.stop(error)
+
+
+class _HttpStream:
+    """HTTP-ответ, который ЧИТАЕТСЯ ПО МЕРЕ ПРИХОДА, а не целиком.
+
+    ⚠ Ради длинного опроса и потоковых ответов вендора: одиночный `connect`
+    ждёт ответ целиком и режется сроком, а снаружи его к тому же обрывает
+    перенос менеджера. Заголовки уезжают отдельным кадром `stream.head` ДО
+    тела — иначе вызывающий не отличит «ответ 401» от «тело ещё едет».
+
+    ⚠ Запрос собирается ТЕМ ЖЕ `connect.prepare_http`, включая второй круг
+    Digest: разбор описания у форм один.
+    """
+
+    def __init__(self, stream_id: int, req: dict[str, Any], owner: Streams, idle: float) -> None:
+        self.id = stream_id
+        self._req = req
+        self._owner = owner
+        self._idle_s = idle
+        self._tasks: list[asyncio.Task[None]] = []
+        self._session: aiohttp.ClientSession | None = None
+        self._bytes = 0
+        self._stopping = False
+
+    def start(self) -> None:
+        self._tasks = [asyncio.ensure_future(self._run()), asyncio.ensure_future(self._deadline())]
+
+    async def to_device(self, chunk: bytes) -> None:
+        """У ответа нет обратного направления — молча, см. `_Stream.to_device_text`."""
+
+    async def to_device_text(self, text: str) -> None:
+        """То же: тело запроса едет в описании, дослать в ответ нечего."""
+
+    async def stop(self, error: str | None) -> None:
+        if self._stopping:
+            return
+        self._stopping = True
+        for task in self._tasks:
+            if task is not asyncio.current_task():
+                task.cancel()
+        if self._session is not None:
+            await self._session.close()
+        if error:
+            LOGGER.info("Сессия %s закрыта: %s", self.id, error)
+
+    async def _run(self) -> None:
+        try:
+            call = connect_mod.prepare_http(self._req)
+        except OpError as err:
+            await self._done(err.message)
+            return
+        try:
+            self._session = aiohttp.ClientSession(connector=call["connector"])
+            response = await self._open_response(call)
+            await self._owner._send_json(
+                {
+                    "t": "stream.head",
+                    "id": self.id,
+                    "status": response.status,
+                    "headers": {str(k): str(v) for k, v in response.headers.items()},
+                }
+            )
+            async for chunk in response.content.iter_any():
+                self._bytes += len(chunk)
+                if self._bytes > MAX_BYTES:
+                    await self._done("превышен потолок трафика сессии")
+                    return
+                await self._owner._send_bytes(frame(self.id, chunk))
+            # Тело кончилось — это нормальный конец ответа, а не отказ.
+            await self._done(None)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            await self._done("тишина в сессии")
+        except (aiohttp.ClientError, OSError) as err:
+            await self._done(_describe(err))
+
+    async def _open_response(self, call: dict[str, Any]) -> Any:
+        """Запрос и, если устройство просит Digest, второй круг — как у `_http`."""
+        assert self._session is not None
+        timeout = aiohttp.ClientTimeout(total=None, sock_read=self._idle_s)
+        response = await self._session.request(
+            call["method"],
+            call["url"],
+            data=call["body"] or None,
+            headers=call["headers"],
+            auth=call["basic"],
+            allow_redirects=False,
+            timeout=timeout,
+        )
+        if call["digest"] and response.status == 401:
+            asked = next(
+                (v for k, v in response.headers.items() if k.lower() == "www-authenticate"), ""
+            )
+            try:
+                params = digest.parse_www_auth(asked)
+            except ValueError:
+                params = None
+            if params:
+                response.close()
+                signed = dict(call["headers"])
+                signed["Authorization"] = digest.authorization(
+                    call["method"], call["path"], call["digest"][0], call["digest"][1], params
+                )
+                response = await self._session.request(
+                    call["method"],
+                    call["url"],
+                    data=call["body"] or None,
+                    headers=signed,
+                    allow_redirects=False,
+                    timeout=timeout,
+                )
+        return response
+
+    async def _deadline(self) -> None:
+        await asyncio.sleep(MAX_LIFETIME_S)
+        await self._done("истёк срок сессии")
+
+    async def _done(self, error: str | None) -> None:
+        await self._owner._finished(self.id, error)
+        await self.stop(error)
+
+
 class _DatagramProtocol(asyncio.DatagramProtocol):
     def __init__(self) -> None:
         self.owner: _Datagrams | None = None
@@ -320,10 +656,18 @@ class _DatagramProtocol(asyncio.DatagramProtocol):
 class _Datagrams:
     """UDP-сессия: кадр данных = одна датаграмма. Те же сроки и потолок, что у TCP."""
 
-    def __init__(self, stream_id: int, transport: Any, protocol: _DatagramProtocol, owner: Streams) -> None:
+    def __init__(
+        self,
+        stream_id: int,
+        transport: Any,
+        protocol: _DatagramProtocol,
+        owner: Streams,
+        idle: float = IDLE_TIMEOUT_S,
+    ) -> None:
         self.id = stream_id
         self._transport = transport
         self._owner = owner
+        self._idle_s = idle
         self._bytes = 0
         self._stopping = False
         self._tasks: list[asyncio.Task[None]] = []
@@ -343,6 +687,10 @@ class _Datagrams:
         if not self._stopping:
             self._transport.sendto(chunk)
             self._touch()
+
+    async def to_device_text(self, text: str) -> None:
+        """Датаграмма из текста — см. `_Stream.to_device_text`."""
+        await self.to_device(text.encode("utf-8"))
 
     def received(self, data: bytes) -> None:
         if self._stopping:
@@ -385,7 +733,7 @@ class _Datagrams:
         if self._idle is not None:
             self._idle.cancel()
         loop = asyncio.get_running_loop()
-        self._idle = loop.call_later(IDLE_TIMEOUT_S, lambda: self._later(self._done("тишина в сессии")))
+        self._idle = loop.call_later(self._idle_s, lambda: self._later(self._done("тишина в сессии")))
 
     def _later(self, coro: Any) -> None:
         # Только для редких событий (срок, отказ): задача живёт до своего конца.
@@ -422,3 +770,7 @@ def _describe(err: Exception) -> str:
     if isinstance(err, OSError) and err.errno in (101, 113):
         return "хост недостижим (нет маршрута)"
     return str(err) or err.__class__.__name__
+
+
+# Одна из сессий: байтовый поток, датаграммы, WebSocket или HTTP-ответ.
+_Session = _Stream | _Datagrams | _WsStream | _HttpStream

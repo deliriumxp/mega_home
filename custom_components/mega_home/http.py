@@ -28,7 +28,7 @@ from .core.const import (
     URL_ICONS,
     URL_PREFIX,
 )
-from .core import ops
+from .core import ops, stream
 from .core.api import ManagerError
 from .coordinator import MegaHomeCoordinator
 from .core.crops import crop_key_known, crop_keys, crop_value_valid, MAX_CROP_BYTES
@@ -40,6 +40,13 @@ from .core.photos import (
     photo_key_known,
     photo_keys,
 )
+
+# Сколько ждём отклика на ping удержания: уснувший телефон сокет не закрывает,
+# и без этого сессии к устройствам жили бы до своего часа (`stream.py`).
+WS_HEARTBEAT_S = 25
+# Кадр крупнее мегабайта — не наш случай: тело запроса едет в описании, а данные
+# идут кусками. Огромный кадр рвёт сокет громко, а не теряется молча.
+WS_MAX_FRAME = 1024 * 1024
 
 # ⚠ Копии интерфейса в релизе НЕТ (2026-09-06): пока бандл не скачан, отдаём эту
 # страницу. Первый запуск считаем онлайн — а взамен релиз интеграции перестал
@@ -256,6 +263,26 @@ class MegaHomeConnectView(_MegaHomeView):
         return await self.run_async(request, "connect")
 
     async def get(self, request: web.Request) -> web.StreamResponse:
+        """Ресурс — или УДЕРЖАНИЕ, если браузер просит Upgrade.
+
+        ⚠ Третья форма ТОГО ЖЕ пути, а не новый маршрут: меняется способ
+        потребить ответ (данные коду `POST`, ресурс тегу `GET`, кадры сессии
+        `GET` с Upgrade), описание вызова одно и то же. Список маршрутов от
+        этого не растёт — замок считает пути.
+
+        ⚠ Внутри дома дверь без аутентификации, как и весь локальный контур
+        (решение заказчика 2026-09-20): досягаемость у неё ровно та же, что у
+        `POST api/connect`, который тут и так открыт. Снаружи эта же форма
+        идёт переносом менеджера и закрыта сессией жильца.
+        """
+        if request.headers.get("Upgrade", "").lower() == "websocket":
+            socket = web.WebSocketResponse(heartbeat=WS_HEARTBEAT_S, max_msg_size=WS_MAX_FRAME)
+            await socket.prepare(request)
+            await stream.serve(socket)
+            return socket
+        return await self._resource(request)
+
+    async def _resource(self, request: web.Request) -> web.StreamResponse:
         """Тот же вызов, ответ — РЕСУРС: браузер берёт его сам, одной ходкой.
 
         ⚠ Ради этого метода дом не заводит по маршруту на каждую картинку:
