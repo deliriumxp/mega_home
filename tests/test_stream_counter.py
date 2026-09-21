@@ -143,6 +143,54 @@ def test_вкладка_ушла_пока_сессии_открываются(mo
     assert count_after(monkeypatch, tab) == 0
 
 
+def test_штатный_уход_вкладки_при_отмене_обработчика_как_у_ha(monkeypatch):
+    """⚠ Та самая утечка объекта 2026-09-21, воспроизведённая настоящим сервером.
+
+    Home Assistant отменяет обработчик запроса, когда клиент закрыл соединение
+    (`handler_cancellation=True`), и отмена прилетала в `close_all` посреди
+    закрытия первой сессии — вычитание после цикла пропускалось. Четыре вкладки
+    по две сессии давали счёт 8 вместо 0, и навсегда.
+    """
+    allow_loopback(monkeypatch)
+    monkeypatch.setattr(stream_mod, "_open_total", 0)
+
+    async def scenario():
+        import aiohttp
+
+        port, device = await devices()
+
+        async def door(request):
+            sock = web.WebSocketResponse(heartbeat=25)
+            await sock.prepare(request)
+            await stream_mod.serve(sock)
+            return sock
+
+        house = web.Application()
+        house.router.add_get("/connect", door)
+        runner = web.AppRunner(house, handler_cancellation=True, shutdown_timeout=0.5)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        house_port = site._server.sockets[0].getsockname()[1]
+        counts = []
+        try:
+            async with aiohttp.ClientSession() as client:
+                for _ in range(4):
+                    tab = await client.ws_connect(f"http://127.0.0.1:{house_port}/connect")
+                    for i in range(2):
+                        await tab.send_json(open_frame(i + 1, "ws", port, "/ws"))
+                    await asyncio.sleep(0.3)
+                    await asyncio.wait_for(tab.close(), 3)
+                    await asyncio.sleep(0.5)
+                    counts.append(stream_mod._open_total)
+        finally:
+            await runner.cleanup()
+            await device.cleanup()
+        return counts
+
+    assert asyncio.run(scenario()) == [0, 0, 0, 0]
+
+
 def test_потолок_дома_покрывает_самый_тяжёлый_дом():
     """Решение заказчика 2026-09-21: 5 телефонов + 5 мониторов по 8 сессий и канал менеджера."""
     heaviest = (5 + 5) * 8 + stream_mod.MAX_STREAMS

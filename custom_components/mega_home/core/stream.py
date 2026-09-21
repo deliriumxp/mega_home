@@ -243,10 +243,24 @@ class Streams:
         self._opening_tasks.clear()
         self._opening_ids.clear()
         self._abandoned.clear()
-        for stream in list(self._streams.values()):
-            await stream.stop(None)
-        _open_total -= len(self._streams)
+        # ⚠⚠ Счёт — ДО первого `await`, закрытие — под `shield`. Home Assistant
+        # отменяет обработчик запроса, когда клиент рвёт соединение
+        # (`handler_cancellation=True`, `components/http/server.py`), и при
+        # ШТАТНОМ закрытии вкладки отмена прилетает сюда, посреди закрытия
+        # первой сессии. Пока вычитание стояло после цикла, отмена его
+        # пропускала, и сессии закрытой вкладки навсегда оставались в общем
+        # счёте дома: объект 2026-09-21 дошёл так до «дом держит уже 32
+        # соединений» при пустом доме, и лечил это только перезапуск HA
+        # (воспроизведено: четыре вкладки по две сессии → счёт 8 вместо 0).
+        streams = list(self._streams.values())
         self._streams.clear()
+        _open_total -= len(streams)
+        if streams:
+            # Соединения к устройствам закрываем до конца, даже если нас
+            # отменили: иначе они висели бы до тишины, держа устройство.
+            await asyncio.shield(
+                asyncio.gather(*(stream.stop(None) for stream in streams), return_exceptions=True)
+            )
 
     async def _open(self, payload: dict[str, Any]) -> None:
         stream_id = payload.get("id")
