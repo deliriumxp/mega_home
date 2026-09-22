@@ -20,6 +20,7 @@ import ipaddress
 import json
 import re
 import socket
+import ssl
 from typing import Any
 from urllib.parse import unquote
 
@@ -45,7 +46,8 @@ KINDS = ("tcp", "udp", "http", "ws")
 RESOURCE_CACHE = "private, max-age=30"
 
 async def perform(payload: dict[str, Any]) -> dict[str, Any]:
-    """Выполнить один вызов `connect`; ошибка и статус ≥ 400 — `OpError`."""
+    """Выполнить один вызов `connect`. Отказ ДОМА — `OpError`; ответ адресата
+    с любым статусом — данные (`status` в ответе), толкует его вызывающий."""
     if not isinstance(payload, dict):
         raise OpError("Ожидается объект запроса")
     if payload.get("stream") is True:
@@ -181,60 +183,66 @@ def prepare_http(payload: dict[str, Any]) -> dict[str, Any]:
         "connector": aiohttp.TCPConnector(ssl=False) if tls else None,
     }
 
+async def http_send(
+    session: aiohttp.ClientSession, call: dict[str, Any], timeout: aiohttp.ClientTimeout
+) -> aiohttp.ClientResponse:
+    """Запрос по разобранному описанию (`prepare_http`) — ОТКРЫТЫЙ ответ.
+
+    ⚠ ЕДИНСТВЕННЫЙ HTTP-клиент дома: одиночный вызов (`_http`), сессия вида
+    `http` (`stream.py`) и слушатели (`listeners_out.py`). До 0.5.6 их было
+    три, и третий разошёлся: подписывал Digest путём БЕЗ строки запроса (устройство
+    сверяет `uri` с адресом и отказывает), а поток событий Digest не умел вовсе.
+
+    ⚠ Digest требует ДВА круга: параметры приходят только в ответе на запрос без
+    `Authorization`. Второй круг дом делает сам, чтобы вызывающему на другом
+    конце канала не гонять их через менеджер — RFC 7616 это стандарт HTTP, не
+    вендор (`digest.py`). Подписывается `call["path"]` — путь СО строкой запроса.
+    """
+    method, url, body, headers = call["method"], call["url"], call["body"] or None, call["headers"]
+    response = await session.request(
+        method, url, data=body, headers=headers, auth=call["basic"], allow_redirects=False, timeout=timeout
+    )
+    if not call["digest"] or response.status != 401:
+        return response
+    try:
+        params = digest.parse_www_auth(response.headers.get("WWW-Authenticate", ""))
+    except ValueError:
+        return response
+    response.release()
+    signed = {**headers, "Authorization": digest.authorization(method, call["path"], *call["digest"], params)}
+    return await session.request(
+        method, url, data=body, headers=signed, allow_redirects=False, timeout=timeout
+    )
+
 async def _http(payload: dict[str, Any]) -> dict[str, Any]:
     call = prepare_http(payload)
-    method, path, url = call["method"], call["path"], call["url"]
-    headers, body, timeout = call["headers"], call["body"], call["timeout"]
-    basic, digest_creds, connector = call["basic"], call["digest"], call["connector"]
     try:
-        async with aiohttp.ClientSession(connector=connector) as session:
-            status, out_headers, raw = await _request_once(
-                session, method, url, headers, basic, body, timeout
-            )
-            # ⚠ Digest требует ДВА круга: digest_params приходит только в ответе на
-            # первый запрос без Authorization. Второй круг дом делает сам, чтобы
-            # бандлу на другом конце канала не гонять их через менеджер —
-            # RFC 7616 остаётся стандартом HTTP, не вендором (`digest.py`).
-            if digest_creds and status == 401:
-                www_auth = next(
-                    (v for k, v in out_headers.items() if k.lower() == "www-authenticate"), ""
-                )
-                try:
-                    digest_params = digest.parse_www_auth(www_auth)
-                except ValueError:
-                    digest_params = None
-                if digest_params:
-                    signed = dict(headers)
-                    signed["Authorization"] = digest.authorization(
-                        method, path, digest_creds[0], digest_creds[1], digest_params
-                    )
-                    status, out_headers, raw = await _request_once(
-                        session, method, url, signed, None, body, timeout
-                    )
+        async with aiohttp.ClientSession(connector=call["connector"]) as session:
+            timeout = aiohttp.ClientTimeout(total=call["timeout"])
+            async with await http_send(session, call, timeout) as response:
+                raw = await _read_all(response)
+                headers = {str(k): str(v) for k, v in response.headers.items()}
+                return _http_answer(response.status, headers, raw)
     except (aiohttp.ClientError, asyncio.TimeoutError) as err:
         raise OpError(_reason(err), 502) from err
-    return _http_answer(status, out_headers, raw)
 
-async def _request_once(
-    session: aiohttp.ClientSession,
-    method: str,
-    url: str,
-    headers: dict[str, str],
-    auth: aiohttp.BasicAuth | None,
-    body: bytes,
-    timeout: float,
-) -> tuple[int, dict[str, str], bytes]:
-    async with session.request(
-        method,
-        url,
-        data=body or None,
-        headers=headers,
-        auth=auth,
-        allow_redirects=False,
-        timeout=aiohttp.ClientTimeout(total=timeout),
-    ) as response:
-        raw = await _read_all(response)
-        return response.status, {str(k): str(v) for k, v in response.headers.items()}, raw
+_TLS: ssl.SSLContext | None = None
+
+def tls_context() -> ssl.SSLContext:
+    """TLS БЕЗ проверки сертификата — один на весь дом (`connect`, сессии, MQTT, проба).
+
+    ⚠ Проверять нечем: сертификаты устройств объекта самоподписанные, а адреса
+    пускает только частная сеть (`resolve_address`). ⚠ `SSLContext(...)`, а не
+    `create_default_context()`: тот грузит системные сертификаты — блокирующий
+    вызов в цикле событий (Home Assistant ругается на `load_default_certs`), и
+    всё ради проверки, которую мы тут же выключаем.
+    """
+    global _TLS
+    if _TLS is None:
+        _TLS = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        _TLS.check_hostname = False
+        _TLS.verify_mode = ssl.CERT_NONE
+    return _TLS
 
 def _refuse_double_encoded(path: str) -> None:
     """Двойное %-кодирование пути — отказ (сохранённая проверка `gateway.py`)."""
@@ -278,8 +286,11 @@ async def _tcp(payload: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError) as err:
         raise OpError("readUntil.bytes — число") from err
     deadline = _timeout({"timeout": read_until.get("deadline")}, timeout) if read_until.get("deadline") is not None else timeout
+    # ⚠ `tls` — поле того же описания, что у сессии (`stream.py`): без него
+    # `tls: true` молча уходил открытым текстом только в одиночном вызове.
+    context = tls_context() if payload.get("tls") is True else None
     try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port, ssl=context), timeout)
     except (asyncio.TimeoutError, OSError) as err:
         raise OpError(f"Устройство не приняло соединение: {err or 'таймаут'}", 502) from err
     got = bytearray()
@@ -315,14 +326,14 @@ async def _tcp(payload: dict[str, Any]) -> dict[str, Any]:
     return answer
 
 class _UdpCollector(asyncio.DatagramProtocol):
+    """Первая ответная датаграмма — фьючерсом, а не флагом под опросом."""
+
     def __init__(self) -> None:
-        self.data = b""
-        self.got = False
+        self.answer: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
 
     def datagram_received(self, data: bytes, addr: Any) -> None:
-        if not self.got:
-            self.data = data
-            self.got = True
+        if not self.answer.done():
+            self.answer.set_result(data)
 
 async def _udp(payload: dict[str, Any]) -> dict[str, Any]:
     host, port = resolve_address(payload)
@@ -339,15 +350,16 @@ async def _udp(payload: dict[str, Any]) -> dict[str, Any]:
     except OSError as err:
         sock.close()
         raise OpError(f"Датаграмма не ушла: {err}", 502) from err
+    data = b""
     try:
         transport.sendto(send, (host, port))
         if window:
-            end = loop.time() + window
-            while loop.time() < end and not protocol.got:
-                await asyncio.sleep(0.02)
+            data = await asyncio.wait_for(protocol.answer, window)
+    except asyncio.TimeoutError:
+        pass
     finally:
         transport.close()
-    return _body_answer(protocol.data)
+    return _body_answer(data)
 
 def _body_answer(raw: bytes) -> dict[str, Any]:
     try:

@@ -31,6 +31,7 @@ from typing import Any
 
 import aiohttp
 
+from .connect import tls_context
 from .const import LOGGER
 from .host import Host
 from .ops_base import OpError
@@ -74,7 +75,7 @@ async def _one(env: Host, item: Any) -> dict[str, Any]:
         if kind == "http":
             return await _http(env, item, started)
         if kind == "tcp":
-            return await _tcp(item, started)
+            return await _tcp(env, item, started)
     except asyncio.TimeoutError:
         return _failed(f"таймаут {_timeout(item) * 1000:.0f} мс", started)
     except (aiohttp.ClientError, OSError, ssl.SSLError) as err:
@@ -129,7 +130,7 @@ async def _http(
         return result
 
 
-async def _tcp(item: dict[str, Any], started: float) -> dict[str, Any]:
+async def _tcp(env: Host, item: dict[str, Any], started: float) -> dict[str, Any]:
     """Обмен строками по TCP, при надобности под TLS.
 
     ⚠ Ради этого примитива он и заведён: канал `sysmand` контроллера Control4 —
@@ -145,14 +146,12 @@ async def _tcp(item: dict[str, Any], started: float) -> dict[str, Any]:
     timeout = _timeout(item)
     context: ssl.SSLContext | None = None
     if item.get("tls"):
-        # ⚠ Контекст СВОЙ, без загрузки системных сертификатов: `create_default_
-        # context` читает их с диска, а это блокирующий вызов в цикле событий —
-        # Home Assistant за такое ругается в лог на каждой пробе.
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        if item.get("insecure"):
-            # См. `_http`: проверять сертификат контроллера нечем.
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
+        # `insecure` — общий контекст дома без проверки (см. `_http`). С
+        # проверкой — системные сертификаты, и грузятся они в EXECUTOR: чтение с
+        # диска в цикле событий HA ругает в лог. ⚠ Прежний голый
+        # `SSLContext(PROTOCOL_TLS_CLIENT)` корней не грузил вовсе, и проверенная
+        # проба не проходила НИКОГДА.
+        context = tls_context() if item.get("insecure") else await env.run(ssl.create_default_context)
     reader, writer = await asyncio.wait_for(
         asyncio.open_connection(host, port, ssl=context), timeout
     )

@@ -29,10 +29,11 @@ import asyncio
 import base64
 import json
 from typing import Any
+from urllib.parse import quote, urlencode
 
 import aiohttp
 
-from . import digest
+from .connect import http_send
 from .const import LOGGER
 from .devices import DeviceDescriptor
 from .templating import pick, render
@@ -105,14 +106,35 @@ def _session(descriptor: DeviceDescriptor) -> aiohttp.ClientSession:
     return aiohttp.ClientSession(connector=connector)
 
 
-def _auth_kwargs(descriptor: DeviceDescriptor) -> dict[str, Any]:
-    """Только `basic`: `digest` идёт вторым кругом в `_request` (RFC 7616, `digest.py`)."""
-    if descriptor.auth.type == "basic":
-        return {"auth": aiohttp.BasicAuth(descriptor.auth.user, descriptor.auth.password)}
-    return {}
+def _call(descriptor: DeviceDescriptor, block: dict[str, Any], values: dict[str, Any]) -> dict[str, Any]:
+    """Шаблон запроса описания → вызов для ОБЩЕГО клиента дома (`connect.http_send`).
 
-def _url(descriptor: DeviceDescriptor, path: str, scheme: str = "http") -> str:
-    return f"{scheme}://{descriptor.host}:{descriptor.port}{path}"
+    ⚠ `params` дописываются в путь ЗДЕСЬ, а не отдаются aiohttp: Digest
+    подписывает путь вместе со строкой запроса, и подпись без неё устройство
+    отвергает (так и было до 0.5.6). Кодируются они тоже здесь: подставленный
+    в `path` пароль со спецсимволом уезжал бы битым (`docs/home-gateway.md`).
+    """
+    body = block.get("body")
+    raw = b""
+    if isinstance(body, (dict, list)):
+        raw = json.dumps(_render_obj(body, values)).encode()
+    elif isinstance(body, str) and body:
+        raw = render(body, values).encode()
+    path = render(str(block.get("path") or "/"), values)
+    if isinstance(block.get("params"), dict):
+        query = urlencode(_render_obj(block["params"], values), quote_via=quote)
+        path = f"{path}{'&' if '?' in path else '?'}{query}" if query else path
+    headers = _render_obj(block["headers"], values) if isinstance(block.get("headers"), dict) else {}
+    auth = descriptor.auth
+    return {
+        "method": str(block.get("method") or "GET").upper(),
+        "path": path,
+        "url": f"{'https' if descriptor.tls else 'http'}://{descriptor.host}:{descriptor.port}{path}",
+        "headers": headers,
+        "body": raw,
+        "basic": aiohttp.BasicAuth(auth.user, auth.password) if auth.type == "basic" else None,
+        "digest": (auth.user, auth.password) if auth.type == "digest" else None,
+    }
 
 async def split(reader: Any, sep: bytes, emit: Any, idle: float) -> None:
     """Читать до конца, отдавая куски между разделителями; молчание дольше `idle` — обрыв."""
@@ -138,48 +160,10 @@ async def split(reader: Any, sep: bytes, emit: Any, idle: float) -> None:
 async def _request(
     session: aiohttp.ClientSession, descriptor: DeviceDescriptor, block: dict[str, Any], values: dict[str, Any]
 ) -> tuple[int, str, bytes]:
-    body = block.get("body")
-    raw = None
-    if isinstance(body, (dict, list)):
-        raw = json.dumps(_render_obj(body, values)).encode()
-    elif isinstance(body, str) and body:
-        raw = render(body, values).encode()
-    params = block.get("params")
-    scheme = "https" if descriptor.tls else "http"
-    path = render(str(block.get("path") or "/"), values)
-    url = _url(descriptor, path, scheme)
-    headers = _render_obj(block["headers"], values) if isinstance(block.get("headers"), dict) else None
-    method = str(block.get("method") or "GET")
-    long_poll = block.get("longPoll") is True
-    timeout = aiohttp.ClientTimeout(total=descriptor.timeout if not long_poll else max(descriptor.timeout, 120.0))
-    query = _render_obj(params, values) if isinstance(params, dict) else None
-    async with session.request(
-        method, url, params=query, data=raw, headers=headers, timeout=timeout, **_auth_kwargs(descriptor)
-    ) as response:
-        status = response.status
-        payload = await response.read()
-        kind = response.content_type
-    # ⚠ Digest — второй круг, как у `connect.py`: устройство отвечает 401 с
-    # `WWW-Authenticate` только на первый запрос без `Authorization` (RFC 7616,
-    # `digest.py`), а вычислять его дважды тем же кодом не хотим.
-    if descriptor.auth.type == "digest" and status == 401:
-        www_auth = response.headers.get("WWW-Authenticate", "")
-        try:
-            digest_params = digest.parse_www_auth(www_auth)
-        except ValueError:
-            digest_params = None
-        if digest_params:
-            signed = dict(headers or {})
-            signed["Authorization"] = digest.authorization(
-                method, path, descriptor.auth.user, descriptor.auth.password, digest_params
-            )
-            async with session.request(
-                method, url, params=query, data=raw, headers=signed, timeout=timeout
-            ) as response:
-                status = response.status
-                payload = await response.read()
-                kind = response.content_type
-    return status, kind, payload
+    total = max(descriptor.timeout, 120.0) if block.get("longPoll") is True else descriptor.timeout
+    call = _call(descriptor, block, values)
+    async with await http_send(session, call, aiohttp.ClientTimeout(total=total)) as response:
+        return response.status, response.content_type, await response.read()
 
 def _resetup_matches(resetup: dict[str, Any], payload: bytes) -> bool:
     """Ответ говорит «сессия умерла» (`resetup.path` == `resetup.equals`)."""
@@ -246,20 +230,14 @@ async def poll(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[s
 async def stream(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[str, Any]) -> None:
     import re
 
-    values = base_values(descriptor)
-    method = str(spec.get("method") or "GET").upper()
-    path = render(str(spec.get("path") or "/"), values)
-    params = _render_obj(spec["params"], values) if isinstance(spec.get("params"), dict) else None
     idle = seconds(spec.get("idle"), IDLE_S, 5.0)
-    scheme = "https" if descriptor.tls else "http"
+    call = _call(descriptor, spec, base_values(descriptor))
     async with _session(descriptor) as session:
-        async with session.request(
-            method,
-            _url(descriptor, path, scheme),
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=None),
-            **_auth_kwargs(descriptor),
-        ) as response:
+        async with await http_send(session, call, aiohttp.ClientTimeout(total=None)) as response:
+            # ⚠ Отказ устройства — ОТКАЗ, а не поток: тело 401 уходило бы
+            # «событиями», а источник тихо перезапускался бы по кругу.
+            if response.status >= 400:
+                raise ConnectionError(f"устройство ответило {response.status}")
             sep = delimiter(spec, b"")
             if not sep:
                 match = re.search(r"boundary=\"?([^\";]+)", response.headers.get("Content-Type", ""))
@@ -296,16 +274,13 @@ async def _keepalive(send: Any, spec: dict[str, Any], values: dict[str, Any]) ->
 
 async def ws(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[str, Any]) -> None:
     values = base_values(descriptor)
-    scheme = "wss" if descriptor.tls else "ws"
-    path = render(str(spec.get("path") or "/"), values)
     # `params` и `headers` описания — как у `stream`: часть устройств просит
     # ключ в query или свой заголовок уже на рукопожатии.
-    params = _render_obj(spec["params"], values) if isinstance(spec.get("params"), dict) else None
-    headers = _render_obj(spec["headers"], values) if isinstance(spec.get("headers"), dict) else None
+    call = _call(descriptor, spec, values)
     idle = seconds(spec.get("idle"), IDLE_S, 5.0)
     async with _session(descriptor) as session:
         socket_ = await session.ws_connect(
-            _url(descriptor, path, scheme), params=params, headers=headers, heartbeat=30
+            call["url"].replace("http", "ws", 1), headers=call["headers"], heartbeat=30
         )
 
         async def receive() -> str:

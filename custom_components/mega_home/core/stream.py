@@ -40,13 +40,12 @@
 from __future__ import annotations
 
 import asyncio
-import ssl
 import struct
 from typing import Any
 
 import aiohttp
 
-from . import connect as connect_mod, digest
+from . import connect as connect_mod
 from .const import LOGGER
 from .ops_base import OpError
 
@@ -102,14 +101,6 @@ CHUNK = 64 * 1024
 QUEUE_DEPTH = 64
 
 HEADER = struct.Struct(">I")
-
-# ⚠ Сертификат устройства объекта самоподписанный, проверять его нечем — тот же
-# довод, что у одиночного вызова (`connect.prepare_http`): адреса пускает только
-# частная сеть объекта. ⚠ Не `ssl=False`: у `open_connection` это значит «без
-# TLS вовсе», то есть `tls: true` молча ушёл бы открытым текстом.
-_TLS = ssl.create_default_context()
-_TLS.check_hostname = False
-_TLS.verify_mode = ssl.CERT_NONE
 
 # Сколько сессий открыто ВО ВСЁМ доме: сокетов несколько (канал менеджера и
 # вкладки жильца), и потолок на сокет их не считает.
@@ -307,11 +298,11 @@ class Streams:
             elif kind == "http":
                 stream = _HttpStream(stream_id, req, self, idle)
             elif kind == "tcp":
+                # ⚠ Не `ssl=False`: у `open_connection` это значит «без TLS
+                # вовсе», то есть `tls: true` молча ушёл бы открытым текстом.
+                context = connect_mod.tls_context() if req.get("tls") is True else None
                 reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        host, port, ssl=_TLS if req.get("tls") is True else None
-                    ),
-                    10,
+                    asyncio.open_connection(host, port, ssl=context), 10
                 )
                 stream = _Stream(stream_id, reader, writer, self, idle)
             else:
@@ -568,20 +559,21 @@ class _WsStream(_SessionBase):
         try:
             while True:
                 message = await asyncio.wait_for(self._socket.receive(), self._idle_s)
+                if message.type not in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
+                    # Устройство закрыло сокет само — это конец, а не авария.
+                    await self._done(None)
+                    return
+                # Потолок — на ОБА вида кадров: текстом выкачивается так же.
+                self._bytes += len(message.data)
+                if self._bytes > MAX_BYTES:
+                    await self._done("превышен потолок трафика сессии")
+                    return
                 if message.type is aiohttp.WSMsgType.TEXT:
                     await self._owner._send_json(
                         {"t": "stream.data", "id": self.id, "text": message.data}
                     )
-                elif message.type is aiohttp.WSMsgType.BINARY:
-                    self._bytes += len(message.data)
-                    if self._bytes > MAX_BYTES:
-                        await self._done("превышен потолок трафика сессии")
-                        return
-                    await self._owner._send_bytes(frame(self.id, message.data))
                 else:
-                    # Устройство закрыло сокет само — это конец, а не авария.
-                    await self._done(None)
-                    return
+                    await self._owner._send_bytes(frame(self.id, message.data))
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
@@ -610,8 +602,8 @@ class _HttpStream(_SessionBase):
     перенос менеджера. Заголовки уезжают отдельным кадром `stream.head` ДО
     тела — иначе вызывающий не отличит «ответ 401» от «тело ещё едет».
 
-    ⚠ Запрос собирается ТЕМ ЖЕ `connect.prepare_http`, включая второй круг
-    Digest: разбор описания у форм один.
+    ⚠ Запрос собирается и шлётся ТЕМ ЖЕ кодом, что одиночный вызов
+    (`connect.prepare_http`, `connect.http_send`), включая второй круг Digest.
     """
 
     def __init__(self, stream_id: int, req: dict[str, Any], owner: Streams, idle: float) -> None:
@@ -645,7 +637,9 @@ class _HttpStream(_SessionBase):
             return
         try:
             self._session = aiohttp.ClientSession(connector=call["connector"])
-            response = await self._open_response(call)
+            response = await connect_mod.http_send(
+                self._session, call, aiohttp.ClientTimeout(total=None, sock_read=self._idle_s)
+            )
             await self._owner._send_json(
                 {
                     "t": "stream.head",
@@ -669,42 +663,6 @@ class _HttpStream(_SessionBase):
         except (aiohttp.ClientError, OSError) as err:
             await self._done(_describe(err))
 
-    async def _open_response(self, call: dict[str, Any]) -> Any:
-        """Запрос и, если устройство просит Digest, второй круг — как у `_http`."""
-        assert self._session is not None
-        timeout = aiohttp.ClientTimeout(total=None, sock_read=self._idle_s)
-        response = await self._session.request(
-            call["method"],
-            call["url"],
-            data=call["body"] or None,
-            headers=call["headers"],
-            auth=call["basic"],
-            allow_redirects=False,
-            timeout=timeout,
-        )
-        if call["digest"] and response.status == 401:
-            asked = next(
-                (v for k, v in response.headers.items() if k.lower() == "www-authenticate"), ""
-            )
-            try:
-                params = digest.parse_www_auth(asked)
-            except ValueError:
-                params = None
-            if params:
-                response.close()
-                signed = dict(call["headers"])
-                signed["Authorization"] = digest.authorization(
-                    call["method"], call["path"], call["digest"][0], call["digest"][1], params
-                )
-                response = await self._session.request(
-                    call["method"],
-                    call["url"],
-                    data=call["body"] or None,
-                    headers=signed,
-                    allow_redirects=False,
-                    timeout=timeout,
-                )
-        return response
 
 
 class _DatagramProtocol(asyncio.DatagramProtocol):

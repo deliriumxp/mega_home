@@ -132,3 +132,78 @@ def test_сессия_к_устройству_с_tls_без_проверки_с�
 
     insecure, checked = asyncio.run(scenario())
     assert insecure and checked
+
+
+# --- Digest: общий клиент дома (`connect.http_send`) --------------------------
+#
+# ⚠ Настоящий сервер, а не подмена `_request`: дефект жил ровно в том, ЧТО
+# уходит по проводу. Слушатели подписывали Digest путём без строки запроса
+# (`params` дописывал aiohttp), а поток событий Digest не умел вовсе.
+
+REALM, NONCE = "device", "abc123"
+
+
+def _digest_device():  # noqa: ANN202 — приложение aiohttp
+    from aiohttp import web
+
+    from mega_home.core import digest
+
+    async def handle(request: web.Request) -> web.StreamResponse:
+        header = request.headers.get("Authorization", "")
+        if not header.startswith("Digest "):
+            return web.Response(
+                status=401, headers={"WWW-Authenticate": f'Digest realm="{REALM}", nonce="{NONCE}", qop="auth"'}
+            )
+        got = digest.parse_www_auth(header)
+        # Устройство сверяет `uri` подписи с адресом запроса — со строкой запроса.
+        if got["uri"] != request.path_qs:
+            return web.Response(status=401, text="uri mismatch")
+        expected = digest.authorization(
+            request.method, request.path_qs, "admin", "a&b c", {"realm": REALM, "nonce": NONCE, "qop": "auth"},
+            cnonce=got["cnonce"],
+        )
+        if digest.parse_www_auth(expected)["response"] != got["response"]:
+            return web.Response(status=401, text="bad response")
+        return web.Response(text=f"ok {request.query.get('pass')}\n\nсобытие\n\n")
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handle)
+    return app
+
+
+def _digest_descriptor(port: int) -> DeviceDescriptor:
+    return DeviceDescriptor(
+        id="d", host="127.0.0.1", port=port, auth=AuthSpec(type="digest", user="admin", password="a&b c")
+    )
+
+
+def test_digest_подписывает_путь_вместе_со_строкой_запроса() -> None:
+    from aiohttp.test_utils import TestServer
+
+    async def scenario() -> tuple[int, bytes]:
+        async with TestServer(_digest_device()) as server:
+            async with lo._session(_digest_descriptor(server.port)) as session:
+                block = {"path": "/events", "params": {"pass": "{pass}"}}
+                status, _kind, body = await lo._request(
+                    session, _digest_descriptor(server.port), block, lo.base_values(_digest_descriptor(server.port))
+                )
+                return status, body
+
+    status, body = asyncio.run(scenario())
+    assert status == 200
+    # Пароль со спецсимволами доехал целым: `params` кодирует дом.
+    assert body.startswith("ok a&b c".encode())
+
+
+def test_поток_событий_умеет_digest() -> None:
+    from aiohttp.test_utils import TestServer
+
+    async def scenario() -> list[dict]:
+        async with TestServer(_digest_device()) as server:
+            ctx = _Ctx()
+            spec = {"path": "/stream", "until": "Cgo="}  # «\n\n»
+            await lo.stream(ctx, _digest_descriptor(server.port), "s", spec)
+            return ctx.events
+
+    events = asyncio.run(scenario())
+    assert [event["text"] for event in events] == ["ok None", "событие"]

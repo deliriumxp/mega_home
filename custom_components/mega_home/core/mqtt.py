@@ -1,9 +1,11 @@
-"""Минимальный клиент MQTT 3.1.1 — для доступа вида `mqtt` и подписок на события.
+"""Минимальный клиент MQTT 3.1.1 — для подписок слушателей (`listeners_out.mqtt`).
 
 ⚠ Свой клиент, а не зависимость: HACS ставит только каталог интеграции, `pip`
 на объекте требует интернета, а объекты бывают офлайн
-(`docs/home-gateway.md` в менеджере). Поэтому здесь ровно то, что нужно шлюзу:
-CONNECT, PUBLISH (QoS 0 и 1), SUBSCRIBE, PING, DISCONNECT.
+(`docs/home-gateway.md` в менеджере). Поэтому здесь ровно то, что нужно
+подписке: CONNECT, SUBSCRIBE, приём PUBLISH (с PUBACK на QoS 1), PING,
+DISCONNECT. Своей публикации нет: её вызывающих не стало вместе с
+`mqtt_calls.py`, а мёртвый код протокола — это код, который никто не проверяет.
 
 Формат пакетов — стандарт OASIS «MQTT Version 3.1.1» (2014), разделы 2 и 3:
 фиксированный заголовок (тип и флаги в старшем байте, остаток длины — число
@@ -13,10 +15,10 @@ CONNECT, PUBLISH (QoS 0 и 1), SUBSCRIBE, PING, DISCONNECT.
 from __future__ import annotations
 
 import asyncio
-import ssl
 import struct
-from typing import Any, Callable
+from typing import Callable
 
+from .connect import tls_context
 from .const import LOGGER
 
 CONNECT, CONNACK, PUBLISH, PUBACK = 0x10, 0x20, 0x30, 0x40
@@ -66,11 +68,6 @@ def connect_packet(client_id: str, username: str, password: str, keepalive: int)
             payload += _string(password)
     header = _string("MQTT") + bytes([4, flags]) + struct.pack(">H", keepalive)
     return packet(CONNECT, header + payload)
-
-
-def publish_packet(topic: str, data: bytes, qos: int, retain: bool, packet_id: int) -> bytes:
-    body = _string(topic) + (struct.pack(">H", packet_id) if qos else b"") + data
-    return packet(PUBLISH | (qos << 1) | (1 if retain else 0), body)
 
 
 def subscribe_packet(topics: list[str], packet_id: int) -> bytes:
@@ -128,12 +125,9 @@ class MqttClient:
         self.closed = asyncio.Event()
 
     async def connect(self, timeout: float = 10.0) -> None:
-        context = ssl.create_default_context() if self._tls else None
-        if context is not None:
-            # ⚠ Брокер в LAN объекта — самоподписанный сертификат, доверие по адресу
-            # из конфига (то же решение, что у HTTP-доступа).
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
+        # ⚠ Брокер в LAN объекта — самоподписанный сертификат, доверие по адресу
+        # из конфига (то же решение и тот же контекст, что у `connect.py`).
+        context = tls_context() if self._tls else None
         try:
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self._host, self._port, ssl=context), timeout
@@ -155,28 +149,21 @@ class MqttClient:
         self._pong = asyncio.Event()
         self._tasks = [asyncio.ensure_future(self._read_loop()), asyncio.ensure_future(self._ping_loop())]
 
-    async def publish(self, topic: str, data: bytes, qos: int = 0, retain: bool = False) -> None:
-        packet_id = self._packet_id() if qos else 0
-        waiter = self._expect(packet_id) if qos else None
-        try:
-            await self._send(publish_packet(topic, data, 1 if qos else 0, retain, packet_id))
-        except MqttError:
-            # Ожидание снято вместе с отказом отправки: иначе его исключение
-            # никто не читает («Future exception was never retrieved» в логе HA).
-            if waiter is not None:
-                self._acks.pop(packet_id, None)
-                waiter.cancel()
-            raise
-        if waiter is not None:
-            await self._wait(waiter, "брокер не подтвердил публикацию")
-
     async def subscribe(self, topics: list[str]) -> None:
         if not topics:
             return
-        packet_id = self._packet_id()
-        waiter = self._expect(packet_id)
-        await self._send(subscribe_packet(topics, packet_id))
-        granted = await self._wait(waiter, "брокер не подтвердил подписку")
+        packet_id = self._next_id = self._next_id % 65535 + 1
+        waiter: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
+        self._acks[packet_id] = waiter
+        try:
+            await self._send(subscribe_packet(topics, packet_id))
+            granted = await asyncio.wait_for(waiter, 10)
+        except asyncio.TimeoutError as err:
+            raise MqttError("брокер не подтвердил подписку") from err
+        finally:
+            # ⚠ Ожидание снимается на ЛЮБОМ исходе: не дождавшееся брокера
+            # оставалось в `_acks` до закрытия подключения.
+            self._acks.pop(packet_id, None)
         if b"\x80" in granted:
             raise MqttError("брокер отказал в подписке")
 
@@ -200,21 +187,6 @@ class MqttClient:
         self._acks.clear()
         self.closed.set()
 
-    def _packet_id(self) -> int:
-        self._next_id = self._next_id % 65535 + 1
-        return self._next_id
-
-    def _expect(self, packet_id: int) -> asyncio.Future[bytes]:
-        future: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
-        self._acks[packet_id] = future
-        return future
-
-    async def _wait(self, future: asyncio.Future[bytes], what: str) -> bytes:
-        try:
-            return await asyncio.wait_for(future, 10)
-        except asyncio.TimeoutError as err:
-            raise MqttError(what) from err
-
     async def _send(self, data: bytes) -> None:
         if self._writer is None or self.closed.is_set():
             raise MqttError("нет подключения к брокеру")
@@ -237,7 +209,7 @@ class MqttClient:
                         await self._send(packet(PUBACK, struct.pack(">H", packet_id)))
                     if self._on_message is not None:
                         self._on_message(topic, data)
-                elif kind in (PUBACK, SUBACK) and len(body) >= 2:
+                elif kind == SUBACK and len(body) >= 2:
                     (packet_id,) = struct.unpack_from(">H", body)
                     future = self._acks.pop(packet_id, None)
                     if future is not None and not future.done():
@@ -269,16 +241,3 @@ class MqttClient:
                     return
         except (asyncio.CancelledError, MqttError):
             pass
-
-
-def as_bytes(value: Any, raw_base64: Any = None) -> bytes:
-    """Полезная нагрузка: объект — JSON, строка — UTF-8, `payloadBase64` — байты как есть."""
-    if raw_base64:
-        import base64
-
-        return base64.b64decode(str(raw_base64), validate=True)
-    if isinstance(value, (dict, list)):
-        import json
-
-        return json.dumps(value).encode("utf-8")
-    return str(value if value is not None else "").encode("utf-8")
