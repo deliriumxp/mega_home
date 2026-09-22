@@ -71,3 +71,44 @@ def test_подписка_отдаёт_сущность_и_новое_состо
 
     action(_Event())
     assert seen == [("light.a", "S")]
+
+
+def test_камера_без_потока_не_спрашивается_на_каждый_опрос(monkeypatch) -> None:
+    """⚠ Ответ «потока нет» не запоминался: опрос состояний раз в 3 с спрашивал
+    HA о потоке такой камеры каждые 3 с. Теперь — раз в `SOURCE_RETRY`."""
+    import sys
+    import types
+
+    from mega_home import ha_source
+
+    asked: list[str] = []
+
+    async def async_get_stream_source(_hass, entity_id):  # noqa: ANN001, ANN202
+        asked.append(entity_id)
+        return None
+
+    async def async_get_image(_hass, entity_id, width=None):  # noqa: ANN001, ANN202
+        return types.SimpleNamespace(content=b"jpeg", content_type="image/jpeg")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "homeassistant.components.camera",
+        types.SimpleNamespace(async_get_stream_source=async_get_stream_source, async_get_image=async_get_image),
+    )
+    clock = [1000.0]
+    monkeypatch.setattr(ha_source, "monotonic", lambda: clock[0])
+
+    async def scenario() -> None:
+        tasks: list[asyncio.Task] = []
+        hass = types.SimpleNamespace(async_create_task=lambda coro: tasks.append(asyncio.ensure_future(coro)))
+        cameras = ha_source.HaCameras(hass)
+        for _ in range(3):
+            cameras.warm("camera.gate")
+            await asyncio.gather(*tasks)
+        assert asked == ["camera.gate"]
+        clock[0] += ha_source.SOURCE_RETRY + 1
+        cameras.warm("camera.gate")
+        await asyncio.gather(*tasks)
+        assert asked == ["camera.gate", "camera.gate"]
+
+    asyncio.run(scenario())

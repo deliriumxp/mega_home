@@ -113,6 +113,25 @@ def test_new_interface_switches_and_keeps_the_previous_one(tmp_path: Path) -> No
     assert (first / "main-A.js").is_file()
 
 
+def test_unchanged_files_come_from_the_active_version(tmp_path: Path) -> None:
+    """Only what changed crosses the flat's uplink; the rest is copied off disk.
+
+    A file whose checksum matches the manifest is reused — and one that does
+    not (same name, new content) is still downloaded.
+    """
+    client = FakeClient({"index.html": b"<html>", "icon.png": b"icon", "main-A.js": b"one"})
+    bundle = store(tmp_path, client)
+    asyncio.run(bundle.async_sync())
+
+    client.downloads.clear()
+    client.publish({"index.html": b"<html v2>", "icon.png": b"icon", "main-B.js": b"two"})
+    assert asyncio.run(bundle.async_sync()) is True
+
+    assert sorted(client.downloads) == ["index.html", "main-B.js"]
+    assert (bundle.active_dir / "icon.png").read_bytes() == b"icon"
+    assert (bundle.active_dir / "index.html").read_bytes() == b"<html v2>"
+
+
 def test_half_a_bundle_never_becomes_active(tmp_path: Path) -> None:
     """Half a bundle is a white screen, so a failed download stays staged."""
     client = FakeClient({"index.html": b"<html>", "main-A.js": b"one"})

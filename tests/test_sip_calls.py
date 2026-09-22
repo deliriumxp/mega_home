@@ -110,6 +110,16 @@ def test_гость_ушёл_до_ответа_это_отмена() -> None:
     assert calls.state()["calls"] == []
 
 
+def test_остановка_моста_отменяет_вызовы_вслух() -> None:
+    """⚠ «Вызов» уже ушёл в push: без «отмены» телефоны звонили бы по вызову,
+    которого нет (мост остановлен, Asterisk перезапущен)."""
+    calls = _Calls()
+    _run(calls, _start("p1", "panel", peer="192.168.88.90"), _start("p2", "panel", peer="192.168.88.91"), _start("t1", "answer"))
+    asyncio.run(calls.stop())
+    assert sorted(kind for kind, _ in calls.events[-2:]) == ["cancel", "ended"]
+    assert calls.state()["calls"] == []
+
+
 def test_отклонение_гасит_только_наше_плечо() -> None:
     """«Отклонить» у жильца — это отказ 486 по НАШЕМУ приглашению.
 

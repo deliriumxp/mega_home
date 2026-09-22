@@ -184,6 +184,10 @@ class BundleStore:
         if not isinstance(path, str) or not isinstance(digest, str):
             raise ValueError("manifest entry without a path or a hash")
         target = _resolve_inside(staging, path)
+        # Файл с той же суммой уже лежит в активной версии (иконки, шрифты, часть
+        # чанков) — берём его с диска, а не второй раз по уплинку квартиры.
+        if self._active is not None and await self._env.run(_reuse, self._active, path, digest, target):
+            return
         payload = await self._client.async_app_file(path)
         # ⚠ Проверяем хеш КАЖДОГО файла: обрезанный ответ прокси и подменённый
         # файл выглядят одинаково — как бандл, который «почти» скачался.
@@ -227,6 +231,18 @@ def _reset_dir(path: Path) -> None:
 def _write(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(payload)
+
+
+def _reuse(active: Path, relative: str, digest: str, target: Path) -> bool:
+    """Взять файл из активной версии, если его сумма совпала с манифестом."""
+    try:
+        payload = _resolve_inside(active, relative).read_bytes()
+    except (OSError, ValueError):
+        return False
+    if hashlib.new(_DIGEST_ALGO, payload).hexdigest() != digest:
+        return False
+    _write(target, payload)
+    return True
 
 
 def _swap(staging: Path, target: Path) -> None:

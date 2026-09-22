@@ -97,6 +97,17 @@ class DoorCalls:
         if task is not None:
             task.cancel()
         self.connected = False
+        self._drop_all()
+
+    def _drop_all(self) -> None:
+        """Вызовы умерли вместе с Asterisk или мостом — сказать об этом ВСЛУХ.
+
+        ⚠ Молча (`clear()`, как до 0.5.6) нельзя: событие «вызов» уже ушло
+        менеджеру и в push, и без «отмены» телефоны жильцов звонили бы по
+        вызову, которого нет.
+        """
+        for call in list(self._calls.values()):
+            self._emit("ended" if call.talk else "cancel", {"caller": call.caller, "call": call.panel, "peer": call.peer})
         self._calls.clear()
 
     def state(self) -> dict[str, Any]:
@@ -129,7 +140,7 @@ class DoorCalls:
                 LOGGER.debug("SIP-мост: ARI недоступен: %s", err)
             self.connected = False
             # Asterisk перезапустился — вызовы, что он держал, умерли вместе с ним.
-            self._calls.clear()
+            self._drop_all()
             await asyncio.sleep(RECONNECT_S)
 
     # --- события ----------------------------------------------------------

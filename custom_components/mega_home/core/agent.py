@@ -44,6 +44,8 @@ TICK = timedelta(seconds=30)
 
 STORE_VERSION = 1
 STORE_KEY = "mega_home_agent"
+# Отложенная запись тика без событий — как у ленты устройств (`device_store.py`).
+SAVE_DELAY_S = 300.0
 
 # Потолок очереди отчётов. Дом может быть офлайн неделями, и весь этот журнал
 # всё равно никому не нужен: важны последние события, а не каждый тик.
@@ -132,6 +134,7 @@ class AgentRunner:
         if self._busy or not self._rules:
             return
         self._busy = True
+        reports = len(self._pending)
         try:
             for rule in self._rules:
                 try:
@@ -141,7 +144,15 @@ class AgentRunner:
                     # остальные: сторож нужен целиком, а не до первой ошибки.
                     LOGGER.warning("Правило «%s» не выполнено: %s", rule.get("id"), err)
                     self._report(rule.get("id", "?"), "error", str(err)[:200])
-            await self._async_save()
+            # ⚠ Сразу — только когда появился отчёт: он сопровождает каждое
+            # действие, и счётчик «K раз в сутки» обязан пережить перезапуск HA,
+            # который это действие могло и вызвать. Иначе — отложенно: запись на
+            # КАЖДЫЙ тик (30 с) ради метки «когда проверял» изнашивала SD-карту
+            # объекта ради ничего.
+            if len(self._pending) != reports:
+                await self._async_save()
+            else:
+                self._store.async_delay_save(self._snapshot, SAVE_DELAY_S)
         finally:
             self._busy = False
 
@@ -224,14 +235,10 @@ class AgentRunner:
             self._pending = self._pending[-MAX_PENDING_REPORTS:]
 
     async def _async_save(self) -> None:
-        await self._store.async_save(
-            {
-                "version": self._version,
-                "rules": self._rules,
-                "state": self._state,
-                "pending": self._pending,
-            }
-        )
+        await self._store.async_save(self._snapshot())
+
+    def _snapshot(self) -> dict[str, Any]:
+        return {"version": self._version, "rules": self._rules, "state": self._state, "pending": self._pending}
 
     # --- диагностика ---
 
