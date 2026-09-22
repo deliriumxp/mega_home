@@ -147,6 +147,20 @@ async def dispatch(
     if path == "api/device-events" and method == "GET":
         # Лента устройства из хранилища на диске — часть F плана, не вендор.
         return _json(ops.device_events(coordinator, query))
+    if path == "api/event-file" and method == "GET":
+        # Вложение к событию (`event_files.py`): кадр гостя и всё, что за ним.
+        # Хранилище жильца на объекте — часть F; снаружи — тем же переносом.
+        files = getattr(coordinator, "event_files", None)
+        found = await coordinator.env.run(files.find, str(query.get("id") or "")) if files else None
+        if found is None:
+            raise ops.OpError("Вложения нет", HTTPStatus.NOT_FOUND)
+        return (HTTPStatus.OK, found[1], found[0], "private, max-age=604800")
+    if path == "api/dev-log" and method == "POST":
+        # Лог разработки от приложения ВНУТРИ дома (`dev_log.py`): сессии
+        # менеджера на странице дома нет, запись уходит каналом дома.
+        log = getattr(coordinator, "dev_log", None)
+        taken = log.add_app(_json_body(body).get("records")) if log else 0
+        return _json({"accepted": taken})
     if path.startswith("icons/") and method == "GET":
         return await _icon(coordinator, unquote(path[len("icons/") :]))
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.NOT_FOUND)

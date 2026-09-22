@@ -49,6 +49,8 @@ class EventHub:
         # опционально, чтобы демон без диска (`docs/plan-core-without-ha.md`)
         # и тесты этого модуля обходились без него.
         self._store = store
+        # Каждое опубликованное событие — правилам вложений (`event_files.py`).
+        self.on_published: Listener | None = None
 
     def publish(
         self, access: str, source: str, event: str, data: Any = None, local: bool = False
@@ -82,6 +84,10 @@ class EventHub:
         self._keep(frame)
         if self._sender is not None:
             self._sender(frame)
+        # ⚠ ПОСЛЕ отправки: вложение (`event_files.py`) догоняет событие, а не
+        # задерживает его.
+        if self.on_published is not None:
+            self.on_published(frame)
         return frame
 
     def subscribe(self, listener: Listener) -> Callable[[], None]:

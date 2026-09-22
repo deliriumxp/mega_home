@@ -85,6 +85,8 @@ async def async_get_config_entry_diagnostics(
         # Сессии дома против потолка: «дом держит уже 32 соединений» объект
         # 2026-09-21 разбирал без этого числа.
         "sessions": {"open": stream.open_total(), "limit": stream.TOTAL_STREAMS},
+        # Лог разработки: сколько ждёт подтверждения менеджера и с каким уровнем.
+        "dev_log": coordinator.dev_log.state() if coordinator.dev_log else None,
         "home": {
             "name": config.get("home", {}).get("name"),
             "floors": len(config.get("floors", [])),

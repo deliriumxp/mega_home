@@ -250,6 +250,20 @@ class MegaHomeDeviceEventsView(_RoutedView):
     name = "api:mega_home:device-events"
 
 
+class MegaHomeEventFileView(_RoutedView):
+    """Вложение к событию устройства (кадр гостя) — хранилище на объекте, часть F."""
+
+    url = f"{URL_API}/event-file"
+    name = "api:mega_home:event-file"
+
+
+class MegaHomeDevLogView(_RoutedView):
+    """Лог разработки от приложения внутри дома — в очередь дома к менеджеру."""
+
+    url = f"{URL_API}/dev-log"
+    name = "api:mega_home:dev-log"
+
+
 class MegaHomeConnectView(_RoutedView):
     """Единственный контракт транспорта наружу (`connect.py`).
 
@@ -493,6 +507,8 @@ VIEWS: tuple[type[HomeAssistantView], ...] = (
     MegaHomeAssetView,
     MegaHomeCameraFrameView,
     MegaHomeDeviceEventsView,
+    MegaHomeEventFileView,
+    MegaHomeDevLogView,
     MegaHomeRelayView,
     MegaHomeServiceWorkerView,
     MegaHomeAppRootView,

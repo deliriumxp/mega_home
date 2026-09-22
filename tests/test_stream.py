@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
 
 from mega_home.core import stream as stream_mod
 from mega_home.core.stream import HEADER, Streams, frame

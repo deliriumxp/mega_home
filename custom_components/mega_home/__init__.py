@@ -152,6 +152,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     if coordinator.data:
         coordinator.event_sources.apply(coordinator.accesses.descriptors())
 
+    # Вложения к событиям (`event_files.py`): правило конфига исполняется на
+    # опубликованное событие и кладёт ответ файлом рядом с лентой.
+    from .core.event_files import EventFiles
+
+    coordinator.event_files = EventFiles(coordinator.env, device_events_store)
+    coordinator.events.on_published = coordinator.event_files.on_event
+
+    # Лог разработки (`dev_log.py`): один обработчик на логгер интеграции —
+    # весь код покрыт без правки мест логирования.
+    from .core.const import INTEGRATION_VERSION
+    from .core.dev_log import DevLog
+
+    coordinator.dev_log = DevLog(
+        coordinator.env,
+        lambda: {"homeVersion": INTEGRATION_VERSION, "bundleVersion": coordinator.bundle.version},
+    )
+    await coordinator.dev_log.async_load()
+    LOGGER.addHandler(coordinator.dev_log.handler)
+    entry.async_on_unload(lambda: LOGGER.removeHandler(coordinator.dev_log.handler))
+    coordinator.apply_config(coordinator.data)
+
     # SIP-мост домофонии (`sip_bridge.py`): поднимается только конфигом объекта,
     # и сразу получает уже загруженный.
     sip_bridge = SipBridge(

@@ -69,6 +69,14 @@ class DeviceEventStore:
         self._by_access[access] = _trimmed(events)
         self._store.async_delay_save(lambda: {"byAccess": self._by_access}, SAVE_DELAY_S)
 
+    def mark(self, access: Any, event_id: str, file: dict[str, Any]) -> None:
+        """Событию приложен файл (`event_files.py`): приложению не гадать, есть ли кадр."""
+        for event in reversed(self._by_access.get(str(access or ""), [])):
+            if event.get("id") == event_id:
+                event["file"] = file
+                self._store.async_delay_save(lambda: {"byAccess": self._by_access}, SAVE_DELAY_S)
+                return
+
     def list(self, access: str, limit: int, before: float | None) -> list[dict[str, Any]]:
         """Лента устройства, новые первыми — то, что отдаёт `api/device-events`."""
         events = _trimmed(self._by_access.get(access, []))

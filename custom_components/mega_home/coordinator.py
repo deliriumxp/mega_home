@@ -94,6 +94,9 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Открытые потоки `api/events` (`events.StateStream`): выгрузка записи
         # кончает их, чтобы клиенты переподключились к новой.
         self.streams: set[Any] = set()
+        # Вложения к событиям и лог разработки; ставятся в `async_setup_entry`.
+        self.event_files: Any = None
+        self.dev_log: Any = None
         # Бандл интерфейса: качается с менеджера и раздаётся из кэша, поэтому
         # новая версия приложения не требует ни HACS, ни перезапуска.
         #
@@ -261,12 +264,20 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             LOGGER.info("App bundle checks are working again")
         self.app_error = error
 
+    def apply_config(self, config: dict[str, Any] | None) -> None:
+        """Правила вложений (`event_files.py`) и фильтр лога разработки
+        (`dev_log.py`) — данные конфига, как описания устройств."""
+        for part in (self.event_files, self.dev_log):
+            if config and part is not None:
+                part.apply(config)
+
     def _apply_devices(self, config: dict[str, Any] | None) -> None:
         """Отдать реестру устройств (`devices.py`) свежие описания объекта.
 
         ⚠ Зовётся и на «версия не изменилась»: адрес или учётку устройства могли
         сменить, а конфиг тот же хэш только пока состав плиток не менялся.
         """
+        self.apply_config(config)
         if not config or self.accesses is None:
             return
         try:

@@ -203,9 +203,13 @@ class ManagerLink:
         СИНХРОННО, а отправка — сопрограмма. Потерять кадр здесь нельзя и
         незачем беречь: он лежит в концентраторе до
         `event-ack` менеджера и повторится после переподключения.
+
+        Тем же насосом и с тем же подтверждением едут записи лога разработки
+        (`dev_log.py`, кадр `dev-log`): второй механизм доставки завёл бы вторую
+        очередь, второй порядок и второй набор ошибок.
         """
-        hub = getattr(self._coordinator, "events", None)
-        if hub is None:
+        sources = [s for s in (getattr(self._coordinator, n, None) for n in ("events", "dev_log")) if s]
+        if not sources:
             return
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
@@ -213,8 +217,9 @@ class ManagerLink:
             queue.put_nowait(frame)
             return True
 
-        for frame in hub.attach(enqueue):
-            enqueue(frame)
+        for source in sources:
+            for frame in source.attach(enqueue):
+                enqueue(frame)
 
         async def pump() -> None:
             while True:
@@ -228,9 +233,10 @@ class ManagerLink:
         self._event_pump = asyncio.ensure_future(pump())
 
     def _detach_events(self) -> None:
-        hub = getattr(self._coordinator, "events", None)
-        if hub is not None:
-            hub.detach()
+        for name in ("events", "dev_log"):
+            source = getattr(self._coordinator, name, None)
+            if source is not None:
+                source.detach()
         if self._event_pump is not None:
             self._event_pump.cancel()
             self._event_pump = None
@@ -325,10 +331,12 @@ class ManagerLink:
                 await self._streams.dispatch(payload)
             return
         if kind == "event-ack":
-            # Менеджер получил событие устройства — дальше дом его не держит.
-            hub = getattr(self._coordinator, "events", None)
-            if hub is not None:
-                hub.ack(payload.get("id"))
+            # Менеджер получил событие устройства или запись лога разработки —
+            # дальше дом её не держит. `id` уникальны на оба источника.
+            for name in ("events", "dev_log"):
+                source = getattr(self._coordinator, name, None)
+                if source is not None:
+                    source.ack(payload.get("id"))
             return
         op = payload.get("op") or ""
         if kind == "req" and op == "watch":
