@@ -35,11 +35,34 @@ class FakeEntries:
         return [entry]
 
 
+class FakeHass:
+    def __init__(self, coordinator: Any) -> None:
+        self.config_entries = FakeEntries(coordinator)
+
+    async def async_add_executor_job(self, func: Any, *args: Any) -> Any:
+        return func(*args)
+
+
 class FakeRequest:
-    def __init__(self, coordinator: Any, query: dict[str, str] | None = None) -> None:
-        hass = type("Hass", (), {"config_entries": FakeEntries(coordinator)})()
-        self.app = {"hass": hass}
+    def __init__(
+        self,
+        coordinator: Any,
+        query: dict[str, str] | None = None,
+        method: str = "GET",
+        raw_path: str = "/mega-home/",
+        body: bytes = b"",
+    ) -> None:
+        self.app = {"hass": FakeHass(coordinator)}
         self.query = query or {}
+        self.method = method
+        self.raw_path = raw_path
+        self.headers: dict[str, str] = {}
+        self.content_length = len(body) or None
+        self.can_read_body = bool(body)
+        self._body = body
+
+    async def read(self) -> bytes:
+        return self._body
 
 
 def _get(coordinator: Any, path: str) -> Any:
@@ -244,10 +267,76 @@ def test_без_upgrade_тот_же_путь_отдаёт_ресурс() -> None
 
     from mega_home import http as http_mod
 
-    request = FakeRequest(None)
-    request.headers = {}
-    request.query = {}
+    coordinator = FakeCoordinator()
+    coordinator.data = {"tiles": []}
+    request = FakeRequest(coordinator, raw_path="/mega-home/api/connect")
     answer = _asyncio.run(http_mod.MegaHomeConnectView().get(request))
 
     # Описания вызова нет — отказ запроса, а не сессия и не падение.
     assert answer.status == 400
+
+
+# --- Одна дорога на обе двери -------------------------------------------------
+#
+# ⚠ Локальная дверь и перенос разбирались РАЗНЫМ кодом, и копии расходились
+# (сверка ключа фона на чтении была только у переноса). Теперь дверь — это
+# только перевод запроса aiohttp в `relay_api.dispatch`.
+
+
+def test_локальная_дверь_идёт_общим_маршрутизатором(tmp_path) -> None:
+    from mega_home import http as http_mod
+
+    photo = tmp_path / "kitchen.jpg"
+    photo.write_bytes(b"\xff\xd8jpeg")
+    coordinator = FakeCoordinator()
+    coordinator.data = {"rooms": [{"id": "kitchen"}], "tiles": []}
+    coordinator.env = type("Env", (), {"run": staticmethod(lambda f, *a: _now(f(*a)))})()
+
+    async def photo_file(_env: Any, _coordinator: Any, key: str, _query: Any) -> Any:
+        return photo if key == "kitchen" else None
+
+    import mega_home.core.relay_api as relay_mod
+
+    original = relay_mod.photo_file
+    relay_mod.photo_file = photo_file
+    try:
+        request = FakeRequest(coordinator, raw_path="/mega-home/api/photo/kitchen?v=1")
+        answer = asyncio.run(http_mod.MegaHomePhotoView().get(request, room="kitchen"))
+        missing = asyncio.run(
+            http_mod.MegaHomePhotoView().get(
+                FakeRequest(coordinator, raw_path="/mega-home/api/photo/hall"), room="hall"
+            )
+        )
+    finally:
+        relay_mod.photo_file = original
+
+    # Файл — ПОТОКОМ (`FileResponse`), а не прочитанными байтами, с меткой кэша.
+    assert type(answer).__name__ == "FileResponse"
+    assert answer.headers["Cache-Control"] == relay_mod.IMMUTABLE
+    assert missing.status == 404
+
+
+async def _now(value: Any) -> Any:
+    return value
+
+
+def test_несинхронизированный_дом_отвечает_503_на_любой_путь() -> None:
+    from mega_home import http as http_mod
+
+    request = FakeRequest(None, raw_path="/mega-home/api/states")
+    assert asyncio.run(http_mod.MegaHomeStatesView().get(request)).status == 503
+
+
+def test_воркер_берётся_из_бандла_когда_он_есть(tmp_path) -> None:
+    """Долг «ждёт релиза дома» №2: воркер бандла умеет запасную страницу, и
+    меняется он теперь вместе с интерфейсом, а не релизом интеграции."""
+    from mega_home.http import MegaHomeServiceWorkerView
+
+    (tmp_path / "sw.js").write_text("// воркер бандла", encoding="utf-8")
+    response = asyncio.run(
+        MegaHomeServiceWorkerView().get(FakeRequest(FakeCoordinator(tmp_path, "v1")))
+    )
+
+    assert type(response).__name__ == "FileResponse"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Service-Worker-Allowed"] == "/mega-home/"

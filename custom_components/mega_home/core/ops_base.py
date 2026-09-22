@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import json
+from datetime import date, time
 from http import HTTPStatus
 from typing import Any
 
@@ -18,6 +20,27 @@ class OpError(Exception):
         super().__init__(message)
         self.message = message
         self.status = int(status)
+
+def json_default(value: Any) -> Any:
+    """Чего нет в JSON — так же, как у энкодера Home Assistant (`helpers/json.py`).
+
+    ⚠ ОДИН энкодер на все дороги ответа. Атрибуты HA бывают датами
+    (`media_position_updated_at` у плеера), и каждая дорога кодировала их
+    по-своему: локальная дверь — энкодером HA (ISO с `T`), поток и watch —
+    `default=str` (с пробелом: Safari такую дату не разбирает), перенос и ответ
+    канала — голым `json.dumps`, который на дате ПАДАЛ: снаружи `api/states`
+    отвечал 500, а ответ канала не уходил вовсе.
+    """
+    if isinstance(value, (date, time)):
+        return value.isoformat()
+    if isinstance(value, (set, frozenset, tuple)):
+        return list(value)
+    if hasattr(value, "as_dict"):
+        return value.as_dict()
+    return str(value)
+
+def dumps(payload: Any) -> str:
+    return json.dumps(payload, default=json_default)
 
 def find(items: list[dict[str, Any]], item_id: Any) -> dict[str, Any] | None:
     if not isinstance(item_id, str):

@@ -26,13 +26,13 @@ Events on the stream:
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any
 
 from aiohttp import web
 
 from . import ops
 from .const import LOGGER
+from .ops_base import dumps
 from .source import EntityState
 
 # Комментарий-пинг: держит соединение открытым через реверс-прокси с таймаутом
@@ -52,9 +52,8 @@ class StateStream:
         self.coordinator = coordinator
         self.queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(QUEUE_LIMIT)
         self._unsubscribe: Any = None
-        # Клиент перестал читать — дальше в очередь не кладём вовсе: поток
-        # закрывается, а EventSource переподключится за полным снимком.
-        self._overflowed = False
+        # Поток кончается (см. `end`) — дальше в очередь не кладём вовсе.
+        self._ended = False
         self._unsubscribe_config: Any = None
         self._unsubscribe_device: Any = None
 
@@ -121,7 +120,7 @@ class StateStream:
         self._put("config", {"configVersion": self.coordinator.version})
 
     def _put(self, name: str, payload: Any) -> None:
-        if self._overflowed:
+        if self._ended:
             return
         try:
             self.queue.put_nowait((name, payload))
@@ -129,9 +128,25 @@ class StateStream:
             # Клиент не успевает читать (дом щёлкает реле быстрее, чем телефон
             # принимает). Копить события в памяти Home Assistant нельзя, поэтому
             # поток закрывается сигналом: переподключение возьмёт полный снимок.
-            self._overflowed = True
-            self.queue = asyncio.Queue(1)
-            self.queue.put_nowait(("overflow", None))
+            self.end()
+
+    def end(self) -> None:
+        """Закончить поток: клиент не читает, или запись интеграции выгружается.
+
+        ⚠ Второй случай — ради перезагрузки записи: дверь HA снять нельзя, и
+        поток, открытый до неё, держал бы ПРЕЖНИЙ координатор — слал состояния
+        старого набора плиток и молчал о смене конфига. Кончился поток —
+        EventSource переподключается сам и попадает к новой записи.
+
+        ⚠ Очередь та же, а не новая: читатель уже ждёт на ней (`run`, `LinkWatch`),
+        и подменённую он бы не увидел до ближайшего пинга.
+        """
+        if self._ended:
+            return
+        self._ended = True
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        self.queue.put_nowait(("end", None))
 
     # --- выдача клиенту ---
 
@@ -148,6 +163,11 @@ class StateStream:
         )
         await response.prepare(request)
         self.start()
+        # Открытые потоки знает координатор — чтобы закончить их на выгрузке
+        # записи (`end`, `__init__.async_unload_entry`).
+        streams = getattr(self.coordinator, "streams", None)
+        if streams is not None:
+            streams.add(self)
         try:
             await self._write(response, "states", ops.states(self.coordinator))
             while True:
@@ -158,7 +178,7 @@ class StateStream:
                 except TimeoutError:
                     await response.write(b": ping\n\n")
                     continue
-                if name == "overflow":
+                if name == "end":
                     return response
                 await self._write(response, name, payload)
         except (ConnectionResetError, asyncio.CancelledError):
@@ -168,8 +188,9 @@ class StateStream:
             LOGGER.exception("Поток состояний оборвался")
         finally:
             self.stop()
+            if streams is not None:
+                streams.discard(self)
         return response
 
     async def _write(self, response: web.StreamResponse, name: str, payload: Any) -> None:
-        body = json.dumps(payload, default=str)
-        await response.write(f"event: {name}\ndata: {body}\n\n".encode())
+        await response.write(f"event: {name}\ndata: {dumps(payload)}\n\n".encode())

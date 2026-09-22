@@ -95,4 +95,18 @@ def test_переполнение_очереди_закрывает_поток_�
 
     # Клиент не читает: поток закрывается сигналом, EventSource переподключится
     # и возьмёт полный снимок — это дешевле, чем копить события в памяти HA.
-    assert _drain(stream)[-1] == ("overflow", None)
+    assert _drain(stream) == [("end", None)]
+
+
+def test_выгрузка_записи_заканчивает_поток_сразу():
+    """Долг «ждёт релиза дома» №1: поток, открытый до перезагрузки записи, держал
+    прежний координатор. Конец — сигналом в ТУ ЖЕ очередь, которую уже ждёт
+    читатель: подменённую он не увидел бы до пинга."""
+    stream = StateStream(_Coordinator())
+    queue = stream.queue
+    stream._put("entity", {"id": "t1"})
+    stream.end()
+    stream._put("entity", {"id": "t2"})
+
+    assert stream.queue is queue
+    assert _drain(stream) == [("end", None)]

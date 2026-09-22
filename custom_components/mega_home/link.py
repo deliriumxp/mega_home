@@ -10,6 +10,7 @@ import aiohttp
 from homeassistant.core import HomeAssistant
 
 from .core import ops
+from .core.ops_base import dumps
 from .core.const import CONF_MANAGER_URL, CONF_TOKEN, CONF_VERIFY_SSL, LOGGER
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
 
@@ -82,13 +83,17 @@ class ManagerLink:
         )
 
     async def async_stop(self) -> None:
-        """Stop the link (the background task dies with the entry anyway)."""
-        if self._task:
-            self._task.cancel()
-            self._task = None
-        for task in list(self._answers):
-            task.cancel()
+        """Stop the link and WAIT for it: its `finally` closes the device sessions.
+
+        ⚠ Одна отмена без ожидания оставляла уборку (`Streams.close_all`,
+        `LinkWatch.stop`) на потом — поверх уже поднятой новой записи.
+        """
+        tasks = [task for task in (self._task, *self._answers) if task is not None]
+        self._task = None
         self._answers.clear()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _run(self) -> None:
         session = self._coordinator.env.session(self._entry.data.get(CONF_VERIFY_SSL, True))
@@ -163,12 +168,9 @@ class ManagerLink:
         if socket is None or not isinstance(request_id, str):
             return
         try:
-            # ⚠ `remote=True` — дверь линка и ЕСТЬ «снаружи»: по ней приходят
-            # запросы менеджера (жилец не дома / макет инсталлятора). Ответы не
-            # меняются: разница «дома/снаружи» живёт в адресе базы, не в наборе
-            # операций (`ops.py`).
-            op = frame.get("op") or ""
-            payload = await ops.run(self._coordinator, op, frame.get("payload"), remote=True)
+            # Тот же `ops.run`, что у локальной двери: жилец снаружи получает те
+            # же данные и тот же текст отказа, что дома.
+            payload = await ops.run(self._coordinator, frame.get("op") or "", frame.get("payload"))
             reply: dict[str, Any] = {"t": "res", "id": request_id, "ok": True, "payload": payload}
         except ops.OpError as err:
             reply = {
@@ -188,7 +190,9 @@ class ManagerLink:
                 "status": 500,
             }
         try:
-            await socket.send_json(reply)
+            # ⚠ Общим энкодером: в ответе `states` бывают даты атрибутов, и голый
+            # `json.dumps` на них падал — ответ не уходил вовсе (`ops_base.dumps`).
+            await socket.send_json(reply, dumps=dumps)
         except Exception as err:  # noqa: BLE001 - the link reconnects on its own
             LOGGER.debug("Could not send the answer: %s", err)
 
@@ -196,8 +200,8 @@ class ManagerLink:
         """События устройств — кадрами `event` без подписки (`device_events.py`).
 
         ⚠ Очередь и одна качалка, а не `send_json` из источника: источник зовёт
-        синхронно, а два одновременных `send_json` в один сокет aiohttp рвут кадр.
-        Потерять кадр здесь нельзя и незачем беречь: он лежит в концентраторе до
+        СИНХРОННО, а отправка — сопрограмма. Потерять кадр здесь нельзя и
+        незачем беречь: он лежит в концентраторе до
         `event-ack` менеджера и повторится после переподключения.
         """
         hub = getattr(self._coordinator, "events", None)
@@ -216,7 +220,7 @@ class ManagerLink:
             while True:
                 frame = await queue.get()
                 try:
-                    await socket.send_json(frame)
+                    await socket.send_json(frame, dumps=dumps)
                 except Exception as err:  # noqa: BLE001 — канал переподключится сам
                     LOGGER.debug("Event frame not sent: %s", err)
                     return

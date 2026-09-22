@@ -16,7 +16,7 @@ from functools import partial
 from typing import Any
 
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
-from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
@@ -32,7 +32,7 @@ from .core.const import (
 )
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
 from .http import VIEWS as HTTP_VIEWS, async_register_http
-from .core import services
+from .core import go2rtc_embed, services
 from .core.agent import AgentRunner
 from .link import ManagerLink
 from .ha_update import async_self_update
@@ -117,26 +117,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     services.register("ha", getattr(getattr(hass, "http", None), "server_port", None) or 8123)
     entry.async_on_unload(lambda: services.unregister("ha"))
 
-    # Свой go2rtc :8555 stun:8555 без патча HA core — одна схема.
-    #
-    # ⚠ Остановка процесса и закрытие ws-сессий висят на выгрузке записи И на
-    # остановке Home Assistant. Осиротевший go2rtc держит :8555, и следующий
-    # запуск слушатель уже не поднимет: снаружи камеры молча перестают
-    # открываться, а лечится это только ребутом машины.
+    # Свой go2rtc :8555 stun:8555 без патча HA core — одна схема. Остановка —
+    # в `_async_stop_processes` (выгрузка записи и остановка Home Assistant).
     try:
-        from .core.go2rtc_embed import async_start as _go2rtc_start
-        from .core.go2rtc_embed import async_stop as _go2rtc_stop
-
-        async def _shutdown(_event: Any = None) -> None:
-            await _go2rtc_stop()
-
-        await _go2rtc_start(coordinator.env)
-        entry.async_on_unload(
-            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _shutdown)
-        )
-        entry.async_on_unload(lambda: hass.async_create_task(_shutdown()))
+        await go2rtc_embed.async_start(coordinator.env)
     except Exception as err:  # noqa: BLE001
         LOGGER.debug("go2rtc not started: %s", err)
+    # Открытые потоки `api/events` — их заканчивает выгрузка (`StateStream.end`).
+    coordinator.streams = set()
 
     # Устройства объекта (`devices.py`): описания для слушателей событий.
     # Заводится ДО живого канала и сразу получает уже загруженный конфиг.
@@ -161,15 +149,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     coordinator.device_events = device_events_store
     coordinator.events = EventHub(device_events_store)
     coordinator.event_sources = Listeners(coordinator.env, coordinator.accesses, coordinator.events)
-    # ⚠ Остановка источников и двери — в `async_unload_entry` и с ожиданием: порт
-    # 8189 обязан освободиться ДО того, как перезагруженная запись поднимет свой.
     if coordinator.data:
         coordinator.event_sources.apply(coordinator.accesses.descriptors())
 
     # SIP-мост домофонии (`sip_bridge.py`): поднимается только конфигом объекта,
-    # и сразу получает уже загруженный — как видеонаблюдение строкой выше.
-    # ⚠ Остановка — и на выгрузке записи, и на остановке HA: осиротевший
-    # Asterisk держит 5060 (правило своего go2rtc).
+    # и сразу получает уже загруженный.
     sip_bridge = SipBridge(
         coordinator.env,
         coordinator.assets,
@@ -177,14 +161,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
         lambda kind, data: coordinator.events.publish("intercom", "sip-bridge", kind, data, local=True),
     )
     coordinator.sip_bridge = sip_bridge
-    entry.async_on_unload(
-        hass.bus.async_listen_once(
-            EVENT_HOMEASSISTANT_STOP, lambda _event: hass.async_create_task(sip_bridge.async_stop())
-        )
-    )
-    entry.async_on_unload(lambda: hass.async_create_task(sip_bridge.async_stop()))
     if coordinator.data:
         sip_bridge.apply(coordinator.data)
+
+    async def _on_stop(_event: Any) -> None:
+        await _async_stop_processes(coordinator)
+
+    entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _on_stop))
 
     # Живой канал к менеджеру: правка состава доезжает за секунды вместо интервала
     # опроса. Опрос при этом остаётся страховкой — канал может не подняться вовсе
@@ -199,7 +182,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     agent = AgentRunner(coordinator.env, client)
     await agent.async_start()
     coordinator.agent = agent
-    entry.async_on_unload(lambda: hass.async_create_task(agent.async_stop()))
     await agent.async_sync()
     if PLATFORMS:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -217,15 +199,32 @@ async def async_unload_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) ->
         await hass.config_entries.async_unload_platforms(entry, PLATFORMS) if PLATFORMS else True
     )
     coordinator = getattr(entry, "runtime_data", None)
-    # ⚠ С ожиданием: порт 8189 обязан освободиться ДО того, как перезагруженная
-    # запись поднимет свой (ревью 2026-09-19).
-    sources = getattr(coordinator, "event_sources", None)
-    if sources is not None:
-        await sources.stop()
+    if coordinator is not None:
+        if coordinator.link is not None:
+            await coordinator.link.async_stop()
+        # Потоки `api/events` держали бы ПРЕЖНИЙ координатор: кончаем их, и
+        # EventSource переподключается к новой записи за полным снимком.
+        for state_stream in list(getattr(coordinator, "streams", ())):
+            state_stream.end()
+        if coordinator.agent is not None:
+            await coordinator.agent.async_stop()
+        await _async_stop_processes(coordinator)
     return unloaded
 
 
-@callback
-def async_update_listener(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> None:
-    """Reload the entry when its options change."""
-    hass.config_entries.async_schedule_reload(entry.entry_id)
+async def _async_stop_processes(coordinator: MegaHomeCoordinator) -> None:
+    """Остановить всё, что держит порты, и ДОЖДАТЬСЯ этого.
+
+    ⚠⚠ С ожиданием, а не задачей «выстрелил и забыл», как было до 0.5.6.
+    Перезагрузка записи сразу поднимает новую: `go2rtc_embed.async_start` видел
+    ещё живой процесс, считал его своим — а запоздавшая остановка прежней записи
+    убивала его следом, и камеры не открывались до перезапуска HA. Так же порты
+    5060 (Asterisk) и 8189 (слушатели) обязаны освободиться ДО новой записи.
+    Осиротевший процесс держит порт, и следующий запуск его уже не поднимет.
+    """
+    sources = getattr(coordinator, "event_sources", None)
+    if sources is not None:
+        await sources.stop()
+    if coordinator.sip_bridge is not None:
+        await coordinator.sip_bridge.async_stop()
+    await go2rtc_embed.async_stop()

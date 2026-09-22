@@ -4,17 +4,19 @@ Everything the app needs is served by Home Assistant itself, under one prefix:
 the bundle as static files, the config from the local cache, and states and
 commands straight from `hass`. The manager takes no part at runtime.
 
-⚠ Until authentication is designed (phase 4 of docs/local-ha-app.md in the
-manager repo) these views are open to anyone who can reach Home Assistant on the
-local network. That is a deliberate, temporary risk for development — do not put
-this on a customer object in this state.
+⚠ Локальный контур БЕЗ аутентификации — решение заказчика 2026-09-20
+(`docs/local-ha-app.md` менеджера): досягаемость у него та же, что у любого
+устройства в Wi-Fi объекта. Границы — в составе путей и потолках, а не в учётке.
+
+⚠ Пути жильца разбирает ОДИН маршрутизатор — `relay_api.dispatch`, тот же, что
+у переноса через менеджера. Здесь только дверь: запрос aiohttp → `dispatch` →
+ответ aiohttp. Своих проверок у двери нет и не будет: две копии уже расходились.
 """
 
 from __future__ import annotations
 
-import base64
-import json
 from http import HTTPStatus
+from pathlib import Path
 
 from aiohttp import web
 
@@ -28,18 +30,10 @@ from .core.const import (
     URL_ICONS,
     URL_PREFIX,
 )
-from .core import ops, stream
+from .core import ops, relay_api, stream
 from .core.api import ManagerError
 from .coordinator import MegaHomeCoordinator
-from .core.crops import crop_key_known, crop_keys, crop_value_valid, MAX_CROP_BYTES
 from .core.events import StateStream
-from .core.imaging import asset_file, photo_file
-from .core.photos import (
-    JPEG_MAGIC,
-    MAX_PHOTO_BYTES,
-    photo_key_known,
-    photo_keys,
-)
 
 # Сколько ждём отклика на ping удержания: уснувший телефон сокет не закрывает,
 # и без этого сессии к устройствам жили бы до своего часа (`stream.py`).
@@ -116,7 +110,7 @@ def _coordinator(hass: HomeAssistant) -> MegaHomeCoordinator | None:
 
 
 class _MegaHomeView(HomeAssistantView):
-    """Base view: no auth yet (see the module docstring) and no auth needed.
+    """Base view: the local contour has no auth (see the module docstring).
 
     The app never gets a Home Assistant token: states and service calls are made
     by this integration from inside Python, and only our own shape goes out.
@@ -124,57 +118,159 @@ class _MegaHomeView(HomeAssistantView):
 
     requires_auth = False
 
-    def coordinator_or_error(
-        self, request: web.Request
-    ) -> tuple[MegaHomeCoordinator | None, web.Response | None]:
-        coordinator = _coordinator(request.app["hass"])
-        if coordinator is None or not coordinator.data:
-            return None, self.json_message(
-                "Дом ещё не синхронизирован с менеджером",
-                HTTPStatus.SERVICE_UNAVAILABLE,
+
+class _RoutedView(_MegaHomeView):
+    """Дверь, чьи запросы разбирает общий маршрутизатор (`relay_api.dispatch`).
+
+    ⚠ Параметры пути (`{room}`, `{tile}`, `{key}`) Home Assistant передаёт
+    аргументами (`handler(request, **match_info)`), но маршрутизатор берёт путь
+    целиком из `raw_path`, как перенос берёт его из кадра — без второго разбора.
+    """
+
+    async def get(self, request: web.Request, **_match: str) -> web.StreamResponse:
+        return await self.route(request)
+
+    async def post(self, request: web.Request, **_match: str) -> web.StreamResponse:
+        return await self.route(request)
+
+    async def delete(self, request: web.Request, **_match: str) -> web.StreamResponse:
+        return await self.route(request)
+
+    async def route(self, request: web.Request) -> web.StreamResponse:
+        # Размер — по заголовку ДО чтения тела: иначе потолок превращается в
+        # столько памяти, сколько прислали.
+        if (request.content_length or 0) > relay_api.MAX_REQUEST_BYTES:
+            return self.json_message("Запрос слишком большой", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        body = await request.read() if request.can_read_body else b""
+        path = request.raw_path.split("?", 1)[0][len(URL_PREFIX) + 1 :]
+        try:
+            status, content_type, raw, cache = await relay_api.dispatch(
+                _coordinator(request.app["hass"]), request.method, path, body, dict(request.query)
             )
-        return coordinator, None
-
-    # ⚠ Сами операции живут в `ops.py`, а не здесь: тот же код обслуживает
-    # запрос жильца, пришедший СНАРУЖИ через менеджер по живому каналу
-    # (`link.py`). Копия правил на каждый транспорт разъехалась бы.
-    async def run(self, request: web.Request, op: str) -> web.Response:
-        hass: HomeAssistant = request.app["hass"]
-        try:
-            return self.json(await ops.run(_coordinator(hass), op, None))
         except ops.OpError as err:
             return self.json_message(err.message, err.status)
-
-    async def run_async(self, request: web.Request, op: str) -> web.Response:
-        try:
-            payload = await request.json()
-        except ValueError:
-            return self.json_message("Некорректный запрос", HTTPStatus.BAD_REQUEST)
-        hass: HomeAssistant = request.app["hass"]
-        try:
-            return self.json(await ops.run(_coordinator(hass), op, payload))
-        except ops.OpError as err:
-            return self.json_message(err.message, err.status)
+        headers = {"Content-Type": content_type, **({"Cache-Control": cache} if cache else {})}
+        if isinstance(raw, Path):
+            return web.FileResponse(raw, headers=headers)
+        return web.Response(status=status, body=raw, headers=headers)
 
 
-class MegaHomeConfigView(_MegaHomeView):
-    """The cached home config: floors, rooms, tiles, scenarios."""
+class MegaHomeConfigView(_RoutedView):
+    """Состав дома из кэша плюс паспорт самого дома (`ops.config`)."""
 
     url = f"{URL_API}/config"
     name = "api:mega_home:config"
 
-    async def get(self, request: web.Request) -> web.Response:
-        return await self.run(request, "config")
 
-
-class MegaHomeStatesView(_MegaHomeView):
+class MegaHomeStatesView(_RoutedView):
     """Current states of every tile, read straight from this Home Assistant."""
 
     url = f"{URL_API}/states"
     name = "api:mega_home:states"
 
-    async def get(self, request: web.Request) -> web.Response:
-        return await self.run(request, "states")
+
+class MegaHomeCommandView(_RoutedView):
+    """One command for one tile, mapped onto a Home Assistant service call."""
+
+    url = f"{URL_API}/command"
+    name = "api:mega_home:command"
+
+
+class MegaHomeScenarioView(_RoutedView):
+    """Run one scenario (a Home Assistant script)."""
+
+    url = f"{URL_API}/scenario"
+    name = "api:mega_home:scenario"
+
+
+class MegaHomeIntercomView(_RoutedView):
+    """Действие жильца над идущим вызовом домофонии (сегодня — «отклонить»)."""
+
+    url = f"{URL_API}/intercom"
+    name = "api:mega_home:intercom"
+
+
+class MegaHomePhotosView(_RoutedView):
+    """Что имеет фон — комнаты и ОТДЕЛЬНЫЕ ПЛИТКИ (`tile:<id>`) — и какой версии."""
+
+    url = f"{URL_API}/photos"
+    name = "api:mega_home:photos"
+
+
+class MegaHomePhotoView(_RoutedView):
+    """Один фон: прочитать, заменить, снять.
+
+    ⚠ Имя параметра `room` осталось прежним (маршрут менять нельзя — по нему
+    ходят уже работающие дома), но значением приходит КЛЮЧ ФОНА: комната
+    (`kitchen`) или плитка (`tile:light.kitchen_main`).
+    """
+
+    url = f"{URL_API}/photo/{{room}}"
+    name = "api:mega_home:photo"
+
+
+class MegaHomeCropsView(_RoutedView):
+    """Какие камеры имеют СВОЙ участок кадра, подправленный жильцом, и какой."""
+
+    url = f"{URL_API}/crops"
+    name = "api:mega_home:crops"
+
+
+class MegaHomeCropView(_RoutedView):
+    """Один участок кадра камеры, который подправил жилец: записать, снять."""
+
+    url = f"{URL_API}/crop/{{tile}}"
+    name = "api:mega_home:crop"
+
+
+class MegaHomeAssetView(_RoutedView):
+    """ONE route for every file the manager hands to this home (`assets.py`)."""
+
+    url = f"{URL_API}/asset/{{key:.+}}"
+    name = "api:mega_home:asset"
+
+
+class MegaHomeCameraFrameView(_RoutedView):
+    """Один кадр камеры источника плитки — часть B (источник состояний), не вендор.
+
+    ⚠ Путь один и тот же с обеих сторон намеренно, хотя дома кадр есть и у
+    самого HA (`/api/camera_proxy/...`): снаружи у приложения нет ни одного
+    адреса Home Assistant, и расхождение поверхностей — та болезнь, ради лечения
+    которой заведён перенос.
+    """
+
+    url = f"{URL_API}/camera-frame/{{tile}}"
+    name = "api:mega_home:camera-frame"
+
+
+class MegaHomeDeviceEventsView(_RoutedView):
+    """Лента событий устройства из хранилища на диске — часть F, не вендор."""
+
+    url = f"{URL_API}/device-events"
+    name = "api:mega_home:device-events"
+
+
+class MegaHomeConnectView(_RoutedView):
+    """Единственный контракт транспорта наружу (`connect.py`).
+
+    Три формы ОДНОГО пути: данные коду (`POST`), ресурс тегу (`GET`), кадры
+    сессии (`GET` с Upgrade). Меняется способ потребить ответ, описание вызова
+    одно — список маршрутов от этого не растёт, замок считает пути.
+    """
+
+    url = f"{URL_API}/connect"
+    name = "api:mega_home:connect"
+
+    async def get(self, request: web.Request, **_match: str) -> web.StreamResponse:
+        """⚠ Удержание внутри дома — без аутентификации, как весь локальный
+        контур: досягаемость у него та же, что у `POST api/connect`. Снаружи эта
+        же форма идёт переносом менеджера и закрыта сессией жильца."""
+        if request.headers.get("Upgrade", "").lower() == "websocket":
+            socket = web.WebSocketResponse(heartbeat=WS_HEARTBEAT_S, max_msg_size=WS_MAX_FRAME)
+            await socket.prepare(request)
+            await stream.serve(socket)
+            return socket
+        return await self.route(request)
 
 
 class MegaHomeEventsView(_MegaHomeView):
@@ -189,405 +285,12 @@ class MegaHomeEventsView(_MegaHomeView):
     name = "api:mega_home:events"
 
     async def get(self, request: web.Request) -> web.StreamResponse:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
+        coordinator = _coordinator(request.app["hass"])
+        if coordinator is None or not coordinator.data:
+            return self.json_message(
+                "Дом ещё не синхронизирован с менеджером", HTTPStatus.SERVICE_UNAVAILABLE
+            )
         return await StateStream(coordinator).run(request)
-
-
-class MegaHomeCommandView(_MegaHomeView):
-    """One command for one tile, mapped onto a Home Assistant service call."""
-
-    url = f"{URL_API}/command"
-    name = "api:mega_home:command"
-
-    async def post(self, request: web.Request) -> web.Response:
-        return await self.run_async(request, "command")
-
-
-class MegaHomeScenarioView(_MegaHomeView):
-    """Run one scenario (a Home Assistant script)."""
-
-    url = f"{URL_API}/scenario"
-    name = "api:mega_home:scenario"
-
-    async def post(self, request: web.Request) -> web.Response:
-        return await self.run_async(request, "scenario")
-
-
-class MegaHomeIntercomView(_MegaHomeView):
-    """Действие жильца над идущим вызовом домофонии (сегодня — «отклонить»).
-
-    ⚠ Тот же код, что у операции канала и у перенесённого запроса: жилец дома и
-    снаружи отказывается от вызова одинаково.
-    """
-
-    url = f"{URL_API}/intercom"
-    name = "api:mega_home:intercom"
-
-    async def post(self, request: web.Request) -> web.Response:
-        return await self.run_async(request, "intercom")
-
-
-def _resource_request(raw: str | None) -> dict | None:
-    """Описание вызова из параметра `req` — base64url от JSON; `None` — битое.
-
-    ⚠ Одним параметром, а не россыпью полей в адресе: описание составляет БАНДЛ
-    и обязано доехать без толкования по дороге. Разобрать его на `host`/`port`/
-    `path` значило бы завести второй формат запроса рядом с `ConnectRequest`,
-    который разойдётся с ним на первой же правке. Разбор тот же, что у
-    перенесённой двери (`relay_api._resource_request`).
-    """
-    if not raw:
-        return None
-    try:
-        padded = raw + "=" * (-len(raw) % 4)
-        parsed = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
-    except (ValueError, TypeError, UnicodeDecodeError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-class MegaHomeConnectView(_MegaHomeView):
-    """Единственный контракт транспорта наружу (`connect.py`, `ops.py`).
-
-    ⚠ Тот же код, что у операции канала: локальная дверь и перенос через
-    менеджера обязаны отвечать одинаково (`docs/plan-thin-gateway.md`).
-    """
-
-    url = f"{URL_API}/connect"
-    name = "api:mega_home:connect"
-
-    async def post(self, request: web.Request) -> web.Response:
-        return await self.run_async(request, "connect")
-
-    async def get(self, request: web.Request) -> web.StreamResponse:
-        """Ресурс — или УДЕРЖАНИЕ, если браузер просит Upgrade.
-
-        ⚠ Третья форма ТОГО ЖЕ пути, а не новый маршрут: меняется способ
-        потребить ответ (данные коду `POST`, ресурс тегу `GET`, кадры сессии
-        `GET` с Upgrade), описание вызова одно и то же. Список маршрутов от
-        этого не растёт — замок считает пути.
-
-        ⚠ Внутри дома дверь без аутентификации, как и весь локальный контур
-        (решение заказчика 2026-09-20): досягаемость у неё ровно та же, что у
-        `POST api/connect`, который тут и так открыт. Снаружи эта же форма
-        идёт переносом менеджера и закрыта сессией жильца.
-        """
-        if request.headers.get("Upgrade", "").lower() == "websocket":
-            socket = web.WebSocketResponse(heartbeat=WS_HEARTBEAT_S, max_msg_size=WS_MAX_FRAME)
-            await socket.prepare(request)
-            await stream.serve(socket)
-            return socket
-        return await self._resource(request)
-
-    async def _resource(self, request: web.Request) -> web.StreamResponse:
-        """Тот же вызов, ответ — РЕСУРС: браузер берёт его сам, одной ходкой.
-
-        ⚠ Ради этого метода дом не заводит по маршруту на каждую картинку:
-        `<img src>` умеет только адрес, а тело в JSON-конверте адресом не
-        подставить — кадр плитки из-за этого шёл тремя ходками, а сам дом обзавёлся
-        `api/camera-frame/<id>` в обход двери (`docs/home-gateway.md`, «Полнота
-        двери»). Описание вызова едет параметром `req` (base64url от
-        `ConnectRequest`); учётки в нём не бывает — см. `connect.resource`.
-        """
-        payload = _resource_request(request.query.get("req"))
-        if payload is None:
-            return web.Response(
-                status=HTTPStatus.BAD_REQUEST, text="Описание вызова повреждено"
-            )
-        try:
-            status, content_type, body, cache = await ops.connect_resource(payload)
-        except ops.OpError as err:
-            return web.Response(status=err.status, text=err.message)
-        return web.Response(
-            status=status,
-            body=body,
-            headers={"Content-Type": content_type, "Cache-Control": cache},
-        )
-
-
-class MegaHomePhotosView(_MegaHomeView):
-    """What has a background photo, and what version it is.
-
-    ⚠ Не только комнаты. Фон бывает и у ОДНОЙ ПЛИТКИ: инсталлятор снимает в
-    квартире сам прибор — группу света, телевизор, шторы — и ставит снимок
-    фоном его плитки (приложение, долгое удержание). Ключ плитки — `tile:<id>`,
-    и разведён приставкой не для красоты: идентификаторы плиток и комнат
-    приходят из разных источников и совпасть могут запросто.
-
-    Перечислять их обязано именно ЗДЕСЬ: приложение спрашивает «что вообще
-    задано» одним запросом на открытие, и плитка, которой нет в этом списке,
-    покажется без фона, даже если файл на диске лежит.
-    """
-
-    url = f"{URL_API}/photos"
-    name = "api:mega_home:photos"
-
-    async def get(self, request: web.Request) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        hass: HomeAssistant = request.app["hass"]
-        versions = await hass.async_add_executor_job(
-            coordinator.photos.versions, photo_keys(coordinator.data)
-        )
-        # `imaging` — дом сам готовит варианты фото (`imaging.py`). Приложение
-        # узнаёт это ОТВЕТОМ, а не номером версии: без флага оно рисует вид
-        # фильтрами CSS, как раньше.
-        return self.json({"photos": versions, "imaging": True})
-
-
-class MegaHomePhotoView(_MegaHomeView):
-    """One background: read it, replace it, remove it.
-
-    ⚠ `room` is a positional argument, not something to dig out of the request:
-    Home Assistant calls handlers as `handler(request, **request.match_info)`.
-    Имя параметра осталось прежним (маршрут менять нельзя — по нему ходят уже
-    работающие дома), но значением приходит КЛЮЧ ФОНА: комната (`kitchen`) или
-    плитка (`tile:light.kitchen_main`).
-
-    Only a key the current config knows can be written — комната из состава или
-    плитка из него же. That is the bound on this endpoint: без него любой в
-    локальной сети забил бы диск объекта файлами (аутентификации у HTTP-контура
-    пока нет, см. docstring модуля). Хранилище само по себе ключа не боится —
-    имя файла это хеш (`photos.py`), — но неограниченный НАБОР ключей боится.
-    """
-
-    url = f"{URL_API}/photo/{{room}}"
-    name = "api:mega_home:photo"
-
-    async def get(self, request: web.Request, room: str) -> web.StreamResponse:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        # Query может просить готовый вариант (`?w=1080&blur=14`, `imaging.py`).
-        target = await photo_file(coordinator.env, coordinator, room, request.query)
-        if target is None:
-            return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
-        # Адрес несёт версию файла (`?v=<mtime>`), поэтому картинку можно отдать
-        # неизменяемой: сменилось фото — сменился адрес.
-        return web.FileResponse(
-            target, headers={"Cache-Control": "public, max-age=31536000, immutable"}
-        )
-
-    async def post(self, request: web.Request, room: str) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        if not photo_key_known(coordinator.data, room):
-            return self.json_message("Комната или плитка не найдена", HTTPStatus.NOT_FOUND)
-        # Размер проверяется по заголовку ДО чтения тела: иначе четыре мегабайта
-        # ограничения превращаются в столько памяти, сколько прислали.
-        if (request.content_length or 0) > MAX_PHOTO_BYTES:
-            return self.json_message("Фото слишком большое", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-        payload = await request.read()
-        if len(payload) > MAX_PHOTO_BYTES:
-            return self.json_message("Фото слишком большое", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-        if not payload.startswith(JPEG_MAGIC):
-            # Приложение всегда пережимает снимок в JPEG само, так что сюда
-            # попадает либо чужой клиент, либо оборванная загрузка.
-            return self.json_message("Ожидается фотография JPEG", HTTPStatus.BAD_REQUEST)
-
-        hass: HomeAssistant = request.app["hass"]
-        try:
-            version = await hass.async_add_executor_job(
-                coordinator.photos.save, room, payload
-            )
-        except OSError as err:
-            LOGGER.warning("Could not store the photo of room %s: %s", room, err)
-            return self.json_message(
-                "Дом не смог сохранить фото", HTTPStatus.INTERNAL_SERVER_ERROR
-            )
-        return self.json({"accepted": True, "version": version})
-
-    async def delete(self, request: web.Request, room: str) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        hass: HomeAssistant = request.app["hass"]
-        removed = await hass.async_add_executor_job(coordinator.photos.delete, room)
-        if not removed:
-            return self.json_message("Фото не найдено", HTTPStatus.NOT_FOUND)
-        return self.json({"accepted": True})
-
-
-class MegaHomeCropsView(_MegaHomeView):
-    """What camera tiles have their OWN crop, and what it is.
-
-    ⚠ Тот же приём, что `MegaHomePhotosView`: приложение спрашивает «что вообще
-    подправлено» одним запросом на открытие и мешает ответ поверх кадра из
-    конфига (`tiles[].crop`) — сам дом это смешение не делает и делать не
-    должен (`docs/local-ha-app.md`): интеграция остаётся тонкой, толкование
-    живёт в бандле, как и у остального состояния.
-    """
-
-    url = f"{URL_API}/crops"
-    name = "api:mega_home:crops"
-
-    async def get(self, request: web.Request) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        hass: HomeAssistant = request.app["hass"]
-        crops = await hass.async_add_executor_job(
-            coordinator.crops.all, crop_keys(coordinator.data)
-        )
-        return self.json({"crops": crops})
-
-
-class MegaHomeCropView(_MegaHomeView):
-    """Один участок кадра камеры, который подправил жилец: записать, снять.
-
-    ⚠ Писать можно только КАМЕРУ из ТЕКУЩЕГО состава — та же дисциплина, что у
-    `MegaHomePhotoView`, и по той же причине: без неё любой в локальной сети
-    забил бы диск объекта файлами (аутентификации у HTTP-контура пока нет, см.
-    docstring модуля). Кадр из менеджера при этом остаётся ЗАГОТОВКОЙ: снял
-    жилец свою правку — вернулся он, а не пустой центр кадра (`tile-crops.ts`
-    в менеджере ведёт то же самое правило для фона плитки).
-    """
-
-    url = f"{URL_API}/crop/{{tile}}"
-    name = "api:mega_home:crop"
-
-    async def post(self, request: web.Request, tile: str) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        if not crop_key_known(coordinator.data, tile):
-            return self.json_message("Камера не найдена", HTTPStatus.NOT_FOUND)
-        if (request.content_length or 0) > MAX_CROP_BYTES:
-            return self.json_message(
-                "Запрос слишком большой", HTTPStatus.REQUEST_ENTITY_TOO_LARGE
-            )
-        try:
-            payload = await request.json()
-        except ValueError:
-            return self.json_message("Некорректный запрос", HTTPStatus.BAD_REQUEST)
-        if not crop_value_valid(payload):
-            return self.json_message("Некорректный участок кадра", HTTPStatus.BAD_REQUEST)
-
-        hass: HomeAssistant = request.app["hass"]
-        try:
-            await hass.async_add_executor_job(coordinator.crops.save, tile, payload)
-        except OSError as err:
-            LOGGER.warning("Could not store the crop of tile %s: %s", tile, err)
-            return self.json_message(
-                "Дом не смог сохранить кадр", HTTPStatus.INTERNAL_SERVER_ERROR
-            )
-        return self.json({"accepted": True, "crop": payload})
-
-    async def delete(self, request: web.Request, tile: str) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        hass: HomeAssistant = request.app["hass"]
-        removed = await hass.async_add_executor_job(coordinator.crops.delete, tile)
-        if not removed:
-            return self.json_message("Кадр не найден", HTTPStatus.NOT_FOUND)
-        return self.json({"accepted": True})
-
-
-class MegaHomeAssetView(_MegaHomeView):
-    """ONE route for every file the manager hands to this home.
-
-    ⚠ The route knows nothing about what it serves: key, version and content
-    type all come from the manifest in the cached config (`assets.py`). That is
-    what keeps a new kind of file — a sound, a font, a floor plan — from costing
-    a release of this integration.
-
-    ⚠ The version comes from the CONFIG, never from `?v=` in the URL: the query
-    is a cache marker for the browser, and trusting it as a file name would mean
-    serving, by an old link, what the config no longer names.
-    """
-
-    url = f"{URL_API}/asset/{{key:.+}}"
-    name = "api:mega_home:asset"
-
-    async def get(self, request: web.Request, key: str) -> web.StreamResponse:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        found = await asset_file(coordinator.env, coordinator, key, request.query)
-        if found is None:
-            return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
-        target, content_type = found
-        return web.FileResponse(
-            target,
-            headers={
-                "Cache-Control": "public, max-age=31536000, immutable",
-                "Content-Type": content_type,
-            },
-        )
-
-
-class MegaHomeCameraFrameView(_MegaHomeView):
-    """Один кадр камеры источника плитки — часть B (источник состояний), не вендор.
-
-    ⚠ Есть и здесь, хотя ДОМА приложение берёт кадр напрямую у Home Assistant
-    (`/api/camera_proxy/...`, тот же origin, дешевле на один поход к камере).
-    Путь один и тот же с обеих сторон намеренно: расхождение поверхностей —
-    та самая болезнь, ради лечения которой заведён перенос (`relay_api.py`).
-    Снаружи у приложения нет ни одного адреса Home Assistant, поэтому без этой
-    двери плитка камеры вне дома остаётся без картинки.
-    """
-
-    url = f"{URL_API}/camera-frame/{{tile}}"
-    name = "api:mega_home:camera-frame"
-
-    async def get(self, request: web.Request, tile: str) -> web.StreamResponse:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        try:
-            content_type, body = await ops.camera_frame(coordinator, {"id": tile})
-        except ops.OpError as err:
-            return web.Response(status=err.status, text=err.message)
-
-        # ⚠ Байты как есть, без base64: `ops.camera_frame` отдаёт их уже
-        # сырыми — эта дверь не переносит запрос по каналу менеджера,
-        # кодировать здесь было бы работой ради самой себя.
-        return web.Response(
-            body=body,
-            headers={
-                "Content-Type": content_type,
-                # Кадр живой и короткий: закешированный постер показывал бы
-                # прошлую минуту, но плитка обновляется опросом раз в 3 с.
-                "Cache-Control": "private, max-age=3",
-            },
-        )
-
-
-class MegaHomeDeviceEventsView(_MegaHomeView):
-    """Лента событий устройства из хранилища на диске — часть F, не вендор.
-
-    ⚠ Тот же обработчик, что у переноса (`relay_api._dispatch`,
-    `ops.device_events`): приложение без менеджера обязано видеть историю
-    устройства так же, как жилец у экрана дома (`docs/plan-thin-gateway.md`).
-    """
-
-    url = f"{URL_API}/device-events"
-    name = "api:mega_home:device-events"
-
-    async def get(self, request: web.Request) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
-        try:
-            return self.json(ops.device_events(coordinator, dict(request.query)))
-        except ops.OpError as err:
-            return self.json_message(err.message, err.status)
 
 
 class MegaHomeRelayView(_MegaHomeView):
@@ -604,10 +307,11 @@ class MegaHomeRelayView(_MegaHomeView):
     name = "api:mega_home:relay"
 
     async def post(self, request: web.Request) -> web.Response:
-        coordinator, error = self.coordinator_or_error(request)
-        if error is not None:
-            return error
-        assert coordinator is not None
+        coordinator = _coordinator(request.app["hass"])
+        if coordinator is None or not coordinator.data:
+            return self.json_message(
+                "Дом ещё не синхронизирован с менеджером", HTTPStatus.SERVICE_UNAVAILABLE
+            )
         try:
             payload = await request.json()
         except ValueError:
@@ -624,32 +328,44 @@ class MegaHomeRelayView(_MegaHomeView):
         return self.json(body if isinstance(body, dict) else {"answer": body}, status)
 
 
-# Наш собственный service worker. Не кэширует НИЧЕГО и не обязан: его работа —
-# ЗАНЯТЬ scope `/mega-home/`.
-SERVICE_WORKER = (
+# Запасной воркер — пока бандла нет. Его работа — ЗАНЯТЬ scope `/mega-home/`.
+FALLBACK_SERVICE_WORKER = (
     "self.addEventListener('install', () => self.skipWaiting());\n"
     "self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));\n"
 )
+SERVICE_WORKER_HEADERS = {
+    # Застрявшая копия воркера — это застрявший scope.
+    "Cache-Control": "no-store",
+    # Scope шире собственного каталога нам не нужен, но заявить его явно
+    # дешевле, чем потом гадать, почему регистрация отклонена.
+    "Service-Worker-Allowed": f"{URL_PREFIX}/",
+}
 
 
 class MegaHomeServiceWorkerView(_MegaHomeView):
-    """`/mega-home/sw.js` — воркер, забирающий scope у воркера Home Assistant."""
+    """`/mega-home/sw.js` — воркер ИЗ БАНДЛА, забирающий scope у воркера HA.
+
+    ⚠ Из бандла, а не строкой отсюда (долг «ждёт релиза дома» №2): воркер
+    бандла умеет запасную страницу вместо мёртвой (`navigate`) и push, а строка
+    в коде дома менялась только релизом интеграции — открытие PWA во время
+    перезапуска HA давало страницу ошибки браузера, из которой без адресной
+    строки не выйти. Строка осталась ЗАПАСНОЙ: до первой загрузки бандла.
+    """
 
     url = f"{URL_PREFIX}/sw.js"
     name = "mega_home:sw"
 
     async def get(self, request: web.Request) -> web.StreamResponse:
+        hass: HomeAssistant = request.app["hass"]
+        root = _active_dir(request)
+        worker = root / "sw.js" if root is not None else None
+        if worker is not None and await hass.async_add_executor_job(worker.is_file):
+            return web.FileResponse(
+                worker, headers={"Content-Type": "text/javascript", **SERVICE_WORKER_HEADERS}
+            )
         return web.Response(
-            text=SERVICE_WORKER,
-            headers={
-                "Content-Type": "text/javascript",
-                # Воркер меняется раз в никогда, но кэшировать его нельзя:
-                # застрявшая копия — это застрявший scope.
-                "Cache-Control": "no-store",
-                # Scope шире собственного каталога нам не нужен, но заявить его
-                # явно дешевле, чем потом гадать, почему регистрация отклонена.
-                "Service-Worker-Allowed": f"{URL_PREFIX}/",
-            },
+            text=FALLBACK_SERVICE_WORKER,
+            headers={"Content-Type": "text/javascript", **SERVICE_WORKER_HEADERS},
         )
 
 
@@ -697,6 +413,11 @@ class MegaHomeAppView(_MegaHomeView):
         return _serve(request, _strip_version(path))
 
 
+def _active_dir(request: web.Request) -> Path | None:
+    coordinator = _coordinator(request.app["hass"])
+    return coordinator.bundle.active_dir if coordinator and coordinator.bundle else None
+
+
 def _active_version(request: web.Request) -> str | None:
     """Имя каталога активного бандла — оно же версия в адресе."""
     coordinator = _coordinator(request.app["hass"])
@@ -722,8 +443,7 @@ def _serve(request: web.Request, relative: str) -> web.StreamResponse:
     a Home Assistant restart. Until the first download there is no directory at
     all (the release carries no copy), and the page is the placeholder above.
     """
-    coordinator = _coordinator(request.app["hass"])
-    root = coordinator.bundle.active_dir if coordinator and coordinator.bundle else None
+    root = _active_dir(request)
     if root is None:
         # Бандл ещё не скачан. Заглушку отдаём только на саму страницу: запрос
         # файла бандла должен остаться честным 404, иначе браузер получит HTML

@@ -25,17 +25,12 @@ added — the integration's route lock (`tests/test_routes.py`) is untouched.
 from __future__ import annotations
 
 import asyncio
-import json
-from functools import partial
 from typing import Any
 
 from . import ops
 from .const import LOGGER
 from .events import StateStream
-
-# Атрибуты HA бывают датами и прочим, чего `json` не знает. Поток SSE пишет
-# их `default=str` (`events.py`) — канал обязан отдавать ровно то же самое.
-_dumps = partial(json.dumps, default=str)
+from .ops_base import dumps
 
 
 class LinkWatch:
@@ -105,7 +100,7 @@ class LinkWatch:
             await self._send("states", ops.states(self._coordinator))
             while True:
                 name, payload = await stream.queue.get()
-                if name == "overflow":
+                if name == "end":
                     # Менеджер не успевал читать (дом щёлкает быстрее, чем уходит
                     # канал). Копить в памяти Home Assistant нельзя — подписываемся
                     # заново и отдаём полный снимок: он и есть «наверстать».
@@ -125,5 +120,5 @@ class LinkWatch:
 
     async def _send(self, name: str, payload: Any) -> None:
         await self._socket.send_json(
-            {"t": "watch", "event": name, "payload": payload}, dumps=_dumps
+            {"t": "watch", "event": name, "payload": payload}, dumps=dumps
         )

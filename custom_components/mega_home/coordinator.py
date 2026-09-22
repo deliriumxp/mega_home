@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from shutil import rmtree
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -26,7 +25,6 @@ from .core.const import (
     LOGGER,
     MAX_UPDATE_INTERVAL,
     PHOTO_DIR,
-    STOCK_PHOTO_DIR,
     ASSET_DIR,
     LOOK_DIR,
     STORAGE_KEY,
@@ -93,6 +91,9 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.events: Any = None
         # ⚠ Не `listeners`: так зовётся поле подписчиков самого координатора HA.
         self.event_sources: Any = None
+        # Открытые потоки `api/events` (`events.StateStream`): выгрузка записи
+        # кончает их, чтобы клиенты переподключились к новой.
+        self.streams: set[Any] = set()
         # Бандл интерфейса: качается с менеджера и раздаётся из кэша, поэтому
         # новая версия приложения не требует ни HACS, ни перезапуска.
         #
@@ -131,15 +132,6 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             Path(hass.config.path(STORAGE_DIR, LOOK_DIR)),
             {"p": self.photos.directory, "a": self.assets.directory},
         )
-        # ⚠ Отдельного зеркала «заготовок инсталлятора» здесь БОЛЬШЕ НЕТ
-        # (0.2.20). Оно появилось раньше общего канала и делало то же самое:
-        # фон комнаты качался своим маршрутом, фон плитки — ОБОИМИ сразу, по
-        # два запроса и две копии на диске за одни и те же байты. Теперь фоны
-        # приезжают ключами `photo/room/*` и `photo/tile/*` общего манифеста.
-        # Старый каталог подчищаем один раз: он больше никогда не наполнится.
-        stale = Path(hass.config.path(STORAGE_DIR, STOCK_PHOTO_DIR))
-        if stale.is_dir():
-            rmtree(stale, ignore_errors=True)
 
     @property
     def icons_dir(self) -> Path:

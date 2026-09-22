@@ -58,18 +58,12 @@ __all__ = [
     "states",
 ]
 
-async def run(
-    coordinator: Any,
-    op: str,
-    payload: dict[str, Any] | None,
-    remote: bool = False,
-) -> Any:
+async def run(coordinator: Any, op: str, payload: dict[str, Any] | None) -> Any:
     """Run one operation by name. Unknown name is a refusal, not a crash.
 
-    ⚠ `remote` — жилец пришёл ЧЕРЕЗ МЕНЕДЖЕРА, а не локальной дверью. Ответы от
-    этого не меняются и меняться не должны: разница «дома/снаружи» живёт в
-    адресе базы, а не в наборе функций. Признак нужен ровно там, где физика
-    разная, — сколько ждать внешний адрес дома (дома он не нужен вовсе).
+    ⚠ Признака «пришёл через менеджера» здесь нет и не нужно: разница
+    «дома/снаружи» живёт в адресе базы, а не в наборе функций. Он был нужен
+    одной снятой операции (`webrtc`: сколько ждать внешний адрес дома).
     """
     if coordinator is None or not coordinator.data:
         raise OpError(

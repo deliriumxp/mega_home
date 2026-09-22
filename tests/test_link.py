@@ -19,12 +19,16 @@ class _Socket:
     def __init__(self) -> None:
         self.sent: list[dict] = []
 
-    async def send_json(self, payload: dict) -> None:
+    async def send_json(self, payload: dict, dumps=None) -> None:  # noqa: ANN001 - как у aiohttp
+        # Кадр проходит тем же энкодером, что уйдёт в сокет: иначе дата в
+        # атрибуте, на которой падал голый `json.dumps`, прошла бы спеку молча.
+        if dumps is not None:
+            dumps(payload)
         self.sent.append(payload)
 
 
 class _DeadSocket(_Socket):
-    async def send_json(self, payload: dict) -> None:
+    async def send_json(self, payload: dict, dumps=None) -> None:  # noqa: ANN001
         raise ConnectionResetError("сокет закрылся")
 
 
@@ -37,7 +41,7 @@ def link(answer):
     instance._answers = set()
     ops_run = ops.run
 
-    async def patched(coordinator, op, payload, remote=False):
+    async def patched(coordinator, op, payload):
         return answer(op, payload)
 
     ops.run = patched
@@ -78,7 +82,7 @@ def test_ответ_не_держит_чтение_сокета():
     instance._coordinator = object()
     instance._answers = set()
     ops_run = ops.run
-    ops.run = lambda coordinator, op, payload, remote=False: slow(op, payload)
+    ops.run = lambda coordinator, op, payload: slow(op, payload)
     socket = _Socket()
 
     async def run():
@@ -98,6 +102,21 @@ def test_ответ_возвращается_с_тем_же_идентифика
     instance = link(lambda op, payload: {"connected": True})
     sent = answer(instance, {"t": "req", "id": "r7", "op": "states"})
     assert sent == [{"t": "res", "id": "r7", "ok": True, "payload": {"connected": True}}]
+
+
+def test_дата_в_атрибуте_не_роняет_ответ():
+    """⚠ Атрибут плеера `media_position_updated_at` — дата. Голый `json.dumps`
+    на ней падал, ответ не уходил, и менеджер ждал его до таймаута."""
+    from datetime import datetime, timezone
+
+    moment = datetime(2026, 9, 22, 10, 0, tzinfo=timezone.utc)
+    instance = link(lambda op, payload: {"entities": [{"attributes": {"at": moment}}]})
+    sent = answer(instance, {"t": "req", "id": "r10", "op": "states"})
+
+    assert sent[0]["ok"] is True
+    from mega_home.core.ops_base import dumps
+
+    assert '"2026-09-22T10:00:00+00:00"' in dumps(sent[0])
 
 
 def test_отказ_едет_ответом_а_не_молчанием():
@@ -121,39 +140,6 @@ def test_неожиданная_ошибка_тоже_возвращается_�
     # ⚠ Внутренности наружу не уезжают: жильцу нечего делать с текстом
     # исключения, а менеджеру — тем более.
     assert "что-то сломалось" not in sent[0]["error"]
-
-
-def test_дверь_линка_помечает_запрос_снаружи():
-    """⚠ Весь фикс холодного STUN держится на этом признаке: переговоры WebRTC,
-    пришедшие от менеджера, обязаны считаться «снаружи». Без него дом не ждёт
-    внешний адрес (`CANDIDATE_WINDOW_COLD`), первый оффер уезжает с одними
-    host-кандидатами и не открывается — а повтор, уже тёплый, работает. Ровно
-    это и выглядело как «камера открывается со второго раза».
-    """
-    instance = ManagerLink.__new__(ManagerLink)
-    instance._coordinator = object()
-    instance._answers = set()
-    seen: list[bool] = []
-    ops_run = ops.run
-
-    async def patched(coordinator, op, payload, remote=False):
-        seen.append(remote)
-        return {}
-
-    ops.run = patched
-    socket = _Socket()
-
-    async def run():
-        await instance._handle({"t": "req", "id": "r1", "op": "webrtc"}, socket)
-        if instance._answers:
-            await asyncio.gather(*instance._answers)
-
-    try:
-        asyncio.run(run())
-    finally:
-        ops.run = ops_run
-
-    assert seen == [True]
 
 
 def test_кадр_без_идентификатора_игнорируется():
