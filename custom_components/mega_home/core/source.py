@@ -81,10 +81,14 @@ class StateSource(Protocol):
 
     def get(self, entity_id: str) -> EntityState | None: ...
 
-    async def call(self, domain: str, service: str, data: dict[str, Any]) -> None:
+    async def call(
+        self, domain: str, service: str, data: dict[str, Any], response: bool = False
+    ) -> Any:
         """Выполнить команду и дождаться её: ответ жильцу несёт НОВОЕ состояние.
 
-        Отказы — `CommandUnknown`/`CommandRejected`, а не исключения источника.
+        `response` — вернуть ОТВЕТ службы (прогноз, события календаря, пункты
+        списка дел есть только в нём); без него — `None`. Отказы —
+        `CommandUnknown`/`CommandRejected`, а не исключения источника.
         """
 
     def subscribe(

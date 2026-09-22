@@ -231,6 +231,11 @@ async def _tcp_sweep(ips: list[str]) -> set[str]:
 
 async def _reachable(ip: str, port: int) -> bool:
     """Хост жив: соединение открылось ИЛИ отклонено (RST — ответ живого стека)."""
+    return await _is_open(ip, port, refused=True)
+
+
+async def _is_open(ip: str, port: int, refused: bool = False) -> bool:
+    """Порт открыт; `refused` — чем считать отказ (RST): для «жив ли хост» — да."""
     try:
         _reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, port), CONNECT_TIMEOUT_S
@@ -238,18 +243,7 @@ async def _reachable(ip: str, port: int) -> bool:
         writer.close()
         return True
     except ConnectionRefusedError:
-        return True
-    except (asyncio.TimeoutError, OSError):
-        return False
-
-
-async def _is_open(ip: str, port: int) -> bool:
-    try:
-        _reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port), CONNECT_TIMEOUT_S
-        )
-        writer.close()
-        return True
+        return refused
     except (asyncio.TimeoutError, OSError):
         return False
 

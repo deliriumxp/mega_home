@@ -396,8 +396,23 @@ class Streams:
 class _SessionBase:
     """Общее у всех видов сессии: срок жизни и конец с уведомлением владельца.
 
-    Наследник задаёт `id`, `_owner` и `stop(error)`.
+    Наследник задаёт `id`, `_owner`, `_tasks`, `_stopping` и `_release()` —
+    что закрыть у своего вида (сокет, сессию HTTP, транспорт UDP).
     """
+
+    async def stop(self, error: str | None) -> None:
+        if self._stopping:
+            return
+        self._stopping = True
+        for task in self._tasks:
+            # ⚠ Не свою: закрытие по потолку или по концу приходит из задачи,
+            # живущей в этом же списке, и отменить себя значило бы не дойти до
+            # конца — `_release` оборвался бы на первом же `await`.
+            if task is not asyncio.current_task():
+                task.cancel()
+        await self._release()
+        if error:
+            LOGGER.info("Сессия %s закрыта: %s", self.id, error)
 
     async def _deadline(self) -> None:
         await asyncio.sleep(MAX_LIFETIME_S)
@@ -453,19 +468,12 @@ class _Stream(_SessionBase):
         """
         await self.to_device(text.encode("utf-8"))
 
-    async def stop(self, error: str | None) -> None:
-        if self._stopping:
-            return
-        self._stopping = True
-        for task in self._tasks:
-            task.cancel()
+    async def _release(self) -> None:
         self._writer.close()
         try:
             await asyncio.wait_for(self._writer.wait_closed(), 2)
         except (asyncio.TimeoutError, OSError):
             pass
-        if error:
-            LOGGER.info("Сессия %s закрыта: %s", self.id, error)
 
     async def _pump_in(self) -> None:
         """Менеджер → устройство."""
@@ -540,19 +548,11 @@ class _WsStream(_SessionBase):
         if not self._stopping:
             await self._outgoing.put(("text", text))
 
-    async def stop(self, error: str | None) -> None:
-        if self._stopping:
-            return
-        self._stopping = True
-        for task in self._tasks:
-            if task is not asyncio.current_task():
-                task.cancel()
+    async def _release(self) -> None:
         if self._socket is not None:
             await self._socket.close()
         if self._session is not None:
             await self._session.close()
-        if error:
-            LOGGER.info("Сессия %s закрыта: %s", self.id, error)
 
     async def _run(self) -> None:
         headers = self._req.get("headers") if isinstance(self._req.get("headers"), dict) else None
@@ -633,17 +633,9 @@ class _HttpStream(_SessionBase):
     async def to_device_text(self, text: str) -> None:
         """То же: тело запроса едет в описании, дослать в ответ нечего."""
 
-    async def stop(self, error: str | None) -> None:
-        if self._stopping:
-            return
-        self._stopping = True
-        for task in self._tasks:
-            if task is not asyncio.current_task():
-                task.cancel()
+    async def _release(self) -> None:
         if self._session is not None:
             await self._session.close()
-        if error:
-            LOGGER.info("Сессия %s закрыта: %s", self.id, error)
 
     async def _run(self) -> None:
         try:
@@ -792,20 +784,10 @@ class _Datagrams(_SessionBase):
     def failed(self, exc: Exception) -> None:
         self._later(self._done(_describe(exc)))
 
-    async def stop(self, error: str | None) -> None:
-        if self._stopping:
-            return
-        self._stopping = True
-        for task in self._tasks:
-            # ⚠ Не свою: закрытие по потолку приходит из задачи, живущей в этом
-            # же списке (`_later`), и отменить себя значило бы не дойти до конца.
-            if task is not asyncio.current_task():
-                task.cancel()
+    async def _release(self) -> None:
         if self._idle is not None:
             self._idle.cancel()
         self._transport.close()
-        if error:
-            LOGGER.info("Сессия %s закрыта: %s", self.id, error)
 
     def _touch(self) -> None:
         # ⚠ У UDP нет «закрыли соединение»: тишина — единственный признак, что

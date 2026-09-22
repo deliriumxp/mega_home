@@ -7,7 +7,7 @@ from typing import Any
 
 import voluptuous as vol
 from homeassistant.core import Event, EventStateChangedData, HomeAssistant, State, callback
-from homeassistant.exceptions import ServiceNotFound
+from homeassistant.exceptions import HomeAssistantError, ServiceNotFound
 from homeassistant.helpers.event import async_track_state_change_event
 
 from . import webrtc
@@ -57,14 +57,24 @@ class HaSource:
     def get(self, entity_id: str) -> State | None:
         return self.hass.states.get(entity_id)
 
-    async def call(self, domain: str, service: str, data: dict[str, Any]) -> None:
+    async def call(
+        self, domain: str, service: str, data: dict[str, Any], response: bool = False
+    ) -> Any:
         try:
             # blocking=True: ответ обязан нести состояние ПОСЛЕ команды. Служба
             # выполняется внутри того же HA — ожидание здесь доли миллисекунды.
-            await self.hass.services.async_call(domain, service, data, blocking=True)
+            # ⚠ `return_response` только по просьбе: служба без ответа на него
+            # падает (dev-api-websocket.md, «return_response»: «Must be included
+            # for service actions that return response data»).
+            return await self.hass.services.async_call(
+                domain, service, data, blocking=True, return_response=response
+            )
         except ServiceNotFound as err:
             raise CommandUnknown(f"{domain}.{service}") from err
-        except vol.Invalid as err:
+        except (vol.Invalid, HomeAssistantError) as err:
+            # `HomeAssistantError` — отказ самого прибора или службы (режим не из
+            # `fan_modes`, служба без ответа), а не поломка дома: жильцу — «HA
+            # отклонил команду», а не пятисотка.
             raise CommandRejected(str(err)) from err
 
     def subscribe(

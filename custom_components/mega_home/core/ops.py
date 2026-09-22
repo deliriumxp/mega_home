@@ -31,7 +31,7 @@ from typing import Any
 
 from . import connect as connect_mod
 from .const import LOGGER
-from .ops_base import OpError, find, number
+from .ops_base import OpError, arguments, find, number
 from .probe import run as run_probe
 from .scan import run as run_scan
 from .source import CommandRejected, CommandUnknown, EntityState, StateSource
@@ -307,13 +307,17 @@ async def command(
     if spec is None:
         raise OpError("Команда не поддерживается устройством", HTTPStatus.NOT_FOUND)
 
+    state = coordinator.source.get(tile["entityId"])
     try:
-        data = service_data(spec, payload.get("value"))
+        data = arguments(spec, payload.get("value"), state.attributes if state else {})
     except ValueError as err:
         raise OpError(str(err)) from err
 
-    await call(
-        coordinator.source, spec["domain"], spec["service"], {"entity_id": tile["entityId"], **data}
+    # `response` в описании — службе нужен её ОТВЕТ (`weather.get_forecasts`,
+    # `calendar.get_events`, `todo.get_items`: этих данных нет в атрибутах).
+    wants = spec.get("response") is True
+    answer = await call(
+        coordinator.source, spec["domain"], spec["service"], {"entity_id": tile["entityId"], **data}, wants
     )
     # ⚠ Ответ несёт НОВОЕ состояние плитки, а не только «принято». Иначе
     # приложению остаётся либо ждать следующего снимка (тап выглядит
@@ -322,6 +326,7 @@ async def command(
     # Служба вызвана блокирующе, поэтому машина состояний уже обновлена.
     return {
         "accepted": True,
+        **({"response": answer["response"]} if wants else {}),
         "entity": entity_view(
             tile, coordinator.source.get(tile["entityId"]), coordinator.source.cameras
         ),
@@ -336,10 +341,11 @@ async def scenario(
         raise OpError("Сценарий не найден", HTTPStatus.NOT_FOUND)
     if not item.get("entityId"):
         raise OpError("Сценарий не создан в Home Assistant", HTTPStatus.NOT_FOUND)
-    return await call(coordinator.source, "script", "turn_on", {"entity_id": item["entityId"]})
+    await call(coordinator.source, "script", "turn_on", {"entity_id": item["entityId"]})
+    return {"accepted": True}
 
 async def call(
-    source: StateSource, domain: str, service: str, data: dict[str, Any]
+    source: StateSource, domain: str, service: str, data: dict[str, Any], response: bool = False
 ) -> dict[str, Any]:
     """Command the source of states and turn its refusals into plain answers.
 
@@ -351,7 +357,7 @@ async def call(
     try:
         # Источник ждёт выполнения: ответ обязан нести состояние ПОСЛЕ команды
         # (см. command).
-        await source.call(domain, service, data)
+        result = await source.call(domain, service, data, response)
     except CommandUnknown as err:
         LOGGER.warning("Service %s.%s is not available", domain, service)
         raise OpError(
@@ -361,7 +367,7 @@ async def call(
     except CommandRejected as err:
         LOGGER.warning("Service %s.%s rejected the payload: %s", domain, service, err)
         raise OpError("Home Assistant отклонил команду") from err
-    return {"accepted": True}
+    return {"accepted": True, "response": result}
 
 def command_spec(tile: dict[str, Any], name: Any) -> dict[str, Any] | None:
     """Чем исполнять команду: службой ИЗ КОНФИГА — другого источника больше нет.
@@ -384,28 +390,8 @@ def command_spec(tile: dict[str, Any], name: Any) -> dict[str, Any] | None:
     described = (tile.get("commands") or {}).get(name)
     if not isinstance(described, dict) or not described.get("service"):
         return None
-    return {
-        "domain": described.get("domain") or tile["domain"],
-        "service": described["service"],
-        "arg": described.get("arg"),
-        "min": described.get("min"),
-        "max": described.get("max"),
-    }
-
-def service_data(spec: dict[str, Any], value: Any) -> dict[str, Any]:
-    """Единственный аргумент команды, проверенный по описанным границам.
-
-    ⚠ Границы приходят из конфига, но проверяет их ЭТА сторона: службу зовём мы,
-    а браузеру жильца верить нельзя. Аргумент без границ — строковый (режим
-    термостата), с границами — число.
-    """
-    arg = spec.get("arg")
-    if not arg:
-        return {}
-    low, high = spec.get("min"), spec.get("max")
-    if low is None or high is None:
-        return {arg: str(value or "")}
-    return {arg: number(value, low, high)}
+    # Аргументы разбирает `ops_base.arguments` по описанию целиком.
+    return {**described, "domain": described.get("domain") or tile["domain"]}
 
 # Что из атрибутов наружу НЕ уходит.
 #

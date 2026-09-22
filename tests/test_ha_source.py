@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 import voluptuous as vol
-from homeassistant.exceptions import ServiceNotFound
+from homeassistant.exceptions import HomeAssistantError, ServiceNotFound
 from homeassistant.helpers import event as event_helper
 
 from mega_home.ha_source import HaSource
@@ -18,10 +18,11 @@ class _Services:
         self.calls: list[tuple] = []
         self.raises = raises
 
-    async def async_call(self, domain, service, data, blocking=False):  # noqa: ANN001, ANN201
-        self.calls.append((domain, service, data, blocking))
+    async def async_call(self, domain, service, data, blocking=False, return_response=False):  # noqa: ANN001, ANN201
+        self.calls.append((domain, service, data, blocking, return_response))
         if self.raises:
             raise self.raises
+        return {"forecast": []} if return_response else None
 
 
 class _Hass:
@@ -32,13 +33,26 @@ class _Hass:
 def test_команда_ждёт_выполнения() -> None:
     """Ответ жильцу несёт состояние ПОСЛЕ команды — служба зовётся блокирующе."""
     hass = _Hass()
-    asyncio.run(HaSource(hass).call("light", "turn_on", {"entity_id": "light.a"}))
-    assert hass.services.calls == [("light", "turn_on", {"entity_id": "light.a"}, True)]
+    assert asyncio.run(HaSource(hass).call("light", "turn_on", {"entity_id": "light.a"})) is None
+    assert hass.services.calls == [("light", "turn_on", {"entity_id": "light.a"}, True, False)]
+
+
+def test_ответ_службы_только_по_просьбе() -> None:
+    # dev-api-websocket.md: `return_response` — только для служб с ответом.
+    hass = _Hass()
+    answer = asyncio.run(HaSource(hass).call("weather", "get_forecasts", {"type": "daily"}, True))
+    assert answer == {"forecast": []}
+    assert hass.services.calls[0][-1] is True
 
 
 @pytest.mark.parametrize(
     ("raised", "expected"),
-    [(ServiceNotFound(), CommandUnknown), (vol.Invalid("bad"), CommandRejected)],
+    [
+        (ServiceNotFound(), CommandUnknown),
+        (vol.Invalid("bad"), CommandRejected),
+        # Отказ самого прибора (режим не из списка) — не пятисотка.
+        (HomeAssistantError("bad mode"), CommandRejected),
+    ],
 )
 def test_отказы_ha_становятся_отказами_источника(raised, expected) -> None:  # noqa: ANN001
     with pytest.raises(expected):

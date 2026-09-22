@@ -39,10 +39,12 @@ class FakeSource:
     def get(self, entity_id: str) -> Any:
         return self.states.get(entity_id)
 
-    async def call(self, domain: str, service: str, data: dict[str, Any]) -> None:
+    async def call(self, domain: str, service: str, data: dict[str, Any], response: bool = False) -> Any:
         if self.raises:
             raise self.raises
         self.calls.append((domain, service, data))
+        # Ответ службы — только по просьбе, как у HA (`return_response`).
+        return {"asked": f"{domain}.{service}"} if response else None
 
     def subscribe(self, entity_ids: list[str], on_change: Any) -> Any:
         self.subscriptions.append((list(entity_ids), on_change))

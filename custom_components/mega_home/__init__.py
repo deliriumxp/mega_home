@@ -32,6 +32,7 @@ from .core.const import (
 )
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
 from .http import VIEWS as HTTP_VIEWS, async_register_http
+from .core import services
 from .core.agent import AgentRunner
 from .link import ManagerLink
 from .ha_update import async_self_update
@@ -106,6 +107,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # Обновление по кнопке менеджера (`ha_update.py`): ядро зовёт его операцией
     # `self-update`; файлы качает тот же клиент менеджера, что и бандл.
     coordinator.self_update = partial(async_self_update, hass, coordinator.client)
+
+    # Сам Home Assistant — служба дома для `connect`, как go2rtc. Картинки
+    # сущностей (`entity_picture` плеера, домен `image`) HA отдаёт по своему
+    # адресу с токеном в запросе: дома бандл открывает их напрямую (он на том
+    # же origin), а снаружи — только через `connect`. Без имени бандлу пришлось
+    # бы знать LAN-адрес HA, а в контейнере это бывает мост docker
+    # (менеджер: `docs/plan-ha-domains.md`, этап 1 — обложка плеера).
+    services.register("ha", getattr(getattr(hass, "http", None), "server_port", None) or 8123)
+    entry.async_on_unload(lambda: services.unregister("ha"))
 
     # Свой go2rtc :8555 stun:8555 без патча HA core — одна схема.
     #
