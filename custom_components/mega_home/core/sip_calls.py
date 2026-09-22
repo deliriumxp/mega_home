@@ -59,8 +59,21 @@ class DoorCall:
     started: float = field(default_factory=time)
     talk: str = ""
     bridge: str = ""
-    # Сетевой адрес отправителя — по нему пауза и «один вызов разом».
+    # Сетевой адрес отправителя — как пришёл; пусто, если диалплан его не дал.
     peer: str = ""
+
+    @property
+    def key(self) -> str:
+        """По чему пауза и «один вызов разом»: адрес, а без него — номер."""
+        return self.peer or self.caller
+
+    def payload(self) -> dict[str, str]:
+        """Данные события вызова — одни на `call`, `answered`, `cancel` и `ended`.
+
+        ⚠ `peer` — ровно тот, что ушёл в `call`: снаружи по нему опознают панель,
+        и событие конца обязано называть ту же, что событие начала.
+        """
+        return {"caller": self.caller, "call": self.panel, "peer": self.peer}
 
 
 class DoorCalls:
@@ -107,7 +120,7 @@ class DoorCalls:
         вызову, которого нет.
         """
         for call in list(self._calls.values()):
-            self._emit("ended" if call.talk else "cancel", {"caller": call.caller, "call": call.panel, "peer": call.peer})
+            self._emit("ended" if call.talk else "cancel", call.payload())
         self._calls.clear()
 
     def state(self) -> dict[str, Any]:
@@ -152,18 +165,18 @@ class DoorCalls:
         if not channel_id:
             return
         if kind == "StasisStart":
-            role = (event.get("args") or [""])[0]
+            args = event.get("args") or [""]
+            role = args[0]
+            extra = str(args[1]) if len(args) > 1 and args[1] else ""
             if role == "panel":
                 # Второй аргумент — СЕТЕВОЙ адрес отправителя (`CHANNEL(pjsip,
                 # remote_addr)`, «ip:порт»): номер звонящего выбирает сам INVITE.
-                args = event.get("args") or []
-                peer = str(args[1]).rsplit(":", 1)[0] if len(args) > 1 and args[1] else ""
-                await self._ringing(channel_id, channel, peer)
+                await self._ringing(channel_id, channel, extra.rsplit(":", 1)[0])
             elif role == "answer":
-                # Второй аргумент — id вызова, которому отвечают (`answer-<id>`);
-                # пусто — последний звонящий.
-                args = event.get("args") or []
-                await self._answer(channel_id, str(args[1]) if len(args) > 1 else "")
+                # Второй аргумент — id вызова, которому отвечают: заголовок
+                # `X-Mega-Call` INVITE телефона (диалплан менеджера,
+                # `asterisk-config.util.ts`); пусто — последний звонящий.
+                await self._answer(channel_id, extra)
             else:
                 await self._hangup(channel_id, "unallocated")
         elif kind == "StasisEnd":
@@ -174,15 +187,18 @@ class DoorCalls:
         # ⚠ Ограничения — по СЕТЕВОМУ адресу, а не по номеру: номер (CALLERID)
         # выбирает отправитель, и, меняя его, подделка проходила бы паузу каждый
         # раз (повторное ревью 2026-09-19). Сверх того — общий потолок на дом.
-        key = peer or caller
+        call = DoorCall(channel_id, caller, peer=peer)
         now = time()
-        busy = any(c.peer == key for c in self._calls.values())
+        # Отметки старше паузы ничего не решают — не копим их по каждому
+        # адресу, с которого когда-либо звонили (подделка шлёт их сколько угодно).
+        self._last_call = {k: at for k, at in self._last_call.items() if now - at < CALL_COOLDOWN_S}
+        busy = any(c.key == call.key for c in self._calls.values())
         crowded = len(self._calls) >= MAX_CALLS
-        if busy or crowded or now - self._last_call.get(key, 0.0) < CALL_COOLDOWN_S:
+        if busy or crowded or call.key in self._last_call:
             await self._hangup(channel_id, "busy")
             return
-        self._last_call[key] = now
-        self._calls[channel_id] = DoorCall(channel_id, caller, peer=key)
+        self._last_call[call.key] = now
+        self._calls[channel_id] = call
         # ⚠ Не `answer`: панель считает вызов принятым и гасит мониторы.
         await self._request("POST", f"/channels/{channel_id}/ring")
         # `call` — id вызова: им телефон отвечает именно этой панели, им же
@@ -194,10 +210,10 @@ class DoorCalls:
         # годится нам для ограничений выше. Менеджер и приложение сверяют
         # именно его (`intercom-call-push.service.ts`, `intercom-incoming.ts`),
         # `caller` остаётся подписью в уведомлении.
-        self._emit("call", {"caller": caller, "call": channel_id, "peer": peer})
+        self._emit("call", call.payload())
 
     async def _answer(self, phone: str, target: str = "") -> None:
-        """Телефон набрал `answer[-<id>]`: соединяем с этим вызовом или последним звонящим."""
+        """Телефон набрал `answer`: соединяем с вызовом `target` или последним звонящим."""
         waiting = [c for c in self._calls.values() if not c.talk and (not target or c.panel == target)]
         if not waiting:
             # Гость ушёл, пока жилец открывал приложение, или трубку взял другой.
@@ -218,7 +234,7 @@ class DoorCalls:
             f"/bridges/{call.bridge}/addChannel",
             {"channel": f"{call.panel},{phone}"},
         )
-        self._emit("answered", {"caller": call.caller, "call": call.panel, "peer": call.peer})
+        self._emit("answered", call.payload())
 
     async def reject(self, call_id: str) -> bool:
         """Жилец отказался: гасим НАШЕ плечо вызова, не трогая остальные.
@@ -249,16 +265,13 @@ class DoorCalls:
     async def _ended(self, channel_id: str) -> None:
         call = self._calls.get(channel_id)
         if call is not None:
-            self._emit(
-                "ended" if call.talk else "cancel",
-                {"caller": call.caller, "call": call.panel, "peer": call.peer},
-            )
+            self._emit("ended" if call.talk else "cancel", call.payload())
             await self._finish(call, "normal")
             return
         for call in list(self._calls.values()):
             if call.talk == channel_id:
                 # Жилец положил трубку — разговор окончен и для гостя.
-                self._emit("ended", {"caller": call.caller, "call": call.panel, "peer": call.peer})
+                self._emit("ended", call.payload())
                 await self._finish(call, "normal")
                 return
 

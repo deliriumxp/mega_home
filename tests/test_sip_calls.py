@@ -82,6 +82,36 @@ def test_второй_вызов_той_же_панели_сбрасываетс
     assert [e for e, _ in calls.events] == ["call"]
 
 
+def test_без_адреса_начало_и_конец_вызова_называют_одно_и_то_же() -> None:
+    """⚠ Снаружи панель ищут по `peer`: `call` и `cancel` одного вызова обязаны
+    нести один и тот же адрес. Раньше `cancel` без адреса уезжал с номером."""
+    calls = _Calls()
+    _run(calls, _start("p1", "panel", "999222"), _end("p1"))
+    assert calls.events == [
+        ("call", {"caller": "999222", "call": "p1", "peer": ""}),
+        ("cancel", {"caller": "999222", "call": "p1", "peer": ""}),
+    ]
+
+
+def test_ответ_по_id_вызова_из_заголовка_соединяет_именно_его() -> None:
+    calls = _Calls()
+    _run(
+        calls,
+        _start("p1", "panel", peer="192.168.88.90"),
+        _start("p2", "panel", peer="192.168.88.91"),
+        {"type": "StasisStart", "args": ["answer", "p1"], "channel": {"id": "t1"}},
+    )
+    assert ("POST", "/bridges/br1/addChannel", {"channel": "p1,t1"}) in calls.sent
+
+
+def test_отметки_паузы_старше_срока_не_копятся() -> None:
+    """Подделка может звонить с новых адресов бесконечно — словарь пауз не растёт."""
+    calls = _Calls()
+    calls._last_call = {f"10.0.0.{n}": 0.0 for n in range(50)}
+    _run(calls, _start("p1", "panel", peer="192.168.88.90"))
+    assert list(calls._last_call) == ["192.168.88.90"]
+
+
 def test_ответ_телефона_соединяет_с_панелью() -> None:
     calls = _Calls()
     _run(calls, _start("p1", "panel"), _start("t1", "answer"))
