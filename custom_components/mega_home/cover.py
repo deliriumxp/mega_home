@@ -151,6 +151,17 @@ class MegaPulseCover(CoverEntity, RestoreEntity):
         if self._unsub_knx is not None:
             self._unsub_knx()
             self._unsub_knx = None
+            # ⚠ И фильтр событий KNX снимаем (`remove`, `services.yaml` ядра):
+            # штора с новым адресом или снятая из состава оставляла бы шине
+            # старый адрес, и `knx_event` по нему шли бы в пустоту вечно.
+            try:
+                await self.hass.services.async_call(
+                    "knx", "event_register",
+                    {"address": [self.spec.position_address], "remove": True},
+                    blocking=True,
+                )
+            except Exception:  # noqa: BLE001 — KNX мог уйти раньше шторы
+                LOGGER.debug("%s: подписка KNX не снята", self.entity_id)
         await self.blind.shutdown()
         await super().async_will_remove_from_hass()
 

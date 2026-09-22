@@ -63,7 +63,7 @@ def test_close_that_overtakes_open_is_honored(monkeypatch):
         streams = Streams(socket)
         allow_loopback(monkeypatch)
         slow_connect(monkeypatch, 0.2)
-        before = stream_mod._total()
+        before = stream_mod.open_total()
         try:
             await streams.dispatch(
                 {"t": "stream.open", "id": 5, "req": {"kind": "tcp", "host": "127.0.0.1", "port": port}}
@@ -71,7 +71,7 @@ def test_close_that_overtakes_open_is_honored(monkeypatch):
             await streams.dispatch({"t": "stream.close", "id": 5})
             await asyncio.sleep(0.4)
             await settle()
-            return socket.kinds(), dict(streams._streams), stream_mod._total() - before
+            return socket.kinds(), dict(streams._streams), stream_mod.open_total() - before
         finally:
             await streams.close_all()
             server.close()

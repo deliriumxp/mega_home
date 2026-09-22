@@ -76,8 +76,22 @@ NAME_CONCURRENCY = 32
 ARP_TOUCH_PORT = 9
 
 
+_RUNNING = asyncio.Lock()
+
+
 async def run(env: Host, payload: dict[str, Any]) -> dict[str, Any]:
-    """Обойти подсеть и вернуть найденные хосты с открытыми веб-портами."""
+    """Обойти подсеть и вернуть найденные хосты с открытыми веб-портами.
+
+    ⚠ Один обход разом: второй заказ посреди первого (повторное нажатие, две
+    вкладки инсталлятора) удвоил бы поток соединений по сети клиента.
+    """
+    if _RUNNING.locked():
+        raise OpError("Обход сети уже идёт — дождитесь результата", HTTPStatus.CONFLICT)
+    async with _RUNNING:
+        return await _run(env, payload)
+
+
+async def _run(env: Host, payload: dict[str, Any]) -> dict[str, Any]:
     network = _target_network(payload.get("subnet") if payload else None)
     started = time.monotonic()
     ips = [str(ip) for ip in network.hosts()][:MAX_HOSTS]

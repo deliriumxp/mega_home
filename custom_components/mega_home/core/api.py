@@ -95,22 +95,8 @@ class ManagerClient:
         payload: dict[str, Any] = {"reports": reports}
         if version:
             payload["version"] = version
-        try:
-            async with self._session.post(
-                f"{self._base}{API_AGENT}",
-                headers=self._headers(),
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-            ) as response:
-                self._raise_for_status(response.status)
-                answer = await response.json(content_type=None)
-        except aiohttp.ClientError as err:
-            raise ManagerError(str(err)) from err
-        except ValueError as err:
-            raise ManagerError("manager answered with non-JSON content") from err
-        if not isinstance(answer, dict):
-            raise ManagerError("manager answered with an unexpected payload")
-        return answer
+        _, answer = await self._request("POST", API_AGENT, json=payload)
+        return _object(answer)
 
     async def async_relay(self, payload: dict[str, Any]) -> tuple[int, Any]:
         """Ask the manager something on behalf of the app; return status and answer.
@@ -119,31 +105,11 @@ class ManagerClient:
         interpret the answer. That is what keeps a future feature — the AI chat
         first of all — from needing a release of this integration.
         """
-        try:
-            async with self._session.post(
-                f"{self._base}{API_RELAY}",
-                headers=self._headers(),
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=RELAY_TIMEOUT),
-            ) as response:
-                body = await response.json(content_type=None)
-                return response.status, body
-        except aiohttp.ClientError as err:
-            raise ManagerError(str(err)) from err
-        except ValueError as err:
-            raise ManagerError("manager answered with non-JSON content") from err
+        return await self._request("POST", API_RELAY, json=payload, timeout=RELAY_TIMEOUT, strict=False)
 
     async def _get_bytes(self, path: str) -> bytes:
-        try:
-            async with self._session.get(
-                f"{self._base}{path}",
-                headers=self._headers(),
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-            ) as response:
-                self._raise_for_status(response.status)
-                return await response.read()
-        except aiohttp.ClientError as err:
-            raise ManagerError(str(err)) from err
+        _, body = await self._request("GET", path, raw=True)
+        return body
 
     async def async_app_manifest(self) -> dict[str, Any]:
         """Return the manifest of the resident app bundle."""
@@ -162,31 +128,52 @@ class ManagerClient:
         return await self._get_bytes(f"{API_INTEGRATION_FILE}?path={quote(path)}")
 
     async def _get_json(self, path: str) -> dict[str, Any]:
+        _, payload = await self._request("GET", path)
+        return _object(payload)
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Any = None,
+        timeout: float = REQUEST_TIMEOUT,
+        raw: bool = False,
+        strict: bool = True,
+    ) -> tuple[int, Any]:
+        """Один запрос к менеджеру. ЛЮБОЙ отказ дороги — `ManagerError`.
+
+        ⚠ Таймаут тоже: у aiohttp это `TimeoutError`, а не `ClientError`, и до
+        0.5.6 он проходил мимо — опрос конфига падал «неожиданной ошибкой» с
+        трейсбеком и без отступа, синхронизация бандла (обещано «не бросает»)
+        бросала, а сторож ронял весь цикл. Недоступный менеджер для дома — норма.
+
+        `strict=False` — статус не отказ, а часть ответа (перенос `relay`).
+        """
         try:
-            async with self._session.get(
+            async with self._session.request(
+                method,
                 f"{self._base}{path}",
-                headers=self._headers(),
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                headers={"Authorization": f"Bearer {self._token}"},
+                json=json,
+                timeout=aiohttp.ClientTimeout(total=timeout),
             ) as response:
-                self._raise_for_status(response.status)
+                if strict and response.status in (401, 403):
+                    raise ManagerAuthError(f"manager rejected the object token ({response.status})")
+                if strict and response.status >= 400:
+                    raise ManagerError(f"manager answered with HTTP {response.status}")
                 # The manager always answers JSON here, but a reverse proxy in
                 # front of it may not (a captive portal or an error page), so
                 # the content type is not trusted.
-                payload = await response.json(content_type=None)
-        except aiohttp.ClientError as err:
-            raise ManagerError(str(err)) from err
+                body = await response.read() if raw else await response.json(content_type=None)
+                return response.status, body
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise ManagerError(str(err) or "manager did not answer in time") from err
         except ValueError as err:
             raise ManagerError("manager answered with non-JSON content") from err
-        if not isinstance(payload, dict):
-            raise ManagerError("manager answered with an unexpected payload")
-        return payload
 
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._token}"}
 
-    @staticmethod
-    def _raise_for_status(status: int) -> None:
-        if status in (401, 403):
-            raise ManagerAuthError(f"manager rejected the object token ({status})")
-        if status >= 400:
-            raise ManagerError(f"manager answered with HTTP {status}")
+def _object(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ManagerError("manager answered with an unexpected payload")
+    return payload

@@ -39,6 +39,26 @@ def test_версия_меняется_при_замене_фото(tmp_path: Pa
     assert store.path("r1").read_bytes() == JPEG + b"other"
 
 
+def test_версия_из_кэша_пока_файл_не_менялся(tmp_path: Path, monkeypatch) -> None:
+    """Список фонов спрашивают часто: сумма по содержимому считается раз на файл,
+    а замена снаружи (другой размер или время) всё равно даёт новую версию."""
+    store = PhotoStore(tmp_path)
+    saved = store.save("r1", JPEG)
+    opened: list[Path] = []
+    real_open = Path.open
+
+    def counting_open(self, *args, **kwargs):  # noqa: ANN001, ANN202
+        opened.append(self)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    assert store.versions(["r1"]) == {"r1": saved}
+    assert opened == []
+
+    store.path("r1").write_bytes(JPEG + b"outside")
+    assert store.versions(["r1"])["r1"] != saved
+
+
 def test_список_версий_только_по_существующим(tmp_path: Path) -> None:
     store = PhotoStore(tmp_path)
     store.save("r1", JPEG)

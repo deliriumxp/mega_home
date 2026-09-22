@@ -29,6 +29,11 @@ STEP_USER = vol.Schema(
 )
 
 
+def unique_id_of(token: str) -> str:
+    """Личность записи — объект, то есть его токен (хэшем: сам токен — секрет)."""
+    return sha256(token.encode()).hexdigest()[:16]
+
+
 def check_url(url: str) -> str | None:
     """Return the error key for an unusable manager address, else None."""
     parsed = urlparse(url)
@@ -86,9 +91,7 @@ class MegaHomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 # меняло адрес, но оставляло прежнюю проверку сертификата —
                 # переезд с прокси на порт 8055 с самоподписанным TLS молча не
                 # работал.
-                await self.async_set_unique_id(
-                    sha256(data[CONF_TOKEN].encode()).hexdigest()[:16]
-                )
+                await self.async_set_unique_id(unique_id_of(data[CONF_TOKEN]))
                 self._abort_if_unique_id_configured(updates=data)
                 return self.async_create_entry(
                     title=f"Mega Home ({urlparse(data[CONF_MANAGER_URL]).hostname})",
@@ -117,7 +120,18 @@ class MegaHomeConfigFlow(ConfigFlow, domain=DOMAIN):
             data = self._clean(user_input)
             errors = await self._async_validate(data)
             if not errors:
-                return self.async_update_reload_and_abort(entry, data_updates=data)
+                # ⚠ Токен объекта менеджер может перевыпустить — и тогда личность
+                # записи (`unique_id` — хэш токена) обязана смениться вместе с ним.
+                # Прежний хэш оставлял запись под старым токеном, и «Добавить» с
+                # новым заводило второй дом. Новый токен уже у другой записи —
+                # отказ: это другой объект.
+                unique_id = unique_id_of(data[CONF_TOKEN])
+                if unique_id != entry.unique_id:
+                    await self.async_set_unique_id(unique_id)
+                    self._abort_if_unique_id_configured()
+                return self.async_update_reload_and_abort(
+                    entry, unique_id=unique_id, data_updates=data
+                )
 
         return self.async_show_form(
             step_id="reconfigure",

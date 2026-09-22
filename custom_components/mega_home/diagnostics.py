@@ -7,6 +7,7 @@ from typing import Any
 from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
 
+from .core import stream
 from .core.const import CONF_TOKEN
 from .coordinator import MegaHomeConfigEntry
 
@@ -76,6 +77,14 @@ async def async_get_config_entry_diagnostics(
         "sip_bridge": (
             coordinator.sip_bridge.state() if coordinator.sip_bridge else None
         ),
+        # Слушатели событий устройств: почему источник мёртв (порт 8189 занят,
+        # у источника нет порта) — иначе «ленты нет» видно только по коду.
+        "listeners": coordinator.event_sources.state() if coordinator.event_sources else None,
+        # Недоставленные менеджеру события и сколько потеряно переполнением.
+        "device_events": coordinator.events.state() if coordinator.events else None,
+        # Сессии дома против потолка: «дом держит уже 32 соединений» объект
+        # 2026-09-21 разбирал без этого числа.
+        "sessions": {"open": stream.open_total(), "limit": stream.TOTAL_STREAMS},
         "home": {
             "name": config.get("home", {}).get("name"),
             "floors": len(config.get("floors", [])),

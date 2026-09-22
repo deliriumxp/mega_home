@@ -107,7 +107,8 @@ HEADER = struct.Struct(">I")
 _open_total = 0
 
 
-def _total() -> int:
+def open_total() -> int:
+    """Сколько сессий открыто во всём доме — для потолка и диагностики."""
     return _open_total
 
 
@@ -343,7 +344,7 @@ class Streams:
         # этого шесть одновременных запросов браузера обходили бы потолок.
         if len(self._streams) + len(self._opening_ids) > MAX_STREAMS:
             return f"на объекте уже {MAX_STREAMS} открытых сессии"
-        if _total() >= TOTAL_STREAMS:
+        if open_total() >= TOTAL_STREAMS:
             return f"дом держит уже {TOTAL_STREAMS} соединений"
         return None
 
@@ -550,7 +551,9 @@ class _WsStream(_SessionBase):
         try:
             connector = aiohttp.TCPConnector(ssl=False) if self._req.get("tls") is True else None
             self._session = aiohttp.ClientSession(connector=connector)
-            self._socket = await self._session.ws_connect(self._url, headers=headers, timeout=10)
+            # Срок — на РУКОПОЖАТИЕ: число в `timeout=` у aiohttp задавало лишь
+            # срок закрытия (и устарело), а к мёртвому адресу ждали бы минуты.
+            self._socket = await asyncio.wait_for(self._session.ws_connect(self._url, headers=headers), 10)
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as err:
             await self._done(_describe(err))
             return

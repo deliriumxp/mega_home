@@ -25,6 +25,8 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
+from .photos import write_atomic
+
 # {"x": 0.123, "y": 0.456, "w": 0.789} weighs well under a hundred bytes; this
 # leaves headroom without allowing an arbitrary-size upload.
 MAX_CROP_BYTES = 1024
@@ -59,10 +61,7 @@ class CropStore:
     def save(self, tile_id: str, crop: dict[str, float]) -> None:
         """Write one crop. Temp file + rename: no half-written JSON ever served."""
         self._dir.mkdir(0o755, parents=True, exist_ok=True)
-        target = self.path(tile_id)
-        temporary = target.with_suffix(".part")
-        temporary.write_text(json.dumps(crop), encoding="utf-8")
-        temporary.replace(target)
+        write_atomic(self.path(tile_id), json.dumps(crop).encode("utf-8"))
 
     def delete(self, tile_id: str) -> bool:
         try:

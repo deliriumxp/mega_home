@@ -390,7 +390,9 @@ async def _ws(payload: dict[str, Any]) -> dict[str, Any]:
         # проверять его нечем (`resolve_address` пускает только частные адреса).
         connector = aiohttp.TCPConnector(ssl=False) if payload.get("tls") is True else None
         async with aiohttp.ClientSession(connector=connector) as session:
-            socket_ = await session.ws_connect(url, headers=headers, timeout=timeout)
+            # Срок — на рукопожатие (`timeout=` числом у aiohttp — лишь срок
+            # закрытия, и он устарел): к мёртвому адресу иначе ждали бы минуты.
+            socket_ = await asyncio.wait_for(session.ws_connect(url, headers=headers), timeout)
             got: list[dict[str, Any]] = []
             try:
                 for item in messages:

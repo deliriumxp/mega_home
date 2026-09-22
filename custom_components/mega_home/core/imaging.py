@@ -58,6 +58,9 @@ QUALITY = 82
 # Сколько картинок считается одновременно: у дома слабый процессор, а плиток
 # в комнате два десятка.
 PARALLEL = 2
+# Сколько вариантов одной картинки дом хранит (см. `LookStore.ensure`): ступени
+# ширины на классы экранов, фон с размытием, ч/б выключенного прибора — с запасом.
+MAX_LOOKS_PER_SOURCE = 32
 
 # ⚠ Коэффициенты яркости — те же, что у `filter: grayscale()` в CSS
 # (Filter Effects, матрица `grayscale`), чтобы вид не сменился при переходе.
@@ -161,6 +164,12 @@ class LookStore:
         target = self.path(tag, source, look)
         if target.is_file():
             return target
+        # ⚠ Потолок вариантов на ОДИН исходник: ступени держат только ширину, а
+        # размытие, затенение и ч/б дают ~77 тысяч сочетаний — из Wi-Fi объекта
+        # без учётки ими забивался бы диск. Приложению хватает единиц на картинку.
+        same_source = target.name[: -len(f"{look.slug}.jpg")]
+        if len(list(self._dir.glob(f"{same_source}*.jpg"))) >= MAX_LOOKS_PER_SOURCE:
+            raise ValueError(f"вариантов {source.name} уже {MAX_LOOKS_PER_SOURCE}")
         payload = render(source, look)
         self._dir.mkdir(0o755, parents=True, exist_ok=True)
         # ⚠ Имя черновика уникальное: тот же вариант может считать `refresh` в

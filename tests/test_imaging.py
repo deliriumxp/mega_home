@@ -89,6 +89,23 @@ def test_вариант_считается_один_раз(tmp_path: Path):
     assert first == second and second.stat().st_mtime_ns == stamp
 
 
+def test_вариантов_одной_картинки_не_больше_потолка(tmp_path: Path):
+    """⚠ Ступени держат только ширину: размытие × затенение × ч/б — десятки
+    тысяч сочетаний, и из Wi-Fi объекта без учётки ими забивался бы диск."""
+    import pytest
+
+    from mega_home.core import imaging
+
+    source = jpeg(tmp_path / "p" / "room.jpg", size=(400, 300))
+    store = LookStore(tmp_path / "looks", {"p": source.parent})
+    for dim in range(imaging.MAX_LOOKS_PER_SOURCE):
+        store.ensure("p", source, Look(360, 0, False, dim))
+    with pytest.raises(ValueError):
+        store.ensure("p", source, Look(360, 0, False, 89))
+    # Уже посчитанный — отдаётся и дальше.
+    assert store.ensure("p", source, Look(360, 0, False, 0)).is_file()
+
+
 def test_замена_фото_пересчитывает_виды_заранее(tmp_path: Path):
     photos = tmp_path / "photos"
     source = jpeg(photos / "abc.jpg", color=(10, 10, 10))

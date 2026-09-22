@@ -24,6 +24,7 @@ from collections.abc import Iterable
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .const import TILE_PHOTO_PREFIX
 
@@ -34,11 +35,28 @@ JPEG_MAGIC = b"\xff\xd8\xff"
 MAX_PHOTO_BYTES = 4 * 1024 * 1024
 
 
+def write_atomic(target: Path, payload: bytes) -> None:
+    """Черновик и переименование: полузаписанный файл не отдаётся никогда.
+
+    ⚠ Имя черновика УНИКАЛЬНОЕ: два телефона, сохраняющие фон одной комнаты
+    разом, общим `.part` писали бы в один файл и переименовывали чужой.
+    """
+    temporary = target.with_name(f"{target.name}.{uuid4().hex}.part")
+    temporary.write_bytes(payload)
+    temporary.replace(target)
+
+
 class PhotoStore:
     """Room photos on disk. Every method here blocks — call it in an executor."""
 
     def __init__(self, directory: Path) -> None:
         self._dir = directory
+        # Имя файла → (mtime_ns, размер, версия). ⚠ Только кэш счёта, не версия:
+        # список фонов приложение спрашивает часто, а сумма по содержимому
+        # десятков снимков до 4 МБ — дорогой проход на слабом процессоре дома.
+        # Свои записи кладут версию сюда сами (`save`), поэтому зернистость
+        # `st_mtime_ns` (см. `versions`) здесь не укусит.
+        self._known: dict[str, tuple[int, int, str]] = {}
 
     @property
     def directory(self) -> Path:
@@ -77,18 +95,24 @@ class PhotoStore:
         """
         self._dir.mkdir(0o755, parents=True, exist_ok=True)
         target = self.path(room_id)
-        temporary = target.with_suffix(".part")
-        temporary.write_bytes(payload)
-        temporary.replace(target)
-        return self._version(target)
+        write_atomic(target, payload)
+        version = sha1(payload).hexdigest()[:16]
+        stat = target.stat()
+        self._known[target.name] = (stat.st_mtime_ns, stat.st_size, version)
+        return version
 
-    @staticmethod
-    def _version(path: Path) -> str:
+    def _version(self, path: Path) -> str:
+        stat = path.stat()
+        known = self._known.get(path.name)
+        if known is not None and known[:2] == (stat.st_mtime_ns, stat.st_size):
+            return known[2]
         digest = sha1()
         with path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(64 * 1024), b""):
                 digest.update(chunk)
-        return digest.hexdigest()[:16]
+        version = digest.hexdigest()[:16]
+        self._known[path.name] = (stat.st_mtime_ns, stat.st_size, version)
+        return version
 
     def delete(self, room_id: str) -> bool:
         try:
