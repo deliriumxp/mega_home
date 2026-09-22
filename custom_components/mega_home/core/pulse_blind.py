@@ -26,7 +26,10 @@ from typing import Any, Awaitable, Callable
 OPEN, CLOSE = "open", "close"
 STOP_METHODS = ("pulse_both", "pulse_last", "pulse_opposite", "pulse_up", "pulse_down", "none")
 # Как часто пересчитывается оценка положения на ходу (ползунок у жильца).
-POSITION_UPDATE_S = 0.25
+# ⚠ Раз в секунду, а не 4 раза (решение заказчика 2026-09-22): каждый пересчёт —
+# новое состояние сущности, то есть запись в историю HA и кадр в поток жильца;
+# при 0.25 с один ход шторы давал ~80 записей. Ползунок идёт шагами, и это принято.
+POSITION_UPDATE_S = 1.0
 
 Call = Callable[[str, str, dict[str, Any]], Awaitable[None]]
 
