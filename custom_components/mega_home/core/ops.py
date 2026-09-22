@@ -319,18 +319,13 @@ async def command(
     answer = await call(
         coordinator.source, spec["domain"], spec["service"], {"entity_id": tile["entityId"], **data}, wants
     )
-    # ⚠ Ответ несёт НОВОЕ состояние плитки, а не только «принято». Иначе
-    # приложению остаётся либо ждать следующего снимка (тап выглядит
-    # непринятым почти секунду), либо рисовать угаданное состояние — и то и
-    # другое неправильно там, где настоящее состояние лежит в двух шагах.
-    # Служба вызвана блокирующе, поэтому машина состояний уже обновлена.
-    return {
-        "accepted": True,
-        **({"response": answer["response"]} if wants else {}),
-        "entity": entity_view(
-            tile, coordinator.source.get(tile["entityId"]), coordinator.source.cameras
-        ),
-    }
+    # ⚠ Только «выполнено». Здесь отдавалось состояние сразу после вызова с
+    # припиской «машина состояний уже обновлена» — это наша догадка, а не
+    # контракт: HA обещает выполнение службы, а изменения велит слушать
+    # `state_changed` (менеджер: `docs/docs-ha/dev-api-websocket.md`, «Calling a
+    # service action»). У KNX состояние меняется по телеграмме подтверждения,
+    # позже ответа. Новое состояние приносит поток дома (`events.py`).
+    return {"accepted": True, **({"response": answer["response"]} if wants else {})}
 
 async def scenario(
     coordinator: Any, payload: dict[str, Any]
@@ -355,8 +350,7 @@ async def call(
     not set up yet.
     """
     try:
-        # Источник ждёт выполнения: ответ обязан нести состояние ПОСЛЕ команды
-        # (см. command).
+        # Источник ждёт выполнения службы: отказ приходит ответом на команду.
         result = await source.call(domain, service, data, response)
     except CommandUnknown as err:
         LOGGER.warning("Service %s.%s is not available", domain, service)

@@ -61,8 +61,9 @@ class HaSource:
         self, domain: str, service: str, data: dict[str, Any], response: bool = False
     ) -> Any:
         try:
-            # blocking=True: ответ обязан нести состояние ПОСЛЕ команды. Служба
-            # выполняется внутри того же HA — ожидание здесь доли миллисекунды.
+            # blocking=True: ждём ВЫПОЛНЕНИЯ службы, чтобы её отказ дошёл до
+            # жильца ответом. Нового состояния это не обещает — его несёт
+            # `state_changed` (подписка `subscribe` ниже).
             # ⚠ `return_response` только по просьбе: служба без ответа на него
             # падает (dev-api-websocket.md, «return_response»: «Must be included
             # for service actions that return response data»).

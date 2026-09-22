@@ -43,18 +43,6 @@ _frames: dict[str, tuple[float, str, bytes]] = {}
 _grabbing: set[str] = set()
 
 
-def _camera(hass: HomeAssistant, entity_id: str):  # noqa: ANN201 - HA camera entity
-    """Сущность камеры или отказ, понятный жильцу (`HomeAssistantError` от HA)."""
-    from homeassistant.components.camera.helper import get_camera_from_entity_id
-    from homeassistant.exceptions import HomeAssistantError
-
-    try:
-        return get_camera_from_entity_id(hass, entity_id)
-    except HomeAssistantError as err:
-        LOGGER.debug("Camera %s is not available: %s", entity_id, err)
-        raise OpError("Камера недоступна в Home Assistant", HTTPStatus.NOT_FOUND) from err
-
-
 async def stream_source(hass: HomeAssistant, entity_id: str) -> str | None:
     """Адрес живого потока этой камеры (`source.Cameras.stream_source`).
 
@@ -63,12 +51,19 @@ async def stream_source(hass: HomeAssistant, entity_id: str) -> str | None:
     адрес потока камеры, кроме как у самого HA. Нет потока или камера сейчас
     недоступна — `None`, а не отказ: вызывающая сторона (`ha_source.HaCameras`,
     фоновый прогрев) не читает у пользователя, ей нечего показать в ответ.
+
+    ⚠ Публичной функцией компонента `camera.async_get_stream_source`, а не его
+    внутренним хелпером `camera.helper.get_camera_from_entity_id`, как было:
+    хелпер — деталь ядра, функция — то, чем компонент отдаёт поток наружу
+    (менеджер: `docs/ha-official-api.md`).
     """
+    from homeassistant.components.camera import async_get_stream_source
+    from homeassistant.exceptions import HomeAssistantError
+
     try:
-        camera = _camera(hass, entity_id)
-        return await camera.stream_source()
-    except OpError as err:
-        LOGGER.debug("Stream source of %s unavailable: %s", entity_id, err.message)
+        return await async_get_stream_source(hass, entity_id)
+    except HomeAssistantError as err:
+        LOGGER.debug("Stream source of %s unavailable: %s", entity_id, err)
         return None
 
 
