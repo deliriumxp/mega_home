@@ -21,6 +21,34 @@ class OpError(Exception):
         self.message = message
         self.status = int(status)
 
+# Кто скомандовал домом — для журнала источника состояний (в HA — подпись
+# «вызвано: Mega Home — Иван, удалённое приложение»). Только ИСТОЧНИК: что и
+# какой прибор переключился, источник знает сам и пишет своей строкой.
+#
+# ⚠ `via` называет ДВЕРЬ, а не приложение: локальную дверь дом знает сам, а
+# снаружи подпись ставит менеджер (он же знает учётку из сессии). Тексту из
+# тела запроса доверять нельзя — его пишет телефон, — поэтому имя из тела
+# (`by`, как человек назвался на устройстве) берётся, только когда менеджер
+# своего не дал.
+VIA_LOCAL = "локальное приложение"
+VIA_REMOTE = "удалённое приложение"
+ACTOR_MAX = 64
+Actor = dict[str, str]
+
+
+def actor(given: Any, payload: Any, via: str) -> Actor:
+    """Подпись команды из того, что дала дверь, и того, что назвало приложение."""
+    trusted = given if isinstance(given, dict) else {}
+    body = payload if isinstance(payload, dict) else {}
+    return {
+        "name": _label(trusted.get("name")) or _label(body.get("by")),
+        "via": _label(trusted.get("via")) or via,
+    }
+
+
+def _label(value: Any) -> str:
+    return " ".join(value.split())[:ACTOR_MAX] if isinstance(value, str) else ""
+
 def json_default(value: Any) -> Any:
     """Чего нет в JSON — так же, как у энкодера Home Assistant (`helpers/json.py`).
 

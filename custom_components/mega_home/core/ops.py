@@ -31,7 +31,7 @@ from typing import Any
 
 from . import connect as connect_mod
 from .const import LOGGER
-from .ops_base import OpError, arguments, find, number
+from .ops_base import VIA_REMOTE, Actor, OpError, actor, arguments, find, number
 from .probe import run as run_probe
 from .scan import run as run_scan
 from .source import CommandRejected, CommandUnknown, EntityState, StateSource
@@ -74,10 +74,12 @@ async def run(coordinator: Any, op: str, payload: dict[str, Any] | None) -> Any:
         return config(coordinator)
     if op == "states":
         return states(coordinator)
+    # Операцию канала собирает МЕНЕДЖЕР (он знает учётку из сессии): его `actor`
+    # и есть подпись команды.
     if op == "command":
-        return await command(coordinator, data)
+        return await command(coordinator, data, actor(data.get("actor"), data, VIA_REMOTE))
     if op == "scenario":
-        return await scenario(coordinator, data)
+        return await scenario(coordinator, data, actor(data.get("actor"), data, VIA_REMOTE))
     if op == "connect":
         # Единственный контракт транспорта наружу (`connect.py`): один код для
         # операции канала и для локального маршрута `api/connect`
@@ -283,9 +285,12 @@ def device_events(coordinator: Any, query: dict[str, Any]) -> dict[str, Any]:
     return {"events": store.list(access, limit, before)}
 
 async def command(
-    coordinator: Any, payload: dict[str, Any]
+    coordinator: Any, payload: dict[str, Any], by: Actor | None = None
 ) -> dict[str, Any]:
-    """One command for one tile, mapped onto a Home Assistant service call."""
+    """One command for one tile, mapped onto a Home Assistant service call.
+
+    `by` — кто скомандовал (`ops_base.actor`): его подписывает журнал источника.
+    """
     tile = find(coordinator.data.get("tiles", []), payload.get("id"))
     if tile is None:
         raise OpError("Устройство не найдено", HTTPStatus.NOT_FOUND)
@@ -311,7 +316,7 @@ async def command(
     # `calendar.get_events`, `todo.get_items`: этих данных нет в атрибутах).
     wants = spec.get("response") is True
     answer = await call(
-        coordinator.source, spec["domain"], spec["service"], {"entity_id": tile["entityId"], **data}, wants
+        coordinator.source, spec["domain"], spec["service"], {"entity_id": tile["entityId"], **data}, wants, by
     )
     # ⚠ Только «выполнено». Здесь отдавалось состояние сразу после вызова с
     # припиской «машина состояний уже обновлена» — это наша догадка, а не
@@ -322,7 +327,7 @@ async def command(
     return {"accepted": True, **({"response": answer["response"]} if wants else {})}
 
 async def scenario(
-    coordinator: Any, payload: dict[str, Any]
+    coordinator: Any, payload: dict[str, Any], by: Actor | None = None
 ) -> dict[str, Any]:
     """Run one scenario (a Home Assistant script)."""
     item = find(coordinator.data.get("scenarios", []), payload.get("id"))
@@ -330,11 +335,16 @@ async def scenario(
         raise OpError("Сценарий не найден", HTTPStatus.NOT_FOUND)
     if not item.get("entityId"):
         raise OpError("Сценарий не создан в Home Assistant", HTTPStatus.NOT_FOUND)
-    await call(coordinator.source, "script", "turn_on", {"entity_id": item["entityId"]})
+    await call(coordinator.source, "script", "turn_on", {"entity_id": item["entityId"]}, by=by)
     return {"accepted": True}
 
 async def call(
-    source: StateSource, domain: str, service: str, data: dict[str, Any], response: bool = False
+    source: StateSource,
+    domain: str,
+    service: str,
+    data: dict[str, Any],
+    response: bool = False,
+    by: Actor | None = None,
 ) -> dict[str, Any]:
     """Command the source of states and turn its refusals into plain answers.
 
@@ -345,7 +355,7 @@ async def call(
     """
     try:
         # Источник ждёт выполнения службы: отказ приходит ответом на команду.
-        result = await source.call(domain, service, data, response)
+        result = await source.call(domain, service, data, response, by)
     except CommandUnknown as err:
         LOGGER.warning("Service %s.%s is not available", domain, service)
         raise OpError(

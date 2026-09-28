@@ -114,10 +114,20 @@ def _callback(func: object) -> object:
     return func
 
 
+class _Context:  # noqa: D101 - HA's context: an id that ties an event to a call
+    def __init__(self, user_id: object = None, parent_id: object = None) -> None:
+        import uuid
+
+        self.id = uuid.uuid4().hex
+        self.user_id = user_id
+        self.parent_id = parent_id
+
+
 _module(
     "homeassistant.core",
     HomeAssistant=_HomeAssistant,
     State=_State,
+    Context=_Context,
     callback=_callback,
     Event=dict,
     EventStateChangedData=dict,
@@ -159,6 +169,12 @@ class _HomeAssistantView:  # noqa: D101 - stand-in for the HA base class
 
 
 _module("homeassistant.components")
+# Ключи записи журнала — те же строки, что в ядре (`src-components-logbook-const.py`).
+_module(
+    "homeassistant.components.logbook",
+    LOGBOOK_ENTRY_MESSAGE="message",
+    LOGBOOK_ENTRY_NAME="name",
+)
 _module(
     "homeassistant.components.http",
     HomeAssistantView=_HomeAssistantView,

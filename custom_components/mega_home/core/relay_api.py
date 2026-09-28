@@ -37,7 +37,7 @@ from urllib.parse import parse_qsl, unquote
 from . import ops
 from .crops import crop_key_known, crop_keys, crop_value_valid
 from .imaging import asset_file, photo_file
-from .ops_base import dumps
+from .ops_base import VIA_LOCAL, VIA_REMOTE, actor, dumps
 from .photos import JPEG_MAGIC, MAX_PHOTO_BYTES, photo_key_known, photo_keys
 
 JSON_TYPE = "application/json"
@@ -63,8 +63,10 @@ async def handle(coordinator: Any, payload: dict[str, Any]) -> dict[str, Any]:
     """
     path, query = _path(payload.get("path"))
     method = str(payload.get("method") or "GET").upper()
+    # Подпись команды ставит МЕНЕДЖЕР рядом с запросом, а не в его теле: тело
+    # пишет телефон, и верить ему в том, кто он, нельзя (`ops_base.actor`).
     status, content_type, raw, cache = await dispatch(
-        coordinator, method, path, _body(payload.get("body")), query
+        coordinator, method, path, _body(payload.get("body")), query, payload.get("actor"), VIA_REMOTE
     )
     if isinstance(raw, Path):
         raw = await coordinator.env.run(raw.read_bytes)
@@ -80,9 +82,19 @@ async def handle(coordinator: Any, payload: dict[str, Any]) -> dict[str, Any]:
     return answer
 
 async def dispatch(
-    coordinator: Any, method: str, path: str, body: bytes, query: dict[str, str]
+    coordinator: Any,
+    method: str,
+    path: str,
+    body: bytes,
+    query: dict[str, str],
+    by: Any = None,
+    via: str = VIA_LOCAL,
 ) -> Reply:
-    """Один запрос жильца по пути `api/...` — одинаково для обеих дверей."""
+    """Один запрос жильца по пути `api/...` — одинаково для обеих дверей.
+
+    `by`/`via` — подпись команды от двери: снаружи её даёт менеджер, у
+    локальной двери — только «в доме» и имя, которым назвалось приложение.
+    """
     if coordinator is None or not coordinator.data:
         raise ops.OpError("Дом ещё не синхронизирован с менеджером", HTTPStatus.SERVICE_UNAVAILABLE)
     if ".." in path:
@@ -94,9 +106,11 @@ async def dispatch(
     if path == "api/states" and method == "GET":
         return _json(ops.states(coordinator))
     if path == "api/command" and method == "POST":
-        return _json(await ops.command(coordinator, _json_body(body)))
+        payload = _json_body(body)
+        return _json(await ops.command(coordinator, payload, actor(by, payload, via)))
     if path == "api/scenario" and method == "POST":
-        return _json(await ops.scenario(coordinator, _json_body(body)))
+        payload = _json_body(body)
+        return _json(await ops.scenario(coordinator, payload, actor(by, payload, via)))
     if path == "api/intercom" and method == "POST":
         # Отбой идущего вызова домофонии: тот же код, что у операции канала.
         return _json(await ops.intercom(coordinator, _json_body(body)))
