@@ -51,7 +51,7 @@ def test_подпись_команды_событием_до_вызова_тем
     """Журнал HA подписывает смену ПЕРВЫМ событием контекста (`src-core.py`,
     `origin_event`): позже вызова им стал бы сам вызов службы."""
     hass = _Hass()
-    by = {"name": "Иван", "via": "удалённое приложение"}
+    by = {"name": "Иван", "via": "Удалённо"}
     asyncio.run(HaSource(hass).call("light", "turn_on", {"entity_id": "light.a"}, by=by))
     assert [step for step, _ in hass.log] == ["fire", "call"]
     ((event_type, data, context),) = hass.bus.fired
@@ -74,8 +74,8 @@ def test_без_подписи_событие_не_пишется() -> None:
 def test_серия_команд_одного_человека_одним_контекстом_и_одним_событием() -> None:
     hass = _Hass()
     source = HaSource(hass)
-    ivan = {"name": "Иван", "via": "удалённое приложение"}
-    ira = {"name": "Ира", "via": "локальное приложение"}
+    ivan = {"name": "Иван", "via": "Удалённо"}
+    ira = {"name": "Ира", "via": "Локально"}
     first = source._context(ivan, now=100.0)
     assert source._context(ivan, now=105.0) is first  # слайдер тянут дальше
     assert source._context(ivan, now=114.0) is first  # пауза меньше SERIES_GAP от ПОСЛЕДНЕЙ

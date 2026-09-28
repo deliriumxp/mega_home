@@ -113,38 +113,44 @@ def test_команда_прибором_идёт_через_тот_же_пер�
     assert json_of(answer)["accepted"] is True
 
 
-# Подпись команды для журнала HA: снаружи её ставит менеджер РЯДОМ с запросом,
-# и тело телефона её не перебивает — иначе любой назвался бы кем угодно.
-def test_команда_снаружи_подписана_менеджером_а_не_телом(coordinator):
-    body = json.dumps({"id": "t1", "command": "turn_on", "by": "Самозванец"}).encode()
+# Подпись команды для журнала HA: имя — заданное в приложении, источник — от
+# двери. Снаружи источник ставит менеджер РЯДОМ с запросом, и тело телефона его
+# не перебивает — иначе локальная команда назвалась бы удалённой.
+def test_снаружи_имя_из_приложения_источник_от_менеджера(coordinator):
+    body = json.dumps({"id": "t1", "command": "turn_on", "by": "Ноутбук"}).encode()
     payload = {
         "method": "POST",
         "path": "api/command",
         "body": base64.b64encode(body).decode("ascii"),
-        "actor": {"name": "Иван", "via": "удалённое приложение"},
+        "actor": {"name": "Павел", "via": "Удалённо"},
     }
     asyncio.run(handle(coordinator, payload))
-    assert coordinator.source.by == [{"name": "Иван", "via": "удалённое приложение"}]
+    assert coordinator.source.by == [
+        {"name": "Ноутбук", "via": "Удалённо", "action": "turn_on", "target": "Свет"}
+    ]
 
 
-# Гость по временной ссылке: учётки нет, менеджер даёт только источник
-# («временный доступ №5»), имя — то, которым назвался телефон.
-def test_гость_снаружи_назван_телефоном_а_источник_от_менеджера(coordinator):
-    body = json.dumps({"id": "t1", "command": "turn_on", "by": "Сергей"}).encode()
+def test_телефон_не_назвался_имя_учётки_от_менеджера(coordinator):
+    body = json.dumps({"id": "t1", "command": "turn_on", "via": "Локально"}).encode()
     payload = {
         "method": "POST",
         "path": "api/command",
         "body": base64.b64encode(body).decode("ascii"),
-        "actor": {"via": "временный доступ №5"},
+        "actor": {"name": "Павел", "via": "Временный доступ №5"},
     }
     asyncio.run(handle(coordinator, payload))
-    assert coordinator.source.by == [{"name": "Сергей", "via": "временный доступ №5"}]
+    assert coordinator.source.by[0] == {
+        "name": "Павел",
+        "via": "Временный доступ №5",
+        "action": "turn_on",
+        "target": "Свет",
+    }
 
 
 def test_перенос_без_подписи_менеджера_всё_равно_снаружи(coordinator):
     body = json.dumps({"id": "t1", "command": "turn_on", "by": "Ира"}).encode()
     call(coordinator, "POST", "api/command", body)
-    assert coordinator.source.by == [{"name": "Ира", "via": "удалённое приложение"}]
+    assert coordinator.source.by[0]["via"] == "Удалённо"
 
 
 def test_операция_канала_command_подписана_менеджером(coordinator):
@@ -152,11 +158,27 @@ def test_операция_канала_command_подписана_менедже
         ops.run(
             coordinator,
             "command",
-            {"id": "t1", "command": "turn_on", "actor": {"name": "  Иван\n Петров ", "via": "менеджер"}},
+            {"id": "t1", "command": "turn_on", "actor": {"name": "  Иван\n Петров ", "via": "Менеджер"}},
         )
     )
     # Пробелы и переводы строк схлопнуты: подпись — одна строка журнала.
-    assert coordinator.source.by == [{"name": "Иван Петров", "via": "менеджер"}]
+    assert coordinator.source.by[0]["name"] == "Иван Петров"
+    assert coordinator.source.by[0]["via"] == "Менеджер"
+
+
+# Название действия — из описания команды менеджера, прибор — имя плитки.
+def test_действие_из_описания_команды_и_имя_плитки(coordinator):
+    coordinator.data = {
+        **CONFIG,
+        "tiles": [
+            {**CONFIG["tiles"][0], "commands": {"turn_on": {"domain": "light", "service": "turn_on", "label": "Включение"}}}
+        ],
+    }
+    body = json.dumps({"id": "t1", "command": "turn_on", "by": "Ноутбук"}).encode()
+    asyncio.run(dispatch(coordinator, "POST", "api/command", body, {}))
+    assert coordinator.source.by == [
+        {"name": "Ноутбук", "via": "Локально", "action": "Включение", "target": "Свет"}
+    ]
 
 
 def test_подпись_не_длиннее_потолка(coordinator):
@@ -168,7 +190,8 @@ def test_подпись_не_длиннее_потолка(coordinator):
 def test_локальная_дверь_подписана_в_доме(coordinator):
     body = json.dumps({"id": "t1", "command": "turn_on", "by": "Ира"}).encode()
     asyncio.run(dispatch(coordinator, "POST", "api/command", body, {}))
-    assert coordinator.source.by == [{"name": "Ира", "via": "локальное приложение"}]
+    assert coordinator.source.by[0]["name"] == "Ира"
+    assert coordinator.source.by[0]["via"] == "Локально"
 
 
 # ⚠ Подпись — строка «Активности» HA, а строка прибора бывает лишь при смене

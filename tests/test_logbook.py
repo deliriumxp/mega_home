@@ -1,4 +1,4 @@
-"""Подпись Mega Home в журнале HA (`logbook.py`): кто скомандовал, и только он."""
+"""Подпись Mega Home в журнале HA (`logbook.py`): кто — в имени, что — в тексте."""
 
 from __future__ import annotations
 
@@ -7,17 +7,22 @@ from types import SimpleNamespace
 from mega_home.logbook import async_describe_events, describe
 
 
-# ⚠ Вся подпись — в ИМЕНИ: «С помощью: …» строки прибора журнал собирает только
-# из него, а текст записи туда не попадает.
-def test_подпись_целиком_в_имени_без_текста() -> None:
+# ⚠ «С помощью: …» строки прибора журнал собирает только из ИМЕНИ, поэтому кто —
+# там; действие и прибор — в тексте, который виден лишь в строке события.
+def test_кто_в_имени_что_в_тексте() -> None:
     described: dict = {}
     async_describe_events(None, lambda domain, event, fn: described.update({(domain, event): fn}))
     fn = described[("mega_home", "mega_home_command")]
-    entry = fn(SimpleNamespace(data={"name": "Иван", "via": "удалённое приложение"}))
-    assert entry == {"name": "Mega Home — Иван, удалённое приложение"}
+    data = {"name": "Ноутбук", "via": "Локально", "action": "Включение", "target": "Люстра"}
+    assert fn(SimpleNamespace(data=data)) == {
+        "name": "Mega Home: Ноутбук, Локально",
+        "message": "— Включение — Люстра",
+    }
 
 
-def test_без_имени_остаётся_источник() -> None:
-    assert describe({"name": "", "via": "локальное приложение"}) == "Mega Home — локальное приложение"
-    assert describe({"via": "временный доступ №5"}) == "Mega Home — временный доступ №5"
-    assert describe(None) == "Mega Home"
+def test_недостающие_части_не_оставляют_пустых_разделителей() -> None:
+    assert describe({"via": "Временный доступ №5", "action": "Сценарий", "target": ""}) == {
+        "name": "Mega Home: Временный доступ №5",
+        "message": "— Сценарий",
+    }
+    assert describe(None) == {"name": "Mega Home"}

@@ -31,7 +31,20 @@ from typing import Any
 
 from . import connect as connect_mod
 from .const import LOGGER
-from .ops_base import VIA_REMOTE, Actor, OpError, actor, arguments, changes_state, find, number
+from .ops_base import (
+    VIA_REMOTE,
+    Actor,
+    OpError,
+    actor,
+    arguments,
+    changes_state,
+    find,
+    number,
+    signed,
+)
+
+# Название запуска сценария в журнале HA: «… — Сценарий — Вечер».
+SCENARIO_ACTION = "Сценарий"
 from .probe import run as run_probe
 from .scan import run as run_scan
 from .source import CommandRejected, CommandUnknown, EntityState, StateSource
@@ -321,7 +334,11 @@ async def command(
         spec["service"],
         {"entity_id": tile["entityId"], **data},
         wants,
-        by if changes_state(spec, state) else None,
+        # Название действия — из описания команды менеджера (`label`); нет его —
+        # само имя команды. Прибор — как его зовёт плитка приложения.
+        signed(by, spec.get("label") or name, tile.get("name"))
+        if by is not None and changes_state(spec, state)
+        else None,
     )
     # ⚠ Только «выполнено». Здесь отдавалось состояние сразу после вызова с
     # припиской «машина состояний уже обновлена» — это наша догадка, а не
@@ -340,7 +357,13 @@ async def scenario(
         raise OpError("Сценарий не найден", HTTPStatus.NOT_FOUND)
     if not item.get("entityId"):
         raise OpError("Сценарий не создан в Home Assistant", HTTPStatus.NOT_FOUND)
-    await call(coordinator.source, "script", "turn_on", {"entity_id": item["entityId"]}, by=by)
+    await call(
+        coordinator.source,
+        "script",
+        "turn_on",
+        {"entity_id": item["entityId"]},
+        by=signed(by, SCENARIO_ACTION, item.get("name")) if by is not None else None,
+    )
     return {"accepted": True}
 
 async def call(
