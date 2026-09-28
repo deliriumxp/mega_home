@@ -21,7 +21,7 @@ from mega_home.core import ops
 from mega_home.core.crops import CropStore
 from mega_home.core.imaging import LookStore
 from mega_home.core.photos import PhotoStore
-from mega_home.core.relay_api import handle
+from mega_home.core.relay_api import dispatch, handle
 
 JPEG = b"\xff\xd8\xff\xe0" + b"0" * 32
 
@@ -111,6 +111,64 @@ def test_состав_и_состояния_едут_теми_же_путями(
 def test_команда_прибором_идёт_через_тот_же_перенос(coordinator):
     answer = call(coordinator, "POST", "api/command", json.dumps({"id": "t1", "command": "turn_on"}).encode())
     assert json_of(answer)["accepted"] is True
+
+
+# Подпись команды для журнала HA: снаружи её ставит менеджер РЯДОМ с запросом,
+# и тело телефона её не перебивает — иначе любой назвался бы кем угодно.
+def test_команда_снаружи_подписана_менеджером_а_не_телом(coordinator):
+    body = json.dumps({"id": "t1", "command": "turn_on", "by": "Самозванец"}).encode()
+    payload = {
+        "method": "POST",
+        "path": "api/command",
+        "body": base64.b64encode(body).decode("ascii"),
+        "actor": {"name": "Иван", "via": "удалённое приложение"},
+    }
+    asyncio.run(handle(coordinator, payload))
+    assert coordinator.source.by == [{"name": "Иван", "via": "удалённое приложение"}]
+
+
+# Гость по временной ссылке: учётки нет, менеджер даёт только источник
+# («временный доступ №5»), имя — то, которым назвался телефон.
+def test_гость_снаружи_назван_телефоном_а_источник_от_менеджера(coordinator):
+    body = json.dumps({"id": "t1", "command": "turn_on", "by": "Сергей"}).encode()
+    payload = {
+        "method": "POST",
+        "path": "api/command",
+        "body": base64.b64encode(body).decode("ascii"),
+        "actor": {"via": "временный доступ №5"},
+    }
+    asyncio.run(handle(coordinator, payload))
+    assert coordinator.source.by == [{"name": "Сергей", "via": "временный доступ №5"}]
+
+
+def test_перенос_без_подписи_менеджера_всё_равно_снаружи(coordinator):
+    body = json.dumps({"id": "t1", "command": "turn_on", "by": "Ира"}).encode()
+    call(coordinator, "POST", "api/command", body)
+    assert coordinator.source.by == [{"name": "Ира", "via": "удалённое приложение"}]
+
+
+def test_операция_канала_command_подписана_менеджером(coordinator):
+    asyncio.run(
+        ops.run(
+            coordinator,
+            "command",
+            {"id": "t1", "command": "turn_on", "actor": {"name": "  Иван\n Петров ", "via": "менеджер"}},
+        )
+    )
+    # Пробелы и переводы строк схлопнуты: подпись — одна строка журнала.
+    assert coordinator.source.by == [{"name": "Иван Петров", "via": "менеджер"}]
+
+
+def test_подпись_не_длиннее_потолка(coordinator):
+    body = json.dumps({"id": "t1", "command": "turn_on", "by": "И" * 500}).encode()
+    asyncio.run(dispatch(coordinator, "POST", "api/command", body, {}))
+    assert len(coordinator.source.by[0]["name"]) == 64
+
+
+def test_локальная_дверь_подписана_в_доме(coordinator):
+    body = json.dumps({"id": "t1", "command": "turn_on", "by": "Ира"}).encode()
+    asyncio.run(dispatch(coordinator, "POST", "api/command", body, {}))
+    assert coordinator.source.by == [{"name": "Ира", "via": "локальное приложение"}]
 
 
 # ⚠ Ровно то, ради чего перенос и делался: фотография, поставленная СНАРУЖИ,

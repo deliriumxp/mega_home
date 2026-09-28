@@ -14,20 +14,59 @@ from mega_home.core.source import CommandRejected, CommandUnknown
 
 
 class _Services:
-    def __init__(self, raises: Exception | None = None) -> None:
+    def __init__(self, raises: Exception | None = None, log: list | None = None) -> None:
         self.calls: list[tuple] = []
+        self.contexts: list = []
         self.raises = raises
+        self.log = log if log is not None else []
 
-    async def async_call(self, domain, service, data, blocking=False, return_response=False):  # noqa: ANN001, ANN201
+    async def async_call(self, domain, service, data, blocking=False, return_response=False, context=None):  # noqa: ANN001, ANN201
         self.calls.append((domain, service, data, blocking, return_response))
+        self.contexts.append(context)
+        self.log.append(("call", context))
         if self.raises:
             raise self.raises
         return {"forecast": []} if return_response else None
 
 
+class _Bus:
+    def __init__(self, log: list) -> None:
+        self.fired: list[tuple] = []
+        self.log = log
+
+    def async_fire(self, event_type, event_data=None, context=None):  # noqa: ANN001, ANN201
+        self.fired.append((event_type, event_data, context))
+        self.log.append(("fire", context))
+
+
 class _Hass:
     def __init__(self, raises: Exception | None = None) -> None:
-        self.services = _Services(raises)
+        # Общий журнал вызовов шины и служб: проверяется их ПОРЯДОК.
+        self.log: list[tuple] = []
+        self.services = _Services(raises, self.log)
+        self.bus = _Bus(self.log)
+
+
+def test_подпись_команды_событием_до_вызова_тем_же_контекстом() -> None:
+    """Журнал HA подписывает смену ПЕРВЫМ событием контекста (`src-core.py`,
+    `origin_event`): позже вызова им стал бы сам вызов службы."""
+    hass = _Hass()
+    by = {"name": "Иван", "via": "удалённое приложение"}
+    asyncio.run(HaSource(hass).call("light", "turn_on", {"entity_id": "light.a"}, by=by))
+    assert [step for step, _ in hass.log] == ["fire", "call"]
+    ((event_type, data, context),) = hass.bus.fired
+    assert event_type == "mega_home_command"
+    assert context is hass.services.contexts[0]
+    # Только ИСТОЧНИК: что переключилось, HA пишет сам. И ни в коем случае
+    # не `entity_id` — журнал прибора показал бы событие отдельной строкой.
+    assert data == by
+
+
+def test_без_подписи_событие_не_пишется() -> None:
+    hass = _Hass()
+    asyncio.run(HaSource(hass).call("light", "turn_on", {"entity_id": "light.a"}))
+    assert hass.bus.fired == []
+    assert hass.services.contexts[0] is not None
 
 
 def test_команда_ждёт_выполнения() -> None:

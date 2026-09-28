@@ -8,13 +8,19 @@ from time import monotonic
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.core import Event, EventStateChangedData, HomeAssistant, State, callback
+from homeassistant.core import Context, Event, EventStateChangedData, HomeAssistant, State, callback
 from homeassistant.exceptions import HomeAssistantError, ServiceNotFound
 from homeassistant.helpers.event import async_track_state_change_event
 
 from .core.const import LOGGER
 from .core.ops_base import OpError
 from .core.source import CommandRejected, CommandUnknown
+
+# Событие «команда Mega Home»: подпись источника команды в журнале HA
+# (`logbook.py`). ⚠ В данных нет ключа `entity_id`: журнал прибора ищет события
+# по нему, и наше событие встало бы там отдельной строкой рядом со сменой
+# состояния, которую само и подписывает (`src-components-logbook-queries-entities.py`).
+EVENT_COMMAND = "mega_home_command"
 
 # Предел кадра. Больше — отказ, а не обрезанная картинка: кадр едет кадром
 # переноса до менеджера, и переросший его закрыл бы канал в дом целиком.
@@ -149,8 +155,25 @@ class HaSource:
         return self.hass.states.get(entity_id)
 
     async def call(
-        self, domain: str, service: str, data: dict[str, Any], response: bool = False
+        self,
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        response: bool = False,
+        by: dict[str, str] | None = None,
     ) -> Any:
+        # Один контекст на команду: HA связывает им вызов и всё, что из него
+        # вышло, и подписывает в журнале «исходной причиной» (data-context.md:
+        # «The context thus allows to attribute all changes to their original
+        # cause internally and in the logbook»).
+        context = Context()
+        if by is not None:
+            # ⚠ Событие — ДО вызова и тем же контекстом. Причиной журнал считает
+            # ПЕРВОЕ событие контекста (`src-core.py`: `if not
+            # context.origin_event`); позже вызова им стал бы сам вызов службы,
+            # и строка прибора осталась бы «вызвано действием light.turn_on».
+            # В событии только ИСТОЧНИК: что переключилось, HA пишет сам.
+            self.hass.bus.async_fire(EVENT_COMMAND, dict(by), context=context)
         try:
             # blocking=True: ждём ВЫПОЛНЕНИЯ службы, чтобы её отказ дошёл до
             # жильца ответом. Нового состояния это не обещает — его несёт
@@ -159,7 +182,7 @@ class HaSource:
             # падает (dev-api-websocket.md, «return_response»: «Must be included
             # for service actions that return response data»).
             return await self.hass.services.async_call(
-                domain, service, data, blocking=True, return_response=response
+                domain, service, data, blocking=True, return_response=response, context=context
             )
         except ServiceNotFound as err:
             raise CommandUnknown(f"{domain}.{service}") from err

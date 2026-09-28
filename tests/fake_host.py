@@ -35,14 +35,19 @@ class FakeSource:
         self.raises = raises
         self.cameras = cameras
         self.subscriptions: list[tuple[list[str], Any]] = []
+        # Подпись каждой команды (`by`) — отдельным списком, рядом с `calls`.
+        self.by: list[dict[str, str] | None] = []
 
     def get(self, entity_id: str) -> Any:
         return self.states.get(entity_id)
 
-    async def call(self, domain: str, service: str, data: dict[str, Any], response: bool = False) -> Any:
+    async def call(
+        self, domain: str, service: str, data: dict[str, Any], response: bool = False, by: Any = None
+    ) -> Any:
         if self.raises:
             raise self.raises
         self.calls.append((domain, service, data))
+        self.by.append(by)
         # Ответ службы — только по просьбе, как у HA (`return_response`).
         return {"asked": f"{domain}.{service}"} if response else None
 
