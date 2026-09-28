@@ -69,6 +69,28 @@ def test_без_подписи_событие_не_пишется() -> None:
     assert hass.services.contexts[0] is not None
 
 
+# ⚠ Каждое описанное событие — строка «Активности»: слайдер яркости давал
+# строку «Mega Home — …» на каждый шаг. Серия одного человека — одно событие.
+def test_серия_команд_одного_человека_одним_контекстом_и_одним_событием() -> None:
+    hass = _Hass()
+    source = HaSource(hass)
+    ivan = {"name": "Иван", "via": "удалённое приложение"}
+    ira = {"name": "Ира", "via": "локальное приложение"}
+    first = source._context(ivan, now=100.0)
+    assert source._context(ivan, now=105.0) is first  # слайдер тянут дальше
+    assert source._context(ivan, now=114.0) is first  # пауза меньше SERIES_GAP от ПОСЛЕДНЕЙ
+    other = source._context(ira, now=114.5)
+    assert other is not first  # другой человек — своя серия
+    later = source._context(ivan, now=130.0)
+    assert later is not first  # пауза дольше SERIES_GAP — новая серия
+    assert [data for _, data, _ in hass.bus.fired] == [ivan, ira, ivan]
+
+
+def test_команды_без_подписи_серий_не_образуют() -> None:
+    source = HaSource(_Hass())
+    assert source._context(None, now=1.0) is not source._context(None, now=1.5)
+
+
 def test_команда_ждёт_выполнения() -> None:
     """Ответ жильцу несёт состояние ПОСЛЕ команды — служба зовётся блокирующе."""
     hass = _Hass()

@@ -1,8 +1,12 @@
-"""Подпись Mega Home в журнале Home Assistant («Activity»).
+"""Подпись Mega Home в журнале Home Assistant («Активность»).
 
-Смена прибора по команде из приложения подписывается так же, как у HomeKit:
-«вызвано: Mega Home — Иван, удалённое приложение». Связь — общий контекст
-события `mega_home_command` и вызова службы (`ha_source.py`).
+Смена прибора по команде из приложения подписывается источником:
+«Пилон → Выключено · С помощью: Mega Home — Иван, удалённое приложение». Связь —
+общий контекст события `mega_home_command` и вызова службы (`ha_source.py`).
+
+⚠ Вся подпись — в ИМЕНИ записи, текста нет. «С помощью: …» у строки прибора
+журнал собирает только из имени (`context_name`); текст записи (`message`) виден
+лишь в строке самого события, и там он повторял бы имя.
 
 ⚠ Страницы документации у платформы журнала НЕТ — контракт только в коде ядра
 (`docs/ha-api-registry.json`, записи `src-components-logbook-*`): ядро само
@@ -16,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from homeassistant.components.logbook import LOGBOOK_ENTRY_MESSAGE, LOGBOOK_ENTRY_NAME
+from homeassistant.components.logbook import LOGBOOK_ENTRY_NAME
 from homeassistant.core import HomeAssistant, callback
 
 from .core.const import DOMAIN
@@ -26,11 +30,12 @@ NAME = "Mega Home"
 
 
 def describe(data: Any) -> str:
-    """Кто скомандовал: «Иван, удалённое приложение». Что переключилось — пишет HA."""
+    """«Mega Home — Иван, удалённое приложение». Что переключилось — пишет HA."""
     body = data if isinstance(data, dict) else {}
-    return ", ".join(
+    who = ", ".join(
         part for part in (body.get("name"), body.get("via")) if isinstance(part, str) and part
     )
+    return f"{NAME} — {who}" if who else NAME
 
 
 @callback
@@ -45,6 +50,6 @@ def async_describe_events(
     # есть `data`, и больше нам ничего не нужно.
     @callback
     def _describe(event: Any) -> dict[str, Any]:
-        return {LOGBOOK_ENTRY_NAME: NAME, LOGBOOK_ENTRY_MESSAGE: describe(event.data)}
+        return {LOGBOOK_ENTRY_NAME: describe(event.data)}
 
     async_describe_event(DOMAIN, EVENT_COMMAND, _describe)

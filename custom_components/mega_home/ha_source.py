@@ -21,6 +21,9 @@ from .core.source import CommandRejected, CommandUnknown
 # по нему, и наше событие встало бы там отдельной строкой рядом со сменой
 # состояния, которую само и подписывает (`src-components-logbook-queries-entities.py`).
 EVENT_COMMAND = "mega_home_command"
+# Пауза, после которой команды того же человека начинают новую серию (`_context`):
+# дольше движения слайдера, короче «вернулся к приложению через минуту».
+SERIES_GAP = 10.0
 
 # Предел кадра. Больше — отказ, а не обрезанная картинка: кадр едет кадром
 # переноса до менеджера, и переросший его закрыл бы канал в дом целиком.
@@ -150,9 +153,42 @@ class HaSource:
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
         self.cameras = HaCameras(hass)
+        # Серия команд одного человека: подпись → (её контекст, время последней команды).
+        self._series: dict[tuple[str, ...], tuple[Context, float]] = {}
 
     def get(self, entity_id: str) -> State | None:
         return self.hass.states.get(entity_id)
+
+    def _context(self, by: dict[str, str] | None, now: float | None = None) -> Context:
+        """Контекст команды: им HA связывает вызов со всем, что из него вышло, и
+        подписывает это в журнале исходной причиной (data-context.md: «The context
+        thus allows to attribute all changes to their original cause internally
+        and in the logbook»).
+
+        ⚠ Подписанная команда продолжает СЕРИЮ своего человека: пока команды идут
+        чаще `SERIES_GAP`, у них один контекст и одно событие подписи. Каждое
+        описанное событие — отдельная строка «Активности» (`src-components-
+        logbook-processor.py`), и слайдер яркости давал их по строке на шаг,
+        хотя смены яркости журнал не показывает вовсе. Так же один контекст на
+        все действия у запуска сценария.
+        """
+        if by is None:
+            return Context()
+        now = monotonic() if now is None else now
+        key = tuple(sorted(by.items()))
+        for stale in [k for k, (_, at) in self._series.items() if now - at > SERIES_GAP]:
+            del self._series[stale]
+        if key in self._series:
+            context = self._series[key][0]
+        else:
+            context = Context()
+            # ⚠ Событие — ДО вызова и тем же контекстом. Причиной журнал считает
+            # ПЕРВОЕ событие контекста (`src-core.py`: `if not
+            # context.origin_event`); позже вызова им стал бы сам вызов службы, и
+            # строка прибора осталась бы «С помощью: Свет».
+            self.hass.bus.async_fire(EVENT_COMMAND, dict(by), context=context)
+        self._series[key] = (context, now)
+        return context
 
     async def call(
         self,
@@ -162,18 +198,7 @@ class HaSource:
         response: bool = False,
         by: dict[str, str] | None = None,
     ) -> Any:
-        # Один контекст на команду: HA связывает им вызов и всё, что из него
-        # вышло, и подписывает в журнале «исходной причиной» (data-context.md:
-        # «The context thus allows to attribute all changes to their original
-        # cause internally and in the logbook»).
-        context = Context()
-        if by is not None:
-            # ⚠ Событие — ДО вызова и тем же контекстом. Причиной журнал считает
-            # ПЕРВОЕ событие контекста (`src-core.py`: `if not
-            # context.origin_event`); позже вызова им стал бы сам вызов службы,
-            # и строка прибора осталась бы «вызвано действием light.turn_on».
-            # В событии только ИСТОЧНИК: что переключилось, HA пишет сам.
-            self.hass.bus.async_fire(EVENT_COMMAND, dict(by), context=context)
+        context = self._context(by)
         try:
             # blocking=True: ждём ВЫПОЛНЕНИЯ службы, чтобы её отказ дошёл до
             # жильца ответом. Нового состояния это не обещает — его несёт
