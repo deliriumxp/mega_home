@@ -171,6 +171,36 @@ def test_локальная_дверь_подписана_в_доме(coordinato
     assert coordinator.source.by == [{"name": "Ира", "via": "локальное приложение"}]
 
 
+# ⚠ Подпись — строка «Активности» HA, а строка прибора бывает лишь при смене
+# СОСТОЯНИЯ: яркость включённого света журнал не пишет, и подпись рядом была
+# голой лишней строкой. Что сделает команда, говорит её описание из менеджера.
+def _signed(coordinator, state: str, command: str, spec: dict) -> bool:
+    coordinator.data = {
+        **CONFIG,
+        "tiles": [{**CONFIG["tiles"][0], "commands": {command: {"domain": "light", **spec}}}],
+    }
+    coordinator.source.states["light.kitchen"] = State(state, {})
+    body = json.dumps({"id": "t1", "command": command, "value": 40, "by": "Ира"}).encode()
+    asyncio.run(dispatch(coordinator, "POST", "api/command", body, {}))
+    return coordinator.source.by[-1] is not None
+
+
+def test_диммирование_включённого_света_не_подписывается(coordinator):
+    spec = {"service": "turn_on", "stateAfter": "on", "fields": {"brightness_pct": {"type": "number", "min": 1, "max": 100}}}
+    assert _signed(coordinator, "on", "set_brightness", spec) is False
+    # Выключенный свет яркость ВКЛЮЧИТ — у прибора будет строка, её подписываем.
+    assert _signed(coordinator, "off", "set_brightness", spec) is True
+
+
+def test_команда_без_смены_состояния_не_подписывается_никогда(coordinator):
+    spec = {"service": "turn_on", "keepsState": True}
+    assert _signed(coordinator, "off", "set_whatever", spec) is False
+
+
+def test_неразмеченная_команда_подписывается(coordinator):
+    assert _signed(coordinator, "on", "toggle", {"service": "toggle"}) is True
+
+
 # ⚠ Ровно то, ради чего перенос и делался: фотография, поставленная СНАРУЖИ,
 # обязана лечь в дом, а не в браузер телефона.
 def test_фото_комнаты_снаружи_ложится_в_дом_и_потом_отдаётся(coordinator):

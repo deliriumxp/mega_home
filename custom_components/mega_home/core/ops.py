@@ -31,7 +31,7 @@ from typing import Any
 
 from . import connect as connect_mod
 from .const import LOGGER
-from .ops_base import VIA_REMOTE, Actor, OpError, actor, arguments, find, number
+from .ops_base import VIA_REMOTE, Actor, OpError, actor, arguments, changes_state, find, number
 from .probe import run as run_probe
 from .scan import run as run_scan
 from .source import CommandRejected, CommandUnknown, EntityState, StateSource
@@ -316,7 +316,12 @@ async def command(
     # `calendar.get_events`, `todo.get_items`: этих данных нет в атрибутах).
     wants = spec.get("response") is True
     answer = await call(
-        coordinator.source, spec["domain"], spec["service"], {"entity_id": tile["entityId"], **data}, wants, by
+        coordinator.source,
+        spec["domain"],
+        spec["service"],
+        {"entity_id": tile["entityId"], **data},
+        wants,
+        by if changes_state(spec, state) else None,
     )
     # ⚠ Только «выполнено». Здесь отдавалось состояние сразу после вызова с
     # припиской «машина состояний уже обновлена» — это наша догадка, а не

@@ -49,6 +49,22 @@ def actor(given: Any, payload: Any, via: str) -> Actor:
 def _label(value: Any) -> str:
     return " ".join(value.split())[:ACTOR_MAX] if isinstance(value, str) else ""
 
+
+def changes_state(spec: dict[str, Any], state: Any) -> bool:
+    """Может ли команда сменить СОСТОЯНИЕ прибора — подписывать ли её в журнале.
+
+    Подпись нужна только там, где у прибора будет своя строка журнала, а она
+    бывает лишь при смене состояния: яркость включённого света журнал не
+    показывает, и подпись рядом с ней — голая лишняя строка. Что команда сделает
+    с состоянием, знает её описание из менеджера (`keepsState`, `stateAfter`), а
+    не дом: своих правил по доменам здесь нет. Не размечено — подписываем.
+    """
+    if spec.get("keepsState") is True:
+        return False
+    after = spec.get("stateAfter")
+    current = getattr(state, "state", None)
+    return not (isinstance(after, str) and current == after)
+
 def json_default(value: Any) -> Any:
     """Чего нет в JSON — так же, как у энкодера Home Assistant (`helpers/json.py`).
 
