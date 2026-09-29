@@ -85,8 +85,15 @@ def test_файл_сверх_потолка_не_сохраняется(tmp_path
 def test_уборка_сносит_старое_и_лишнее(tmp_path, monkeypatch) -> None:
     files, _, _ = _files(tmp_path, monkeypatch)
     monkeypatch.setattr(ef, "MAX_FILES", 2)
+    # Возраст файлов задаём сами: три записи подряд попадают в один тик часов ФС (под
+    # нагрузкой прогона verify — регулярно), и «самый старый» среди равных — любой. На
+    # объекте события приходят с интервалом в секунды.
+    start = time.time() - 60
     for index in range(3):
         _publish(files, {**CALL, "id": f"e{index}"})
+        written = files.find(f"e{index}")
+        if written is not None:
+            os.utime(written[0], (start + index, start + index))
     assert files.find("e0") is None and files.find("e2") is not None
 
     old = files.find("e1")[0]
