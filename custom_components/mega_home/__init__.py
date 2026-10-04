@@ -36,6 +36,7 @@ from .core import go2rtc_embed, services
 from .core.agent import AgentRunner
 from .link import ManagerLink
 from .ha_update import async_self_update
+from .host_system import switch_unit
 from .core.sip_bridge import SipBridge
 
 # Шторы на импульсных реле (`cover.py`) — единственные сущности интеграции: их
@@ -107,6 +108,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # Обновление по кнопке менеджера (`ha_update.py`): ядро зовёт его операцией
     # `self-update`; файлы качает тот же клиент менеджера, что и бандл.
     coordinator.self_update = partial(async_self_update, hass, coordinator.client)
+    # Службы хоста по кнопке менеджера (операция `host-unit`): systemd по D-Bus,
+    # без HA — `host_system.py`.
+    coordinator.host_unit = switch_unit
 
     # Сам Home Assistant — служба дома для `connect`, как go2rtc. Картинки
     # сущностей (`entity_picture` плеера, домен `image`) HA отдаёт по своему

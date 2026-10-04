@@ -137,6 +137,14 @@ async def run(coordinator: Any, op: str, payload: dict[str, Any] | None) -> Any:
         # `version` — какую ставить: менеджер знает релиз раньше HACS (`ha_update.py`).
         wanted = data.get("version")
         return await updater(str(wanted) if isinstance(wanted, str) and wanted else None)
+    if op == "host-unit":
+        # Остановить/запустить службу ХОСТА по кнопке инсталлятора (сегодня —
+        # Bluetooth на ядре с ошибкой MGMT, `host_system.py`). Какая служба и зачем,
+        # решает менеджер; умеет ли хост — адаптер, у ядра этого умения нет.
+        switch = getattr(coordinator, "host_unit", None)
+        if switch is None:
+            raise OpError("Этот дом не управляет службами хоста", HTTPStatus.NOT_IMPLEMENTED)
+        return await switch(str(data.get("unit") or ""), bool(data.get("on")))
     raise OpError("Неизвестная операция", HTTPStatus.NOT_FOUND)
 
 async def connect(payload: dict[str, Any]) -> dict[str, Any]:
