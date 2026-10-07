@@ -181,7 +181,7 @@ class StateStream:
                         self.queue.get(), PING_SECONDS
                     )
                 except TimeoutError:
-                    await self._write(response, "ping", {})
+                    await self._ping(response)
                     continue
                 if name == "end":
                     return response
@@ -196,6 +196,10 @@ class StateStream:
             if streams is not None:
                 streams.discard(self)
         return response
+
+    async def _ping(self, response: web.StreamResponse) -> None:
+        """Пульс после PING_SECONDS тишины — событием, которое видит приложение."""
+        await self._write(response, "ping", {})
 
     async def _write(self, response: web.StreamResponse, name: str, payload: Any) -> None:
         await response.write(f"event: {name}\ndata: {dumps(payload)}\n\n".encode())

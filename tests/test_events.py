@@ -124,6 +124,6 @@ def test_пульс_именованным_событием_которое_ви�
             written.append(data)
 
     stream = StateStream(_Coordinator())
-    asyncio.run(stream._write(_Response(), "ping", {}))
+    asyncio.run(stream._ping(_Response()))
 
     assert written == [b"event: ping\ndata: {}\n\n"]
