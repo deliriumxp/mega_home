@@ -19,8 +19,8 @@ Events on the stream:
 * `entity`  — one tile whose Home Assistant state changed;
 * `config`  — the installer changed the home; carries the new version, and the
   app rereads the config;
-* comment lines (`: ping`) every PING_SECONDS to keep proxies from closing an
-  idle stream.
+* `ping` — every PING_SECONDS of silence: keeps proxies from closing an idle
+  stream and lets the app tell a silent stream from a dead one.
 """
 
 from __future__ import annotations
@@ -35,8 +35,13 @@ from .const import LOGGER
 from .ops_base import dumps
 from .source import EntityState
 
-# Комментарий-пинг: держит соединение открытым через реверс-прокси с таймаутом
-# простоя (у nginx по умолчанию 60 с) и даёт заметить оборванный сокет.
+# Пульс: держит соединение открытым через реверс-прокси с таймаутом простоя
+# (у nginx по умолчанию 60 с) и даёт заметить оборванный сокет.
+# ⚠ Именованное СОБЫТИЕ, а не комментарий `: ping`, как было до 0.5.11:
+# комментарий EventSource приложению не показывает, и замолчавший без обрыва
+# поток приложение отличало от живого только страховочным опросом раз в минуту.
+# Событие приложение видит, и по его отсутствию сверяется с домом само
+# (`home-stream.ts` менеджера). Старые бандлы незнакомое событие не слушают.
 PING_SECONDS = 25
 # Очередь на одного клиента. Переполнение означает, что клиент не читает: дом
 # щёлкает реле быстрее, чем телефон успевает принимать. Тогда стрим закрывается,
@@ -176,7 +181,7 @@ class StateStream:
                         self.queue.get(), PING_SECONDS
                     )
                 except TimeoutError:
-                    await response.write(b": ping\n\n")
+                    await self._ping(response)
                     continue
                 if name == "end":
                     return response
@@ -191,6 +196,10 @@ class StateStream:
             if streams is not None:
                 streams.discard(self)
         return response
+
+    async def _ping(self, response: web.StreamResponse) -> None:
+        """Пульс после PING_SECONDS тишины — событием, которое видит приложение."""
+        await self._write(response, "ping", {})
 
     async def _write(self, response: web.StreamResponse, name: str, payload: Any) -> None:
         await response.write(f"event: {name}\ndata: {dumps(payload)}\n\n".encode())

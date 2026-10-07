@@ -110,3 +110,20 @@ def test_выгрузка_записи_заканчивает_поток_сра�
 
     assert stream.queue is queue
     assert _drain(stream) == [("end", None)]
+
+
+def test_пульс_именованным_событием_которое_видит_приложение():
+    """Комментарий `: ping` EventSource не показывает, и приложение не могло
+    отличить замолчавший поток от живого — держало страховочный опрос."""
+    import asyncio
+
+    written: list[bytes] = []
+
+    class _Response:
+        async def write(self, data: bytes) -> None:
+            written.append(data)
+
+    stream = StateStream(_Coordinator())
+    asyncio.run(stream._ping(_Response()))
+
+    assert written == [b"event: ping\ndata: {}\n\n"]
