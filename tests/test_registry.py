@@ -166,11 +166,13 @@ def test_ответ_спрашивает_источник_про_сущност�
     answer = ops.registry(_Coordinator(source))
     assert source.asked == [["vacuum.robot"]]
     assert answer["areas"][0]["id"] == "kitchen"
+    # Какая плитка — какая сущность: приложение entity_id плиток не знает (он остаётся в доме).
+    assert answer["tiles"] == {"t1": "vacuum.robot"}
 
 
 def test_источник_без_реестров_отвечает_пустым_а_не_падает() -> None:
     answer = ops.registry(_Coordinator(FakeSource()))
-    assert answer == {"areas": [], "floors": [], "labels": [], "devices": [], "entities": []}
+    assert answer == {"areas": [], "floors": [], "labels": [], "devices": [], "entities": [], "tiles": {"t1": "vacuum.robot"}}
 
 
 def test_путь_api_registry_работает_и_для_двери_и_для_переноса() -> None:

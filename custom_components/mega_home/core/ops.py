@@ -248,14 +248,16 @@ def registry(coordinator: Any) -> dict[str, Any]:
     несут (`ha_registry.py`). Сырые данные — толкует приложение. Источник без реестров — пустой
     ответ, а не отказ: это «ничего не знаю», приложение показывает прибор без этих возможностей.
     """
+    tiles = {
+        tile["id"]: tile["entityId"]
+        for tile in (coordinator.data or {}).get("tiles", [])
+        if tile.get("entityId")
+    }
     empty: dict[str, Any] = {"areas": [], "floors": [], "labels": [], "devices": [], "entities": []}
     reader = getattr(coordinator.source, "registry", None)
-    if reader is None:
-        return empty
-    entity_ids = [
-        tile["entityId"] for tile in (coordinator.data or {}).get("tiles", []) if tile.get("entityId")
-    ]
-    return reader(entity_ids)
+    # `tiles` — какая плитка какая сущность: приложение entity_id плиток не знает (он остаётся
+    # в доме, `entity_view`), а записи реестра ищутся по нему.
+    return {**(reader(list(tiles.values())) if reader else empty), "tiles": tiles}
 
 
 def states(coordinator: Any) -> dict[str, Any]:
