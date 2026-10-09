@@ -152,3 +152,15 @@ def test_ответ_службы_только_по_описанию_команд
 def test_число_без_границ_не_проходит():
     with pytest.raises(ValueError):
         arguments({"fields": {"x": {"type": "number"}}}, 1, {})
+
+
+# Список переменной длины (`of`): `cleaning_area_id` у `vacuum.clean_area` — области HA в порядке
+# уборки. Зеркало менеджера (`smart-home-command-args.util.ts`): две стороны одной схемы.
+def test_список_переменной_длины_проверяется_поэлементно() -> None:
+    spec = {"fields": {"cleaning_area_id": {"type": "list", "of": {"type": "string"}}}}
+    assert arguments(spec, ["kitchen", "yard"], {}) == {"cleaning_area_id": ["kitchen", "yard"]}
+    for bad in ([], "kitchen", ["kitchen", 7], ["a"] * 51):
+        with pytest.raises(ValueError):
+            arguments(spec, bad, {})
+    with pytest.raises(ValueError, match="1–50"):
+        arguments(spec, [], {})

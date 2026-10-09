@@ -145,6 +145,13 @@ def _checked(value: Any, rule: dict[str, Any], attributes: dict[str, Any]) -> An
     if kind == "number":
         bound = lambda key: attributes.get(rule.get(key + "Attr"), rule.get(key))  # noqa: E731
         return number(value, bound("min"), bound("max"))
+    if kind == "list" and rule.get("of"):
+        # Список переменной длины: каждый элемент по правилу `of`, число — в `min`/`max`
+        # (по умолчанию 1–50). Зеркало менеджера (`smart-home-command-args.util.ts`).
+        low, high = rule.get("min", 1), rule.get("max", 50)
+        if not isinstance(value, list) or not low <= len(value) <= high:
+            raise ValueError(f"Ожидается список из {low}–{high} значений")
+        return [_checked(item, rule["of"], attributes) for item in value]
     if kind == "list":
         items = rule.get("items") or []
         if not isinstance(value, list) or len(value) != len(items):
