@@ -241,6 +241,23 @@ def _devices(coordinator: Any) -> list[dict[str, str]]:
         return []
     return [{"id": device_id} for device_id in registry.ids()]
 
+def registry(coordinator: Any) -> dict[str, Any]:
+    """Реестры источника по сущностям плиток: области, этажи, метки, устройства и записи сущностей.
+
+    Зачем: зоны уборки пылесоса (области, сопоставленные с его сегментами) и всё, что состояния не
+    несут (`ha_registry.py`). Сырые данные — толкует приложение. Источник без реестров — пустой
+    ответ, а не отказ: это «ничего не знаю», приложение показывает прибор без этих возможностей.
+    """
+    empty: dict[str, Any] = {"areas": [], "floors": [], "labels": [], "devices": [], "entities": []}
+    reader = getattr(coordinator.source, "registry", None)
+    if reader is None:
+        return empty
+    entity_ids = [
+        tile["entityId"] for tile in (coordinator.data or {}).get("tiles", []) if tile.get("entityId")
+    ]
+    return reader(entity_ids)
+
+
 def states(coordinator: Any) -> dict[str, Any]:
     """Current states of every tile, read straight from the source of this home."""
     source: StateSource = coordinator.source

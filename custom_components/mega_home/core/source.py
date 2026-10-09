@@ -106,3 +106,7 @@ class StateSource(Protocol):
         on_change: Callable[[str, EntityState | None], None],
     ) -> Callable[[], None]:
         """Звать `on_change(entity_id, новое состояние)`; возвращает отписку."""
+
+    # Необязательно: `registry(entity_ids) -> dict` — реестры источника (области, этажи, метки,
+    # устройства, записи сущностей; у HA — `ha_registry.read`). Источник без реестров метода не
+    # имеет, и `ops.registry` отвечает пустым (`docs/superpowers/specs/2026-10-10-vacuum-design.md`).

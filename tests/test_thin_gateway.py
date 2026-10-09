@@ -222,7 +222,7 @@ def test_операции_канала_и_маршруты_api_заперты() 
         "intercom",
     }
     locked_routes = {
-        "api/config", "api/states", "api/command", "api/scenario", "api/connect",
+        "api/config", "api/states", "api/registry", "api/command", "api/scenario", "api/connect",
         "api/asset/*", "api/photo*", "api/crop*",
         # кадр сущности camera.* источника — часть B, не вендор
         "api/camera-frame/*",

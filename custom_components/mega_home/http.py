@@ -169,6 +169,13 @@ class MegaHomeStatesView(_RoutedView):
     name = "api:mega_home:states"
 
 
+class MegaHomeRegistryView(_RoutedView):
+    """Реестры Home Assistant по приборам дома: области, этажи, метки, записи сущностей."""
+
+    url = f"{URL_API}/registry"
+    name = "api:mega_home:registry"
+
+
 class MegaHomeCommandView(_RoutedView):
     """One command for one tile, mapped onto a Home Assistant service call."""
 
@@ -495,6 +502,7 @@ def _serve(request: web.Request, relative: str) -> web.StreamResponse:
 VIEWS: tuple[type[HomeAssistantView], ...] = (
     MegaHomeConfigView,
     MegaHomeStatesView,
+    MegaHomeRegistryView,
     MegaHomeEventsView,
     MegaHomeCommandView,
     MegaHomeScenarioView,

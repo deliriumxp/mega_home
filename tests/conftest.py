@@ -207,6 +207,10 @@ _module(
 _module("homeassistant.helpers.aiohttp_client", async_get_clientsession=lambda *a, **k: None)
 _module("homeassistant.helpers")
 _module("homeassistant.helpers.storage", STORAGE_DIR=".storage", Store=_Store)
+# Реестры HA (`ha_registry.py`): тестам нужны сами имена модулей, чтобы адаптер импортировался;
+# настоящие реестры подменяются прямо в спеке (`snapshot` принимает их параметрами).
+for _registry in ("area_registry", "device_registry", "entity_registry", "floor_registry", "label_registry"):
+    _module(f"homeassistant.helpers.{_registry}")
 _module(
     "homeassistant.helpers.update_coordinator",
     DataUpdateCoordinator=_DataUpdateCoordinator,

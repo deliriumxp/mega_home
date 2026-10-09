@@ -12,6 +12,7 @@ from homeassistant.core import Context, Event, EventStateChangedData, HomeAssist
 from homeassistant.exceptions import HomeAssistantError, ServiceNotFound
 from homeassistant.helpers.event import async_track_state_change_event
 
+from . import ha_registry
 from .core.const import LOGGER
 from .core.ops_base import OpError
 from .core.source import CommandRejected, CommandUnknown
@@ -158,6 +159,10 @@ class HaSource:
 
     def get(self, entity_id: str) -> State | None:
         return self.hass.states.get(entity_id)
+
+    def registry(self, entity_ids: list[str]) -> dict[str, Any]:
+        """Реестры этого HA по сущностям плиток (`ha_registry.py`)."""
+        return ha_registry.read(self.hass, entity_ids)
 
     def _context(self, by: dict[str, str] | None, now: float | None = None) -> Context:
         """Контекст команды: им HA связывает вызов со всем, что из него вышло, и

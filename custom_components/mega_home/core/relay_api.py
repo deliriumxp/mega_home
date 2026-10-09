@@ -105,6 +105,11 @@ async def dispatch(
         return _json(ops.config(coordinator))
     if path == "api/states" and method == "GET":
         return _json(ops.states(coordinator))
+    if path == "api/registry" and method == "GET":
+        # Реестры источника (области, этажи, метки, записи сущностей) — ДАННЫЕ дома, как состояния:
+        # менеджер их не знает, живые они только в самом Home Assistant. Тот же код у операции
+        # канала (`http`): ответы не должны разъезжаться.
+        return _json(ops.registry(coordinator))
     if path == "api/command" and method == "POST":
         payload = _json_body(body)
         return _json(await ops.command(coordinator, payload, actor(by, payload, via)))
