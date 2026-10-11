@@ -172,6 +172,52 @@ def test_recovery_is_reported_only_after_a_reported_failure(monkeypatch):
     assert "fail" in events and "recovered" in events
 
 
+PAUSE = [{"probe": 0, "contains": "maintenance"}]
+PAUSED = [{"ok": False, "ms": 5, "error": "refused", "body": "maintenance"}]
+
+
+def test_pause_skips_the_action_and_says_so_once(monkeypatch):
+    # Устройство остановлено намеренно: действие по нему недопустимо, сколько бы
+    # ни длилась остановка, а журнал узнаёт об этом один раз, а не каждый тик.
+    client = FakeClient(answer={"version": "v1", "rules": [rule(pauseIf=PAUSE, pauseNote="обслуживание")]})
+    runner, calls = make(monkeypatch, client, [PAUSED])
+    run(runner.async_start())
+    run(runner.async_sync())
+    for _ in range(3):
+        runner._state.setdefault("r1", {})["ranAt"] = 0
+        run(runner._async_tick())
+    assert len(calls) == 3  # только проверки
+    assert [(r["event"], r["note"]) for r in runner._pending] == [("paused", "обслуживание")]
+
+
+def test_after_a_pause_the_grace_period_starts_over(monkeypatch):
+    # Нарушение, начатое до паузы, не доживает до действия: после остановки
+    # устройство поднимается заново и имеет право на всю выдержку.
+    client = FakeClient(answer={"version": "v1", "rules": [rule(pauseIf=PAUSE, failForSec=3600)]})
+    runner, calls = make(monkeypatch, client, [SICK, PAUSED, SICK])
+    run(runner.async_start())
+    run(runner.async_sync())
+    run(runner._async_tick())
+    runner._state["r1"]["failingSince"] = 1  # нарушение длится давно
+    runner._state["r1"]["ranAt"] = 0
+    run(runner._async_tick())
+    assert "failingSince" not in runner._state["r1"]
+    runner._state["r1"]["ranAt"] = 0
+    run(runner._async_tick())
+    assert len(calls) == 3  # действие так и не ушло
+    assert [r["event"] for r in runner._pending] == ["paused", "resumed"]
+
+
+def test_rule_without_pause_behaves_as_before(monkeypatch):
+    # Правила менеджера старше поля `pauseIf` его не несут — и обязаны работать.
+    client = FakeClient(answer={"version": "v1", "rules": [rule(pauseIf=None)]})
+    runner, calls = make(monkeypatch, client, [PAUSED])
+    run(runner.async_start())
+    run(runner.async_sync())
+    run(runner._async_tick())
+    assert len(calls) == 2  # проверка + действие
+
+
 def test_broken_rule_does_not_take_the_others_down(monkeypatch):
     # Сторож нужен целиком, а не до первого испорченного правила.
     client = FakeClient(answer={"version": "v1", "rules": [{"id": "bad"}, rule(id="good")]})

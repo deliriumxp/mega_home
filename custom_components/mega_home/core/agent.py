@@ -166,8 +166,23 @@ class AgentRunner:
 
         answer = await run_probe(self._env, {"probes": rule["probes"][:MAX_PROBES]})
         results = answer.get("results", [])
-        healthy = all(_check(results, c) for c in rule["healthy"])
 
+        # Пауза: устройство остановлено НАМЕРЕННО (обновление, ручное выключение),
+        # и действовать по нему нельзя — перезагрузка посреди установки пакетов
+        # может не дать устройству подняться вовсе. Серия нарушений сбрасывается:
+        # после паузы выдержка отсчитывается заново, как после старта.
+        pause = rule.get("pauseIf") or []
+        if pause and all(_check(results, c) for c in pause):
+            if not state.get("paused"):
+                state["paused"] = True
+                self._report(rule_id, "paused", rule.get("pauseNote"))
+            state.pop("failingSince", None)
+            state.pop("reported", None)
+            return
+        if state.pop("paused", None):
+            self._report(rule_id, "resumed")
+
+        healthy = all(_check(results, c) for c in rule["healthy"])
         if healthy:
             if state.get("failingSince"):
                 if state.get("reported"):
@@ -269,6 +284,8 @@ def _valid(rule: Any) -> bool:
             and rule["probes"]
             and isinstance(rule.get("healthy"), list)
             and rule["healthy"]
+            # Необязательное: правила менеджера старше этого поля его не несут.
+            and isinstance(rule.get("pauseIf") or [], list)
             and float(rule["everySec"]) > 0
             and float(rule["failForSec"]) >= 0
             and isinstance(rule.get("action"), dict)
