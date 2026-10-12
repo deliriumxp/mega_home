@@ -15,6 +15,7 @@ commands straight from `hass`. The manager takes no part at runtime.
 
 from __future__ import annotations
 
+import re
 from http import HTTPStatus
 from pathlib import Path
 
@@ -486,13 +487,25 @@ def _serve(request: web.Request, relative: str) -> web.StreamResponse:
     if not target.is_file():
         return web.Response(status=HTTPStatus.NOT_FOUND, text="404: Not Found")
 
-    # Хешированные бандлы неизменяемы, `index.html` НЕ ХРАНИМ вовсе.
-    headers = (
-        {"Cache-Control": "no-store"}
-        if target.name == "index.html"
-        else {"Cache-Control": "public, max-age=31536000, immutable"}
-    )
-    return web.FileResponse(target, headers=headers)
+    return web.FileResponse(target, headers={"Cache-Control": bundle_cache(target.name)})
+
+
+# Имя с хешем содержимого от сборщика Angular (`main-4GFSECTS.js`, `inter-latin-KZ4OTMG4.woff2`).
+HASHED_NAME = re.compile(r"-[A-Za-z0-9_-]{8}\.[a-z0-9]+$")
+# По ним вкладка узнаёт, что пора на новый интерфейс; воркер меняется с бандлом под тем же именем.
+NEVER_CACHED = frozenset({"index.html", "version.json", "manifest.json", "sw.js"})
+
+
+def bundle_cache(name: str) -> str:
+    """Срок кэша файла бандла — как у облачной двери менеджера (`resident-app.controller.ts`).
+
+    ⚠ Навсегда — только имя с хешем. Прочие ПОСТОЯННЫЕ имена (иконки, `compat.json`) — с
+    перепроверкой: `immutable` на `icon-192.png` оставлял у телефонов старую иконку после смены
+    (2026-10-12), а манифест и воркер с ним не обновлялись вовсе.
+    """
+    if name in NEVER_CACHED:
+        return "no-store"
+    return "public, max-age=31536000, immutable" if HASHED_NAME.search(name) else "no-cache"
 
 
 # ⚠ СПИСОК РЕГИСТРИРУЕМЫХ ДВЕРЕЙ — модульной константой, а не выражением внутри

@@ -340,3 +340,15 @@ def test_воркер_берётся_из_бандла_когда_он_есть(
     assert type(response).__name__ == "FileResponse"
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Service-Worker-Allowed"] == "/mega-home/"
+
+
+def test_срок_кэша_файлов_бандла() -> None:
+    """Навсегда — только имя с хешем; иконка с постоянным именем — с перепроверкой."""
+    from mega_home.http import bundle_cache
+
+    assert bundle_cache("main-4GFSECTS.js") == "public, max-age=31536000, immutable"
+    assert bundle_cache("inter-latin-KZ4OTMG4.woff2") == "public, max-age=31536000, immutable"
+    assert bundle_cache("icon-192.png") == "no-cache"
+    assert bundle_cache("compat.json") == "no-cache"
+    for name in ("index.html", "sw.js", "manifest.json", "version.json"):
+        assert bundle_cache(name) == "no-store"
