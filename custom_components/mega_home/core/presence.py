@@ -27,6 +27,7 @@ import struct
 import time
 from typing import Any
 
+from .const import LOGGER
 from .host import Host
 
 # Сколько ждём ответов пачки. Запрос уходит дважды (второй — через `RESEND_S`): одиночная
@@ -121,8 +122,10 @@ def _arp_batch(link: dict[str, Any], hosts: list[str]) -> dict[str, dict[str, An
     """ARP по пачке через сырой сокет. `None` — прав нет (запасной путь у вызывающего)."""
     try:
         sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_ARP))
-    except (OSError, AttributeError):
+    except (OSError, AttributeError) as err:
         _raw["arp"] = False
+        # Один раз за жизнь процесса (`_raw`): дальше молча идём запасным путём.
+        LOGGER.warning("Присутствие в своей подсети — без ARP, нет прав на сырой сокет: %s", err)
         return None
     frames = [arp_request(link["mac"], link["ip"], host) for host in hosts]
     try:
@@ -151,6 +154,7 @@ def _icmp_batch(hosts: list[str]) -> dict[str, dict[str, Any]] | None:
             continue
     else:
         _raw["icmp"] = False
+        LOGGER.warning("Присутствие — запасным путём TCP: нет прав на ICMP-сокет")
         return None
     raw = kind == socket.SOCK_RAW
 

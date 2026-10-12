@@ -86,3 +86,16 @@ def test_неподтверждённое_уходит_повторно_по_п�
     assert [f["record"]["message"] for f in again] == ["вторая"]
     log.add("app", "error", "c", "третья")
     assert sent[-1]["t"] == "dev-log" and sent[-1]["record"]["message"] == "третья"
+
+
+def test_подробный_лог_опускает_порог_логгера_и_возвращает_его() -> None:
+    """HA держит логгеры интеграций на WARNING: без этого `LOGGER.info` не доходил до обработчика."""
+    import logging
+
+    from mega_home.core.const import LOGGER
+
+    log = dl.DevLog(FakeHost(), lambda: {})
+    log.apply({"devLog": {"level": "debug"}})
+    assert LOGGER.level == logging.DEBUG
+    log.apply({})
+    assert LOGGER.level == logging.NOTSET

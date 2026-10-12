@@ -29,6 +29,7 @@ from time import time
 from typing import Any
 from uuid import uuid4
 
+from .const import LOGGER
 from .host import Host, PeriodicSave
 from .ops_base import dumps
 
@@ -95,6 +96,11 @@ class DevLog:
         block = (config or {}).get("devLog")
         block = block if isinstance(block, dict) else {}
         self.level = LEVELS.get(str(block.get("level") or "warn"), logging.WARNING)
+        # ⚠ Порог обработчика мало: HA держит логгеры интеграций на WARNING, и `LOGGER.info`
+        # отбрасывается ДО обработчиков — подробный лог не получал от дома ни строки. Подробный
+        # опускает порог нашего логгера (наш INFO редок; в журнал HA он идёт, пока включён),
+        # обычный возвращает его HA (`NOTSET` — как настроено в `logger:`).
+        LOGGER.setLevel(self.level if self.level < logging.WARNING else logging.NOTSET)
         modules = block.get("modules")
         self.modules = {str(m) for m in modules} if isinstance(modules, list) else set()
         try:
