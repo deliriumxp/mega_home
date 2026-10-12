@@ -34,7 +34,7 @@ from typing import Any
 
 from .api import ManagerClient, ManagerError
 from .const import LOGGER
-from .host import Host
+from .host import Host, PeriodicSave
 from .probe import run as run_probe
 
 # Тик сторожа. Само правило говорит, как часто ему выполняться (`everySec`);
@@ -44,8 +44,6 @@ TICK = timedelta(seconds=30)
 
 STORE_VERSION = 1
 STORE_KEY = "mega_home_agent"
-# Отложенная запись тика без событий — как у ленты устройств (`device_store.py`).
-SAVE_DELAY_S = 300.0
 
 # Потолок очереди отчётов. Дом может быть офлайн неделями, и весь этот журнал
 # всё равно никому не нужен: важны последние события, а не каждый тик.
@@ -62,6 +60,7 @@ class AgentRunner:
         self._env = env
         self._client = client
         self._store = env.store(STORE_KEY, STORE_VERSION)
+        self._saver = PeriodicSave(self._store, self._snapshot)
         self._version: str | None = None
         self._rules: list[dict[str, Any]] = []
         # Состояние по правилу: когда началась непрерывная серия нарушений,
@@ -137,22 +136,34 @@ class AgentRunner:
         reports = len(self._pending)
         try:
             for rule in self._rules:
+                state = self._state.setdefault(rule["id"], {})
+                ran = state.get("ranAt")
                 try:
                     await self._async_run_rule(rule)
                 except Exception as err:  # noqa: BLE001
                     # Одно испорченное правило не должно останавливать
                     # остальные: сторож нужен целиком, а не до первой ошибки.
-                    LOGGER.warning("Правило «%s» не выполнено: %s", rule.get("id"), err)
-                    self._report(rule.get("id", "?"), "error", str(err)[:200])
+                    # ⚠ Журнал и отчёт — только на СМЕНУ текста ошибки: битое
+                    # правило иначе писало строку и отчёт каждые 30 с, неделями
+                    # без менеджера, и вытесняло из очереди настоящие события.
+                    text = str(err)[:200]
+                    if state.get("error") != text:
+                        state["error"] = text
+                        LOGGER.warning("Правило «%s» не выполнено: %s", rule["id"], text)
+                        self._report(rule["id"], "error", text)
+                    continue
+                # Прошло до конца, а не «ещё не пора» — ошибка позади, следующая снова слышна.
+                if state.get("ranAt") != ran:
+                    state.pop("error", None)
             # ⚠ Сразу — только когда появился отчёт: он сопровождает каждое
             # действие, и счётчик «K раз в сутки» обязан пережить перезапуск HA,
-            # который это действие могло и вызвать. Иначе — отложенно: запись на
-            # КАЖДЫЙ тик (30 с) ради метки «когда проверял» изнашивала SD-карту
-            # объекта ради ничего.
+            # который это действие могло и вызвать. Иначе — раз в период и на
+            # остановке (`host.PeriodicSave`): запись на КАЖДЫЙ тик (30 с) ради метки
+            # «когда проверял» изнашивала SD-карту объекта ради ничего.
             if len(self._pending) != reports:
                 await self._async_save()
             else:
-                self._store.async_delay_save(self._snapshot, SAVE_DELAY_S)
+                self._saver.touch()
         finally:
             self._busy = False
 
@@ -250,7 +261,7 @@ class AgentRunner:
             self._pending = self._pending[-MAX_PENDING_REPORTS:]
 
     async def _async_save(self) -> None:
-        await self._store.async_save(self._snapshot())
+        await self._saver.flush()
 
     def _snapshot(self) -> dict[str, Any]:
         return {"version": self._version, "rules": self._rules, "state": self._state, "pending": self._pending}

@@ -82,3 +82,20 @@ def test_каталог_создаётся_при_первом_сохранен�
     assert store.count() == 1
     # Незавершённых файлов не остаётся: запись идёт через .part с переименованием.
     assert not list(store.directory.glob("*.part"))
+
+
+def test_уборка_оставляет_свежий_черновик_и_сносит_обломок(tmp_path) -> None:
+    import os
+    import time as clock
+
+    from mega_home.core import photos as module
+
+    store = module.PhotoStore(tmp_path)
+    store.save("r1", b"\xff\xd8\xffa")
+    fresh, stale = tmp_path / "a.jpg.1.part", tmp_path / "b.jpg.2.part"
+    fresh.write_bytes(b"x")
+    stale.write_bytes(b"x")
+    old = clock.time() - module.PART_STALE_S - 10
+    os.utime(stale, (old, old))
+    store.prune(["r1"])
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted([store.path("r1").name, fresh.name])

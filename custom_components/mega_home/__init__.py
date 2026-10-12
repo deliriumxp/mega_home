@@ -34,6 +34,7 @@ from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
 from .http import VIEWS as HTTP_VIEWS, async_register_http
 from .core import go2rtc_embed, services
 from .core.agent import AgentRunner
+from .core.observe import Observer
 from .link import ManagerLink
 from .ha_update import async_self_update
 from .core.sip_bridge import SipBridge
@@ -220,6 +221,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     await agent.async_start()
     coordinator.agent = agent
     await agent.async_sync()
+    # Наблюдатель (`observe.py`): пульс по целям менеджера и счёт «жив с …». Поднимается из
+    # своего хранилища — счёт переживает перезапуск HA (`host.PeriodicSave`), задание
+    # приходит операцией канала `observe`.
+    observer = Observer(coordinator.env)
+    await observer.async_start()
+    coordinator.observer = observer
     if PLATFORMS:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
@@ -245,6 +252,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) ->
             state_stream.end()
         if coordinator.agent is not None:
             await coordinator.agent.async_stop()
+        if getattr(coordinator, "observer", None) is not None:
+            await coordinator.observer.async_stop()
         await _async_stop_processes(coordinator)
     return unloaded
 

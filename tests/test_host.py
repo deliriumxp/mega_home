@@ -69,3 +69,31 @@ def test_отложенная_запись_сливается_в_одну(tmp_pa
         return await store.async_load()
 
     assert asyncio.run(scenario()) == {"n": 2}
+
+
+def test_запись_раз_в_период_а_не_дребезг(monkeypatch) -> None:
+    """Частые изменения не переносят запись: одна отложенная на период, на остановке — сразу."""
+    from mega_home.core import host as host_mod
+
+    calls: list[float] = []
+
+    class Store:
+        def async_delay_save(self, data_func, delay=0):  # noqa: ANN001
+            calls.append(delay)
+
+        async def async_save(self, data):  # noqa: ANN001
+            calls.append(-1)
+
+    clock = [1000.0]
+    monkeypatch.setattr(host_mod.time, "monotonic", lambda: clock[0])
+    saver = host_mod.PeriodicSave(Store(), lambda: {}, 600)
+    for step in range(100):
+        clock[0] = 1000.0 + step * 5
+        saver.touch()
+    assert calls == [600]
+    clock[0] = 1601.0
+    saver.touch()
+    assert calls == [600, 600]
+    asyncio.run(saver.flush())
+    saver.touch()
+    assert calls == [600, 600, -1, 600]

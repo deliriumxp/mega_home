@@ -229,6 +229,31 @@ def test_broken_rule_does_not_take_the_others_down(monkeypatch):
     assert len(calls) == 1
 
 
+def test_failing_rule_reports_its_error_once_per_change(monkeypatch):
+    # Падающее правило не пишет журнал и очередь каждые 30 с, неделями без
+    # менеджера: только смена текста ошибки, а после удачного прохода — снова.
+    client = FakeClient()
+    runner, _ = make(monkeypatch, client, [HEALTHY])
+    run(runner.async_start())
+    run(runner.async_sync())
+    errors = iter(["нет сети", "нет сети", "нет сети", "отказ", None, "отказ"])
+
+    async def probe(env, payload):
+        text = next(errors)
+        if text:
+            raise RuntimeError(text)
+        return {"results": HEALTHY}
+
+    monkeypatch.setattr(agent_module, "run_probe", probe)
+    for _ in range(6):
+        runner._state.setdefault("r1", {})["ranAt"] = 0
+        run(runner._async_tick())
+    run(runner._async_tick())  # «ещё не пора» — не удачный проход, ошибку не сбрасывает
+    notes = [r["note"] for r in runner._pending if r["event"] == "error"]
+    assert notes == ["нет сети", "отказ", "отказ"]
+    assert runner._state["r1"]["error"] == "отказ"
+
+
 def test_checks_read_json_fields_and_nothing_more():
     # Язык условий беден намеренно: богаче — значит толкование ответов
     # переехало сюда, а ему сюда нельзя.

@@ -255,3 +255,52 @@ def test_недоступный_файл_не_роняет_синхрониза�
 
     assert not coordinator.assets.has("sound/doorbell", "s1")
     assert coordinator.assets.has("photo/tile/x", "p1"), "соседний файл обязан доехать"
+
+
+# --- пределы диска (решение заказчика 2026-10-12) ---
+
+
+def test_иконки_снятых_сценариев_уходят_крупная_не_пишется(tmp_path: Path) -> None:
+    from mega_home import coordinator as module
+
+    client = FakeClient()
+    scenarios = [{"icon": "sun"}, {"icon": "huge"}]
+    config = client.async_config
+
+    async def with_scenarios() -> dict[str, Any]:
+        return {**await config(), "scenarios": scenarios}
+
+    async def icon(name: str) -> bytes:
+        return b"x" * (module.MAX_ICON_BYTES + 1) if name == "huge" else b"png"
+
+    client.async_config, client.async_icon = with_scenarios, icon  # type: ignore[method-assign]
+    coordinator = _coordinator(tmp_path, client)
+    coordinator.bundle = FakeBundle()
+    old = coordinator.icons_dir / "gone_old.png"
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"png")
+    asyncio.run(coordinator._async_update_data())
+    names = sorted(p.name for p in coordinator.icons_dir.iterdir())
+    assert names == [f"sun_{module.ICON_SIZE}.png"]
+
+
+def test_фоны_и_кадры_снятых_ключей_уходят_пустой_состав_не_трогает(tmp_path: Path) -> None:
+    client = FakeClient()
+    client.rooms = [{"id": "r1"}]
+    client.tiles = [{"id": "c1", "domain": "camera"}]
+    coordinator = _coordinator(tmp_path, client)
+    coordinator.bundle = FakeBundle()
+    for key in ("r1", "r2"):
+        coordinator.photos.save(key, b"\xff\xd8\xffjpeg")
+    for tile in ("c1", "c2"):
+        coordinator.crops.save(tile, {"x": 0, "y": 0, "w": 1})
+
+    asyncio.run(coordinator._async_update_data())
+    assert coordinator.photos.path("r1").is_file() and not coordinator.photos.path("r2").exists()
+    assert coordinator.crops.path("c1").is_file() and not coordinator.crops.path("c2").exists()
+
+    # Состав без комнат и плиток — скорее сбой менеджера: единственная копия жильца остаётся.
+    client.rooms, client.tiles = [], []
+    coordinator.data = None
+    asyncio.run(coordinator._async_update_data())
+    assert coordinator.photos.path("r1").is_file() and coordinator.crops.path("c1").is_file()

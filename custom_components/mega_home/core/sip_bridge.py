@@ -16,7 +16,8 @@ WebSocket не наберёт `answer` (`sip_calls.py`); `echo` — звук т�
 перезапускает Asterisk. Пароль ARI — ЕДИНСТВЕННАЯ подстановка, которую делает
 дом: менеджер шлёт `ari.conf` с плейсхолдером `{ari_password}`, дом генерирует
 пароль сам (как раньше) и подставляет его при записи файла. Инфраструктурные
-файлы (`asterisk.conf`, `modules.conf`, `logger.conf`, `http.conf`, `rtp.conf`)
+файлы (`asterisk.conf`, `modules.conf`, `logger.conf`, `cdr.conf`, `cel.conf`,
+`http.conf`, `rtp.conf`)
 остаются данными процесса, а не диалплана, и пишутся домом как прежде.
 
 ⚠ Вход только двумя дверями: панели — с адресов из конфига объекта
@@ -155,11 +156,27 @@ noload => res_hep_rtcp.so
 noload => res_xmpp.so
 noload => chan_motif.so
 """,
+        # ⚠ Ни одного ФАЙЛОВОГО канала: дом без менеджера живёт неделями, а
+        # `messages` в `{root}/log` рос без ротации до заполнения диска. Только
+        # `console` — его вывод уже вычитывается в хвост `LOG_TAIL` строк в памяти.
+        # `queue_log` по умолчанию `yes` и пишет файл в astlogdir — гасим явно.
+        # Синтаксис — docs.asterisk.org «Logging Configuration» и
+        # configs/samples/logger.conf.sample: `<канал> => <уровни>`, `console` —
+        # корневая консоль, `queue_log = no` в [general].
         "logger.conf": """[general]
+queue_log = no
 [logfiles]
 console => notice,warning,error,verbose
-messages => notice,warning,error,verbose
 """,
+        # ⚠ CDR и CEL выключены: `autoload = yes` грузит cdr_csv, а тот пишет
+        # строку в `Master.csv` на КАЖДЫЙ вызов — вечно. Журнал вызовов дом ведёт
+        # своей лентой событий с пределами (`device_store.py`).
+        # configs/samples/cdr.conf.sample: «enable … Setting this to "no" will
+        # override any loading of backend CDR modules. Default is "yes"»;
+        # cel.conf.sample: «enable … Accepted values: yes and no» (по умолчанию no,
+        # пишем явно — чужой cel.conf пакета не включит его за нас).
+        "cdr.conf": "[general]\nenable = no\n",
+        "cel.conf": "[general]\nenable = no\n",
         # ⚠ Только loopback: WebSocket телефона приходит каналом менеджера
         # (`stream.py` пускает loopback по имени службы «asterisk»), учётки у
         # телефона нет. TLS не нужен: снаружи шифрует WSS менеджера, внутри —
@@ -190,6 +207,9 @@ def _write_dialplan(root: Path, files: dict[str, bytes], ari_password: str) -> N
         (root / "etc" / name).write_text(text, encoding="utf-8")
 
 def _write_all(root: Path, keys: dict[str, str], dialplan: dict[str, bytes]) -> None:
+    # ⚠ Каталог логов прежних выпусков (`messages`, `cdr-csv/Master.csv`) копился
+    # без предела — сносим целиком; файлов в него мост больше не пишет.
+    shutil.rmtree(root / "log", ignore_errors=True)
     for name in ("etc", "lib", "run", "log", "spool", "cache", "agi-bin"):
         (root / name).mkdir(parents=True, exist_ok=True)
     for name, text in _infra_config(root).items():

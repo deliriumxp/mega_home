@@ -58,7 +58,19 @@ class FakeSource:
 
 class _MemoryStore:
     def __init__(self) -> None:
-        self.data: Any = None
+        self._data: Any = None
+        self._pending: Any = None
+
+    @property
+    def data(self) -> Any:
+        """Что окажется на диске. ⚠ Как у HA `Store`: `data_func` зовётся в момент ЗАПИСИ, а не
+        вызова `async_delay_save` — запись раз в период (`host.PeriodicSave`) уносит то, что
+        накопилось к ней, и спека обязана видеть то же."""
+        return self._pending() if self._pending else self._data
+
+    @data.setter
+    def data(self, value: Any) -> None:
+        self._data, self._pending = value, None
 
     async def async_load(self) -> Any:
         return self.data
@@ -67,8 +79,7 @@ class _MemoryStore:
         self.data = data
 
     def async_delay_save(self, data_func: Any, delay: float = 0) -> None:
-        """Настоящий откладывает запись; спеке важен только её факт."""
-        self.data = data_func()
+        self._pending = data_func
 
 
 class FakeHost(PlainHost):

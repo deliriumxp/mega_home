@@ -152,7 +152,8 @@ class LookStore:
         self._dir = directory
         # Метка → каталог исходников: `p` — фото жильца, `a` — файлы менеджера.
         self._sources = dict(sources)
-        self._locks: dict[str, asyncio.Lock] = {}
+        # Имя варианта → [замок, сколько его ждут].
+        self._locks: dict[str, list[Any]] = {}
         self._gate: asyncio.Semaphore | None = None
 
     def path(self, tag: str, source: Path, look: Look) -> Path:
@@ -191,13 +192,20 @@ class LookStore:
         if look is None:
             return source
         target = await env.run(self.path, tag, source, look)
-        # Замков столько, сколько вариантов запрашивали, — набор ограничен (см.
-        # шапку), поэтому словарь не чистится.
-        lock = self._locks.setdefault(target.name, asyncio.Lock())
+        # ⚠ Замок живёт, пока его кто-то ждёт, и уходит с последним: имя несёт
+        # отметку исходника, а потолок вариантов (`ensure`) проверяется уже ПОД
+        # замком — словарь «на каждый когда-либо запрошенный вид» рос без предела.
+        held = self._locks.setdefault(target.name, [asyncio.Lock(), 0])
+        held[1] += 1
         if self._gate is None:
             self._gate = asyncio.Semaphore(PARALLEL)
-        async with lock, self._gate:
-            return await env.run(self.ensure, tag, source, look)
+        try:
+            async with held[0], self._gate:
+                return await env.run(self.ensure, tag, source, look)
+        finally:
+            held[1] -= 1
+            if not held[1]:
+                self._locks.pop(target.name, None)
 
     def refresh(self) -> None:
         """Пересчитать виды для сменившихся исходников и убрать осиротевшие.

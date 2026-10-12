@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from hashlib import sha1
 from pathlib import Path
+from time import time
 from typing import Any
 from uuid import uuid4
 
@@ -44,6 +45,29 @@ def write_atomic(target: Path, payload: bytes) -> None:
     temporary = target.with_name(f"{target.name}.{uuid4().hex}.part")
     temporary.write_bytes(payload)
     temporary.replace(target)
+
+
+PART_STALE_S = 3600.0
+
+
+def prune_dir(directory: Path, keep: set[str]) -> None:
+    """Снести всё, чего нет в `keep`. Блокирует — в executor.
+
+    ⚠ Черновик `.part` — только старше часа: моложе пишется прямо сейчас
+    (`write_atomic`), а старший — обломок записи, оборванной перезапуском.
+    """
+    try:
+        paths = list(directory.iterdir())
+    except OSError:
+        return
+    stale_before = time() - PART_STALE_S
+    for path in paths:
+        try:
+            if path.name in keep or (path.name.endswith(".part") and path.stat().st_mtime > stale_before):
+                continue
+            path.unlink()
+        except OSError:
+            continue
 
 
 class PhotoStore:
@@ -113,6 +137,10 @@ class PhotoStore:
         version = digest.hexdigest()[:16]
         self._known[path.name] = (stat.st_mtime_ns, stat.st_size, version)
         return version
+
+    def prune(self, keys: Iterable[str]) -> None:
+        """Фоны ключей, которых больше нет в составе (снятая комната, плитка), — вон."""
+        prune_dir(self._dir, {self.path(key).name for key in keys})
 
     def delete(self, room_id: str) -> bool:
         try:

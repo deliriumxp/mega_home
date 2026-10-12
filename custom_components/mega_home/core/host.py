@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import timedelta
 from pathlib import Path
@@ -58,6 +59,40 @@ class KeyStore(Protocol):
 
     def async_delay_save(self, data_func: Callable[[], Any], delay: float = 0) -> None:
         """Записать позже; новые вызовы до записи сливаются в одну."""
+
+
+SAVE_PERIOD_S = 600.0
+
+
+class PeriodicSave:
+    """Запись документа на диск не чаще раза в `period` и обязательно на остановке.
+
+    Решение заказчика 2026-10-12: данные дома живут в памяти, флеш-память объекта не трогаем
+    на каждое событие. Образец — HA `helpers/restore_state.py` (раз в 15 мин и на остановке).
+
+    ⚠ Голый `async_delay_save` этого НЕ даёт: в HA это дребезг — каждый вызов ПЕРЕНОСИТ запись
+    (`helpers/storage.py`, `_next_write_time`), и хранилище, которое зовёт его чаще задержки,
+    не пишет вообще до остановки HA: сбой питания терял всё с прошлой остановки. Здесь
+    отложенная запись ставится один раз на период; на остановке незаписанное дописывает сам
+    HA `Store` (`EVENT_HOMEASSISTANT_FINAL_WRITE`), без отдельной подписки у модулей.
+    """
+
+    def __init__(self, store: KeyStore, data_func: Callable[[], Any], period: float = SAVE_PERIOD_S) -> None:
+        self._store, self._data_func, self._period = store, data_func, period
+        self._due = 0.0
+
+    def touch(self) -> None:
+        """Данные изменились: записать в пределах периода."""
+        now = time.monotonic()
+        if now < self._due:
+            return
+        self._due = now + self._period
+        self._store.async_delay_save(self._data_func, self._period)
+
+    async def flush(self) -> None:
+        """Записать сейчас (выгрузка записи, событие, которое обязано пережить сбой)."""
+        self._due = 0.0
+        await self._store.async_save(self._data_func())
 
 
 class JsonStore:

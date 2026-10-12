@@ -106,6 +106,19 @@ def test_вариантов_одной_картинки_не_больше_пот
     assert store.ensure("p", source, Look(360, 0, False, 0)).is_file()
 
 
+def test_замки_вариантов_не_копятся(tmp_path: Path):
+    """Замок на имя варианта уходит с последним ждущим — и после отказа потолка."""
+    import pytest
+
+    source = jpeg(tmp_path / "p" / "room.jpg", size=(400, 300))
+    store = LookStore(tmp_path / "looks", {"p": source.parent})
+    asyncio.run(store.async_file(FakeHost(), "p", source, {"w": "540"}))
+    store.ensure = lambda *args: (_ for _ in ()).throw(ValueError("потолок"))  # type: ignore[method-assign]
+    with pytest.raises(ValueError):
+        asyncio.run(store.async_file(FakeHost(), "p", source, {"w": "720", "dim": "5"}))
+    assert store._locks == {}  # noqa: SLF001
+
+
 def test_замена_фото_пересчитывает_виды_заранее(tmp_path: Path):
     photos = tmp_path / "photos"
     source = jpeg(photos / "abc.jpg", color=(10, 10, 10))

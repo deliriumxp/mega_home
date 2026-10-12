@@ -18,6 +18,11 @@ from __future__ import annotations
 from hashlib import blake2b
 from pathlib import Path
 
+from .const import LOGGER
+
+# Потолок одного файла: фоны, звуки, конфиги моста — единицы мегабайт.
+MAX_FILE_BYTES = 8 * 1024 * 1024
+
 
 class AssetStore:
     """Mirrored manager files on disk. Every method blocks — use an executor."""
@@ -38,6 +43,11 @@ class AssetStore:
 
     def save(self, key: str, version: str, payload: bytes) -> None:
         """Write one file aside and rename it: a half-written asset is garbage."""
+        if len(payload) > MAX_FILE_BYTES:
+            # ⚠ Не пишем и не падаем: следующий опрос попробует снова, а один
+            # чрезмерный файл менеджера не стоит диска дома (решение 2026-10-12).
+            LOGGER.warning("Asset %s is %d bytes — over %d, not stored", key, len(payload), MAX_FILE_BYTES)
+            return
         self._dir.mkdir(0o755, parents=True, exist_ok=True)
         target = self.path(key, version)
         temporary = target.with_suffix(".part")

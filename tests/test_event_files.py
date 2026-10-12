@@ -44,7 +44,13 @@ def _files(tmp_path: Path, monkeypatch, body: bytes = b"\xff\xd8jpeg", status: i
     monkeypatch.setattr(ef.connect, "resource", resource)
     journal = _Journal()
     files = ef.EventFiles(PlainHost(tmp_path), journal)
-    files.apply({"attachments": [RULE]})
+
+    async def apply() -> None:
+        # `apply` поручает хозяину уборку фоном — как в HA, внутри цикла событий.
+        files.apply({"attachments": [RULE]})
+        await asyncio.gather(*files._env._tasks)  # noqa: SLF001
+
+    asyncio.run(apply())
     return files, journal, calls
 
 
@@ -117,3 +123,23 @@ def test_отдача_одним_маршрутизатором_и_перено�
     )
     assert answer["status"] == 200 and answer["contentType"] == "image/jpeg"
     assert base64.b64decode(answer["body"]) == b"\xff\xd8jpeg"
+
+
+def test_уборка_на_старте_без_новых_событий_и_обломки_черновиков(tmp_path) -> None:
+    root = tmp_path / ef.DIR
+    root.mkdir()
+    old, fresh = root / "a__image-jpeg", root / "b__image-jpeg"
+    part, writing = root / "c__image-jpeg.1.part", root / "d__image-jpeg.2.part"
+    for path in (old, fresh, part, writing):
+        path.write_bytes(b"x")
+    os.utime(old, (time.time() - ef.TTL_S - 10,) * 2)
+    os.utime(part, (time.time() - 7200,) * 2)
+    host = FakeHost(tmp_path)
+    files = ef.EventFiles(host)
+    files.apply({})  # старт: уборка поручена хозяину
+    assert host.spawned == ["mega_home event files prune"]
+    files.apply({})  # следующий опрос в пределах часа — без второго прохода
+    assert host.spawned == ["mega_home event files prune"]
+    files._next_prune = 0.0  # noqa: SLF001 — прошёл час, менеджер недоступен: добирает `find`
+    assert files.find("нет") is None
+    assert sorted(p.name for p in root.iterdir()) == [fresh.name, writing.name]

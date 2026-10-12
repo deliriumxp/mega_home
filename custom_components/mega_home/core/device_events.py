@@ -45,6 +45,7 @@ class EventHub:
         self._sender: Callable[[dict[str, Any]], bool] | None = None
         self.recent: deque[dict[str, Any]] = deque(maxlen=20)
         self.dropped = 0
+        self._overflowing = False
         # Хранилище ленты устройств (`device_store.DeviceEventStore`) — часть F:
         # опционально, чтобы демон без диска (`docs/plan-core-without-ha.md`)
         # и тесты этого модуля обходились без него.
@@ -117,10 +118,17 @@ class EventHub:
     def _keep(self, frame: dict[str, Any]) -> None:
         self._expire()
         self._unacked[frame["id"]] = frame
+        overflow = len(self._unacked) > BUFFER
         while len(self._unacked) > BUFFER:
             self._unacked.popitem(last=False)
             self.dropped += 1
-            LOGGER.warning("События устройств: буфер полон, старейшее не доставлено менеджеру")
+        # ⚠ Одна строка на НАЧАЛО потерь, а не на каждое событие: менеджер
+        # недоступен неделями, и болтливый датчик писал бы журнал HA без конца.
+        # Сколько потеряно — счётчик `dropped` в диагностике; флаг снимается,
+        # как только буфер снова вмещает (подтверждения или срок `BUFFER_TTL_S`).
+        if overflow and not self._overflowing:
+            LOGGER.warning("События устройств: буфер полон, старейшие не доставляются менеджеру")
+        self._overflowing = overflow
 
     def _expire(self) -> None:
         now = time()

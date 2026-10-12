@@ -20,19 +20,21 @@ from __future__ import annotations
 import re
 from hashlib import sha1
 from pathlib import Path
-from time import time
+from time import monotonic, time
 from typing import Any
 
 from . import connect
 from .const import LOGGER
 from .host import Host
 from .ops_base import OpError
-from .photos import write_atomic
+from .photos import PART_STALE_S, write_atomic
 
 DIR = "mega_home_event_files"
 TTL_S = 7 * 24 * 3600.0  # ровно столько живёт журнал (`device_store.py`)
 MAX_FILES = 300
 MAX_BYTES = 512 * 1024
+# Уборка вне записи — не чаще: `find` зовётся на каждый показ кадра.
+PRUNE_EVERY_S = 3600.0
 
 
 class EventFiles:
@@ -43,10 +45,21 @@ class EventFiles:
         self._dir = env.path(DIR)
         self._journal = journal
         self._rules: list[dict[str, Any]] = []
+        self._next_prune = 0.0
 
     def apply(self, config: dict[str, Any] | None) -> None:
         rules = (config or {}).get("attachments")
         self._rules = [r for r in rules if _valid(r)] if isinstance(rules, list) else []
+        # ⚠ Уборка не только при записи: дом без событий хранил бы файлы сверх срока
+        # вечно. `apply` зовётся на старте и каждым опросом; `find` добирает офлайн.
+        if self._prune_due():
+            self._env.spawn(self._env.run(self._prune), "mega_home event files prune")
+
+    def _prune_due(self) -> bool:
+        if monotonic() < self._next_prune:
+            return False
+        self._next_prune = monotonic() + PRUNE_EVERY_S
+        return True
 
     def on_event(self, frame: dict[str, Any]) -> None:
         """Опубликовано событие: подходящее правило — фоном, не задерживая его."""
@@ -79,8 +92,12 @@ class EventFiles:
 
     def find(self, event_id: str) -> tuple[Path, str] | None:
         """Файл вложения и его тип; `None` — вложения нет. Блокирует — в executor."""
+        if self._prune_due():
+            self._prune()
         stem = _stem(event_id)
         for path in self._dir.glob(f"{stem}__*"):
+            if path.name.endswith(".part"):
+                continue
             return path, path.name.split("__", 1)[1].replace("-", "/", 1)
         return None
 
@@ -91,15 +108,21 @@ class EventFiles:
         self._prune()
 
     def _prune(self) -> None:
-        """Старше срока журнала и сверх потолка — вон; тем же проходом, что запись."""
-        cutoff = time() - TTL_S
+        """Старше срока журнала и сверх потолка — вон; черновики `.part` старше
+        часа (обломки оборванной записи) — тоже. Зовут запись, `apply` и `find`."""
+        try:
+            stats = [(p, p.stat().st_mtime) for p in self._dir.iterdir()]
+        except OSError:
+            return
+        cutoff, part_cutoff = time() - TTL_S, time() - PART_STALE_S
         files = sorted(
-            (p for p in self._dir.iterdir() if "__" in p.name and not p.name.endswith(".part")),
-            key=lambda p: p.stat().st_mtime,
+            ((p, m) for p, m in stats if "__" in p.name and not p.name.endswith(".part")),
+            key=lambda item: item[1],
         )
-        for index, path in enumerate(files):
-            if index < len(files) - MAX_FILES or path.stat().st_mtime < cutoff:
-                path.unlink(missing_ok=True)
+        stale = [p for i, (p, m) in enumerate(files) if i < len(files) - MAX_FILES or m < cutoff]
+        stale += [p for p, m in stats if p.name.endswith(".part") and m < part_cutoff]
+        for path in stale:
+            path.unlink(missing_ok=True)
 
 
 def _stem(event_id: str) -> str:

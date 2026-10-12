@@ -227,3 +227,35 @@ def test_two_runs_of_one_version_do_not_share_a_staging_directory(tmp_path: Path
     assert sorted(client.downloads) == ["index.html", "main-A.js"]
     assert (bundle.active_dir / "main-A.js").read_bytes() == b"one"
     assert (bundle.active_dir / "index.html").read_bytes() == b"<html>"
+
+
+def test_потолок_по_реально_скачанному_а_не_по_обещанию_манифеста(tmp_path: Path, monkeypatch) -> None:
+    from mega_home.core import bundle as module
+
+    class LyingClient(FakeClient):
+        async def async_app_manifest(self) -> dict[str, Any]:
+            manifest = await super().async_app_manifest()
+            for item in manifest["files"]:
+                item["bytes"] = 0
+            return manifest
+
+    monkeypatch.setattr(module, "MAX_TOTAL_BYTES", 10)
+    bundle = store(tmp_path, LyingClient({"index.html": b"<html>", "main-A.js": b"x" * 20}))
+    assert asyncio.run(bundle.async_sync()) is False
+    assert bundle.active_dir is None and "exceeds" in (bundle.last_error or "")
+
+
+def test_брошенный_черновик_уходит_на_старте(tmp_path: Path) -> None:
+    import os
+    import time
+
+    from mega_home.core import bundle as module
+
+    root = tmp_path / ".storage" / module.BUNDLE_DIR
+    stale, fresh = root / ".partial-old", root / ".partial-now"
+    for path in (stale, fresh):
+        (path / "chunk").mkdir(parents=True)
+    old = time.time() - module.PARTIAL_STALE_S - 10
+    os.utime(stale, (old, old))
+    asyncio.run(store(tmp_path, FakeClient({})).async_load())
+    assert not stale.exists() and fresh.exists()

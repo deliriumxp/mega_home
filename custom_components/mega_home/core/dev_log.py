@@ -29,13 +29,12 @@ from time import time
 from typing import Any
 from uuid import uuid4
 
-from .host import Host
+from .host import Host, PeriodicSave
 from .ops_base import dumps
 
 STORE_KEY = "mega_home_dev_log"
 QUEUE_LIMIT = 200
 QUEUE_TTL_S = 24 * 3600.0
-SAVE_DELAY_S = 30.0
 MAX_RECORD_BYTES = 8 * 1024
 MAX_APP_BATCH = 50
 LEVELS = {"debug": logging.DEBUG, "info": logging.INFO, "warn": logging.WARNING, "error": logging.ERROR}
@@ -73,6 +72,8 @@ class DevLog:
 
     def __init__(self, env: Host, context: Callable[[], dict[str, Any]]) -> None:
         self._store = env.store(STORE_KEY)
+        # Очередь — раз в период и на остановке (`host.PeriodicSave`), а не на каждую запись.
+        self._saver = PeriodicSave(self._store, lambda: {"queue": self._queue})
         self._context = context
         self._queue: list[dict[str, Any]] = []
         self._sender: Callable[[dict[str, Any]], None] | None = None
@@ -120,7 +121,7 @@ class DevLog:
         if len(self._queue) > QUEUE_LIMIT:
             del self._queue[: len(self._queue) - QUEUE_LIMIT]
             self.dropped += 1
-        self._store.async_delay_save(lambda: {"queue": self._queue}, SAVE_DELAY_S)
+        self._saver.touch()
         if self._sender is not None:
             self._sender(_frame(record))
 
@@ -168,7 +169,7 @@ class DevLog:
         before = len(self._queue)
         self._queue = [r for r in self._queue if r["id"] != record_id]
         if len(self._queue) != before:
-            self._store.async_delay_save(lambda: {"queue": self._queue}, SAVE_DELAY_S)
+            self._saver.touch()
 
     def state(self) -> dict[str, Any]:
         return {"queued": len(self._queue), "dropped": self.dropped, "level": logging.getLevelName(self.level)}

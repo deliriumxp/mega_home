@@ -25,13 +25,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from .host import Host
+from .host import Host, PeriodicSave
 from .source import EntityState, StateSource
 
 STORE_KEY = "mega_home_changes"
-# Датчик меняется часто; каждое изменение на диск — лишний износ карты у Raspberry. Потерять
-# последние секунды при аварийном выключении не страшно: время возьмётся со старта.
-SAVE_DELAY = 30
+# Датчик меняется часто; на диск — раз в период и на остановке (`host.PeriodicSave`), а не на
+# каждое изменение: износ карты у Raspberry. Сбой питания теряет только время смен за период.
 
 # Значения «прибора не видно», а не его состояния (`entity-index.md` HA: `unavailable`,
 # `unknown`). Их время не пишем — см. правила выше.
@@ -49,6 +48,7 @@ class Changes:
 
     def __init__(self, env: Host, source: StateSource) -> None:
         self._store = env.store(STORE_KEY)
+        self._saver = PeriodicSave(self._store, lambda: dict(self._seen))
         self._source = source
         # entity_id → {"v": значение, "at": мс}
         self._seen: dict[str, dict[str, Any]] = {}
@@ -110,4 +110,4 @@ class Changes:
         return True
 
     def _save(self) -> None:
-        self._store.async_delay_save(lambda: dict(self._seen), SAVE_DELAY)
+        self._saver.touch()

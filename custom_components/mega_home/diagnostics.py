@@ -66,6 +66,8 @@ async def async_get_config_entry_diagnostics(
         # видел и сколько отчётов не доехало до менеджера. Без этого «контроллер
         # перезагрузился сам» неотличимо от «его перезагрузил кто-то».
         "agent": coordinator.agent.summary if coordinator.agent else None,
+        # Наблюдатель (`observe.py`): сколько целей и сколько смен ждут менеджера.
+        "observe": coordinator.observer.summary if getattr(coordinator, "observer", None) else None,
         # ⚠ Запись и удалённая камера идут ТОЛЬКО через свой go2rtc, и когда он
         # не поднялся, у жильца молчат сразу три экрана: живой поток, архив и
         # календарь (календарь читается у ОТКРЫТОГО потока). Причина при этом

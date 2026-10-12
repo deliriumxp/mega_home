@@ -25,7 +25,7 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
-from .photos import write_atomic
+from .photos import prune_dir, write_atomic
 
 # {"x": 0.123, "y": 0.456, "w": 0.789} weighs well under a hundred bytes; this
 # leaves headroom without allowing an arbitrary-size upload.
@@ -62,6 +62,10 @@ class CropStore:
         """Write one crop. Temp file + rename: no half-written JSON ever served."""
         self._dir.mkdir(0o755, parents=True, exist_ok=True)
         write_atomic(self.path(tile_id), json.dumps(crop).encode("utf-8"))
+
+    def prune(self, tile_ids: Iterable[str]) -> None:
+        """Кадры плиток, которых больше нет среди камер состава, — вон."""
+        prune_dir(self._dir, {self.path(tile_id).name for tile_id in tile_ids})
 
     def delete(self, tile_id: str) -> bool:
         try:

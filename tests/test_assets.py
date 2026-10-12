@@ -41,3 +41,13 @@ def test_чистка_оставляет_только_названное_ман�
     assert not store.has("sound/doorbell", "v1")
     assert store.has("font/inter", "f1")
     assert store.count() == 1
+
+
+def test_файл_сверх_потолка_не_пишется(tmp_path: Path, monkeypatch) -> None:
+    from mega_home.core import assets as module
+
+    monkeypatch.setattr(module, "MAX_FILE_BYTES", 4)
+    store = AssetStore(tmp_path)
+    store.save("big", "v1", b"12345")
+    store.save("ok", "v1", b"1234")
+    assert not store.has("big", "v1") and store.has("ok", "v1")

@@ -31,11 +31,14 @@ from .core.const import (
     STORAGE_VERSION,
 )
 from .core.assets import AssetStore
-from .core.crops import CropStore
+from .core.crops import CropStore, crop_keys
 from .core.imaging import LookStore
-from .core.photos import PhotoStore
+from .core.photos import PhotoStore, photo_keys, prune_dir
 
 type MegaHomeConfigEntry = ConfigEntry["MegaHomeCoordinator"]
+
+# Потолок одной иконки сценария: PNG `ICON_SIZE` весит единицы килобайт.
+MAX_ICON_BYTES = 256 * 1024
 
 
 class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -221,6 +224,8 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         await self._store.async_save(config)
         await self._async_sync_icons(config)
+        # ⚠ До файлов менеджера: их `looks.refresh` убирает и варианты снятых фонов.
+        await self._async_prune_resident_files(config)
         await self._async_sync_assets(config)
         await self._async_sync_bundle()
         self._apply_devices(config)
@@ -350,6 +355,17 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # заодно уходят варианты снятых и заменённых фото (`imaging.py`).
         await self.hass.async_add_executor_job(self.looks.refresh)
 
+    async def _async_prune_resident_files(self, config: dict[str, Any]) -> None:
+        """Фоны и кадры жильца для ключей, которых в свежем составе больше нет.
+
+        ⚠ Только по конфигу, ПРИШЕДШЕМУ от менеджера (не по кэшу), и только при
+        непустом составе: эти файлы — единственная копия того, что выбрал жилец,
+        и состав без комнат и плиток — скорее сбой менеджера, чем пустой дом.
+        """
+        for store, keys in ((self.photos, photo_keys(config)), (self.crops, crop_keys(config))):
+            if keys:
+                await self.hass.async_add_executor_job(store.prune, keys)
+
     async def _async_sync_icons(self, config: dict[str, Any]) -> None:
         """Download every scenario icon the config names.
 
@@ -361,6 +377,10 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for scenario in config.get("scenarios", [])
             if isinstance(scenario.get("icon"), str) and scenario["icon"]
         }
+        # ⚠ Уборка — и при пустом списке: иконка снятого сценария иначе жила на
+        # диске вечно (тот же урок, что у `assets.prune`).
+        keep = {f"{icon}_{ICON_SIZE}.png" for icon in wanted}
+        await self.hass.async_add_executor_job(prune_dir, self._icons_dir, keep)
         if not wanted:
             return
         await self.hass.async_add_executor_job(
@@ -376,6 +396,11 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # A missing icon is not worth failing the whole sync over: the
                 # home is usable without one picture.
                 LOGGER.warning("Could not fetch scenario icon %s: %s", icon, err)
+                continue
+            if len(payload) > MAX_ICON_BYTES:
+                # Иконка — картинка плитки; больше потолка — ошибка менеджера, а
+                # не повод занимать диск дома.
+                LOGGER.warning("Scenario icon %s is %d bytes — not stored", icon, len(payload))
                 continue
             await self.hass.async_add_executor_job(target.write_bytes, payload)
             LOGGER.debug("Stored scenario icon %s", target.name)

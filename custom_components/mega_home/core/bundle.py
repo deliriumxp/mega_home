@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import shutil
 from pathlib import Path
+from time import time
 from typing import Any
 
 from .api import ManagerClient, ManagerError
@@ -29,6 +30,7 @@ _DIGEST_ALGO = "sha256"
 KEEP_VERSIONS = 2
 MAX_FILES = 200
 MAX_TOTAL_BYTES = 32 * 1024 * 1024
+PARTIAL_STALE_S = 3600.0
 
 
 class BundleStore:
@@ -86,6 +88,8 @@ class BundleStore:
 
     async def async_load(self) -> None:
         """Pick up the newest complete version left by a previous run."""
+        # Обломки прошлого запуска — до первой синхронизации: она может не случиться неделями.
+        await self._env.run(self._prune)
         versions = await self._env.run(self._stored_versions)
         if versions:
             self._active = versions[-1]
@@ -154,8 +158,13 @@ class BundleStore:
         staging = self._root / f".partial-{name}"
         try:
             await self._env.run(_reset_dir, staging)
+            # ⚠ Потолок — по РЕАЛЬНО записанным байтам: `bytes` в манифесте —
+            # обещание, у записи без него сумма выше считала ноль.
+            written = 0
             for item in files:
-                await self._async_fetch_file(staging, item)
+                written += await self._async_fetch_file(staging, item)
+                if written > MAX_TOTAL_BYTES:
+                    raise ValueError(f"bundle exceeds {MAX_TOTAL_BYTES} bytes")
         except (ManagerError, OSError, ValueError) as err:
             # ⚠ Half a bundle is a white screen for the resident, so a failed
             # download never becomes the active version: the staging directory
@@ -175,7 +184,8 @@ class BundleStore:
         await self._env.run(self._prune)
         return True
 
-    async def _async_fetch_file(self, staging: Path, item: dict[str, Any]) -> None:
+    async def _async_fetch_file(self, staging: Path, item: dict[str, Any]) -> int:
+        """Положить файл манифеста в черновик; сколько байт записано."""
         path = item.get("path")
         # ⚠ Имя ключа манифеста и алгоритм СОБРАНЫ из частей: это контрольная
         # сумма бандла с менеджером, не вход устройства, но замок 1 плана
@@ -186,14 +196,17 @@ class BundleStore:
         target = _resolve_inside(staging, path)
         # Файл с той же суммой уже лежит в активной версии (иконки, шрифты, часть
         # чанков) — берём его с диска, а не второй раз по уплинку квартиры.
-        if self._active is not None and await self._env.run(_reuse, self._active, path, digest, target):
-            return
+        if self._active is not None:
+            reused = await self._env.run(_reuse, self._active, path, digest, target)
+            if reused is not None:
+                return reused
         payload = await self._client.async_app_file(path)
         # ⚠ Проверяем хеш КАЖДОГО файла: обрезанный ответ прокси и подменённый
         # файл выглядят одинаково — как бандл, который «почти» скачался.
         if hashlib.new(_DIGEST_ALGO, payload).hexdigest() != digest:
             raise ValueError(f"checksum mismatch for {path}")
         await self._env.run(_write, target, payload)
+        return len(payload)
 
     def _stored_versions(self) -> list[Path]:
         if not self._root.is_dir():
@@ -208,6 +221,16 @@ class BundleStore:
     def _prune(self) -> None:
         for stale in self._stored_versions()[:-KEEP_VERSIONS]:
             shutil.rmtree(stale, ignore_errors=True)
+        # ⚠ Черновики, брошенные перезапуском посреди скачивания: `_reset_dir`
+        # чистит только черновик ТОЙ ЖЕ версии, а версии идут новые. Моложе часа
+        # не трогаем — его может писать прогон прямо сейчас.
+        cutoff = time() - PARTIAL_STALE_S
+        for partial in self._root.glob(".partial-*") if self._root.is_dir() else ():
+            try:
+                if partial.stat().st_mtime < cutoff:
+                    shutil.rmtree(partial, ignore_errors=True)
+            except OSError:
+                continue
 
 
 def _safe_name(version: str) -> str:
@@ -233,16 +256,16 @@ def _write(path: Path, payload: bytes) -> None:
     path.write_bytes(payload)
 
 
-def _reuse(active: Path, relative: str, digest: str, target: Path) -> bool:
-    """Взять файл из активной версии, если его сумма совпала с манифестом."""
+def _reuse(active: Path, relative: str, digest: str, target: Path) -> int | None:
+    """Взять файл из активной версии, если его сумма совпала с манифестом; байты или None."""
     try:
         payload = _resolve_inside(active, relative).read_bytes()
     except (OSError, ValueError):
-        return False
+        return None
     if hashlib.new(_DIGEST_ALGO, payload).hexdigest() != digest:
-        return False
+        return None
     _write(target, payload)
-    return True
+    return len(payload)
 
 
 def _swap(staging: Path, target: Path) -> None:

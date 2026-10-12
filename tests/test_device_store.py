@@ -81,3 +81,24 @@ def test_запись_откладывается_и_переживает_пер�
     asyncio.run(reloaded.async_load())
 
     assert reloaded.list("dev1", 10, None)[0]["id"] == frame["id"]
+
+
+def test_пределы_тела_байтов_и_срок_всем_устройствам() -> None:
+    from mega_home.core import device_store as ds
+
+    host = FakeHost()
+    store = DeviceEventStore(host)
+    now = time.time()
+    # Крупное тело — метка с размером, а не выкачанный ответ устройства.
+    store.add({**_frame("dev1", now), "data": "x" * (ds.MAX_EVENT_DATA_BYTES + 1)})
+    assert store.list("dev1", 1, None)[0]["data"]["truncated"] is True
+    # Байтовый потолок режет старейшие раньше счётного — при записи на диск.
+    for i in range(400):
+        store.add({**_frame("dev2", now - 400 + i), "data": "y" * 3000})
+    assert host.stores[ds.STORE_KEY].data
+    kept = store.list("dev2", 1000, None)
+    assert 300 < len(kept) < 400 and kept[0]["at"] == now - 1
+    # Замолчавшее устройство: срок режет его ленту при любой записи, пустая — уходит.
+    store._by_access["old"] = [_frame("old", now - RETENTION_S - 10)]  # noqa: SLF001
+    store.add(_frame("dev1", now))
+    assert "old" not in host.stores[ds.STORE_KEY].data["byAccess"]

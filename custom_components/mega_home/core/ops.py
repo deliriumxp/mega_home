@@ -122,6 +122,14 @@ async def run(coordinator: Any, op: str, payload: dict[str, Any] | None) -> Any:
         # нет вовсе. Здесь только примитивы — что и зачем спрашивать, знает
         # менеджер, и меняется это его деплоем, а не релизом HACS.
         return await run_probe(coordinator.env, data)
+    if op == "observe":
+        # Счёт «жив с …» по целям менеджера (`observe.py`): часть «жизнь без менеджера»
+        # закрытого списка — пульс идёт и тогда, когда канала нет, а менеджер только
+        # забирает интервалы и подтверждает журнал смен.
+        observer = getattr(coordinator, "observer", None)
+        if observer is None:
+            raise OpError("Наблюдение в этом доме не поднято", HTTPStatus.SERVICE_UNAVAILABLE)
+        return observer.read(data)
     if op == "scan":
         # Обход локальной сети объекта по заказу МЕНЕДЖЕРА (`scan.py`): какие
         # устройства стоят и куда из них можно войти по веб-интерфейсу. Список

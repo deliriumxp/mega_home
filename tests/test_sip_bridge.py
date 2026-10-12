@@ -96,11 +96,27 @@ def test_диалплан_пишется_как_есть_кроме_подста
 
 def test_инфраструктурные_файлы_не_диалплан(tmp_path: Path) -> None:
     files = sb._infra_config(tmp_path)
-    assert set(files) == {"asterisk.conf", "modules.conf", "logger.conf", "http.conf", "rtp.conf"}
+    assert set(files) == {
+        "asterisk.conf", "modules.conf", "logger.conf", "cdr.conf", "cel.conf", "http.conf", "rtp.conf"
+    }
     assert f"astetcdir => {tmp_path}/etc" in files["asterisk.conf"]
     assert f"bindport={sb.HTTP_PORT}" in files["http.conf"]
     assert "bindaddr=127.0.0.1" in files["http.conf"]
     assert f"rtpstart={sb.RTP_START}" in files["rtp.conf"]
+
+
+def test_мост_не_пишет_файлов_логов_и_сносит_старые(tmp_path: Path) -> None:
+    files = sb._infra_config(tmp_path)
+    # Только консоль: файловый канал рос без ротации, CDR писал Master.csv на каждый вызов.
+    channels = files["logger.conf"].split("[logfiles]", 1)[1].split()
+    assert channels[0] == "console" and "messages" not in files["logger.conf"]
+    assert "queue_log = no" in files["logger.conf"]
+    assert "enable = no" in files["cdr.conf"] and "enable = no" in files["cel.conf"]
+    old = tmp_path / "log" / "cdr-csv"
+    old.mkdir(parents=True)
+    (old / "Master.csv").write_text("x")
+    sb._write_all(tmp_path, {"ari": "p" * 16}, {})
+    assert list((tmp_path / "log").iterdir()) == []
 
 
 def test_смена_версии_диалплана_у_работающего_моста_перечитывает_конфиг(tmp_path: Path) -> None:

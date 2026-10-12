@@ -191,7 +191,7 @@ class Listeners:
         app = web.Application(client_max_size=MAX_CHUNK)
         app.router.add_route("*", "/hook/{access}/{source}", self._hook)
         app.router.add_route("*", "/{tail:.*}", self._hook_any)
-        delay = RETRY_FIRST_S
+        delay, told = RETRY_FIRST_S, None
         while True:
             runner = web.AppRunner(app, access_log=None)
             await runner.setup()
@@ -201,8 +201,12 @@ class Listeners:
                 await runner.cleanup()
                 # ⚠ Порт мог ещё держать прошлый запуск записи — повторяем, а не
                 # сдаёмся: иначе Action URL домофона молча не принимался бы.
-                self.why = f"порт {HOOK_PORT} занят — повторю через {delay:.0f} с: {err.strerror}"
-                LOGGER.warning("События устройств: %s", self.why)
+                # ⚠ В журнал — только смена причины, как у `_forever`: порт, занятый
+                # чужим, повторялся бы строкой в минуту неделями. Текущее — в `why`.
+                cause = err.strerror
+                self.why = f"порт {HOOK_PORT} занят — повторю через {delay:.0f} с: {cause}"
+                (LOGGER.warning if cause != told else LOGGER.debug)("События устройств: %s", self.why)
+                told = cause
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, RETRY_MAX_S)
                 continue
