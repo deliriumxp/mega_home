@@ -268,6 +268,7 @@ def states(coordinator: Any) -> dict[str, Any]:
             tile,
             source.get(tile["entityId"]) if tile.get("entityId") else None,
             source.cameras,
+            getattr(coordinator, "changes", None),
         )
         for tile in coordinator.data.get("tiles", [])
     ]
@@ -457,7 +458,7 @@ def _public_attributes(attributes: Any) -> dict[str, Any]:
     }
 
 def entity_view(
-    tile: dict[str, Any], state: EntityState | None, cameras: Any = None
+    tile: dict[str, Any], state: EntityState | None, cameras: Any = None, changes: Any = None
 ) -> dict[str, Any]:
     """Что дом отвечает о приборе: сырое состояние Home Assistant и атрибуты.
 
@@ -494,6 +495,9 @@ def entity_view(
     адрес живого потока ИЗ КЭША (`cached_source`, часть B). `None` там, где его
     нет под рукой (снимок конфига без источника) — поле `source` тогда не
     добавляется, как и без прогретого кэша.
+
+    `changes` — память дома «с какого момента это значение» (`changes.Changes`), поле
+    `changedAt`; без неё (`None`) — `null`, приложение тогда времени не пишет.
     """
     domain = tile["domain"]
     raw = state.state if state else None
@@ -521,4 +525,7 @@ def entity_view(
         "attributes": _public_attributes(attributes),
         "available": available,
         "updatedAt": int(state.last_updated.timestamp() * 1000) if state else None,
+        # С какого момента значение — переживает перезапуск HA (`changes.py`), в отличие от
+        # `last_changed`. `updatedAt` для этого не годится: его двигает и смена атрибутов.
+        "changedAt": changes.since(tile.get("entityId"), state) if changes else None,
     }

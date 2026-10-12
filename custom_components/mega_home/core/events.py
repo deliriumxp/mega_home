@@ -118,7 +118,12 @@ class StateStream:
         # Несколько плиток на одну сущность — законный случай: тот же прибор
         # может стоять в двух комнатах приложения.
         for tile in self._by_entity.get(entity_id, []):
-            self._put("entity", ops.entity_view(tile, state, self.coordinator.source.cameras))
+            self._put(
+                "entity",
+                ops.entity_view(
+                    tile, state, self.coordinator.source.cameras, getattr(self.coordinator, "changes", None)
+                ),
+            )
 
     def _on_config(self) -> None:
         self._subscribe_entities()

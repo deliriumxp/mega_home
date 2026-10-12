@@ -291,6 +291,7 @@ def test_дом_не_подмешивает_состав_в_ответ_о_при
         "attributes",
         "available",
         "updatedAt",
+        "changedAt",
     }
 
 

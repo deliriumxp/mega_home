@@ -100,6 +100,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # ЯВНО — почему, написано в `keep_polling`.
     coordinator.keep_polling(entry)
 
+    # С какого момента приборы в своём состоянии (`changes.py`) — ДО дверей: первый же ответ
+    # `api/states` несёт `changedAt`. Состав плиток меняется — подписка за ним.
+    from .core.changes import Changes
+
+    changes = Changes(coordinator.env, coordinator.source)
+    await changes.async_load()
+    coordinator.changes = changes
+
+    def _track_changes() -> None:
+        tiles = (coordinator.data or {}).get("tiles", []) or []
+        changes.track([tile["entityId"] for tile in tiles if tile.get("entityId")])
+
+    _track_changes()
+    entry.async_on_unload(coordinator.async_add_listener(_track_changes))
+    entry.async_on_unload(changes.stop)
+
     await async_register_http(hass, coordinator)
     # Паспорт дома называет ПОДНЯТЫЕ пути (`ops.config`) — их знает тот, кто
     # поднимал двери.

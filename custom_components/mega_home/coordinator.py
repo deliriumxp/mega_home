@@ -97,6 +97,8 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Вложения к событиям и лог разработки; ставятся в `async_setup_entry`.
         self.event_files: Any = None
         self.dev_log: Any = None
+        # С какого момента приборы в своём состоянии (`changes.py`); ставится в `async_setup_entry`.
+        self.changes: Any = None
         # Бандл интерфейса: качается с менеджера и раздаётся из кэша, поэтому
         # новая версия приложения не требует ни HACS, ни перезапуска.
         #
