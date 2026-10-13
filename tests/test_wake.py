@@ -196,3 +196,31 @@ def test_источник_без_подписки_молчит() -> None:
     wake = make(object(), sent)  # type: ignore[arg-type]
     run(wake.track(config()))
     assert wake.summary["attached"] == {}
+
+
+def test_исключение_подписки_не_роняет_проход_и_ждёт_паузу() -> None:
+    """Сбой подписки одного прибора — как отказ: пауза `RETRY_S`, остальные плитки подписываются."""
+
+    class Flaky(Source):
+        async def on_turn_on(self, entity_id: str, trigger: str, action: Any) -> Any:
+            if entity_id == "media_player.tv":
+                self.attached.append((entity_id, trigger))
+                raise RuntimeError("интеграция плеера упала")
+            return await super().on_turn_on(entity_id, trigger, action)
+
+    cfg = {
+        "tiles": [
+            {"id": "t-tv", "entityId": "media_player.tv", "wake": WAKE, "wakeTrigger": "webostv.turn_on"},
+            {"id": "t-tv3", "entityId": "media_player.tv3", "wake": WAKE, "wakeTrigger": "webostv.turn_on"},
+        ]
+    }
+    source, clock = Flaky(), Clock()
+    wake = make(source, [], clock)
+    run(wake.track(cfg))
+    assert wake.summary["attached"] == {"media_player.tv3": "webostv.turn_on"}
+    assert wake.summary["failed"] == {"media_player.tv": "webostv.turn_on"}
+    run(wake.track(cfg))
+    assert source.attached.count(("media_player.tv", "webostv.turn_on")) == 1
+    clock.now += RETRY_S
+    run(wake.track(cfg))
+    assert source.attached.count(("media_player.tv", "webostv.turn_on")) == 2

@@ -232,3 +232,37 @@ def test_неизвестный_триггер_не_роняет_а_отвеча
         pass
 
     assert asyncio.run(HaSource(_Hass()).on_turn_on("media_player.tv", "webostv.turn_on", action)) is None
+
+
+def test_отказ_подключения_триггера_в_журнале_называет_прибор(monkeypatch, caplog) -> None:  # noqa: ANN001
+    """HA пишет «Got error '…' when setting up triggers for» — имя дописывает вызывающий."""
+    import logging
+    import sys
+    import types
+
+    async def async_validate_trigger_config(_hass, config):  # noqa: ANN001, ANN202
+        return config
+
+    async def async_initialize_triggers(_hass, config, action, domain, name, log_cb):  # noqa: ANN001, ANN202
+        # Ровно как хелпер HA (`src-helpers-trigger-__init__.py`): фраза без имени, `exc_info` ключом.
+        log_cb(logging.ERROR, "Got error 'Integration not loaded' when setting up triggers for")
+        log_cb(logging.ERROR, "Error setting up trigger", exc_info=ValueError("x"))
+        return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "homeassistant.helpers.trigger",
+        types.SimpleNamespace(
+            async_validate_trigger_config=async_validate_trigger_config,
+            async_initialize_triggers=async_initialize_triggers,
+        ),
+    )
+
+    async def action() -> None:
+        pass
+
+    with caplog.at_level(logging.ERROR, logger="custom_components.mega_home"):
+        assert asyncio.run(HaSource(_Hass()).on_turn_on("media_player.tv", "webostv.turn_on", action)) is None
+    messages = [r.getMessage() for r in caplog.records]
+    assert "Got error 'Integration not loaded' when setting up triggers for media_player.tv" in messages
+    assert "Error setting up trigger media_player.tv" in messages

@@ -265,6 +265,11 @@ class HaSource:
         async def _run(variables: dict[str, Any], context: Context | None = None) -> None:
             await action()
 
-        return await async_initialize_triggers(
-            self.hass, config, _run, DOMAIN, f"wake {entity_id}", LOGGER.log
-        )
+        # ⚠ Хелпер зовёт `log_cb(level, msg, **kwargs)` фразой, которую дописывает ВЫЗЫВАЮЩИЙ:
+        # «Got error '…' when setting up triggers for» (`src-helpers-trigger-__init__.py`,
+        # `async_initialize_triggers`). Голый `LOGGER.log` оставлял её обрубленной — в журнале не
+        # видно, какой прибор не подписан. Дописываем сущность, как подписчики HA своё имя.
+        def _log(level: int, msg: str, **kwargs: Any) -> None:
+            LOGGER.log(level, "%s %s", msg, entity_id, **kwargs)
+
+        return await async_initialize_triggers(self.hass, config, _run, DOMAIN, f"wake {entity_id}", _log)

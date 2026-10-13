@@ -92,7 +92,15 @@ class WakeOnRequest:
                 failed = self._failed.get(entity_id)
                 if failed and now - failed[1] < RETRY_S:
                     continue
-                unsub = await attach(entity_id, trigger, self._action(entity_id))
+                try:
+                    unsub = await attach(entity_id, trigger, self._action(entity_id))
+                except Exception as err:  # noqa: BLE001
+                    # ⚠ Исключение источника — та же неудача, что `None`: иначе задача падала, запись
+                    # в `_failed` не появлялась (повтор на каждом опросе без паузы `RETRY_S`), а
+                    # плитки дальше по проходу оставались без подписки из-за одного прибора.
+                    LOGGER.warning("Wake on %s for %s not attached: %s", trigger, entity_id, err)
+                    self._last_error = f"{entity_id}: {err}"
+                    unsub = None
                 if unsub is not None and self._stopped:
                     # Запись выгрузили, пока HA подключал: подписка пережила бы её.
                     unsub()
