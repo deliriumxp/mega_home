@@ -17,13 +17,19 @@
 heartbeat и пропадает. Поэтому кадр живёт здесь до подтверждения и повторяется
 после переподключения В ИСХОДНОМ ПОРЯДКЕ; менеджер отбрасывает повторы по `id`.
 Срок и число ограничены: событие старше минуты для push бесполезно.
+
+Кадр менеджеру несёт `age` — секунды (число с плавающей точкой, ≥ 0, три знака) от события до
+передачи кадра каналу, по монотонным часам дома. ⚠ Свежесть события решают по нему, а не по `at`:
+`at` — стенные часы дома, а сравнивать их с часами телефона или менеджера нельзя — часы дома
+уходят, и push пометился бы запоздавшим (или свежим) по чужой ошибке. Повтор после обрыва
+несёт уже больший `age`. `at` остаётся для совместимости и показа времени.
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict, deque
 from collections.abc import Callable
-from time import time
+from time import monotonic, time
 from typing import Any
 from uuid import uuid4
 
@@ -44,6 +50,9 @@ class EventHub:
         self._unacked: OrderedDict[str, dict[str, Any]] = OrderedDict()
         # Свой срок ожидания подтверждения — у событий, которым минуты мало (`publish`, `ttl`).
         self._ttl: dict[str, float] = {}
+        # Когда случилось событие, по монотонным часам: `age` кадра и срок ожидания. Стенные `at`
+        # для срока не годятся — поправка часов дома выбрасывала бы свежие кадры или держала старые.
+        self._born: dict[str, float] = {}
         self._sender: Callable[[dict[str, Any]], bool] | None = None
         self.recent: deque[dict[str, Any]] = deque(maxlen=20)
         self.dropped = 0
@@ -96,9 +105,10 @@ class EventHub:
                 self._store.add(frame)
         if ttl != BUFFER_TTL_S:
             self._ttl[frame["id"]] = ttl
+        self._born[frame["id"]] = monotonic()
         self._keep(frame)
         if self._sender is not None:
-            self._sender(frame)
+            self._sender(self._outgoing(frame))
         # ⚠ ПОСЛЕ отправки: вложение (`event_files.py`) догоняет событие, а не
         # задерживает его.
         if self.on_published is not None:
@@ -118,14 +128,25 @@ class EventHub:
         """Канал поднялся: вернуть неподтверждённое свежее (в порядке событий)."""
         self._sender = sender
         self._expire()
-        return list(self._unacked.values())
+        return [self._outgoing(frame) for frame in self._unacked.values()]
 
     def detach(self) -> None:
         self._sender = None
 
     def ack(self, frame_id: Any) -> None:
-        self._unacked.pop(str(frame_id), None)
-        self._ttl.pop(str(frame_id), None)
+        self._forget(str(frame_id))
+
+    def _outgoing(self, frame: dict[str, Any]) -> dict[str, Any]:
+        """Кадр каналу: копия с `age` на момент передачи (буферный кадр не меняется — повтор
+        считает возраст заново). Очередь канала (`link._attach_events`) добавляет миллисекунды."""
+        born = self._born.get(frame["id"])
+        age = max(0.0, monotonic() - born) if born is not None else 0.0
+        return {**frame, "age": round(age, 3)}
+
+    def _forget(self, frame_id: str) -> None:
+        self._unacked.pop(frame_id, None)
+        self._ttl.pop(frame_id, None)
+        self._born.pop(frame_id, None)
 
     def state(self) -> dict[str, Any]:
         return {"unacked": len(self._unacked), "dropped": self.dropped, "recent": list(self.recent)}
@@ -139,8 +160,7 @@ class EventHub:
             # как раз уведомление с часовым (`ttl`), и болтливый слушатель выбил бы «протечку»
             # раньше своего же свежего шума.
             dropped_id = next((i for i in self._unacked if i not in self._ttl), next(iter(self._unacked)))
-            del self._unacked[dropped_id]
-            self._ttl.pop(dropped_id, None)
+            self._forget(dropped_id)
             self.dropped += 1
         # ⚠ Одна строка на НАЧАЛО потерь, а не на каждое событие: менеджер
         # недоступен неделями, и болтливый датчик писал бы журнал HA без конца.
@@ -151,12 +171,11 @@ class EventHub:
         self._overflowing = overflow
 
     def _expire(self) -> None:
-        now = time()
+        now = monotonic()
         for frame_id in [
-            i for i, f in self._unacked.items() if now - f["at"] > self._ttl.get(i, BUFFER_TTL_S)
+            i for i in self._unacked if now - self._born.get(i, now) > self._ttl.get(i, BUFFER_TTL_S)
         ]:
-            del self._unacked[frame_id]
-            self._ttl.pop(frame_id, None)
+            self._forget(frame_id)
 
 
 def _bounded(data: Any) -> Any:

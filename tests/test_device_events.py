@@ -13,7 +13,7 @@ def test_свой_срок_ожидания_подтверждения(monkeypat
     Звонку домофона старше минуты смысла нет — у остальных событий срок прежний.
     """
     now = [1000.0]
-    monkeypatch.setattr(de, "time", lambda: now[0])
+    monkeypatch.setattr(de, "monotonic", lambda: now[0])
     hub = de.EventHub()
     hub.publish("intercom", "s", "ring")
     alert = hub.publish("home", "t", "alert", ttl=3600)
@@ -50,3 +50,22 @@ def test_переполнение_вытесняет_сначала_обычны
         hub.publish("mqtt", "s", "noise")
     assert alert["id"] in hub._unacked  # noqa: SLF001
     assert hub.dropped == 3
+
+
+def test_кадр_несёт_возраст_события_на_момент_отправки(monkeypatch) -> None:
+    """`age` — по монотонным часам дома: менеджер и телефон не сравнивают свои часы с часами дома."""
+    mono, wall = [500.0], [1_000_000.0]
+    monkeypatch.setattr(de, "monotonic", lambda: mono[0])
+    monkeypatch.setattr(de, "time", lambda: wall[0])
+    hub = de.EventHub()
+    sent: list[dict] = []
+    hub.attach(lambda frame: sent.append(frame) or True)
+    alert = hub.publish("home", "t", "alert", ttl=3600)
+    assert sent[0]["age"] == 0.0
+    assert "age" not in alert  # буферный кадр не меняется
+    hub.detach()
+    mono[0] += 42.5
+    wall[0] -= 86400  # часы дома поправили назад: на возраст и срок не влияет
+    again = hub.attach(lambda frame: True)
+    assert [(f["id"], f["age"]) for f in again] == [(alert["id"], 42.5)]
+    assert again[0]["at"] == alert["at"]
