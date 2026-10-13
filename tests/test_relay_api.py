@@ -466,7 +466,7 @@ def _with_alerts(coordinator):
 
     sensor = {"id": "t-temp", "roomId": "r1", "name": "Температура", "domain": "sensor", "entityId": "sensor.t"}
     coordinator.data = {**CONFIG, "tiles": [*CONFIG["tiles"], sensor]}
-    coordinator.alerts = Alerts(coordinator.env, coordinator.source, lambda tile, data: None)
+    coordinator.alerts = Alerts(coordinator.env, coordinator.source, lambda tile, data: True)
     return coordinator
 
 

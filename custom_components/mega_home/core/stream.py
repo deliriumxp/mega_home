@@ -388,9 +388,29 @@ class Streams:
 class _SessionBase:
     """Общее у всех видов сессии: срок жизни и конец с уведомлением владельца.
 
-    Наследник задаёт `id`, `_owner`, `_tasks`, `_stopping` и `_release()` —
-    что закрыть у своего вида (сокет, сессию HTTP, транспорт UDP).
+    Наследник задаёт `id`, `_owner`, `_tasks` и `_release()` — что закрыть у
+    своего вида (сокет, сессию HTTP, транспорт UDP); `_run()` или свой `start()`.
     """
+
+    # Неизменяемые умолчания класса: присваивание в экземпляре их не трогает.
+    _bytes = 0
+    _stopping = False
+
+    def start(self) -> None:
+        self._tasks = [asyncio.ensure_future(self._run()), asyncio.ensure_future(self._deadline())]
+
+    async def _relay(self, data: bytes | str) -> bool:
+        """Кадр менеджеру под потолком трафика (текст — кадром `stream.data`). `False` — потолок
+        превышен и сессия закрыта. Потолок — на ОБА вида кадров: текстом выкачивается так же."""
+        self._bytes += len(data)
+        if self._bytes > MAX_BYTES:
+            await self._done("превышен потолок трафика сессии")
+            return False
+        if isinstance(data, str):
+            await self._owner._send_json({"t": "stream.data", "id": self.id, "text": data})
+        else:
+            await self._owner._send_bytes(frame(self.id, data))
+        return True
 
     async def stop(self, error: str | None) -> None:
         if self._stopping:
@@ -435,8 +455,6 @@ class _Stream(_SessionBase):
         self._idle_s = idle
         self._queue: asyncio.Queue[bytes] = asyncio.Queue(QUEUE_DEPTH)
         self._tasks: list[asyncio.Task[None]] = []
-        self._bytes = 0
-        self._stopping = False
 
     def start(self) -> None:
         self._tasks = [
@@ -487,11 +505,8 @@ class _Stream(_SessionBase):
                 if not chunk:
                     await self._done(None)
                     return
-                self._bytes += len(chunk)
-                if self._bytes > MAX_BYTES:
-                    await self._done("превышен потолок трафика сессии")
+                if not await self._relay(chunk):
                     return
-                await self._owner._send_bytes(frame(self.id, chunk))
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
@@ -526,11 +541,6 @@ class _WsStream(_SessionBase):
         self._tasks: list[asyncio.Task[None]] = []
         self._session: aiohttp.ClientSession | None = None
         self._socket: Any = None
-        self._bytes = 0
-        self._stopping = False
-
-    def start(self) -> None:
-        self._tasks = [asyncio.ensure_future(self._run()), asyncio.ensure_future(self._deadline())]
 
     async def to_device(self, chunk: bytes) -> None:
         if not self._stopping:
@@ -566,17 +576,9 @@ class _WsStream(_SessionBase):
                     # Устройство закрыло сокет само — это конец, а не авария.
                     await self._done(None)
                     return
-                # Потолок — на ОБА вида кадров: текстом выкачивается так же.
-                self._bytes += len(message.data)
-                if self._bytes > MAX_BYTES:
-                    await self._done("превышен потолок трафика сессии")
+                # Текстовый кадр несёт `str`, двоичный — `bytes`: вид кадра выбирает `_relay`.
+                if not await self._relay(message.data):
                     return
-                if message.type is aiohttp.WSMsgType.TEXT:
-                    await self._owner._send_json(
-                        {"t": "stream.data", "id": self.id, "text": message.data}
-                    )
-                else:
-                    await self._owner._send_bytes(frame(self.id, message.data))
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
@@ -616,11 +618,6 @@ class _HttpStream(_SessionBase):
         self._idle_s = idle
         self._tasks: list[asyncio.Task[None]] = []
         self._session: aiohttp.ClientSession | None = None
-        self._bytes = 0
-        self._stopping = False
-
-    def start(self) -> None:
-        self._tasks = [asyncio.ensure_future(self._run()), asyncio.ensure_future(self._deadline())]
 
     async def to_device(self, chunk: bytes) -> None:
         """У ответа нет обратного направления — молча, см. `_Stream.to_device_text`."""
@@ -652,11 +649,8 @@ class _HttpStream(_SessionBase):
                 }
             )
             async for chunk in response.content.iter_any():
-                self._bytes += len(chunk)
-                if self._bytes > MAX_BYTES:
-                    await self._done("превышен потолок трафика сессии")
+                if not await self._relay(chunk):
                     return
-                await self._owner._send_bytes(frame(self.id, chunk))
             # Тело кончилось — это нормальный конец ответа, а не отказ.
             await self._done(None)
         except asyncio.CancelledError:
@@ -696,8 +690,6 @@ class _Datagrams(_SessionBase):
         self._transport = transport
         self._owner = owner
         self._idle_s = idle
-        self._bytes = 0
-        self._stopping = False
         self._overflow = False
         self._tasks: list[asyncio.Task[None]] = []
         self._idle: asyncio.TimerHandle | None = None
