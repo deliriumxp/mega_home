@@ -457,3 +457,48 @@ def test_лента_событий_устройства_доезжает_пер�
     assert json_of(answer) == {
         "events": [{"id": "e1", "at": at, "source": "cam", "event": "motion", "data": None}]
     }
+
+
+# Правило уведомлений по датчику — выбор жильца, как фото и кадр: снаружи ложится в дом
+# теми же путями, ключ — только датчик текущего состава (`core/alerts.py`).
+def _with_alerts(coordinator):
+    from mega_home.core.alerts import Alerts  # noqa: PLC0415
+
+    sensor = {"id": "t-temp", "roomId": "r1", "name": "Температура", "domain": "sensor", "entityId": "sensor.t"}
+    coordinator.data = {**CONFIG, "tiles": [*CONFIG["tiles"], sensor]}
+    coordinator.alerts = Alerts(coordinator.env, coordinator.source, lambda tile, data: None)
+    return coordinator
+
+
+def test_правило_уведомления_снаружи_ложится_в_дом(coordinator):
+    _with_alerts(coordinator)
+    rule = {"op": "gt", "value": 25, "holdSec": 60, "cooldownSec": 900, "enabled": True}
+    posted = call(coordinator, "POST", "api/alert/t-temp", json.dumps(rule).encode())
+    assert json_of(posted) == {"accepted": True, "alert": rule}
+    assert json_of(call(coordinator, "GET", "api/alerts")) == {"alerts": {"t-temp": rule}}
+
+    assert json_of(call(coordinator, "DELETE", "api/alert/t-temp"))["accepted"] is True
+    assert json_of(call(coordinator, "GET", "api/alerts")) == {"alerts": {}}
+    # Удалённого нет — тоже успех: два телефона сняли правило одновременно.
+    assert json_of(call(coordinator, "DELETE", "api/alert/t-temp"))["accepted"] is True
+
+
+def test_правило_только_датчику_и_в_нашей_форме(coordinator):
+    _with_alerts(coordinator)
+    rule = {"op": "gt", "value": 25, "holdSec": 0, "cooldownSec": 900, "enabled": True}
+    with pytest.raises(ops.OpError) as err:
+        call(coordinator, "POST", "api/alert/t1", json.dumps(rule).encode())  # свет, не датчик
+    assert err.value.status == HTTPStatus.NOT_FOUND
+
+    with pytest.raises(ops.OpError) as err:
+        call(coordinator, "POST", "api/alert/t-temp", json.dumps({**rule, "op": "между"}).encode())
+    assert err.value.status == HTTPStatus.BAD_REQUEST
+
+    with pytest.raises(ops.OpError) as err:
+        call(coordinator, "POST", "api/alert/t-temp", json.dumps({**rule, "pad": "x" * 2000}).encode())
+    assert err.value.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+
+
+def test_дом_без_правил_отвечает_пустым(coordinator):
+    # Модуль ещё не поднят (ранний запрос на старте) — пусто, а не падение.
+    assert json_of(call(coordinator, "GET", "api/alerts")) == {"alerts": {}}

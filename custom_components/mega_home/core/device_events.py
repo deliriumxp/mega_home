@@ -42,6 +42,8 @@ class EventHub:
     def __init__(self, store: Any = None) -> None:
         self._listeners: list[Listener] = []
         self._unacked: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        # Свой срок ожидания подтверждения — у событий, которым минуты мало (`publish`, `ttl`).
+        self._ttl: dict[str, float] = {}
         self._sender: Callable[[dict[str, Any]], bool] | None = None
         self.recent: deque[dict[str, Any]] = deque(maxlen=20)
         self.dropped = 0
@@ -54,9 +56,19 @@ class EventHub:
         self.on_published: Listener | None = None
 
     def publish(
-        self, access: str, source: str, event: str, data: Any = None, local: bool = False
+        self,
+        access: str,
+        source: str,
+        event: str,
+        data: Any = None,
+        local: bool = False,
+        ttl: float = BUFFER_TTL_S,
     ) -> dict[str, Any]:
         """Событие устройства. `local` — можно ли показать его в локальном контуре.
+
+        `ttl` — сколько ждать подтверждения менеджера. Умолчание — минута, предел для звонка;
+        уведомлению по датчику (`alerts.py`) нужен час: протечка при моргнувшем интернете обязана
+        дойти, пусть и с пометкой о задержке. В кадр срок не попадает.
 
         ⚠ Умолчание — НЕ показывать: локальный контур без аутентификации, и
         новый источник не должен попадать туда по забывчивости. Ровно тот же
@@ -82,6 +94,8 @@ class EventHub:
                     LOGGER.warning("Событие устройства: подписчик упал", exc_info=True)
             if self._store is not None:
                 self._store.add(frame)
+        if ttl != BUFFER_TTL_S:
+            self._ttl[frame["id"]] = ttl
         self._keep(frame)
         if self._sender is not None:
             self._sender(frame)
@@ -111,6 +125,7 @@ class EventHub:
 
     def ack(self, frame_id: Any) -> None:
         self._unacked.pop(str(frame_id), None)
+        self._ttl.pop(str(frame_id), None)
 
     def state(self) -> dict[str, Any]:
         return {"unacked": len(self._unacked), "dropped": self.dropped, "recent": list(self.recent)}
@@ -120,7 +135,8 @@ class EventHub:
         self._unacked[frame["id"]] = frame
         overflow = len(self._unacked) > BUFFER
         while len(self._unacked) > BUFFER:
-            self._unacked.popitem(last=False)
+            dropped_id, _ = self._unacked.popitem(last=False)
+            self._ttl.pop(dropped_id, None)
             self.dropped += 1
         # ⚠ Одна строка на НАЧАЛО потерь, а не на каждое событие: менеджер
         # недоступен неделями, и болтливый датчик писал бы журнал HA без конца.
@@ -132,8 +148,11 @@ class EventHub:
 
     def _expire(self) -> None:
         now = time()
-        for frame_id in [i for i, f in self._unacked.items() if now - f["at"] > BUFFER_TTL_S]:
+        for frame_id in [
+            i for i, f in self._unacked.items() if now - f["at"] > self._ttl.get(i, BUFFER_TTL_S)
+        ]:
             del self._unacked[frame_id]
+            self._ttl.pop(frame_id, None)
 
 
 def _bounded(data: Any) -> Any:

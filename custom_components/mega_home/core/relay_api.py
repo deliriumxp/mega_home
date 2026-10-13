@@ -35,6 +35,7 @@ from typing import Any
 from urllib.parse import parse_qsl, unquote
 
 from . import ops
+from .alerts import MAX_RULE_BYTES, alert_key_known, rule_valid
 from .crops import crop_key_known, crop_keys, crop_value_valid
 from .imaging import asset_file, photo_file
 from .ops_base import VIA_LOCAL, VIA_REMOTE, actor, dumps
@@ -150,6 +151,15 @@ async def dispatch(
             return _json({"crops": crops})
         if rest.startswith("/"):
             return await _crop(coordinator, method, unquote(rest[1:]), body)
+    if path.startswith("api/alert"):
+        # Правила уведомлений по датчикам (`alerts.py`): `api/alerts` — все, `api/alert/<плитка>` —
+        # одно. Один префикс, как у фото и кадров (замок 2 считает пути).
+        rest = path[len("api/alert") :]
+        if rest in ("", "s") and method == "GET":
+            alerts = getattr(coordinator, "alerts", None)
+            return _json({"alerts": alerts.all() if alerts else {}})
+        if rest.startswith("/"):
+            return await _alert(coordinator, method, unquote(rest[1:]), body)
     if path.startswith("api/asset/") and method == "GET":
         # Файлы менеджера: ключ, версия и тип — из манифеста в конфиге
         # (`assets.py`), а не из `?v=` адреса — тот лишь метка кэша.
@@ -234,6 +244,33 @@ async def _crop(coordinator: Any, method: str, tile: str, body: bytes) -> Reply:
     if method == "DELETE":
         if not await coordinator.env.run(coordinator.crops.delete, tile):
             raise ops.OpError("Кадр не найден", HTTPStatus.NOT_FOUND)
+        return _json({"accepted": True})
+    raise ops.OpError("Дом не знает такого запроса", HTTPStatus.METHOD_NOT_ALLOWED)
+
+async def _alert(coordinator: Any, method: str, tile: str, body: bytes) -> Reply:
+    """Правило уведомлений по датчику, заданное жильцом: записать, снять.
+
+    Ключ — только датчик текущего состава, той же дисциплиной, что у `_photo`; тело — не больше
+    килобайта: локальный контур без аутентификации.
+    """
+    alerts = getattr(coordinator, "alerts", None)
+    if alerts is None:
+        raise ops.OpError("Дом ещё запускается", HTTPStatus.SERVICE_UNAVAILABLE)
+    if method == "POST":
+        if not alert_key_known(coordinator.data, tile):
+            raise ops.OpError("Датчик не найден", HTTPStatus.NOT_FOUND)
+        if len(body) > MAX_RULE_BYTES:
+            raise ops.OpError("Слишком большое правило", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        rule = rule_valid(_json_body(body))
+        if rule is None:
+            raise ops.OpError("Некорректное правило", HTTPStatus.BAD_REQUEST)
+        await alerts.save(tile, rule)
+        alerts.track(coordinator.data)
+        return _json({"accepted": True, "alert": rule})
+    if method == "DELETE":
+        # Отсутствующее — тоже успех: два телефона сняли правило разом, оба правы.
+        if await alerts.delete(tile):
+            alerts.track(coordinator.data)
         return _json({"accepted": True})
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.METHOD_NOT_ALLOWED)
 

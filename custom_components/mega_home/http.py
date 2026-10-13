@@ -231,6 +231,20 @@ class MegaHomeCropView(_RoutedView):
     name = "api:mega_home:crop"
 
 
+class MegaHomeAlertsView(_RoutedView):
+    """Правила уведомлений по датчикам, заданные жильцом (`core/alerts.py`)."""
+
+    url = f"{URL_API}/alerts"
+    name = "api:mega_home:alerts"
+
+
+class MegaHomeAlertView(_RoutedView):
+    """Одно правило уведомлений по датчику: записать, снять."""
+
+    url = f"{URL_API}/alert/{{tile}}"
+    name = "api:mega_home:alert"
+
+
 class MegaHomeAssetView(_RoutedView):
     """ONE route for every file the manager hands to this home (`assets.py`)."""
 
@@ -525,6 +539,8 @@ VIEWS: tuple[type[HomeAssistantView], ...] = (
     MegaHomePhotoView,
     MegaHomeCropsView,
     MegaHomeCropView,
+    MegaHomeAlertsView,
+    MegaHomeAlertView,
     MegaHomeAssetView,
     MegaHomeCameraFrameView,
     MegaHomeDeviceEventsView,

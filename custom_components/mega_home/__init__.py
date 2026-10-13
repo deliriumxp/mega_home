@@ -117,6 +117,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     entry.async_on_unload(coordinator.async_add_listener(_track_changes))
     entry.async_on_unload(changes.stop)
 
+    # Уведомления по датчикам (`alerts.py`) — ДО дверей, как `changes`: первый же `api/alerts`
+    # отвечает правилами. Сигнал уходит концентратором событий, который ставится ниже, — поэтому
+    # берётся в момент срабатывания, а не при сборке. Час ожидания менеджера: протечка при
+    # моргнувшем интернете обязана дойти (`device_events.publish`, `ttl`).
+    from .core.alerts import ALERT_TTL_S, Alerts
+
+    def _publish_alert(tile: str, data: dict[str, Any]) -> None:
+        if coordinator.events is not None:
+            coordinator.events.publish("home", tile, "alert", data, ttl=ALERT_TTL_S)
+
+    alerts = Alerts(coordinator.env, coordinator.source, _publish_alert)
+    await alerts.async_load()
+    coordinator.alerts = alerts
+
+    def _track_alerts() -> None:
+        alerts.track(coordinator.data)
+
+    _track_alerts()
+    entry.async_on_unload(coordinator.async_add_listener(_track_alerts))
+    entry.async_on_unload(alerts.stop)
+
     await async_register_http(hass, coordinator)
     # Паспорт дома называет ПОДНЯТЫЕ пути (`ops.config`) — их знает тот, кто
     # поднимал двери.

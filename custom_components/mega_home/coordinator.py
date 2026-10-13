@@ -31,6 +31,7 @@ from .core.const import (
     STORAGE_VERSION,
 )
 from .core.assets import AssetStore
+from .core.alerts import alert_keys
 from .core.crops import CropStore, crop_keys
 from .core.imaging import LookStore
 from .core.photos import PhotoStore, photo_keys, prune_dir
@@ -102,6 +103,8 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.dev_log: Any = None
         # С какого момента приборы в своём состоянии (`changes.py`); ставится в `async_setup_entry`.
         self.changes: Any = None
+        # Правила уведомлений по датчикам (`alerts.py`); ставятся в `async_setup_entry`.
+        self.alerts: Any = None
         # Бандл интерфейса: качается с менеджера и раздаётся из кэша, поэтому
         # новая версия приложения не требует ни HACS, ни перезапуска.
         #
@@ -365,6 +368,9 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for store, keys in ((self.photos, photo_keys(config)), (self.crops, crop_keys(config))):
             if keys:
                 await self.hass.async_add_executor_job(store.prune, keys)
+        # Правила уведомлений по датчикам (`alerts.py`) — тот же выбор жильца, та же дисциплина.
+        if self.alerts is not None:
+            await self.alerts.prune(alert_keys(config))
 
     async def _async_sync_icons(self, config: dict[str, Any]) -> None:
         """Download every scenario icon the config names.
