@@ -138,6 +138,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     entry.async_on_unload(coordinator.async_add_listener(_track_alerts))
     entry.async_on_unload(alerts.stop)
 
+    # Включение по сети на команду «включи» от кого угодно — голос, автоматизация, интерфейс HA
+    # (`wake.py`). Подписка живёт без жильца и без менеджера, как уведомления выше.
+    from .core.wake import WakeOnRequest
+
+    wake = WakeOnRequest(coordinator.source)
+    coordinator.wake = wake
+
+    def _track_wake() -> None:
+        coordinator.env.spawn(wake.track(coordinator.data), "mega_home_wake")
+
+    _track_wake()
+    entry.async_on_unload(coordinator.async_add_listener(_track_wake))
+    entry.async_on_unload(wake.stop)
+
     await async_register_http(hass, coordinator)
     # Паспорт дома называет ПОДНЯТЫЕ пути (`ops.config`) — их знает тот, кто
     # поднимал двери.

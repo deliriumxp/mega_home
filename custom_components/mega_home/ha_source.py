@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from http import HTTPStatus
 from time import monotonic
 from typing import Any
@@ -13,7 +13,7 @@ from homeassistant.exceptions import HomeAssistantError, ServiceNotFound
 from homeassistant.helpers.event import async_track_state_change_event
 
 from . import ha_registry
-from .core.const import LOGGER
+from .core.const import DOMAIN, LOGGER
 from .core.ops_base import OpError
 from .core.source import CommandRejected, CommandUnknown
 
@@ -232,3 +232,39 @@ class HaSource:
             on_change(event.data.get("entity_id") or "", event.data.get("new_state"))
 
         return async_track_state_change_event(self.hass, entity_ids, _on_state)
+
+    async def on_turn_on(
+        self,
+        entity_id: str,
+        trigger: str,
+        action: Callable[[], Awaitable[None]],
+    ) -> Callable[[], None] | None:
+        """Подписка на триггер «прибор просят включить» его интеграции (`wake.py`).
+
+        Тот же путь, каким HA обслуживает `subscribe_trigger` (`dev-api-websocket.md`: «These are
+        the same triggers syntax as used for automation triggers»): проверка конфига триггера и
+        подключение (`src-components-websocket_api-commands.py`, `handle_subscribe_trigger`).
+        Интеграция прибора, увидев подписчика, сама объявляет TURN_ON и зовёт его на
+        `media_player.turn_on` от кого угодно (`user-webostv.md`: «To turn on your TV from Home
+        Assistant, you need to create an automation using the [Device is requested to turn on]…
+        trigger») — автоматизация в HA не нужна.
+
+        ⚠ Отказ подключения HA не бросает, а пишет в журнал и возвращает `None`
+        (`src-helpers-trigger-__init__.py`, `async_initialize_triggers`) — так же отвечаем и мы.
+        """
+        from homeassistant.helpers.trigger import async_initialize_triggers, async_validate_trigger_config
+
+        try:
+            config = await async_validate_trigger_config(
+                self.hass, [{"platform": trigger, "entity_id": [entity_id]}]
+            )
+        except (vol.Invalid, HomeAssistantError) as err:
+            LOGGER.warning("Trigger %s for %s is not available: %s", trigger, entity_id, err)
+            return None
+
+        async def _run(variables: dict[str, Any], context: Context | None = None) -> None:
+            await action()
+
+        return await async_initialize_triggers(
+            self.hass, config, _run, DOMAIN, f"wake {entity_id}", LOGGER.log
+        )

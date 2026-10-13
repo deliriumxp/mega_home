@@ -105,6 +105,8 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.changes: Any = None
         # Правила уведомлений по датчикам (`alerts.py`); ставятся в `async_setup_entry`.
         self.alerts: Any = None
+        # Включение по сети на чужую команду «включи» (`wake.py`); ставится в `async_setup_entry`.
+        self.wake: Any = None
         # Бандл интерфейса: качается с менеджера и раздаётся из кэша, поэтому
         # новая версия приложения не требует ни HACS, ни перезапуска.
         #

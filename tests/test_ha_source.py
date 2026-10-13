@@ -173,3 +173,62 @@ def test_камера_без_потока_не_спрашивается_на_к�
         assert asked == ["camera.gate", "camera.gate"]
 
     asyncio.run(scenario())
+
+
+def test_просьба_включить_подписывает_триггер_интеграции_путём_subscribe_trigger(monkeypatch) -> None:  # noqa: ANN001
+    """Конфиг — как у `subscribe_trigger`: платформа и сущность; срабатывание зовёт действие дома."""
+    import sys
+    import types
+
+    seen: dict = {}
+
+    async def async_validate_trigger_config(_hass, config):  # noqa: ANN001, ANN202
+        seen["validated"] = config
+        return config
+
+    async def async_initialize_triggers(_hass, config, action, domain, name, log_cb):  # noqa: ANN001, ANN202
+        seen.update(initialized=config, domain=domain, action=action)
+        return lambda: seen.setdefault("removed", True)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "homeassistant.helpers.trigger",
+        types.SimpleNamespace(
+            async_validate_trigger_config=async_validate_trigger_config,
+            async_initialize_triggers=async_initialize_triggers,
+        ),
+    )
+    fired: list = []
+
+    async def action() -> None:
+        fired.append(True)
+
+    async def scenario() -> None:
+        unsub = await HaSource(_Hass()).on_turn_on("media_player.tv", "webostv.turn_on", action)
+        assert seen["validated"] == [{"platform": "webostv.turn_on", "entity_id": ["media_player.tv"]}]
+        assert seen["domain"] == "mega_home"
+        await seen["action"]({"trigger": {}}, None)
+        unsub()
+
+    asyncio.run(scenario())
+    assert fired == [True]
+    assert seen["removed"] is True
+
+
+def test_неизвестный_триггер_не_роняет_а_отвечает_none(monkeypatch) -> None:  # noqa: ANN001
+    import sys
+    import types
+
+    async def async_validate_trigger_config(_hass, config):  # noqa: ANN001, ANN202
+        raise vol.Invalid("Invalid trigger 'webostv.turn_on' specified")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "homeassistant.helpers.trigger",
+        types.SimpleNamespace(async_validate_trigger_config=async_validate_trigger_config, async_initialize_triggers=None),
+    )
+
+    async def action() -> None:
+        pass
+
+    assert asyncio.run(HaSource(_Hass()).on_turn_on("media_player.tv", "webostv.turn_on", action)) is None
