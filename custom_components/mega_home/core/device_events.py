@@ -135,7 +135,11 @@ class EventHub:
         self._unacked[frame["id"]] = frame
         overflow = len(self._unacked) > BUFFER
         while len(self._unacked) > BUFFER:
-            dropped_id, _ = self._unacked.popitem(last=False)
+            # ⚠ Первым уходит старейший кадр с ОБЫЧНЫМ сроком: через минуту простоя старейший —
+            # как раз уведомление с часовым (`ttl`), и болтливый слушатель выбил бы «протечку»
+            # раньше своего же свежего шума.
+            dropped_id = next((i for i in self._unacked if i not in self._ttl), next(iter(self._unacked)))
+            del self._unacked[dropped_id]
             self._ttl.pop(dropped_id, None)
             self.dropped += 1
         # ⚠ Одна строка на НАЧАЛО потерь, а не на каждое событие: менеджер

@@ -39,3 +39,14 @@ def test_переполнение_буфера_предупреждает_оди
     for _ in range(4):
         hub.publish("a", "s", "e")
     assert len([r for r in caplog.records if "буфер полон" in r.message]) == 2
+
+
+def test_переполнение_вытесняет_сначала_обычные_кадры(monkeypatch) -> None:
+    """Уведомление с часовым сроком переживает поток шума, которым забит буфер."""
+    monkeypatch.setattr(de, "BUFFER", 3)
+    hub = de.EventHub()
+    alert = hub.publish("home", "t", "alert", ttl=3600)
+    for _ in range(5):
+        hub.publish("mqtt", "s", "noise")
+    assert alert["id"] in hub._unacked  # noqa: SLF001
+    assert hub.dropped == 3

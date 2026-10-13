@@ -230,3 +230,28 @@ def test_форма_правила() -> None:
     assert rule_valid({**ok, "enabled": "да"}) is None
     assert rule_valid({**ok, "extra": 1}) is None
     assert rule_valid([]) is None
+
+
+def test_порог_nan_и_бесконечность_не_число() -> None:
+    ok = {"op": "gt", "value": 25, "holdSec": 0, "cooldownSec": 900, "enabled": True}
+    assert rule_valid({**ok, "value": "nan"}) is None
+    assert rule_valid({**ok, "value": "inf"}) is None
+
+
+def test_испорченная_память_срабатываний_не_роняет_правило() -> None:
+    host = FakeHost()
+    first = Rig({"sensor.temp": S("20")}, host=host)
+    first.save("t-temp")
+    asyncio.run(first.alerts.flush())
+    host.stores[STORE_KEY].data["seen"]["t-temp"] = {"in": False, "last": "вчера"}
+
+    second = Rig({"sensor.temp": S("20")}, host=host)
+    second.change("sensor.temp", S("26"))
+    assert [tile for tile, _ in second.sent] == ["t-temp"]
+
+
+def test_срабатывание_пишется_на_диск_сразу() -> None:
+    rig = Rig({"sensor.temp": S("20")})
+    rig.save("t-temp")
+    rig.change("sensor.temp", S("26"))
+    assert "mega_home alerts flush" in rig.host.spawned

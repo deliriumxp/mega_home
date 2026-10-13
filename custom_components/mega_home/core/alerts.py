@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import Callable
 from typing import Any
@@ -65,12 +66,15 @@ def alert_key_known(config: dict[str, Any] | None, tile_id: str) -> bool:
 
 
 def _number(value: Any) -> float | None:
+    """Конечное число или `None`. ⚠ `nan`/`inf` — не число: NaN-порог не срабатывает никогда, а
+    хранилище HA пишет его как `null`, и после перезапуска правило молча пропадало бы."""
     if isinstance(value, bool):
         return None
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    return number if math.isfinite(number) else None
 
 
 def rule_valid(payload: Any) -> dict[str, Any] | None:
@@ -129,6 +133,7 @@ class Alerts:
         clock: Callable[[], float] = time.time,
         later: Later = _call_later,
     ) -> None:
+        self._env = env
         self._store = env.store(STORE_KEY)
         self._saver = PeriodicSave(self._store, self._snapshot)
         self._source, self._publish, self._clock, self._later = source, publish, clock, later
@@ -149,7 +154,16 @@ class Alerts:
         self._rules = {
             str(k): v for k, v in (rules or {}).items() if isinstance(v, dict) and rule_valid(v) == v
         }
-        self._seen = {str(k): v for k, v in (seen or {}).items() if isinstance(v, dict) and k in self._rules}
+        # ⚠ Память срабатываний тоже проверяется: нечисловое `last` из испорченного файла роняло
+        # бы `_fire` на каждой смене датчика, и правило было бы мертво до правки жильцом.
+        self._seen = {
+            str(k): v
+            for k, v in (seen or {}).items()
+            if k in self._rules
+            and isinstance(v, dict)
+            and isinstance(v.get("in"), bool)
+            and (v.get("last") is None or (isinstance(v["last"], (int, float)) and not isinstance(v["last"], bool)))
+        }
 
     def all(self) -> dict[str, dict[str, Any]]:
         return {tile: dict(rule) for tile, rule in self._rules.items()}
@@ -266,6 +280,11 @@ class Alerts:
             self._publish(
                 tile, {"op": rule["op"], "value": rule["value"], "actual": state.state if state else None, "unit": unit}
             )
+            # ⚠ Срабатывание — на диск СРАЗУ, а не раз в период: пропадание питания в эти минуты
+            # дало бы после загрузки повторный push по той же протечке. Срабатывания редки —
+            # флеш одна запись на каждое не изнашивает.
+            self._env.spawn(self.flush(), "mega_home alerts flush")
+            return
         self._saver.touch()
 
     def _cancel_hold(self, tile: str) -> None:
