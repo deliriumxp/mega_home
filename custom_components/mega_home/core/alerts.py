@@ -39,6 +39,8 @@ STORE_KEY = "mega_home_alerts"
 DOMAINS = frozenset({"sensor", "binary_sensor"})
 OPS = frozenset({"on", "off", "eq", "gt", "lt"})
 FIELDS = frozenset({"op", "value", "holdSec", "cooldownSec", "enabled"})
+# Поля, задающие САМ вход в условие; пауза и включённость его не меняют (`save`).
+CONDITION = ("op", "value", "holdSec")
 # Тело правила с телефона — меньше килобайта: локальный контур без аутентификации, и диск
 # объекта не должен заполняться чем попало (тот же довод, что у фото, `photos.py`).
 MAX_RULE_BYTES = 1024
@@ -47,8 +49,17 @@ MIN_COOLDOWN_SEC = 60
 # Сколько событие ждёт подтверждения менеджера (`device_events.publish`, `ttl`): звонку минута —
 # предел, а протечка при моргнувшем интернете обязана дойти, пусть и с пометкой о задержке.
 ALERT_TTL_S = 3600.0
+# Срабатывание сразу на диск — только первое после затишья такой длины. Чаще правило срабатывает
+# лишь при дребезге (числовой датчик у порога, пауза от минуты): повтор push после пропадания
+# питания тогда безвреден — жилец только что получил такой же, — а запись на каждое срабатывание
+# изнашивала бы флеш раз в минуту на правило бесконечно (`docs/plan-device-presence.md`, запись на
+# флеш). Частые повторы ложатся периодическим сохранением (`PeriodicSave`, раз в `SAVE_PERIOD_S`).
+# 15 минут — дольше периода сохранения: правило, срабатывающее чаще, пишет сразу не чаще 4 раз в час.
+FLUSH_QUIET_S = 900.0
 
-Publish = Callable[[str, dict[str, Any]], None]
+# Принят ли сигнал к доставке. `False` — нет (концентратора событий ещё нет): вход не помечается
+# учтённым, и следующая оценка даст его снова (`Alerts._fire`).
+Publish = Callable[[str, dict[str, Any]], bool]
 Later = Callable[[float, Callable[[], None]], Callable[[], None]]
 
 
@@ -169,12 +180,26 @@ class Alerts:
         return {tile: dict(rule) for tile, rule in self._rules.items()}
 
     async def save(self, tile: str, rule: dict[str, Any]) -> None:
-        """Записать правило (уже проверенное `rule_valid`). Точка отсчёта — текущее состояние."""
+        """Записать правило (уже проверенное `rule_valid`). Точка отсчёта — текущее состояние.
+
+        ⚠ Исключение — идущая выдержка при том же УСЛОВИИ (`op`, `value`, `holdSec`): форма жильца
+        сохраняет на каждый тап, и смена паузы или включённости посреди выдержки иначе гасила бы
+        её, а вход считался бы учтённым — протечка не дошла бы вовсе. Условие то же и всё ещё
+        выполнено — значит, это тот же вход, и выдержка досчитывает срок от него. Сменилось
+        условие — прежний вход к новому правилу отношения не имеет: точка отсчёта — сейчас.
+        """
+        previous = self._rules.get(tile)
         self._rules[tile] = dict(rule)
-        self._cancel_hold(tile)
         entity_id = self._entity.get(tile)
         current = self._source.get(entity_id) if entity_id else None
-        self._seen[tile] = {"in": matches(rule, current) is True, "last": self._seen.get(tile, {}).get("last")}
+        last = self._seen.get(tile, {}).get("last")
+        same_condition = previous is not None and all(previous[k] == rule[k] for k in CONDITION)
+        if tile in self._holds and same_condition and matches(rule, current) is True:
+            self._seen[tile] = {"in": False, "last": last}
+            await self.flush()
+            return
+        self._cancel_hold(tile)
+        self._seen[tile] = {"in": matches(rule, current) is True, "last": last}
         # ⚠ Сразу на диск, а не раз в период: это единственная копия выбора жильца.
         await self.flush()
 
@@ -273,19 +298,29 @@ class Alerts:
     def _fire(self, tile: str, state: EntityState | None) -> None:
         rule, seen = self._rules[tile], self._seen[tile]
         now = self._clock()
-        seen["in"] = True
-        if seen.get("last") is None or now - seen["last"] >= rule["cooldownSec"]:
-            seen["last"] = now
-            unit = state.attributes.get("unit_of_measurement") if state else None
-            self._publish(
-                tile, {"op": rule["op"], "value": rule["value"], "actual": state.state if state else None, "unit": unit}
-            )
-            # ⚠ Срабатывание — на диск СРАЗУ, а не раз в период: пропадание питания в эти минуты
-            # дало бы после загрузки повторный push по той же протечке. Срабатывания редки —
-            # флеш одна запись на каждое не изнашивает.
-            self._env.spawn(self.flush(), "mega_home alerts flush")
+        last = seen.get("last")
+        # ⚠ Прошлое срабатывание «в будущем» — часы дома ушли вперёд, и их поправили: пауза по
+        # стенным часам держала бы правило немым до старого `last` + пауза, хоть неделю. Паузы нет.
+        if last is not None and last > now:
+            last = None
+        if last is not None and now - last < rule["cooldownSec"]:
+            # Вход внутри паузы учтён и позже не шлётся.
+            seen["in"] = True
+            self._saver.touch()
             return
-        self._saver.touch()
+        unit = state.attributes.get("unit_of_measurement") if state else None
+        data = {"op": rule["op"], "value": rule["value"], "actual": state.state if state else None, "unit": unit}
+        # ⚠ Не принят — вход НЕ учтён: иначе протечка, пойманная до концентратора событий, молча
+        # пропадала бы, а правило ждало бы выхода из условия.
+        if not self._publish(tile, data):
+            return
+        seen["in"], seen["last"] = True, now
+        if last is None or now - last >= FLUSH_QUIET_S:
+            # ⚠ Первое после затишья — на диск СРАЗУ, а не раз в период: пропадание питания в эти
+            # минуты дало бы после загрузки повторный push по той же протечке.
+            self._env.spawn(self.flush(), "mega_home alerts flush")
+        else:
+            self._saver.touch()
 
     def _cancel_hold(self, tile: str) -> None:
         cancel = self._holds.pop(tile, None)

@@ -12,12 +12,15 @@ from typing import Any
 
 from fake_host import FakeHost, FakeSource
 from mega_home.core.alerts import (
+    ALERT_TTL_S,
+    FLUSH_QUIET_S,
     STORE_KEY,
     Alerts,
     alert_key_known,
     alert_keys,
     rule_valid,
 )
+from mega_home.core.device_events import EventHub
 
 CONFIG = {
     "tiles": [
@@ -65,7 +68,7 @@ class Later:
 
 
 class Rig:
-    def __init__(self, states: dict[str, Any], host: FakeHost | None = None) -> None:
+    def __init__(self, states: dict[str, Any], host: FakeHost | None = None, publish: Any = None) -> None:
         self.host = host or FakeHost()
         self.source = FakeSource(states)
         self.clock = Clock()
@@ -74,7 +77,7 @@ class Rig:
         self.alerts = Alerts(
             self.host,
             self.source,
-            lambda tile, data: self.sent.append((tile, data)),
+            publish or (lambda tile, data: self.sent.append((tile, data)) or True),
             clock=self.clock,
             later=self.later,
         )
@@ -255,3 +258,91 @@ def test_срабатывание_пишется_на_диск_сразу() -> N
     rig.save("t-temp")
     rig.change("sensor.temp", S("26"))
     assert "mega_home alerts flush" in rig.host.spawned
+
+
+def test_вход_при_выключенном_ha_доходит_до_концентратора_на_старте() -> None:
+    # Протечка случилась, пока HA лежал: первая же оценка на старте обязана дать событие менеджеру.
+    first = Rig({"binary_sensor.leak": S("off")})
+    first.save("t-leak", op="on", value=None)
+    asyncio.run(first.alerts.flush())
+
+    hub = EventHub()
+
+    def publish(tile: str, data: dict[str, Any]) -> bool:
+        hub.publish("home", tile, "alert", data, ttl=ALERT_TTL_S)
+        return True
+
+    Rig({"binary_sensor.leak": S("on")}, host=first.host, publish=publish)
+    frames = hub.attach(lambda frame: True)
+    assert [(f["source"], f["event"]) for f in frames] == [("t-leak", "alert")]
+
+
+def test_непринятый_сигнал_не_учитывает_вход() -> None:
+    accepted: list[bool] = [False]
+    sent: list[str] = []
+
+    def publish(tile: str, data: dict[str, Any]) -> bool:
+        if accepted[0]:
+            sent.append(tile)
+        return accepted[0]
+
+    first = Rig({"binary_sensor.leak": S("off")})
+    first.save("t-leak", op="on", value=None)
+    asyncio.run(first.alerts.flush())
+    second = Rig({"binary_sensor.leak": S("on")}, host=first.host, publish=publish)
+    assert first.host.stores[STORE_KEY].data["seen"]["t-leak"]["last"] is None
+    accepted[0] = True
+    second.alerts.track(CONFIG)  # следующий опрос координатора
+    assert sent == ["t-leak"]
+
+
+def test_дребезг_у_порога_не_пишет_на_диск_каждое_срабатывание() -> None:
+    rig = Rig({"sensor.temp": S("20")})
+    rig.save("t-temp", cooldownSec=60)
+    for _ in range(5):
+        rig.change("sensor.temp", S("26"))
+        rig.change("sensor.temp", S("24"))
+        rig.clock.now += 60
+    assert len(rig.sent) == 5
+    assert rig.host.spawned.count("mega_home alerts flush") == 1
+    # После затишья — снова сразу на диск.
+    rig.clock.now += FLUSH_QUIET_S
+    rig.change("sensor.temp", S("26"))
+    assert rig.host.spawned.count("mega_home alerts flush") == 2
+
+
+def test_смена_паузы_не_гасит_идущую_выдержку() -> None:
+    rig = Rig({"sensor.temp": S("20")})
+    rig.save("t-temp", holdSec=60)
+    rig.change("sensor.temp", S("26"))
+    rig.save("t-temp", holdSec=60, cooldownSec=600)  # форма сохраняет на каждый тап
+    rig.later.fire()
+    assert [tile for tile, _ in rig.sent] == ["t-temp"]
+
+
+def test_смена_условия_во_время_выдержки_отсчёт_от_сейчас() -> None:
+    rig = Rig({"sensor.temp": S("20")})
+    rig.save("t-temp", holdSec=60)
+    rig.change("sensor.temp", S("26"))
+    rig.save("t-temp", holdSec=60, value=24)
+    rig.later.fire()
+    assert rig.sent == []
+
+
+def test_прыжок_часов_назад_не_глушит_правило() -> None:
+    rig = Rig({"sensor.temp": S("20")})
+    rig.save("t-temp", cooldownSec=900)
+    rig.change("sensor.temp", S("26"))
+    rig.change("sensor.temp", S("20"))
+    rig.clock.now -= 86400  # часы дома ушли вперёд, их поправили
+    rig.change("sensor.temp", S("26"))
+    assert len(rig.sent) == 2
+
+
+def test_концентратор_событий_заводится_до_первой_оценки_правил() -> None:
+    # Порядок запуска (`__init__.async_setup_entry`): первая оценка срабатывает сразу, и без
+    # концентратора протечка, случившаяся при выключенном HA, пропадала бы.
+    from pathlib import Path
+
+    text = (Path(__file__).parents[1] / "custom_components" / "mega_home" / "__init__.py").read_text()
+    assert text.index("coordinator.events = EventHub(") < text.index("    _track_alerts()\n")

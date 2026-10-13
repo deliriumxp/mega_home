@@ -117,15 +117,40 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     entry.async_on_unload(coordinator.async_add_listener(_track_changes))
     entry.async_on_unload(changes.stop)
 
+    # События устройств (`device_events.py`): один концентратор — менеджеру по
+    # каналу и в локальный поток приложения. Источники — описания устройств
+    # (`listeners.py`, ниже), SIP-мост (вызов, отмена, ответ, конец) и уведомления по датчикам.
+    # ⚠ ДО уведомлений: первая же оценка правил (`alerts.track`) срабатывает по протечке, случившейся,
+    # пока HA лежал, — без концентратора сигнал пропадал, а правило считало вход учтённым.
+    from .core.device_events import EventHub
+    from .core.device_store import DeviceEventStore
+    from .core.event_files import EventFiles
+
+    # Лента событий устройств на диске (часть F): жильцу видна и без менеджера,
+    # как до 0.4.0 — только теперь без вендора (`docs/plan-thin-gateway.md`).
+    device_events_store = DeviceEventStore(coordinator.env)
+    await device_events_store.async_load()
+    coordinator.device_events = device_events_store
+    coordinator.events = EventHub(device_events_store)
+    # Вложения к событиям (`event_files.py`): правило конфига исполняется на
+    # опубликованное событие и кладёт ответ файлом рядом с лентой. Правила — сразу, а не
+    # в `apply_config` ниже: событие первой оценки уведомлений обязано их застать.
+    coordinator.event_files = EventFiles(coordinator.env, device_events_store)
+    coordinator.events.on_published = coordinator.event_files.on_event
+    if coordinator.data:
+        coordinator.event_files.apply(coordinator.data)
+
     # Уведомления по датчикам (`alerts.py`) — ДО дверей, как `changes`: первый же `api/alerts`
-    # отвечает правилами. Сигнал уходит концентратором событий, который ставится ниже, — поэтому
-    # берётся в момент срабатывания, а не при сборке. Час ожидания менеджера: протечка при
-    # моргнувшем интернете обязана дойти (`device_events.publish`, `ttl`).
+    # отвечает правилами. Час ожидания менеджера: протечка при моргнувшем интернете обязана
+    # дойти (`device_events.publish`, `ttl`).
     from .core.alerts import ALERT_TTL_S, Alerts
 
-    def _publish_alert(tile: str, data: dict[str, Any]) -> None:
-        if coordinator.events is not None:
-            coordinator.events.publish("home", tile, "alert", data, ttl=ALERT_TTL_S)
+    def _publish_alert(tile: str, data: dict[str, Any]) -> bool:
+        # Концентратора нет — сигнал не принят: правило не помечает вход учтённым (`alerts._fire`).
+        if coordinator.events is None:
+            return False
+        coordinator.events.publish("home", tile, "alert", data, ttl=ALERT_TTL_S)
+        return True
 
     alerts = Alerts(coordinator.env, coordinator.source, _publish_alert)
     await alerts.async_load()
@@ -187,29 +212,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     if coordinator.data:
         registry.apply(coordinator.data.get("accesses"))
 
-    # События устройств (`device_events.py`): один концентратор — менеджеру по
-    # каналу и в локальный поток приложения. Источники — описания устройств
-    # (`listeners.py`) и SIP-мост (вызов, отмена, ответ, конец).
-    from .core.device_events import EventHub
-    from .core.device_store import DeviceEventStore
+    # Слушатели событий по описаниям устройств — в концентратор, заведённый выше.
     from .core.listeners import Listeners
 
-    # Лента событий устройств на диске (часть F): жильцу видна и без менеджера,
-    # как до 0.4.0 — только теперь без вендора (`docs/plan-thin-gateway.md`).
-    device_events_store = DeviceEventStore(coordinator.env)
-    await device_events_store.async_load()
-    coordinator.device_events = device_events_store
-    coordinator.events = EventHub(device_events_store)
     coordinator.event_sources = Listeners(coordinator.env, coordinator.accesses, coordinator.events)
     if coordinator.data:
         coordinator.event_sources.apply(coordinator.accesses.descriptors())
-
-    # Вложения к событиям (`event_files.py`): правило конфига исполняется на
-    # опубликованное событие и кладёт ответ файлом рядом с лентой.
-    from .core.event_files import EventFiles
-
-    coordinator.event_files = EventFiles(coordinator.env, device_events_store)
-    coordinator.events.on_published = coordinator.event_files.on_event
 
     # Лог разработки (`dev_log.py`): один обработчик на логгер интеграции —
     # весь код покрыт без правки мест логирования.
