@@ -85,15 +85,16 @@ class HaCameras:
         asked = self._sources.get(entity_id)
         return asked[1] if asked else None
 
-    async def snapshot(self, entity_id: str) -> tuple[str, bytes]:
+    async def snapshot(self, entity_id: str, fresh: bool = False) -> tuple[str, bytes]:
         """Один кадр камеры для плитки, снаружи — единственный способ его увидеть.
 
         ⚠ Свежий кадр отдаётся ИЗ ПАМЯТИ, не дожидаясь камеры, а обновляется фоном.
         Иначе открытие плитки стоило бы ровно тех секунд, которые уходят у Home
-        Assistant на ffmpeg.
+        Assistant на ffmpeg. `fresh` (вложение к событию) память обходит: кадр
+        пятиминутной давности к «дверь открыта» показал бы не тот момент.
         """
         cached = self._frames.get(entity_id)
-        if cached is not None and monotonic() - cached[0] <= SNAPSHOT_USABLE:
+        if not fresh and cached is not None and monotonic() - cached[0] <= SNAPSHOT_USABLE:
             # На эту камеру СЕЙЧАС смотрят: обновляем сразу, а не по общему сроку.
             self.warm(entity_id, SNAPSHOT_FRESH)
             return cached[1], cached[2]

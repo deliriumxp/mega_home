@@ -135,7 +135,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # Вложения к событиям (`event_files.py`): правило конфига исполняется на
     # опубликованное событие и кладёт ответ файлом рядом с лентой. Правила — сразу, а не
     # в `apply_config` ниже: событие первой оценки уведомлений обязано их застать.
-    coordinator.event_files = EventFiles(coordinator.env, device_events_store)
+    from .core.ops_camera import camera_frame
+
+    async def tile_frame(tile: str) -> tuple[str, bytes]:
+        # Кадр камеры плитки тем же снимком, что у плитки, но снятый сейчас — правило `{kind: "camera"}`.
+        return await camera_frame(coordinator, {"id": tile}, fresh=True)
+
+    coordinator.event_files = EventFiles(coordinator.env, device_events_store, camera=tile_frame)
     coordinator.events.on_published = coordinator.event_files.on_event
     if coordinator.data:
         coordinator.event_files.apply(coordinator.data)

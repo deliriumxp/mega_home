@@ -59,7 +59,10 @@ class Cameras(Protocol):
 
     def warm(self, entity_id: str) -> None: ...
 
-    async def snapshot(self, entity_id: str) -> tuple[str, bytes]: ...
+    async def snapshot(self, entity_id: str, fresh: bool = False) -> tuple[str, bytes]:
+        """Кадр камеры. Плитке годится и недавний из памяти; `fresh` — только снятый сейчас
+        (вложение к событию: кадр обязан показать момент срабатывания, а не пять минут назад)."""
+        ...
 
     async def stream_source(self, entity_id: str) -> str | None:
         """Адрес живого потока камеры источника (у HA — `camera.stream_source()`).

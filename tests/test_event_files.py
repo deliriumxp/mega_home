@@ -143,3 +143,42 @@ def test_уборка_на_старте_без_новых_событий_и_об
     files._next_prune = 0.0  # noqa: SLF001 — прошёл час, менеджер недоступен: добирает `find`
     assert files.find("нет") is None
     assert sorted(p.name for p in root.iterdir()) == [fresh.name, writing.name]
+
+
+def test_кадр_камеры_плитки_снимает_сам_дом_без_connect(tmp_path, monkeypatch) -> None:
+    asked: list[str] = []
+
+    async def resource(request: dict):  # pragma: no cover — сюда идти нельзя
+        raise AssertionError("кадр камеры плитки — не HTTP-вызов")
+
+    async def camera(tile: str) -> tuple[str, bytes]:
+        asked.append(tile)
+        return "image/jpeg", b"\xff\xd8cam"
+
+    monkeypatch.setattr(ef.connect, "resource", resource)
+    journal = _Journal()
+    files = ef.EventFiles(PlainHost(tmp_path), journal, camera=camera)
+    alert = {"on": {"access": "home", "source": "door", "event": "alert"}, "request": {"kind": "camera", "tile": "cam1"}, "type": "image/jpeg"}
+
+    async def go() -> None:
+        files.apply({"attachments": [alert]})
+        files.on_event({"id": "a1", "access": "home", "source": "door", "event": "alert"})
+        await asyncio.gather(*files._env._tasks)  # noqa: SLF001
+
+    asyncio.run(go())
+    assert asked == ["cam1"]
+    found = files.find("a1")
+    assert found is not None and found[0].read_bytes() == b"\xff\xd8cam"
+
+
+def test_кадр_камеры_без_источника_камер_не_роняет_правило(tmp_path) -> None:
+    files = ef.EventFiles(PlainHost(tmp_path))
+    alert = {"on": {"event": "alert"}, "request": {"kind": "camera", "tile": "cam1"}}
+
+    async def go() -> None:
+        files.apply({"attachments": [alert]})
+        files.on_event({"id": "a1", "event": "alert"})
+        await asyncio.gather(*files._env._tasks)  # noqa: SLF001
+
+    asyncio.run(go())
+    assert files.find("a1") is None

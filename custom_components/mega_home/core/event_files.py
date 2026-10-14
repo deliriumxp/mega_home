@@ -6,7 +6,8 @@
 вендора без архива — тем же правилом, без релиза на каждый случай.
 
 Правило — данные конфига (`attachments[]`): `on` (доступ, источник, событие),
-`request` (форма `ConnectRequest`), `type`, `fallback` (второй запрос).
+`request` (форма `ConnectRequest` либо `{kind: "camera", tile}` — кадр камеры плитки
+источника), `type`, `fallback` (второй запрос).
 ⚠ Исполняется РЕСУРСНОЙ формой `connect` (`connect.resource`): только GET и
 без учётки — правило читает, а не командует; перезагрузить контроллер им
 нельзя, ровно поэтому его можно везти в конфиге, в отличие от правил сторожа.
@@ -21,7 +22,7 @@ import re
 from hashlib import sha1
 from pathlib import Path
 from time import monotonic, time
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from . import connect
 from .const import LOGGER
@@ -36,14 +37,18 @@ MAX_BYTES = 512 * 1024
 # Уборка вне записи — не чаще: `find` зовётся на каждый показ кадра.
 PRUNE_EVERY_S = 3600.0
 
+# Кадр камеры плитки: id плитки → (тип, байты); `OpError` — снять нечем.
+CameraFrame = Callable[[str], Awaitable[tuple[str, bytes]]]
+
 
 class EventFiles:
     """Правила вложений, их исполнение и файлы на диске."""
 
-    def __init__(self, env: Host, journal: Any = None) -> None:
+    def __init__(self, env: Host, journal: Any = None, camera: CameraFrame | None = None) -> None:
         self._env = env
         self._dir = env.path(DIR)
         self._journal = journal
+        self._camera = camera
         self._rules: list[dict[str, Any]] = []
         self._next_prune = 0.0
 
@@ -69,12 +74,28 @@ class EventFiles:
                 self._env.spawn(self._attach(frame, rule), "mega_home event file")
                 return
 
+    async def _fetch(self, request: dict[str, Any]) -> tuple[int, str, bytes]:
+        """Ответ запроса правила: кадр камеры плитки — снимком источника, остальное — `connect`.
+
+        ⚠ `camera` — камера ИСТОЧНИКА дома (у HA — `camera.*`), её кадр дом берёт сам тем же
+        снимком, что у плитки (`ops_camera.camera_frame`), а не HTTP-вызовом к себе: учётки у
+        ресурса нет, а камеру видеонаблюдения со своей строкой источника снимает go2rtc описанным
+        вызовом. Плитка — из конфига дома, чужую камеру правилом не открыть.
+        """
+        if request.get("kind") == "camera":
+            if self._camera is None:
+                raise OpError("Камеры этого дома показать нечем")
+            content_type, body = await self._camera(str(request.get("tile") or ""))
+            return 200, content_type, body
+        status, content_type, body, _cache = await connect.resource(request)
+        return status, content_type, body
+
     async def _attach(self, frame: dict[str, Any], rule: dict[str, Any]) -> None:
         for request in (rule["request"], rule.get("fallback")):
             if not isinstance(request, dict):
                 continue
             try:
-                status, content_type, body, _cache = await connect.resource(request)
+                status, content_type, body = await self._fetch(request)
             except OpError as err:
                 LOGGER.warning("Вложение к событию %s не снято: %s", frame.get("event"), err.message)
                 continue

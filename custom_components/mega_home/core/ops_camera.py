@@ -16,7 +16,7 @@ from .ops_base import OpError, find
 from .source import Cameras
 
 async def camera_frame(
-    coordinator: Any, payload: dict[str, Any]
+    coordinator: Any, payload: dict[str, Any], fresh: bool = False
 ) -> tuple[str, bytes]:
     """Один кадр камеры источника плитки (`Cameras.snapshot`).
 
@@ -30,7 +30,9 @@ async def camera_frame(
     JSON, см. его докстринг); локальная дверь (`http.py`) отдаёт эти байты
     браузеру как есть.
     """
-    return await source_cameras(coordinator).snapshot(camera_entity(coordinator, payload))
+    entity_id = camera_entity(coordinator, payload)
+    cameras = source_cameras(coordinator)
+    return await (cameras.snapshot(entity_id, fresh=True) if fresh else cameras.snapshot(entity_id))
 
 def camera_entity(
     coordinator: Any, payload: dict[str, Any]
