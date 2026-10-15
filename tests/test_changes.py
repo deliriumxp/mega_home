@@ -90,3 +90,14 @@ def test_ответ_дома_несёт_changedAt() -> None:
     assert ops.entity_view(tile, source.get("light.a"), None, changes)["changedAt"] == ms(1)
     # Без памяти (старый вызов) — поле есть, но пустое.
     assert ops.entity_view(tile, source.get("light.a"))["changedAt"] is None
+
+
+def test_flush_пишет_отложенное_сейчас() -> None:
+    """Выгрузка записи: отложенная запись не должна пережить экземпляр (`__init__.async_unload_entry`)."""
+    host = FakeHost()
+    changes = _changes(host, FakeSource({"light.a": S("on", at(1))}))
+    changes.track(["light.a"])
+    store = host.stores[STORE_KEY]
+    assert store._pending is not None  # noqa: SLF001 — запись отложена
+    asyncio.run(changes.flush())
+    assert store._pending is None and store._data["light.a"]["at"] == ms(1)  # noqa: SLF001

@@ -180,6 +180,11 @@ class DevLog:
     def state(self) -> dict[str, Any]:
         return {"queued": len(self._queue), "dropped": self.dropped, "level": logging.getLevelName(self.level)}
 
+    async def flush(self) -> None:
+        """На диск сейчас — выгрузка записи (`__init__.async_unload_entry`): отложенная запись
+        этого экземпляра иначе сработала бы уже под новым и затёрла бы его очередь."""
+        await self._saver.flush()
+
     def _expire(self) -> None:
         cutoff = (time() - QUEUE_TTL_S) * 1000
         self._queue = [r for r in self._queue if (r.get("at") or 0) >= cutoff]

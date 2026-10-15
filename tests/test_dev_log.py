@@ -99,3 +99,15 @@ def test_подробный_лог_опускает_порог_логгера_и
     assert LOGGER.level == logging.DEBUG
     log.apply({})
     assert LOGGER.level == logging.NOTSET
+
+
+def test_flush_пишет_отложенное_сейчас() -> None:
+    """Выгрузка записи: отложенная запись не должна пережить экземпляр (`__init__.async_unload_entry`)."""
+    host = FakeHost()
+    log = dl.DevLog(host, lambda: {})
+    asyncio.run(log.async_load())
+    log.add("home", "error", "c", "запись")
+    disk = host.stores[dl.STORE_KEY]
+    assert disk._pending is not None  # noqa: SLF001 — запись отложена
+    asyncio.run(log.flush())
+    assert disk._pending is None and disk._data["queue"][0]["message"] == "запись"  # noqa: SLF001

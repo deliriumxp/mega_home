@@ -102,3 +102,17 @@ def test_пределы_тела_байтов_и_срок_всем_устрой�
     store._by_access["old"] = [_frame("old", now - RETENTION_S - 10)]  # noqa: SLF001
     store.add(_frame("dev1", now))
     assert "old" not in host.stores[ds.STORE_KEY].data["byAccess"]
+
+
+def test_flush_пишет_отложенное_сейчас() -> None:
+    """Выгрузка записи: отложенная запись не должна пережить экземпляр (`__init__.async_unload_entry`)."""
+    from mega_home.core import device_store as ds
+
+    host = FakeHost()
+    store = DeviceEventStore(host)
+    frame = _frame("dev1", time.time())
+    store.add(frame)
+    disk = host.stores[ds.STORE_KEY]
+    assert disk._pending is not None  # noqa: SLF001 — запись отложена
+    asyncio.run(store.flush())
+    assert disk._pending is None and disk._data["byAccess"]["dev1"][0]["id"] == frame["id"]  # noqa: SLF001
