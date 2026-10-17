@@ -39,7 +39,7 @@ _PART = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def sign(secret: str, device: str, account: str = NONE, epoch: str = NONE) -> str:
-    """Ключ устройства. ⚠ Пара с менеджером (`local-door-keys.util.ts`): вектор в спеках обеих сторон."""
+    """Ключ устройства. ⚠ Пара с менеджером (`local-keys.util.ts`): вектор в спеках обеих сторон."""
     body = f"1.{device}.{account}.{epoch}"
     mac = hmac.new(secret.encode("utf-8"), f"mm-local:{body}".encode("utf-8"), hashlib.sha256)
     return f"{body}.{base64.urlsafe_b64encode(mac.digest()).decode('ascii').rstrip('=')}"

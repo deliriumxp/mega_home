@@ -11,7 +11,7 @@ from __future__ import annotations
 from mega_home.core import ops
 from mega_home.core.local_keys import LocalKeys, sign
 
-# ⚠ Тот же вектор — в спеке менеджера (`local-door-keys.util.spec.ts`): ключ подписывает
+# ⚠ Тот же вектор — в спеке менеджера (`local-keys.util.spec.ts`): ключ подписывает
 # менеджер, проверяет дом, и разойтись им нельзя.
 VECTOR = "1.dev1.42.7.tkwQpYSxVg1iYuBWGqWGgY4gPIZHupkQJb2KxLcy2cU"
 
