@@ -39,7 +39,7 @@ _PART = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def sign(secret: str, device: str, account: str = NONE, epoch: str = NONE) -> str:
-    """Ключ устройства. ⚠ Пара с менеджером (`local-key.util.ts`): вектор в спеках обеих сторон."""
+    """Ключ устройства. ⚠ Пара с менеджером (`local-door-keys.util.ts`): вектор в спеках обеих сторон."""
     body = f"1.{device}.{account}.{epoch}"
     mac = hmac.new(secret.encode("utf-8"), f"mm-local:{body}".encode("utf-8"), hashlib.sha256)
     return f"{body}.{base64.urlsafe_b64encode(mac.digest()).decode('ascii').rstrip('=')}"
@@ -86,8 +86,11 @@ class LocalKeys:
             return True, None, False
         if self.valid(cookie):
             return True, cookie, False
-        if self.valid(header):
-            return True, header, True
+        # Заголовок несёт до двух ключей через запятую: копию из хранилища браузера
+        # первой, пропуск из адреса запасным — действует первый годный.
+        for candidate in (header or "").split(",")[:2]:
+            if self.valid(candidate.strip()):
+                return True, candidate.strip(), True
         if not self.closed:
             return True, sign(self.secret, secrets.token_urlsafe(12)), True
         return False, None, False

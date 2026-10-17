@@ -135,9 +135,13 @@ class _MegaHomeView(HomeAssistantView):
             request.cookies.get(local_keys.COOKIE), request.headers.get(local_keys.HEADER)
         )
         if not allowed:
-            # Код отказа читает бандл: экран «подключитесь к интернету», а не ошибка.
+            # Текст — жильцу как есть (экран «дом недоступен», причина `other`); код
+            # отказа — бандлу, если ему понадобится свой экран.
             refusal = self.json_message(
-                "Новые локальные подключения закрыты", HTTPStatus.FORBIDDEN, "local-closed"
+                "Это устройство не подключено к дому. Подключитесь к интернету и войдите "
+                "в приложение — после входа оно заработает и по Wi-Fi дома.",
+                HTTPStatus.FORBIDDEN,
+                "local-closed",
             )
             return refusal, None, False
         return None, key, fresh

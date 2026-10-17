@@ -11,7 +11,7 @@ from __future__ import annotations
 from mega_home.core import ops
 from mega_home.core.local_keys import LocalKeys, sign
 
-# ⚠ Тот же вектор — в спеке менеджера (`local-key.util.spec.ts`): ключ подписывает
+# ⚠ Тот же вектор — в спеке менеджера (`local-door-keys.util.spec.ts`): ключ подписывает
 # менеджер, проверяет дом, и разойтись им нельзя.
 VECTOR = "1.dev1.42.7.tkwQpYSxVg1iYuBWGqWGgY4gPIZHupkQJb2KxLcy2cU"
 
@@ -46,6 +46,13 @@ def test_открытый_режим_раздаёт_ключ_и_запомина
 def test_пропуск_из_облака_пускает_в_закрытый_дом() -> None:
     keys = _keys(closed=True)
     assert keys.admit(None, VECTOR) == (True, VECTOR, True)
+
+
+def test_отозванная_копия_и_свежий_пропуск_через_запятую() -> None:
+    """Пароль сменили: копия в браузере отозвана, но пропуск из облака того же входа годен."""
+    keys = _keys(closed=True, accounts={"42": 7})
+    revoked = sign("s3cret", "dev1", "42", "6")
+    assert keys.admit(None, f"{revoked},{VECTOR}") == (True, VECTOR, True)
 
 
 def test_кука_сильнее_пропуска_монитор_не_перепривязывается() -> None:
