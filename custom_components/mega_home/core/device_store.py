@@ -85,6 +85,11 @@ class DeviceEventStore:
                 self._saver.touch()
                 return
 
+    async def flush(self) -> None:
+        """На диск сейчас — выгрузка записи (`__init__.async_unload_entry`): отложенная запись
+        этого экземпляра иначе сработала бы уже под новым и затёрла бы его ленту."""
+        await self._saver.flush()
+
     def _snapshot(self) -> dict[str, Any]:
         """Срок — ВСЕМ устройствам при каждой записи: замолчавшее устройство
         иначе держало бы свою ленту вечно, ведь режет её только новое событие."""

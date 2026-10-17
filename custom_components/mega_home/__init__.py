@@ -303,11 +303,16 @@ async def async_unload_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) ->
             await coordinator.agent.async_stop()
         if getattr(coordinator, "observer", None) is not None:
             await coordinator.observer.async_stop()
-        # ⚠ Правила уведомлений — на диск СЕЙЧАС: запись (`Store.async_save`) снимает и отложенную
-        # запись этого экземпляра. Иначе она сработала бы через десять минут после перезагрузки и
-        # затёрла бы правку жильца, сделанную уже в новом экземпляре (`alerts.py`).
-        if getattr(coordinator, "alerts", None) is not None:
-            await coordinator.alerts.flush()
+        # ⚠ Всё, что пишется раз в период (`host.PeriodicSave`), — на диск СЕЙЧАС: запись
+        # (`Store.async_save`) снимает и отложенную запись этого экземпляра. Иначе она сработала бы
+        # через десять минут после перезагрузки записи и затёрла бы то, что новый экземпляр уже
+        # накопил: правку правил жильцом (`alerts.py`), время смен состояния (`changes.py`), ленту
+        # событий (`device_store.py`), очередь лога (`dev_log.py`). Сторож и наблюдатель флашат в
+        # своём `async_stop` выше. Остановку самого HA дописывает его `Store` — здесь перезагрузка
+        # ЗАПИСИ, которую HA не провожает.
+        for part in (coordinator.alerts, coordinator.changes, coordinator.device_events, coordinator.dev_log):
+            if part is not None:
+                await part.flush()
         await _async_stop_processes(coordinator)
     return unloaded
 

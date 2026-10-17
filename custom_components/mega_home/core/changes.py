@@ -83,6 +83,11 @@ class Changes:
             self._unsubscribe()
             self._unsubscribe = None
 
+    async def flush(self) -> None:
+        """На диск сейчас — выгрузка записи (`__init__.async_unload_entry`): отложенная запись
+        этого экземпляра иначе сработала бы уже под новым и затёрла бы его время смен."""
+        await self._saver.flush()
+
     def since(self, entity_id: str | None, state: EntityState | None) -> int | None:
         """С какого момента (мс) у сущности её значение; `None` — не знаем.
 
