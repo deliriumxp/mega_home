@@ -30,6 +30,7 @@ from http import HTTPStatus
 from typing import Any
 
 from . import connect as connect_mod
+from . import services
 from .const import LOGGER
 from .ops_base import (
     VIA_REMOTE,
@@ -231,14 +232,22 @@ def config(coordinator: Any) -> dict[str, Any]:
     except Exception as err:  # noqa: BLE001 — паспорт важнее одной строки в нём
         media = {"running": False, "why": f"состояние go2rtc не прочиталось: {err}"}
 
+    # ⚠ `house` — раздел ТОЛЬКО для дома (секрет ключей, учётка Home Assistant):
+    # тело `config` уходит браузеру жильца, обеим дверям. Замок —
+    # `tests/test_local_keys.py`.
     return {
-        **(coordinator.data or {}),
+        **{k: v for k, v in (coordinator.data or {}).items() if k != "house"},
         "integration": {
             "version": INTEGRATION_VERSION,
             "appVersion": coordinator.bundle.version if coordinator.bundle else None,
             "routes": list(getattr(coordinator, "routes", [])),
             "devices": _devices(coordinator),
             "go2rtc": media,
+            # Поднятые службы транспорта и есть ли у вызова к ним учётка дома: «служба
+            # `ha` с учёткой» — ответ на «доступен ли бандлу API источника» (расписания).
+            "services": {
+                name: {"auth": bool(s.headers or s.ws_open)} for name, s in services.REGISTRY.items()
+            },
         },
     }
 

@@ -37,6 +37,7 @@ from .core.agent import AgentRunner
 from .core.observe import Observer
 from .link import ManagerLink
 from .ha_update import async_self_update
+from .ha_api import NAME as HA_SERVICE, HaApi
 from .core.sip_bridge import SipBridge
 
 # Шторы на импульсных реле (`cover.py`) — единственные сущности интеграции: их
@@ -197,8 +198,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # же origin), а снаружи — только через `connect`. Без имени бандлу пришлось
     # бы знать LAN-адрес HA, а в контейнере это бывает мост docker
     # (менеджер: `docs/plan-ha-domains.md`, этап 1 — обложка плеера).
-    services.register("ha", getattr(getattr(hass, "http", None), "server_port", None) or 8123)
-    entry.async_on_unload(lambda: services.unregister("ha"))
+    # С учёткой объекта — это API HA целиком для бандла (`ha_api.py`): токен
+    # приходит конфигом и применяется в `apply_config`, как ключи локальной двери.
+    coordinator.ha_api = HaApi(hass)
+    coordinator.ha_api.apply(coordinator.data)
+    entry.async_on_unload(lambda: services.unregister(HA_SERVICE))
 
     # Свой go2rtc :8555 stun:8555 без патча HA core — одна схема. Остановка —
     # в `_async_stop_processes` (выгрузка записи и остановка Home Assistant).

@@ -279,6 +279,7 @@ class Streams:
         # Копия этих проверок жила здесь до 2026-09-20 и уже начала расходиться
         # — у `connect` она отвергала `0.0.0.0` и зарезервированное, здесь
         # список был свой.
+        req = connect_mod.with_service(req)
         try:
             host, port = connect_mod.resolve_address(req)
         except OpError as err:
@@ -564,6 +565,10 @@ class _WsStream(_SessionBase):
             # Срок — на РУКОПОЖАТИЕ: число в `timeout=` у aiohttp задавало лишь
             # срок закрытия (и устарело), а к мёртвому адресу ждали бы минуты.
             self._socket = await asyncio.wait_for(self._session.ws_connect(self._url, headers=headers), 10)
+            await asyncio.wait_for(connect_mod.open_ws(self._req, self._socket), 10)
+        except OpError as err:
+            await self._done(err.message)
+            return
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as err:
             await self._done(_describe(err))
             return
