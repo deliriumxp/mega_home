@@ -280,6 +280,7 @@ class Streams:
         # — у `connect` она отвергала `0.0.0.0` и зарезервированное, здесь
         # список был свой.
         try:
+            req = connect_mod.with_service(req)
             host, port = connect_mod.resolve_address(req)
         except OpError as err:
             await self._fail(stream_id, err.message)
@@ -547,8 +548,15 @@ class _WsStream(_SessionBase):
             await self._outgoing.put(("bin", chunk))
 
     async def to_device_text(self, text: str) -> None:
-        if not self._stopping:
-            await self._outgoing.put(("text", text))
+        if self._stopping:
+            return
+        # Кадр к службе дома — через её запрет (`services.Service.guard`): учётку службы
+        # ставит дом, и закрытое ею не открывается кадром вызывающего.
+        refused = connect_mod.refused(self._req, "frame", text)
+        if refused:
+            await self._done(refused)
+            return
+        await self._outgoing.put(("text", text))
 
     async def _release(self) -> None:
         if self._socket is not None:
@@ -564,6 +572,10 @@ class _WsStream(_SessionBase):
             # Срок — на РУКОПОЖАТИЕ: число в `timeout=` у aiohttp задавало лишь
             # срок закрытия (и устарело), а к мёртвому адресу ждали бы минуты.
             self._socket = await asyncio.wait_for(self._session.ws_connect(self._url, headers=headers), 10)
+            await asyncio.wait_for(connect_mod.open_ws(self._req, self._socket), 10)
+        except OpError as err:
+            await self._done(err.message)
+            return
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as err:
             await self._done(_describe(err))
             return

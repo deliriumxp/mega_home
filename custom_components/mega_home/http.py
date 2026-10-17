@@ -8,9 +8,15 @@ commands straight from `hass`. The manager takes no part at runtime.
 (`docs/local-ha-app.md` менеджера): досягаемость у него та же, что у любого
 устройства в Wi-Fi объекта. Границы — в составе путей и потолках, а не в учётке.
 
+⚠ С 2026-10-17 дверь пускает по КЛЮЧУ УСТРОЙСТВА (`core/local_keys.py`), пока
+инсталлятор не закрыл новые подключения, — открыта, как прежде, и раздаёт ключи.
+Это решение «кто», а не «что можно»: путей и их проверок ключ не меняет. Файлы
+бандла раздаются без ключа (бандл не секрет), иначе закрытый дом не смог бы
+показать даже экран «подключитесь к интернету».
+
 ⚠ Пути жильца разбирает ОДИН маршрутизатор — `relay_api.dispatch`, тот же, что
 у переноса через менеджера. Здесь только дверь: запрос aiohttp → `dispatch` →
-ответ aiohttp. Своих проверок у двери нет и не будет: две копии уже расходились.
+ответ aiohttp. Своих проверок путей у двери нет и не будет: две копии уже расходились.
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ from .core.const import (
     URL_ICONS,
     URL_PREFIX,
 )
-from .core import ops, relay_api, stream
+from .core import local_keys, ops, relay_api, stream
 from .core.api import ManagerError
 from .coordinator import MegaHomeCoordinator
 from .core.events import StateStream
@@ -111,13 +117,54 @@ def _coordinator(hass: HomeAssistant) -> MegaHomeCoordinator | None:
 
 
 class _MegaHomeView(HomeAssistantView):
-    """Base view: the local contour has no auth (see the module docstring).
+    """Base view: the local contour has no Home Assistant auth (see the module docstring).
 
     The app never gets a Home Assistant token: states and service calls are made
     by this integration from inside Python, and only our own shape goes out.
     """
 
     requires_auth = False
+
+    def admit(self, request: web.Request) -> tuple[web.Response | None, str | None, bool]:
+        """Ключ устройства (`local_keys.py`): `(отказ или None, ключ, положить ли в куку)`."""
+        coordinator = _coordinator(request.app["hass"])
+        keys = getattr(coordinator, "local_keys", None)
+        if keys is None:
+            return None, None, False
+        allowed, key, fresh = keys.admit(
+            request.cookies.get(local_keys.COOKIE), request.headers.get(local_keys.HEADER)
+        )
+        if not allowed:
+            # Свой экран бандла (`outage: local-closed`): «войдите через интернет» кнопкой на
+            # облачный вход дома, без «Повторить» — повтор здесь ничего не даст.
+            refusal = web.json_response(
+                {
+                    "message": "Это устройство не подключено к дому. Войдите в приложение через интернет "
+                    "— после входа оно заработает и по Wi-Fi дома.",
+                    "code": "local-closed",
+                    "outage": "local-closed",
+                    **({"cloudUrl": keys.cloud} if keys.cloud else {}),
+                },
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return refusal, None, False
+        return None, key, fresh
+
+
+def _keyed(response: web.StreamResponse, key: str | None, fresh: bool) -> web.StreamResponse:
+    """Ключ — в ответ (копия для хранилища браузера) и, если новый, в куку.
+
+    ⚠ Кука, а не только заголовок: её несут и `<img>` ресурса `api/connect?req=`,
+    и апгрейд сокета, и поток `api/events` — им заголовок не поставить.
+    """
+    if key:
+        response.headers[local_keys.HEADER] = key
+    if key and fresh:
+        response.set_cookie(
+            local_keys.COOKIE, key, max_age=local_keys.COOKIE_MAX_AGE,
+            path=URL_PREFIX, httponly=True, samesite="Lax",
+        )
+    return response
 
 
 class _RoutedView(_MegaHomeView):
@@ -138,6 +185,9 @@ class _RoutedView(_MegaHomeView):
         return await self.route(request)
 
     async def route(self, request: web.Request) -> web.StreamResponse:
+        refusal, key, fresh = self.admit(request)
+        if refusal is not None:
+            return refusal
         # Размер — по заголовку ДО чтения тела: иначе потолок превращается в
         # столько памяти, сколько прислали.
         if (request.content_length or 0) > relay_api.MAX_REQUEST_BYTES:
@@ -149,11 +199,11 @@ class _RoutedView(_MegaHomeView):
                 _coordinator(request.app["hass"]), request.method, path, body, dict(request.query)
             )
         except ops.OpError as err:
-            return self.json_message(err.message, err.status)
+            return _keyed(self.json_message(err.message, err.status), key, fresh)
         headers = {"Content-Type": content_type, **({"Cache-Control": cache} if cache else {})}
         if isinstance(raw, Path):
-            return web.FileResponse(raw, headers=headers)
-        return web.Response(status=status, body=raw, headers=headers)
+            return _keyed(web.FileResponse(raw, headers=headers), key, fresh)
+        return _keyed(web.Response(status=status, body=raw, headers=headers), key, fresh)
 
 
 class MegaHomeConfigView(_RoutedView):
@@ -302,6 +352,9 @@ class MegaHomeConnectView(_RoutedView):
         контур: досягаемость у него та же, что у `POST api/connect`. Снаружи эта
         же форма идёт переносом менеджера и закрыта сессией жильца."""
         if request.headers.get("Upgrade", "").lower() == "websocket":
+            refusal, _key, _fresh = self.admit(request)
+            if refusal is not None:
+                return refusal
             socket = web.WebSocketResponse(heartbeat=WS_HEARTBEAT_S, max_msg_size=WS_MAX_FRAME)
             await socket.prepare(request)
             await stream.serve(socket)
@@ -321,6 +374,9 @@ class MegaHomeEventsView(_MegaHomeView):
     name = "api:mega_home:events"
 
     async def get(self, request: web.Request) -> web.StreamResponse:
+        refusal, _key, _fresh = self.admit(request)
+        if refusal is not None:
+            return refusal
         coordinator = _coordinator(request.app["hass"])
         if coordinator is None or not coordinator.data:
             return self.json_message(
@@ -343,6 +399,9 @@ class MegaHomeRelayView(_MegaHomeView):
     name = "api:mega_home:relay"
 
     async def post(self, request: web.Request) -> web.Response:
+        refusal, _key, _fresh = self.admit(request)
+        if refusal is not None:
+            return refusal
         coordinator = _coordinator(request.app["hass"])
         if coordinator is None or not coordinator.data:
             return self.json_message(

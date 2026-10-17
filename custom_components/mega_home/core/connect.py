@@ -54,6 +54,7 @@ async def perform(payload: dict[str, Any]) -> dict[str, Any]:
         raise OpError(
             "Держать соединение — форма Upgrade того же api/connect, а не флаг", 501
         )
+    payload = with_service(payload)
     kind = str(payload.get("kind") or "")
     if kind == "http":
         return await _http(payload)
@@ -94,7 +95,7 @@ async def resource(payload: dict[str, Any]) -> tuple[int, str, bytes, str]:
     method = str(payload.get("method") or "GET").upper()
     if method != "GET":
         raise OpError("Ресурс берётся только GET", 405)
-    answer = await _http({**payload, "method": "GET"})
+    answer = await _http(with_service({**payload, "method": "GET"}))
     raw = (
         base64.b64decode(answer["bodyBase64"])
         if answer.get("bodyBase64") is not None
@@ -110,6 +111,43 @@ async def resource(payload: dict[str, Any]) -> tuple[int, str, bytes, str]:
     # про статику) либо заморозил бы картинку, либо не дал бы браузеру не
     # ходить второй раз в тот же период обновления плитки.
     return int(answer.get("status") or 200), content_type, raw, RESOURCE_CACHE
+
+def with_service(payload: dict[str, Any]) -> dict[str, Any]:
+    """Вызов к службе дома получает то, что служба знает о себе: TLS и учётку.
+
+    ⚠ Заголовки службы ПЕРЕБИВАЮТ заголовки вызывающего — учётку службы ставит
+    дом (`services.Service`), чужой `Authorization` к ней не доедет.
+    """
+    service = services.entry(str(payload.get("host") or "").strip())
+    if service is None:
+        return payload
+    body = payload.get("body") if isinstance(payload.get("body"), str) else ""
+    if payload.get("bodyBase64"):
+        body = _decode_b64(payload["bodyBase64"], "bodyBase64").decode("utf-8", "replace")
+    for what, value in [("path", str(payload.get("path") or "/")), ("body", body)] + [
+        ("frame", item if isinstance(item, str) else json.dumps(item))
+        for item in (payload.get("messages") if isinstance(payload.get("messages"), list) else [])
+    ]:
+        reason = service.guard(what, value) if service.guard else None
+        if reason:
+            raise OpError(reason, 403)
+    headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
+    return {
+        **payload,
+        "tls": service.tls or payload.get("tls") is True,
+        "headers": {**headers, **service.headers},
+    }
+
+def refused(payload: dict[str, Any], what: str, value: str) -> str | None:
+    """Причина отказа службы на кадр открытой сессии; `None` — пропустить (`Service.guard`)."""
+    service = services.entry(str(payload.get("host") or "").strip())
+    return service.guard(what, value) if service is not None and service.guard else None
+
+async def open_ws(payload: dict[str, Any], socket_: Any) -> None:
+    """Рукопожатие службы на только что открытом сокете — до кадров вызывающего."""
+    service = services.entry(str(payload.get("host") or "").strip())
+    if service is not None and service.ws_open is not None:
+        await service.ws_open(socket_)
 
 def resolve_address(payload: dict[str, Any]) -> tuple[str, int]:
     """`host` — частный IPv4 объекта или имя ПОДНЯТОЙ службы дома."""
@@ -395,6 +433,7 @@ async def _ws(payload: dict[str, Any]) -> dict[str, Any]:
             socket_ = await asyncio.wait_for(session.ws_connect(url, headers=headers), timeout)
             got: list[dict[str, Any]] = []
             try:
+                await asyncio.wait_for(open_ws(payload, socket_), timeout)
                 for item in messages:
                     if isinstance(item, dict) and "base64" in item:
                         await socket_.send_bytes(_decode_b64(item["base64"], "messages[].base64"))

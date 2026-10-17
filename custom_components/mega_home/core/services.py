@@ -14,8 +14,32 @@ loopback через `connect` — literal loopback-адрес в запросе 
 from __future__ import annotations
 
 import socket
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any
 
-REGISTRY: dict[str, int] = {}
+
+@dataclass(frozen=True)
+class Service:
+    """Поднятая служба: порт на петле и то, что она знает о себе сама.
+
+    ⚠ `tls`, `headers` и `ws_open` ставит ТОТ, кто регистрирует службу, а не
+    вызывающий: учётка службы (токен Home Assistant) не покидает дом, как второй
+    круг Digest (`docs/home-gateway.md`, «Личность»). Описание вызова от бандла
+    их не знает и перебить не может.
+    """
+
+    port: int
+    tls: bool = False
+    headers: dict[str, str] = field(default_factory=dict)
+    # Рукопожатие сокета до первого кадра вызывающего (вход по протоколу службы).
+    ws_open: Callable[[Any], Awaitable[None]] | None = None
+    # Что учётка службы НЕ даёт вызывающему: `(what, value)` — `"path"` запроса или `"frame"`
+    # сокета; причина отказа словами или `None`. Ставит регистрирующий, как учётку.
+    guard: Callable[[str, str], str | None] | None = None
+
+
+REGISTRY: dict[str, Service] = {}
 
 
 def port_busy(probes: tuple[tuple[int, int, str], ...]) -> str:
@@ -42,9 +66,17 @@ def port_busy(probes: tuple[tuple[int, int, str], ...]) -> str:
                 return name
     return ""
 
-def register(name: str, port: int) -> None:
+def register(
+    name: str,
+    port: int,
+    *,
+    tls: bool = False,
+    headers: dict[str, str] | None = None,
+    ws_open: Callable[[Any], Awaitable[None]] | None = None,
+    guard: Callable[[str, str], str | None] | None = None,
+) -> None:
     """Служба поднялась: доступна для `connect` по имени."""
-    REGISTRY[name] = port
+    REGISTRY[name] = Service(port, tls, dict(headers or {}), ws_open, guard)
 
 def unregister(name: str) -> None:
     """Служба остановлена: адрес по имени больше не резолвится."""
@@ -52,4 +84,9 @@ def unregister(name: str) -> None:
 
 def resolve(name: str) -> int | None:
     """Порт службы на loopback, если она сейчас поднята."""
+    service = REGISTRY.get(name)
+    return service.port if service else None
+
+def entry(name: str) -> Service | None:
+    """Поднятая служба целиком — вместе с тем, что вызов к ней получает от дома."""
     return REGISTRY.get(name)

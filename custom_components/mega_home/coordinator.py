@@ -33,6 +33,7 @@ from .core.const import (
 from .core.assets import AssetStore
 from .core.alerts import alert_keys
 from .core.crops import CropStore, crop_keys
+from .core.local_keys import LocalKeys
 from .core.imaging import LookStore
 from .core.photos import PhotoStore, photo_keys, prune_dir
 
@@ -107,6 +108,10 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.alerts: Any = None
         # Включение по сети на чужую команду «включи» (`wake.py`); ставится в `async_setup_entry`.
         self.wake: Any = None
+        # Ключи локальных подключений (`local_keys.py`): режим и секрет — из конфига.
+        self.local_keys = LocalKeys()
+        # Учётка Home Assistant для службы `ha` транспорта; ставит адаптер (`ha_api.py`).
+        self.ha_api: Any = None
         # Бандл интерфейса: качается с менеджера и раздаётся из кэша, поэтому
         # новая версия приложения не требует ни HACS, ни перезапуска.
         #
@@ -277,9 +282,10 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.app_error = error
 
     def apply_config(self, config: dict[str, Any] | None) -> None:
-        """Правила вложений (`event_files.py`) и фильтр лога разработки
-        (`dev_log.py`) — данные конфига, как описания устройств."""
-        for part in (self.event_files, self.dev_log):
+        """Правила вложений (`event_files.py`), фильтр лога разработки
+        (`dev_log.py`), ключи локальной двери и учётка службы `ha` — данные
+        конфига, как описания устройств."""
+        for part in (self.event_files, self.dev_log, self.local_keys, self.ha_api):
             if config and part is not None:
                 part.apply(config)
 
