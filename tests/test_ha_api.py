@@ -64,6 +64,39 @@ def test_вход_websocket_до_кадров_вызывающего() -> None:
     assert socket_.sent == [{"type": "auth", "access_token": "T"}]
 
 
+def test_учётки_и_систему_ha_через_дом_не_меняют() -> None:
+    """Выпуск токена и управление учётками и супервизором пережили бы любой отзыв ключа."""
+    HaApi(_hass()).apply({"house": {"ha": {"token": "T"}}})
+    for call in (
+        {"host": "ha", "path": "/auth/token"},
+        {"host": "ha", "path": "/api/hassio/addons/core_ssh/start"},
+        {"host": "ha", "path": "/api/services/hassio/addon_stdin"},
+        {"host": "ha", "kind": "ws", "messages": ['{"id":1,"type":"auth/long_lived_access_token","client_name":"x","lifespan":3650}']},
+        {"host": "ha", "kind": "ws", "messages": [{"id": 1, "type": "config/auth/create", "name": "x"}]},
+        {"host": "ha", "kind": "ws", "messages": [{"id": 1, "type": "call_service", "domain": "hassio", "service": "addon_stdin"}]},
+        {"host": "ha", "path": "/api/config/automation/config/sa_1", "body": '{"actions":[{"action":"hassio.addon_stdin"}]}'},
+    ):
+        with pytest.raises(OpError, match="не меняют"):
+            connect.with_service(call)
+    # Всё прочее API HA — открыто: редактор автоматизаций, проверка, реестры, службы приборов.
+    connect.with_service({"host": "ha", "path": "/api/config/automation/config/sa_1", "body": '{"actions":[{"action":"vacuum.start"}]}'})
+    connect.with_service({"host": "ha", "kind": "ws", "messages": [{"id": 1, "type": "validate_config"}, {"id": 2, "type": "call_service", "domain": "vacuum"}]})
+    assert connect.refused({"host": "ha"}, "frame", '{"type":"auth/current_user"}')
+    assert connect.refused({"host": "ha"}, "frame", '{"type":"config/label_registry/list"}') is None
+
+
+def test_закрытый_сокет_при_входе_отказ_словами() -> None:
+    api = HaApi(_hass())
+    api.apply({"house": {"ha": {"token": "T"}}})
+
+    class _Closed:
+        async def receive_json(self, timeout: float) -> Any:
+            raise TypeError("Received message 8:1000 is not WSMsgType.TEXT")
+
+    with pytest.raises(OpError, match="закрыл соединение"):
+        asyncio.run(connect.open_ws({"host": "ha"}, _Closed()))
+
+
 def test_отказ_входа_называется_словами() -> None:
     api = HaApi(_hass())
     api.apply({"house": {"ha": {"token": "T"}}})

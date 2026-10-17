@@ -279,8 +279,8 @@ class Streams:
         # Копия этих проверок жила здесь до 2026-09-20 и уже начала расходиться
         # — у `connect` она отвергала `0.0.0.0` и зарезервированное, здесь
         # список был свой.
-        req = connect_mod.with_service(req)
         try:
+            req = connect_mod.with_service(req)
             host, port = connect_mod.resolve_address(req)
         except OpError as err:
             await self._fail(stream_id, err.message)
@@ -548,8 +548,15 @@ class _WsStream(_SessionBase):
             await self._outgoing.put(("bin", chunk))
 
     async def to_device_text(self, text: str) -> None:
-        if not self._stopping:
-            await self._outgoing.put(("text", text))
+        if self._stopping:
+            return
+        # Кадр к службе дома — через её запрет (`services.Service.guard`): учётку службы
+        # ставит дом, и закрытое ею не открывается кадром вызывающего.
+        refused = connect_mod.refused(self._req, "frame", text)
+        if refused:
+            await self._done(refused)
+            return
+        await self._outgoing.put(("text", text))
 
     async def _release(self) -> None:
         if self._socket is not None:

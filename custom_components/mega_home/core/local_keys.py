@@ -52,11 +52,14 @@ class LocalKeys:
         self.secret = ""
         self.closed = False
         self.accounts: dict[str, int] = {}
+        # Облачный вход дома — в отказ закрытой двери: «войдите через интернет» кнопкой.
+        self.cloud = ""
 
     def apply(self, config: dict[str, Any] | None) -> None:
         local = ((config or {}).get("house") or {}).get("local") or {}
         self.secret = str(local.get("secret") or "")
         self.closed = local.get("closed") is True
+        self.cloud = str(local.get("cloud") or "")
         accounts = local.get("accounts") if isinstance(local.get("accounts"), dict) else {}
         self.accounts = {str(k): v for k, v in accounts.items() if isinstance(v, int)}
 

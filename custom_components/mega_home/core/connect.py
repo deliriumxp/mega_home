@@ -121,12 +121,27 @@ def with_service(payload: dict[str, Any]) -> dict[str, Any]:
     service = services.entry(str(payload.get("host") or "").strip())
     if service is None:
         return payload
+    body = payload.get("body") if isinstance(payload.get("body"), str) else ""
+    if payload.get("bodyBase64"):
+        body = _decode_b64(payload["bodyBase64"], "bodyBase64").decode("utf-8", "replace")
+    for what, value in [("path", str(payload.get("path") or "/")), ("body", body)] + [
+        ("frame", item if isinstance(item, str) else json.dumps(item))
+        for item in (payload.get("messages") if isinstance(payload.get("messages"), list) else [])
+    ]:
+        reason = service.guard(what, value) if service.guard else None
+        if reason:
+            raise OpError(reason, 403)
     headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
     return {
         **payload,
         "tls": service.tls or payload.get("tls") is True,
         "headers": {**headers, **service.headers},
     }
+
+def refused(payload: dict[str, Any], what: str, value: str) -> str | None:
+    """Причина отказа службы на кадр открытой сессии; `None` — пропустить (`Service.guard`)."""
+    service = services.entry(str(payload.get("host") or "").strip())
+    return service.guard(what, value) if service is not None and service.guard else None
 
 async def open_ws(payload: dict[str, Any], socket_: Any) -> None:
     """Рукопожатие службы на только что открытом сокете — до кадров вызывающего."""

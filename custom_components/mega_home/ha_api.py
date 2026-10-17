@@ -17,6 +17,7 @@ HA дом не заводит (`docs/ha-official-api.md` менеджера). П
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -26,6 +27,40 @@ from .core.ops_base import OpError
 
 NAME = "ha"
 HANDSHAKE_S = 10
+
+# ⚠ Чего учётка объекта через дом НЕ даёт (заказчик 2026-10-17, ревью): выпустить себе токен и
+# управлять учётками и системой HA. Такой токен работал бы напрямую с HA и пережил бы любой отзыв
+# — сброс подключений, смену пароля учётки, срок гостевой ссылки. Это не перечень «что можно»
+# под функции: всё прочее API HA бандлу открыто, закрыт только выход из-под отзыва.
+REFUSED_PATHS = ("/auth/", "/api/hassio", "/api/onboarding", "/api/config/auth", "/api/services/hassio/")
+REFUSED_FRAMES = ("auth", "auth/", "config/auth/", "config/auth_provider/", "hassio/", "supervisor/")
+REFUSED_TEXT = "Учётки и систему Home Assistant через дом не меняют"
+
+
+def guard(what: str, value: str) -> str | None:
+    """Запрет службы `ha` (`services.Service.guard`): путь, тело запроса или кадр сокета."""
+    if what == "path":
+        path = value.split("?", 1)[0].lower()
+        return REFUSED_TEXT if any(path.startswith(p) for p in REFUSED_PATHS) else None
+    # Автоматизация или скрипт с действием супервизора исполнились бы позже от имени HA —
+    # тот же выход из-под отзыва, только отложенный.
+    if '"hassio.' in value or "'hassio." in value:
+        return REFUSED_TEXT
+    if what == "body":
+        return None
+    try:
+        frame = json.loads(value)
+    except ValueError:
+        return None
+    if not isinstance(frame, dict):
+        return None
+    kind = str(frame.get("type") or "")
+    if kind in REFUSED_FRAMES or any(kind.startswith(p) for p in REFUSED_FRAMES if p.endswith("/")):
+        return REFUSED_TEXT
+    # Службы супервизора (`hassio.addon_stdin` и т. п.) — та же система, что и её API.
+    if kind == "call_service" and str(frame.get("domain") or "") == "hassio":
+        return REFUSED_TEXT
+    return None
 
 
 class HaApi:
@@ -54,14 +89,22 @@ class HaApi:
             tls=tls,
             headers={"Authorization": f"Bearer {self.token}"},
             ws_open=self._login,
+            guard=guard,
         )
 
     async def _login(self, socket_: Any) -> None:
-        """Фаза входа WebSocket HA до кадров вызывающего (`dev-api-websocket.md`)."""
-        first = await socket_.receive_json(timeout=HANDSHAKE_S)
-        if first.get("type") != "auth_required":
-            raise OpError("Home Assistant не начал вход", 502)
-        await socket_.send_json({"type": "auth", "access_token": self.token})
-        answer = await socket_.receive_json(timeout=HANDSHAKE_S)
+        """Фаза входа WebSocket HA до кадров вызывающего (`dev-api-websocket.md`).
+
+        ⚠ HA, закрывший сокет посреди входа, даёт `receive_json` не JSON, а кадр закрытия —
+        это отказ словами (502), а не падение обработчика.
+        """
+        try:
+            first = await socket_.receive_json(timeout=HANDSHAKE_S)
+            if first.get("type") != "auth_required":
+                raise OpError("Home Assistant не начал вход", 502)
+            await socket_.send_json({"type": "auth", "access_token": self.token})
+            answer = await socket_.receive_json(timeout=HANDSHAKE_S)
+        except (TypeError, ValueError, AttributeError) as err:
+            raise OpError("Home Assistant закрыл соединение при входе", 502) from err
         if answer.get("type") != "auth_ok":
             raise OpError("Home Assistant не принял токен объекта", 502)
