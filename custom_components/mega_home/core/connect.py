@@ -27,6 +27,7 @@ from urllib.parse import unquote
 import aiohttp
 
 from . import digest, services
+from . import reduce as reduce_mod
 from .ops_base import OpError
 
 MAX_SEND = 64 * 1024
@@ -56,8 +57,13 @@ async def perform(payload: dict[str, Any]) -> dict[str, Any]:
         )
     payload = with_service(payload)
     kind = str(payload.get("kind") or "")
+    # Обработка ответа (`reduce.py`) — разбор описания ДО вызова: ошибка в нём не
+    # должна стоить источнику мегабайтов истории.
+    plan = reduce_mod.parse(payload["reduce"]) if payload.get("reduce") is not None else None
+    if plan is not None and kind != "http":
+        raise OpError("reduce обрабатывает только ответ kind: http")
     if kind == "http":
-        return await _http(payload)
+        return await _http(payload, plan)
     if kind == "tcp":
         return await _tcp(payload)
     if kind == "udp":
@@ -92,6 +98,8 @@ async def resource(payload: dict[str, Any]) -> tuple[int, str, bytes, str]:
         raise OpError("Ресурс не носит учётку — этот вызов идёт POST", 400)
     if payload.get("body") or payload.get("bodyBase64"):
         raise OpError("У ресурса нет тела запроса", 400)
+    if payload.get("reduce") is not None:
+        raise OpError("Обработанный ответ — данные коду, он идёт POST", 400)
     method = str(payload.get("method") or "GET").upper()
     if method != "GET":
         raise OpError("Ресурс берётся только GET", 405)
@@ -252,7 +260,7 @@ async def http_send(
         method, url, data=body, headers=signed, allow_redirects=False, timeout=timeout
     )
 
-async def _http(payload: dict[str, Any]) -> dict[str, Any]:
+async def _http(payload: dict[str, Any], plan: reduce_mod.Plan | None = None) -> dict[str, Any]:
     call = prepare_http(payload)
     try:
         async with aiohttp.ClientSession(connector=call["connector"]) as session:
@@ -260,9 +268,17 @@ async def _http(payload: dict[str, Any]) -> dict[str, Any]:
             async with await http_send(session, call, timeout) as response:
                 raw = await _read_all(response)
                 headers = {str(k): str(v) for k, v in response.headers.items()}
-                return _http_answer(response.status, headers, raw)
+                status = response.status
     except (aiohttp.ClientError, asyncio.TimeoutError) as err:
         raise OpError(_reason(err), 502) from err
+    # ⚠ Отказ адресата и не-JSON уходят как есть: чужую ошибку толкует вызывающий.
+    # Свёртка — в исполнителе: разбор мегабайтов JSON в цикле событий остановил
+    # бы весь Home Assistant (у ядра без HA `host` здесь нет — исполнитель цикла).
+    if plan is not None and status < 400:
+        reduced = await asyncio.get_running_loop().run_in_executor(None, reduce_mod.apply, plan, raw)
+        if reduced is not None:
+            return {"status": int(status), "headers": headers, "reduced": reduced}
+    return _http_answer(status, headers, raw)
 
 _TLS: ssl.SSLContext | None = None
 

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from typing import Any
 
 _PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
@@ -22,14 +23,23 @@ def render(template: str, values: dict[str, Any]) -> str:
 
     return _PLACEHOLDER.sub(one, template)
 
-def pick(data: Any, path: str) -> str:
-    """Поле ответа по пути через точку (`data.token`, `result.id`, `list.0.id`)."""
+def dig(data: Any, steps: Iterable[str]) -> Any:
+    """Значение по шагам пути: ключ объекта или индекс массива; нет такого — None.
+
+    Один обход на дом: слушатели (`pick`) и обработка ответа (`reduce.py`) — копии
+    расходились бы в том, что считать индексом.
+    """
     current = data
-    for step in path.split(".") if path else []:
+    for step in steps:
         if isinstance(current, dict):
             current = current.get(step)
         elif isinstance(current, list) and step.isdigit() and int(step) < len(current):
             current = current[int(step)]
         else:
-            return ""
+            return None
+    return current
+
+def pick(data: Any, path: str) -> str:
+    """Поле ответа по пути через точку (`data.token`, `result.id`, `list.0.id`)."""
+    current = dig(data, path.split(".") if path else [])
     return str(current) if isinstance(current, (str, int, float)) and not isinstance(current, bool) else ""
