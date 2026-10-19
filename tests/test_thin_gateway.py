@@ -336,7 +336,7 @@ def test_размер_ядра_не_растёт_прикладной_логик
     универсальный», `docs/superpowers/specs/2026-10-19-home-reduce-design.md` менеджера).
     `reduce.py` (~270 строк) — закрытый набор свёрток рядов по времени без предметного знания
     (замок слов — `test_reduce.py`), поле `reduce` у `connect` и отказ у ресурса и сессии (~15).
-    Замер — 6 493.
+    Обход пути — общий с `templating.pick` (`templating.dig`), не своя копия. Замер — 6 487.
     """
     total = sum(len([l for l in _code(path).splitlines() if l.strip()]) for path in CORE_MODULES)
     assert total <= 6500

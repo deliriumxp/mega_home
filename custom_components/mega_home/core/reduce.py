@@ -34,6 +34,7 @@ from datetime import datetime
 from typing import Any
 
 from .ops_base import OpError
+from .templating import dig as _resolve
 
 FOLDS = ("start", "end", "mean", "min", "max", "share", "count", "changes", "delta", "sum")
 TIME_FORMATS = ("iso", "s", "ms")
@@ -142,10 +143,10 @@ def apply(plan: Plan, raw: bytes) -> dict[str, Any] | None:
     for key, items in groups.items():
         items.sort(key=lambda item: item[0])
         times = [at for at, _ in items]
-        out[key] = {
-            s.name: _fold(plan, s, times, [_resolve(record, s.path) for _, record in items])
-            for s in plan.series
-        }
+        # Один путь — один проход по записям, сколько бы рядов его ни сворачивали
+        # (значение и доли разных вариантов того же поля — частый случай).
+        by_path = {s.path: [_resolve(record, s.path) for _, record in items] for s in plan.series}
+        out[key] = {s.name: _fold(plan, s, times, by_path[s.path]) for s in plan.series}
     return {
         "from": plan.start,
         "to": plan.end,
@@ -159,13 +160,14 @@ def apply(plan: Plan, raw: bytes) -> dict[str, Any] | None:
 
 def _fold(plan: Plan, s: Series, times: list[float], values: list[Any]) -> list[Any]:
     out: list[Any] = []
-    # Последнее непустое значение СТРОГО до записи i — для `changes`.
+    # Последнее непустое значение СТРОГО до записи i — только для `changes`.
     before: list[Any] = []
     last: Any = None
-    for value in values:
-        before.append(last)
-        if value is not None:
-            last = value
+    if s.fold == "changes":
+        for value in values:
+            before.append(last)
+            if value is not None:
+                last = value
     for k in range(plan.count):
         b0 = plan.start + k * plan.step
         b1 = min(b0 + plan.step, plan.end)
@@ -263,18 +265,6 @@ def _path(value: Any, what: str) -> tuple[str, ...]:
     if not isinstance(value, str):
         raise OpError(f"{what} — путь строкой")
     return tuple(value.split(".")) if value else ()
-
-
-def _resolve(value: Any, path: tuple[str, ...]) -> Any:
-    """Ключи и индексы через точку; нет такого — None («значения нет»)."""
-    for part in path:
-        if isinstance(value, dict):
-            value = value.get(part)
-        elif isinstance(value, list) and part.isdigit() and int(part) < len(value):
-            value = value[int(part)]
-        else:
-            return None
-    return value
 
 
 def _time(value: Any, time_format: str) -> float | None:
