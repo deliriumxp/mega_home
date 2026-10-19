@@ -270,7 +270,10 @@ class Streams:
         if not isinstance(req, dict):
             await self._fail(stream_id, "описание сессии — объект req (ConnectRequest)")
             return
-        error = self._refuse()
+        # Обработка (`reduce.py`) — над ЦЕЛЫМ ответом, а у сессии ответа нет, есть кадры.
+        error = self._refuse() or (
+            "reduce — у одиночного вызова connect, не у сессии" if req.get("reduce") is not None else None
+        )
         if error:
             await self._fail(stream_id, error)
             return
