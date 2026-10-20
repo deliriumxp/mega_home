@@ -25,6 +25,7 @@ from typing import Any
 from urllib.parse import unquote
 
 import aiohttp
+from aiohttp.abc import AbstractResolver
 
 from . import digest, services
 from . import reduce as reduce_mod
@@ -158,7 +159,14 @@ async def open_ws(payload: dict[str, Any], socket_: Any) -> None:
         await service.ws_open(socket_)
 
 def resolve_address(payload: dict[str, Any]) -> tuple[str, int]:
-    """`host` — частный IPv4 объекта или имя ПОДНЯТОЙ службы дома."""
+    """`host` — частный IPv4 объекта, имя ПОДНЯТОЙ службы дома или имя хоста в интернете.
+
+    ⚠ Ось «адресат» (`docs/home-gateway.md`, решение заказчика 2026-10-20): дом ходит и в
+    интернет — каталоги, ленты, облака вендоров, — но ТОЛЬКО ПО ИМЕНИ. Литеральный адрес
+    по-прежнему лишь частный: у голого IP нет имени, по которому проверить сертификат, а
+    у имени есть (`connector_for`, `pinned`). Имя здесь проверяется лишь написанием;
+    куда оно ведёт, решает `pinned` перед соединением.
+    """
     host = str(payload.get("host") or "").strip()
     if not host:
         raise OpError("host не указан")
@@ -168,7 +176,9 @@ def resolve_address(payload: dict[str, Any]) -> tuple[str, int]:
     try:
         address = ipaddress.ip_address(host)
     except ValueError as err:
-        raise OpError("host — частный IPv4 объекта или имя службы дома") from err
+        if not is_name(host):
+            raise OpError("host — частный IPv4 объекта, имя службы дома или имя хоста в интернете") from err
+        return host.lower(), _port(payload)
     if (
         address.version != 4
         or address.is_loopback
@@ -177,14 +187,96 @@ def resolve_address(payload: dict[str, Any]) -> tuple[str, int]:
         or address.is_reserved
         or not address.is_private
     ):
-        raise OpError("host вне локальной сети объекта")
+        raise OpError("host вне локальной сети объекта (в интернет — по имени хоста)")
+    return str(address), _port(payload)
+
+def _port(payload: dict[str, Any]) -> int:
     try:
         port = int(payload.get("port"))
     except (TypeError, ValueError) as err:
         raise OpError("port не указан") from err
     if not 1 <= port <= 65535:
         raise OpError("port не указан")
-    return str(address), port
+    return port
+
+# Имя хоста по RFC 1123: метки из букв, цифр и дефиса, хотя бы одна точка. Без точки — это
+# имя службы дома (`services.py`), которая не поднята, а не адрес в интернете.
+_NAME = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$")
+
+def is_name(host: str) -> bool:
+    """Адресат по имени хоста (а не литеральный IP и не служба дома)."""
+    return bool(_NAME.match(host.lower()))
+
+async def pinned(host: str, port: int, family: int = socket.AF_UNSPEC) -> list[dict[str, Any]]:
+    """Адреса имени, куда дом согласен идти, — в форме резолвера aiohttp.
+
+    ⚠ Отказ, если ХОТЬ ОДИН адрес — сама машина, link-local (169.254/16: метаданные облака,
+    автонастройка), мультикаст или служебный: такое имя — не «хост в интернете», а обход
+    правила «loopback только по имени службы». Частные адреса по имени пускаются: до них
+    вызывающий и так достаёт литералом. Соединение идёт РОВНО на проверенные адреса
+    (`_Pinned`), второго разрешения имени нет — подмена DNS между проверкой и соединением
+    ничего не даёт.
+    """
+    try:
+        infos = await _getaddrinfo(host, port, family)
+    except OSError as err:
+        raise OpError(f"Имя {host} не находится в DNS", 502) from err
+    found: list[dict[str, Any]] = []
+    for af, _, proto, _, sockaddr in infos:
+        address = ipaddress.ip_address(str(sockaddr[0]).split("%", 1)[0])
+        if address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified or address.is_reserved:
+            raise OpError(f"Имя {host} ведёт на служебный адрес {address}", 403)
+        found.append({"hostname": host, "host": str(sockaddr[0]), "port": port, "family": af, "proto": proto, "flags": socket.AI_NUMERICHOST})
+    if not found:
+        raise OpError(f"Имя {host} не находится в DNS", 502)
+    return found
+
+async def _getaddrinfo(host: str, port: int, family: int) -> list[Any]:
+    return await asyncio.get_running_loop().getaddrinfo(host, port, family=family, type=socket.SOCK_STREAM)
+
+class _Pinned(AbstractResolver):
+    """Резолвер одного соединения: отдаёт адреса, уже проверенные `pinned`."""
+
+    def __init__(self, addresses: list[dict[str, Any]]) -> None:
+        self._addresses = addresses
+
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET) -> list[dict[str, Any]]:
+        picked = [a for a in self._addresses if family in (socket.AF_UNSPEC, a["family"])]
+        if host.lower() != self._addresses[0]["hostname"] or not picked:
+            raise OSError(f"{host}: адрес не проверен домом")
+        return picked
+
+    async def close(self) -> None:
+        return None
+
+async def connector_for(host: str, port: int, tls: bool) -> aiohttp.TCPConnector | None:
+    """Соединитель aiohttp для адресата `resolve_address`.
+
+    ⚠ По имени сертификат ПРОВЕРЯЕТСЯ (`ssl` по умолчанию у aiohttp — проверенный контекст,
+    собранный при его импорте, без блокирующей загрузки в цикле): в интернете самоподписанных
+    устройств объекта нет, а без проверки ответ подменит любой узел по пути. Литеральный адрес
+    — устройство LAN, его сертификат проверять нечем (`tls_context`).
+    """
+    if is_name(host):
+        return aiohttp.TCPConnector(resolver=_Pinned(await pinned(host, port)))
+    return aiohttp.TCPConnector(ssl=False) if tls else None
+
+async def socket_target(host: str, port: int, tls: bool, family: int = socket.AF_UNSPEC) -> tuple[str, ssl.SSLContext | None, str | None]:
+    """Адрес, TLS и имя для SNI голого сокета (`tcp`, `udp`, сессии): имя — проверенным адресом."""
+    if not is_name(host):
+        return host, tls_context() if tls else None, None
+    address = (await pinned(host, port, family))[0]["host"]
+    return address, await verified_tls() if tls else None, host if tls else None
+
+_VERIFIED: ssl.SSLContext | None = None
+
+async def verified_tls() -> ssl.SSLContext:
+    """TLS С проверкой сертификата — для сокетов по имени. Системные сертификаты грузятся
+    в исполнителе: в цикле событий это блокирующий вызов (`tls_context`)."""
+    global _VERIFIED
+    if _VERIFIED is None:
+        _VERIFIED = await asyncio.get_running_loop().run_in_executor(None, ssl.create_default_context)
+    return _VERIFIED
 
 def prepare_http(payload: dict[str, Any]) -> dict[str, Any]:
     """Разобрать описание HTTP-вызова: адрес, заголовки, тело, учётка, срок.
@@ -223,11 +315,15 @@ def prepare_http(payload: dict[str, Any]) -> dict[str, Any]:
         "timeout": _timeout(payload),
         "basic": basic,
         "digest": digest_creds,
-        # ⚠ Сертификат устройства объекта самоподписанный, проверять его нечем:
-        # `resolve_address` пускает только частные адреса (та же причина, что у
-        # ветки `ws` ниже).
-        "connector": aiohttp.TCPConnector(ssl=False) if tls else None,
+        # Соединитель — `client_for`: адрес по имени проверяется DNS-запросом, а он асинхронный.
+        "host": host,
+        "port": port,
+        "tls": tls,
     }
+
+async def client_for(call: dict[str, Any]) -> aiohttp.ClientSession:
+    """Сессия aiohttp под разобранный вызов (`prepare_http`): соединитель — `connector_for`."""
+    return aiohttp.ClientSession(connector=await connector_for(call["host"], call["port"], call["tls"]))
 
 async def http_send(
     session: aiohttp.ClientSession, call: dict[str, Any], timeout: aiohttp.ClientTimeout
@@ -263,7 +359,7 @@ async def http_send(
 async def _http(payload: dict[str, Any], plan: reduce_mod.Plan | None = None) -> dict[str, Any]:
     call = prepare_http(payload)
     try:
-        async with aiohttp.ClientSession(connector=call["connector"]) as session:
+        async with await client_for(call) as session:
             timeout = aiohttp.ClientTimeout(total=call["timeout"])
             async with await http_send(session, call, timeout) as response:
                 raw = await _read_all(response)
@@ -285,8 +381,8 @@ _TLS: ssl.SSLContext | None = None
 def tls_context() -> ssl.SSLContext:
     """TLS БЕЗ проверки сертификата — один на весь дом (`connect`, сессии, MQTT, проба).
 
-    ⚠ Проверять нечем: сертификаты устройств объекта самоподписанные, а адреса
-    пускает только частная сеть (`resolve_address`). ⚠ `SSLContext(...)`, а не
+    ⚠ Проверять нечем: сертификаты устройств объекта самоподписанные, а литеральные адреса
+    пускает только частная сеть (`resolve_address`; по имени — `verified_tls`). ⚠ `SSLContext(...)`, а не
     `create_default_context()`: тот грузит системные сертификаты — блокирующий
     вызов в цикле событий (Home Assistant ругается на `load_default_certs`), и
     всё ради проверки, которую мы тут же выключаем.
@@ -342,9 +438,11 @@ async def _tcp(payload: dict[str, Any]) -> dict[str, Any]:
     deadline = _timeout({"timeout": read_until.get("deadline")}, timeout) if read_until.get("deadline") is not None else timeout
     # ⚠ `tls` — поле того же описания, что у сессии (`stream.py`): без него
     # `tls: true` молча уходил открытым текстом только в одиночном вызове.
-    context = tls_context() if payload.get("tls") is True else None
+    address, context, sni = await socket_target(host, port, payload.get("tls") is True)
     try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port, ssl=context), timeout)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(address, port, ssl=context, server_hostname=sni), timeout
+        )
     except (asyncio.TimeoutError, OSError) as err:
         raise OpError(f"Устройство не приняло соединение: {err or 'таймаут'}", 502) from err
     got = bytearray()
@@ -391,6 +489,8 @@ class _UdpCollector(asyncio.DatagramProtocol):
 
 async def _udp(payload: dict[str, Any]) -> dict[str, Any]:
     host, port = resolve_address(payload)
+    # Сокет ниже — IPv4 (широковещание объекта), поэтому имя — только его IPv4-адресом.
+    host = (await socket_target(host, port, False, socket.AF_INET))[0]
     send = _decode_b64(payload.get("sendBase64"), "sendBase64")
     read_until = payload.get("readUntil") if isinstance(payload.get("readUntil"), dict) else {}
     deadline = read_until.get("deadline")
@@ -440,9 +540,8 @@ async def _ws(payload: dict[str, Any]) -> dict[str, Any]:
         else timeout
     )
     try:
-        # ⚠ `tls` — как у HTTP-ветки: сертификат устройства самоподписанный,
-        # проверять его нечем (`resolve_address` пускает только частные адреса).
-        connector = aiohttp.TCPConnector(ssl=False) if payload.get("tls") is True else None
+        # ⚠ `tls` — как у HTTP-ветки: устройству LAN сертификат не проверяется, имени — да.
+        connector = await connector_for(host, port, tls)
         async with aiohttp.ClientSession(connector=connector) as session:
             # Срок — на рукопожатие (`timeout=` числом у aiohttp — лишь срок
             # закрытия, и он устарел): к мёртвому адресу иначе ждали бы минуты.

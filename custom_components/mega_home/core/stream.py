@@ -40,6 +40,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import struct
 from typing import Any
 
@@ -285,6 +286,13 @@ class Streams:
         try:
             req = connect_mod.with_service(req)
             host, port = connect_mod.resolve_address(req)
+            # Голому сокету имя — проверенным адресом (`connect.socket_target`); у ws и http это
+            # делает соединитель aiohttp. UDP-сокет сессии — IPv4, как у одиночного вызова.
+            if str(req.get("kind") or "tcp") in ("tcp", "udp"):
+                udp = req.get("kind") == "udp"
+                address, context, sni = await connect_mod.socket_target(
+                    host, port, not udp and req.get("tls") is True, socket.AF_INET if udp else socket.AF_UNSPEC
+                )
         except OpError as err:
             await self._fail(stream_id, err.message)
             return
@@ -295,7 +303,7 @@ class Streams:
             if kind == "udp":
                 loop = asyncio.get_running_loop()
                 transport, protocol = await loop.create_datagram_endpoint(
-                    _DatagramProtocol, remote_addr=(host, port)
+                    _DatagramProtocol, remote_addr=(address, port)
                 )
                 stream = _Datagrams(stream_id, transport, protocol, self, idle)
             elif kind == "ws":
@@ -305,9 +313,8 @@ class Streams:
             elif kind == "tcp":
                 # ⚠ Не `ssl=False`: у `open_connection` это значит «без TLS
                 # вовсе», то есть `tls: true` молча ушёл бы открытым текстом.
-                context = connect_mod.tls_context() if req.get("tls") is True else None
                 reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port, ssl=context), 10
+                    asyncio.open_connection(address, port, ssl=context, server_hostname=sni), 10
                 )
                 stream = _Stream(stream_id, reader, writer, self, idle)
             else:
@@ -539,6 +546,7 @@ class _WsStream(_SessionBase):
         self.id = stream_id
         self._req = req
         self._url = f"{'wss' if req.get('tls') is True else 'ws'}://{host}:{port}{req.get('path') or '/'}"
+        self._host, self._port = host, port
         self._owner = owner
         self._idle_s = idle
         self._outgoing: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(QUEUE_DEPTH)
@@ -570,7 +578,7 @@ class _WsStream(_SessionBase):
     async def _run(self) -> None:
         headers = self._req.get("headers") if isinstance(self._req.get("headers"), dict) else None
         try:
-            connector = aiohttp.TCPConnector(ssl=False) if self._req.get("tls") is True else None
+            connector = await connect_mod.connector_for(self._host, self._port, self._req.get("tls") is True)
             self._session = aiohttp.ClientSession(connector=connector)
             # Срок — на РУКОПОЖАТИЕ: число в `timeout=` у aiohttp задавало лишь
             # срок закрытия (и устарело), а к мёртвому адресу ждали бы минуты.
@@ -651,7 +659,7 @@ class _HttpStream(_SessionBase):
             await self._done(err.message)
             return
         try:
-            self._session = aiohttp.ClientSession(connector=call["connector"])
+            self._session = await connect_mod.client_for(call)
             response = await connect_mod.http_send(
                 self._session, call, aiohttp.ClientTimeout(total=None, sock_read=self._idle_s)
             )
@@ -672,6 +680,9 @@ class _HttpStream(_SessionBase):
             raise
         except asyncio.TimeoutError:
             await self._done("тишина в сессии")
+        except OpError as err:
+            # Имя хоста не прошло проверку адреса (`connect.pinned`).
+            await self._done(err.message)
         except (aiohttp.ClientError, OSError) as err:
             await self._done(_describe(err))
 
