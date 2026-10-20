@@ -290,10 +290,7 @@ async def _shared(coordinator: Any, method: str, name: str, body: bytes) -> Repl
         return _json(docs.get(name))
     if method == "POST":
         payload = _json_body(body)
-        try:
-            return _json(await docs.put(name, payload.get("rev"), payload.get("data")))
-        except ValueError as err:
-            raise ops.OpError(str(err), HTTPStatus.REQUEST_ENTITY_TOO_LARGE) from err
+        return _json(await docs.put(name, payload.get("rev"), payload.get("data")))
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.METHOD_NOT_ALLOWED)
 
 async def _icon(coordinator: Any, name: str) -> Reply:

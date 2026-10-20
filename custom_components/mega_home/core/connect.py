@@ -104,6 +104,12 @@ async def resource(payload: dict[str, Any]) -> tuple[int, str, bytes, str]:
     method = str(payload.get("method") or "GET").upper()
     if method != "GET":
         raise OpError("Ресурс берётся только GET", 405)
+    # ⚠ Ресурсом — только устройство LAN и служба дома, не интернет: ответ ресурса браузер
+    # открывает в ORIGIN ДВЕРИ (HA объекта, менеджер), и чужая страница по ссылке
+    # `api/connect?req=…` исполнила бы там свой скрипт с ключом жильца или сессией инженера.
+    # Данные из интернета — коду, `POST` (`perform`); картинки интернета браузер берёт сам.
+    if is_name(str(payload.get("host") or "").strip()) and services.entry(str(payload.get("host") or "").strip()) is None:
+        raise OpError("Ресурсом отдаётся устройство объекта или служба дома; интернет — данными коду (POST)", 403)
     answer = await _http(with_service({**payload, "method": "GET"}))
     raw = (
         base64.b64decode(answer["bodyBase64"])
@@ -231,8 +237,32 @@ async def pinned(host: str, port: int, family: int = socket.AF_UNSPEC) -> list[d
         raise OpError(f"Имя {host} не находится в DNS", 502)
     return found
 
+# Срок разрешения имени — свой: оно идёт ДО срока вызова (соединителю нужны готовые адреса), и
+# молчащий DNS иначе прибавлял бы к `timeout` вызывающего ещё и свои минуты.
+DNS_TIMEOUT = 10.0
+
 async def _getaddrinfo(host: str, port: int, family: int) -> list[Any]:
-    return await asyncio.get_running_loop().getaddrinfo(host, port, family=family, type=socket.SOCK_STREAM)
+    try:
+        return await asyncio.wait_for(
+            asyncio.get_running_loop().getaddrinfo(host, port, family=family, type=socket.SOCK_STREAM), DNS_TIMEOUT
+        )
+    except asyncio.TimeoutError as err:
+        raise OSError("DNS не ответил") from err
+
+async def _refuse_redirect(session: Any, context: Any, params: Any) -> None:
+    raise aiohttp.ClientError("Адресат перенаправляет запрос — connect по перенаправлениям не ходит")
+
+def no_redirects() -> list[aiohttp.TraceConfig]:
+    """Отказ на перенаправление — для `ws_connect`, где `allow_redirects` не задать.
+
+    ⚠ Перенаправление на литеральный адрес aiohttp соединяет МИМО резолвера (`_Pinned`): имя в
+    интернете увело бы дом на его же loopback или 169.254. У HTTP перенаправлений нет и так
+    (`http_send`, `allow_redirects=False`). Подпись трассировки — с aiohttp 3.0, в отличие от
+    `socket_factory` (3.12): парк HA объектов старше.
+    """
+    trace = aiohttp.TraceConfig()
+    trace.on_request_redirect.append(_refuse_redirect)
+    return [trace]
 
 class _Pinned(AbstractResolver):
     """Резолвер одного соединения: отдаёт адреса, уже проверенные `pinned`."""
@@ -542,7 +572,7 @@ async def _ws(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         # ⚠ `tls` — как у HTTP-ветки: устройству LAN сертификат не проверяется, имени — да.
         connector = await connector_for(host, port, tls)
-        async with aiohttp.ClientSession(connector=connector) as session:
+        async with aiohttp.ClientSession(connector=connector, trace_configs=no_redirects()) as session:
             # Срок — на рукопожатие (`timeout=` числом у aiohttp — лишь срок
             # закрытия, и он устарел): к мёртвому адресу иначе ждали бы минуты.
             socket_ = await asyncio.wait_for(session.ws_connect(url, headers=headers), timeout)

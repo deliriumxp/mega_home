@@ -48,6 +48,10 @@ WS_HEARTBEAT_S = 25
 # Кадр крупнее мегабайта — не наш случай: тело запроса едет в описании, а данные
 # идут кусками. Огромный кадр рвёт сокет громко, а не теряется молча.
 WS_MAX_FRAME = 1024 * 1024
+# Ответы API дома — ДАННЫЕ, а не страницы: открытый по ссылке, ответ не исполняет скрипт в origin
+# HA. Ресурс `api/connect?req=…` несёт чужое тело с чужим типом (устройство LAN), и без этих
+# заголовков HTML или SVG устройства стал бы страницей HA со всеми его ключами.
+CONTAINED = {"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox"}
 
 # ⚠ Копии интерфейса в релизе НЕТ (2026-09-06): пока бандл не скачан, отдаём эту
 # страницу. Первый запуск считаем онлайн — а взамен релиз интеграции перестал
@@ -200,7 +204,7 @@ class _RoutedView(_MegaHomeView):
             )
         except ops.OpError as err:
             return _keyed(self.json_message(err.message, err.status), key, fresh)
-        headers = {"Content-Type": content_type, **({"Cache-Control": cache} if cache else {})}
+        headers = {"Content-Type": content_type, **({"Cache-Control": cache} if cache else {}), **CONTAINED}
         if isinstance(raw, Path):
             return _keyed(web.FileResponse(raw, headers=headers), key, fresh)
         return _keyed(web.Response(status=status, body=raw, headers=headers), key, fresh)
