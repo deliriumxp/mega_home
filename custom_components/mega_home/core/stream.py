@@ -579,7 +579,7 @@ class _WsStream(_SessionBase):
         headers = self._req.get("headers") if isinstance(self._req.get("headers"), dict) else None
         try:
             connector = await connect_mod.connector_for(self._host, self._port, self._req.get("tls") is True)
-            self._session = aiohttp.ClientSession(connector=connector)
+            self._session = aiohttp.ClientSession(connector=connector, trace_configs=connect_mod.no_redirects())
             # Срок — на РУКОПОЖАТИЕ: число в `timeout=` у aiohttp задавало лишь
             # срок закрытия (и устарело), а к мёртвому адресу ждали бы минуты.
             self._socket = await asyncio.wait_for(self._session.ws_connect(self._url, headers=headers), 10)

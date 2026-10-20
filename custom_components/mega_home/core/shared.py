@@ -22,6 +22,7 @@ import re
 from typing import Any
 
 from .host import Host
+from .ops_base import OpError
 
 STORE_KEY = "mega_home_shared"
 NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -57,17 +58,22 @@ class SharedDocs:
     async def put(self, name: str, rev: Any, data: Any) -> dict[str, Any]:
         """Записать, если `rev` — текущий. Ответ — `{accepted, rev, data}` с документом ПОСЛЕ.
 
-        Отказ по пределам — `ValueError` словами (вызывающий отвечает 400/413).
+        Отказ по пределам — `OpError` словами: 413 — велик документ, 507 — документов в доме предел.
         """
         current = self.get(name)
         if not isinstance(rev, int) or isinstance(rev, bool) or rev != current["rev"]:
             return {"accepted": False, **current}
+        # Снимать нечего — записи не заводим: пустое имя не должно занимать место в пределе.
+        if data is None and name not in self._docs:
+            return {"accepted": True, **current}
         # ⚠ Снятый документ остаётся записью с `data: null`: ревизия не возвращается к 0, и телефон,
-        # читавший документ до снятия, не перезапишет пустоту своей старой копией.
+        # читавший документ до снятия, не перезапишет пустоту своей старой копией. В предел он не
+        # считается — снятое не мешает завести новое.
         if len(json.dumps(data, ensure_ascii=False).encode("utf-8")) > MAX_DOC_BYTES:
-            raise ValueError(f"Документ больше {MAX_DOC_BYTES // 1024} КБ")
-        if name not in self._docs and len(self._docs) >= MAX_DOCS:
-            raise ValueError(f"В доме уже {MAX_DOCS} документов")
+            raise OpError(f"Документ больше {MAX_DOC_BYTES // 1024} КБ", 413)
+        live = sum(1 for doc in self._docs.values() if doc["data"] is not None)
+        if data is not None and self._docs.get(name, {}).get("data") is None and live >= MAX_DOCS:
+            raise OpError(f"В доме уже {MAX_DOCS} документов", 507)
         self._docs[name] = {"rev": current["rev"] + 1, "data": data}
         # ⚠ Сразу на диск, а не раз в период: это единственная копия выбора жильцов.
         await self._save()

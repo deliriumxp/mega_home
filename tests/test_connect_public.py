@@ -82,6 +82,61 @@ def test_соединение_идёт_на_проверенный_адрес_с
     assert seen["host"].startswith("www.radiorecord.ru")
 
 
+def test_ресурс_браузеру_не_из_интернета():
+    """⚠ Ответ ресурса браузер открывает в origin двери: чужая страница исполнила бы там скрипт."""
+    with pytest.raises(OpError) as refused:
+        asyncio.run(connect_mod.resource({"kind": "http", "host": "evil.example.com", "port": 443, "tls": True, "path": "/x"}))
+    assert refused.value.status == 403
+
+
+def test_ws_не_идёт_по_перенаправлению(monkeypatch):
+    """⚠ Перенаправление на литерал aiohttp соединяет мимо резолвера: имя увело бы дом на loopback."""
+
+    async def scenario():
+        hits: list[str] = []
+        reached: list[str] = []
+
+        async def secret(request):
+            reached.append(request.path)
+            return web.Response(text="секрет")
+
+        inner = web.Application()
+        inner.router.add_get("/secret", secret)
+        inner_runner = web.AppRunner(inner)
+        await inner_runner.setup()
+        inner_site = web.TCPSite(inner_runner, "127.0.0.1", 0)
+        await inner_site.start()
+        inner_port = inner_site._server.sockets[0].getsockname()[1]
+
+        async def bounce(request):
+            raise web.HTTPFound(f"http://127.0.0.1:{inner_port}/secret")
+
+        app = web.Application()
+        app.router.add_get("/ws", bounce)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.2", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+
+        async def pinned(host, port_, family=0):
+            hits.append(host)
+            return [{"hostname": host, "host": "127.0.0.2", "port": port_, "family": 2, "proto": 6, "flags": 0}]
+
+        monkeypatch.setattr(connect_mod, "pinned", pinned)
+        try:
+            with pytest.raises(OpError):
+                await connect_mod.perform({"kind": "ws", "host": "ws.example.com", "port": port, "path": "/ws", "timeout": 5})
+        finally:
+            await runner.cleanup()
+            await inner_runner.cleanup()
+        return hits, reached
+
+    hits, reached = asyncio.run(scenario())
+    assert hits == ["ws.example.com"]
+    assert reached == []
+
+
 def test_по_имени_сертификат_проверяется(monkeypatch):
     fake_dns(monkeypatch, "93.184.216.34")
 

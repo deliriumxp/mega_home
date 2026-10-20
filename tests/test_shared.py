@@ -72,8 +72,17 @@ def test_пределы_имени_размера_и_числа(coordinator):
     assert big.value.status == 413
     for n in range(MAX_DOCS):
         call(coordinator, "POST", f"api/shared/d{n}", {"rev": 0, "data": n})
-    with pytest.raises(ops.OpError):
+    with pytest.raises(ops.OpError) as full:
         call(coordinator, "POST", "api/shared/one-more", {"rev": 0, "data": 1})
+    assert full.value.status == 507
+    # Снятый документ места не занимает: после снятия новое заводится.
+    call(coordinator, "POST", "api/shared/d0", {"rev": 1, "data": None})
+    assert call(coordinator, "POST", "api/shared/one-more", {"rev": 0, "data": 1})["accepted"]
+
+
+def test_снятие_несуществующего_записи_не_заводит(coordinator):
+    assert call(coordinator, "POST", "api/shared/ghost", {"rev": 0, "data": None}) == {"accepted": True, "rev": 0, "data": None}
+    assert "ghost" not in coordinator.shared._docs
 
 
 def test_снаружи_тем_же_путём(coordinator):
