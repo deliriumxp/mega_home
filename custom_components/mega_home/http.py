@@ -295,6 +295,13 @@ class MegaHomeAlertView(_RoutedView):
     name = "api:mega_home:alert"
 
 
+class MegaHomeSharedView(_RoutedView):
+    """Общий документ жильцов дома (`core/shared.py`): прочитать, записать по ревизии."""
+
+    url = f"{URL_API}/shared/{{name}}"
+    name = "api:mega_home:shared"
+
+
 class MegaHomeAssetView(_RoutedView):
     """ONE route for every file the manager hands to this home (`assets.py`)."""
 
@@ -600,6 +607,7 @@ VIEWS: tuple[type[HomeAssistantView], ...] = (
     MegaHomeCropView,
     MegaHomeAlertsView,
     MegaHomeAlertView,
+    MegaHomeSharedView,
     MegaHomeAssetView,
     MegaHomeCameraFrameView,
     MegaHomeDeviceEventsView,

@@ -77,7 +77,8 @@ async def settle(times: int = 3) -> None:
 
 
 def test_open_refuses_public_address():
-    """⚠ Дверь в локалку объекта не должна быть выходом в интернет с его адреса."""
+    """⚠ Литеральный адрес — только частный: в интернет дом ходит по ИМЕНИ, сертификат
+    проверяется по нему (`connect.resolve_address`, решение заказчика 2026-10-20)."""
 
     async def scenario():
         socket = FakeSocket()
@@ -90,18 +91,37 @@ def test_open_refuses_public_address():
     assert "вне локальной сети" in socket.last_error()
 
 
-def test_open_refuses_hostname():
-    """Имя резолвил бы дом — и резолвер смотрит в интернет. Только литеральный IP."""
+def test_open_refuses_name_without_dot():
+    """Имя без точки — это имя службы дома, а она не поднята; в DNS дом с ним не идёт."""
 
     async def scenario():
         socket = FakeSocket()
         await Streams(socket).handle(
-            {"t": "stream.open", "id": 1, "req": {"kind": "tcp", "host": "router.local", "port": 80}}
+            {"t": "stream.open", "id": 1, "req": {"kind": "tcp", "host": "router", "port": 80}}
         )
         return socket
 
     # ⚠ Формулировка — ОДНА с одиночным вызовом: адрес разбирает `connect`.
     assert "частный IPv4" in asyncio.run(scenario()).last_error()
+
+
+def test_open_refuses_name_leading_to_loopback(monkeypatch):
+    """⚠ Имя, ведущее на саму машину, — обход правила «loopback только по имени службы»."""
+    from mega_home.core import connect as connect_mod
+
+    async def fake_getaddrinfo(host, port, family):
+        return [(2, 1, 6, "", ("127.0.0.1", port))]
+
+    monkeypatch.setattr(connect_mod, "_getaddrinfo", fake_getaddrinfo)
+
+    async def scenario():
+        socket = FakeSocket()
+        await Streams(socket).handle(
+            {"t": "stream.open", "id": 1, "req": {"kind": "tcp", "host": "evil.example.com", "port": 8123}}
+        )
+        return socket
+
+    assert "служебный адрес" in asyncio.run(scenario()).last_error()
 
 
 def test_open_refuses_loopback():

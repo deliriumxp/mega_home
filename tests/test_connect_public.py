@@ -1,0 +1,96 @@
+"""Ось «адресат»: `connect` по ИМЕНИ хоста — в интернет (решение заказчика 2026-10-20).
+
+⚠ Предмет — граница: литеральный адрес по-прежнему только частный, имя проверяется по
+адресам, куда ведёт, и соединение идёт ровно на проверенные адреса (без второго DNS).
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+from aiohttp import web
+
+from mega_home.core import connect as connect_mod
+from mega_home.core.ops_base import OpError
+
+
+def fake_dns(monkeypatch, *addresses: str) -> list[str]:
+    asked: list[str] = []
+
+    async def getaddrinfo(host, port, family):
+        asked.append(host)
+        return [(2, 1, 6, "", (address, port)) for address in addresses]
+
+    monkeypatch.setattr(connect_mod, "_getaddrinfo", getaddrinfo)
+    return asked
+
+
+def test_имя_принимается_литерал_публичный_нет():
+    assert connect_mod.resolve_address({"host": "WWW.Radiorecord.ru", "port": 443}) == ("www.radiorecord.ru", 443)
+    with pytest.raises(OpError, match="по имени хоста"):
+        connect_mod.resolve_address({"host": "8.8.8.8", "port": 443})
+    with pytest.raises(OpError, match="частный IPv4"):
+        connect_mod.resolve_address({"host": "router", "port": 80})
+
+
+@pytest.mark.parametrize("address", ["127.0.0.1", "169.254.169.254", "0.0.0.0", "::1", "fe80::1"])
+def test_имя_на_служебный_адрес_отказ(monkeypatch, address):
+    fake_dns(monkeypatch, "93.184.216.34", address)
+    with pytest.raises(OpError, match="служебный адрес"):
+        asyncio.run(connect_mod.pinned("example.com", 443))
+
+
+def test_имя_на_частный_адрес_пускается(monkeypatch):
+    # До частного адреса вызывающий и так достаёт литералом — имя тут ничего не открывает.
+    fake_dns(monkeypatch, "192.168.1.10")
+    assert asyncio.run(connect_mod.pinned("nas.example.com", 80))[0]["host"] == "192.168.1.10"
+
+
+def test_соединение_идёт_на_проверенный_адрес_с_именем_в_host(monkeypatch):
+    """Имя уходит в Host (и в SNI у TLS), а сокет — на адрес, который проверил `pinned`."""
+
+    async def scenario():
+        seen: dict[str, str] = {}
+
+        async def handler(request):
+            seen["host"] = request.headers.get("Host", "")
+            return web.json_response({"ok": True})
+
+        app = web.Application()
+        app.router.add_get("/api/stations/", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.2", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        # Проверку адреса здесь обходим подменой `pinned`: петля — единственный наш сервер.
+        async def pinned(host, port_, family=0):
+            return [{"hostname": host, "host": "127.0.0.2", "port": port_, "family": 2, "proto": 6, "flags": 0}]
+
+        monkeypatch.setattr(connect_mod, "pinned", pinned)
+        try:
+            answer = await connect_mod.perform(
+                {"kind": "http", "host": "www.radiorecord.ru", "port": port, "path": "/api/stations/"}
+            )
+        finally:
+            await runner.cleanup()
+        return answer, seen
+
+    answer, seen = asyncio.run(scenario())
+    assert answer["status"] == 200
+    assert seen["host"].startswith("www.radiorecord.ru")
+
+
+def test_по_имени_сертификат_проверяется(monkeypatch):
+    fake_dns(monkeypatch, "93.184.216.34")
+
+    async def scenario():
+        connector = await connect_mod.connector_for("example.com", 443, True)
+        try:
+            # `ssl=True` у aiohttp — проверенный контекст; у устройства LAN — `False`.
+            return connector._ssl
+        finally:
+            await connector.close()
+
+    assert asyncio.run(scenario()) is True

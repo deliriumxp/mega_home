@@ -106,6 +106,8 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.changes: Any = None
         # Правила уведомлений по датчикам (`alerts.py`); ставятся в `async_setup_entry`.
         self.alerts: Any = None
+        # Общие данные жильцов дома (`shared.py`); ставятся в `async_setup_entry`.
+        self.shared: Any = None
         # Включение по сети на чужую команду «включи» (`wake.py`); ставится в `async_setup_entry`.
         self.wake: Any = None
         # Ключи локальных подключений (`local_keys.py`): режим и секрет — из конфига.

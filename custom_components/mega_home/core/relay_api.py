@@ -40,6 +40,7 @@ from .crops import crop_key_known, crop_keys, crop_value_valid
 from .imaging import asset_file, photo_file
 from .ops_base import VIA_LOCAL, VIA_REMOTE, actor, dumps
 from .photos import JPEG_MAGIC, MAX_PHOTO_BYTES, photo_key_known, photo_keys
+from .shared import name_valid
 
 JSON_TYPE = "application/json"
 JPEG_TYPE = "image/jpeg"
@@ -160,6 +161,10 @@ async def dispatch(
             return _json({"alerts": alerts.all() if alerts else {}})
         if rest.startswith("/"):
             return await _alert(coordinator, method, unquote(rest[1:]), body)
+    if path.startswith("api/shared/"):
+        # Общие данные жильцов дома (`shared.py`): выбор, один на все устройства, — пункт 3
+        # закрытого списка, «хранилище жильца». Смысла документа дом не знает.
+        return await _shared(coordinator, method, unquote(path[len("api/shared/") :]), body)
     if path.startswith("api/asset/") and method == "GET":
         # Файлы менеджера: ключ, версия и тип — из манифеста в конфиге
         # (`assets.py`), а не из `?v=` адреса — тот лишь метка кэша.
@@ -272,6 +277,23 @@ async def _alert(coordinator: Any, method: str, tile: str, body: bytes) -> Reply
         if await alerts.delete(tile):
             alerts.track(coordinator.data)
         return _json({"accepted": True})
+    raise ops.OpError("Дом не знает такого запроса", HTTPStatus.METHOD_NOT_ALLOWED)
+
+async def _shared(coordinator: Any, method: str, name: str, body: bytes) -> Reply:
+    """Документ жильцов дома: прочитать, записать по ревизии (`{rev, data}`)."""
+    docs = getattr(coordinator, "shared", None)
+    if docs is None:
+        raise ops.OpError("Дом ещё запускается", HTTPStatus.SERVICE_UNAVAILABLE)
+    if not name_valid(name):
+        raise ops.OpError("Имя документа — латиница, цифры, «._-», до 64 знаков", HTTPStatus.NOT_FOUND)
+    if method == "GET":
+        return _json(docs.get(name))
+    if method == "POST":
+        payload = _json_body(body)
+        try:
+            return _json(await docs.put(name, payload.get("rev"), payload.get("data")))
+        except ValueError as err:
+            raise ops.OpError(str(err), HTTPStatus.REQUEST_ENTITY_TOO_LARGE) from err
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.METHOD_NOT_ALLOWED)
 
 async def _icon(coordinator: Any, name: str) -> Reply:

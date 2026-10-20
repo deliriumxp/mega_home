@@ -163,6 +163,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     await alerts.async_load()
     coordinator.alerts = alerts
 
+    # Общие данные жильцов (`shared.py`) — тоже до дверей: первый же `api/shared/*` отвечает ими.
+    from .core.shared import SharedDocs
+
+    coordinator.shared = SharedDocs(coordinator.env)
+    await coordinator.shared.async_load()
+
     def _track_alerts() -> None:
         alerts.track(coordinator.data)
 
