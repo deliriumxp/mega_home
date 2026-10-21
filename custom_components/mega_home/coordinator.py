@@ -36,6 +36,7 @@ from .core.crops import CropStore, crop_keys
 from .core.local_keys import LocalKeys
 from .core.imaging import LookStore
 from .core.photos import PhotoStore, photo_keys, prune_dir
+from .core.topics import APP as TOPIC_APP, Topics
 
 type MegaHomeConfigEntry = ConfigEntry["MegaHomeCoordinator"]
 
@@ -125,6 +126,10 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # при `last_update_success: true`, то есть «не пробовало», а не «не
         # смогло». Порядок инициализации теперь не решает ничего.
         self.bundle = BundleStore(self.env, client)
+        # Темы дома (`topics.py`): пути записи поднимают номер, поток несёт сигнал всем телефонам.
+        # Здесь, рядом с бандлом: подмена бандла — тоже тема, открытая вкладка переходит сразу.
+        self.topics = Topics()
+        self.bundle.on_swap = lambda: self.topics.bump(TOPIC_APP)
         # Почему интерфейс мог не доехать и когда его проверяли в последний раз —
         # это уходит в диагностику: «старый интерфейс» иначе неотличим от нормы.
         self.app_error: str | None = None

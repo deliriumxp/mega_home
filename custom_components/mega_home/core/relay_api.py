@@ -41,6 +41,7 @@ from .imaging import asset_file, photo_file
 from .ops_base import VIA_LOCAL, VIA_REMOTE, actor, dumps
 from .photos import JPEG_MAGIC, MAX_PHOTO_BYTES, photo_key_known, photo_keys
 from .shared import name_valid
+from .topics import ALERTS, CROPS, PHOTOS, SHARED
 
 JSON_TYPE = "application/json"
 JPEG_TYPE = "image/jpeg"
@@ -55,6 +56,18 @@ IMMUTABLE = "public, max-age=31536000, immutable"
 # (статус, тип, тело, cache-control). Тело — байты или ФАЙЛ: локальная дверь
 # отдаёт файл потоком (`FileResponse`), перенос читает его в байты.
 Reply = tuple[int, str, "bytes | Path", str]
+
+
+def _changed(coordinator: Any, topic: str) -> None:
+    """Запись принята — тема дома (`topics.py`): остальные телефоны узнают потоком.
+
+    ⚠ Здесь, у маршрутизатора, а не в хранилищах: фото и кадры пишутся в потоке исполнителя
+    (`env.run`), а слушатели потока живут в цикле событий. Путь записи жильца один — этот.
+    """
+    topics = getattr(coordinator, "topics", None)
+    if topics is not None:
+        topics.bump(topic)
+
 
 async def handle(coordinator: Any, payload: dict[str, Any]) -> dict[str, Any]:
     """Выполнить один перенесённый запрос и вернуть ответ для менеджера.
@@ -225,10 +238,12 @@ async def _photo(
             # либо чужой клиент, либо оборванная загрузка.
             raise ops.OpError("Ожидается фотография JPEG", HTTPStatus.BAD_REQUEST)
         version = await coordinator.env.run(coordinator.photos.save, key, body)
+        _changed(coordinator, PHOTOS)
         return _json({"accepted": True, "version": version})
     if method == "DELETE":
         if not await coordinator.env.run(coordinator.photos.delete, key):
             raise ops.OpError("Фото не найдено", HTTPStatus.NOT_FOUND)
+        _changed(coordinator, PHOTOS)
         return _json({"accepted": True})
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.METHOD_NOT_ALLOWED)
 
@@ -245,10 +260,12 @@ async def _crop(coordinator: Any, method: str, tile: str, body: bytes) -> Reply:
         if not crop_value_valid(payload):
             raise ops.OpError("Некорректный участок кадра", HTTPStatus.BAD_REQUEST)
         await coordinator.env.run(coordinator.crops.save, tile, payload)
+        _changed(coordinator, CROPS)
         return _json({"accepted": True, "crop": payload})
     if method == "DELETE":
         if not await coordinator.env.run(coordinator.crops.delete, tile):
             raise ops.OpError("Кадр не найден", HTTPStatus.NOT_FOUND)
+        _changed(coordinator, CROPS)
         return _json({"accepted": True})
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.METHOD_NOT_ALLOWED)
 
@@ -271,11 +288,13 @@ async def _alert(coordinator: Any, method: str, tile: str, body: bytes) -> Reply
             raise ops.OpError("Некорректное правило", HTTPStatus.BAD_REQUEST)
         await alerts.save(tile, rule)
         alerts.track(coordinator.data)
+        _changed(coordinator, ALERTS)
         return _json({"accepted": True, "alert": rule})
     if method == "DELETE":
         # Отсутствующее — тоже успех: два телефона сняли правило разом, оба правы.
         if await alerts.delete(tile):
             alerts.track(coordinator.data)
+            _changed(coordinator, ALERTS)
         return _json({"accepted": True})
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.METHOD_NOT_ALLOWED)
 
@@ -290,7 +309,10 @@ async def _shared(coordinator: Any, method: str, name: str, body: bytes) -> Repl
         return _json(docs.get(name))
     if method == "POST":
         payload = _json_body(body)
-        return _json(await docs.put(name, payload.get("rev"), payload.get("data")))
+        answer = await docs.put(name, payload.get("rev"), payload.get("data"))
+        if answer.get("accepted"):
+            _changed(coordinator, SHARED + name)
+        return _json(answer)
     raise ops.OpError("Дом не знает такого запроса", HTTPStatus.METHOD_NOT_ALLOWED)
 
 async def _icon(coordinator: Any, name: str) -> Reply:
