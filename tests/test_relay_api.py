@@ -510,6 +510,7 @@ def test_записи_жильца_поднимают_темы_дома(coordina
     from mega_home.core.topics import Topics  # noqa: PLC0415
 
     coordinator.topics = Topics()
+    start = coordinator.topics.bump("x")
     _with_alerts(coordinator)
     call(coordinator, "POST", "api/photo/r1", JPEG)
     call(coordinator, "DELETE", "api/photo/r1")
@@ -517,4 +518,4 @@ def test_записи_жильца_поднимают_темы_дома(coordina
     call(coordinator, "POST", "api/alert/t-temp", json.dumps(rule).encode())
     call(coordinator, "DELETE", "api/alert/t-temp")
     call(coordinator, "DELETE", "api/alert/t-temp")
-    assert coordinator.topics.revs() == {"photos": 2, "alerts": 2}
+    assert coordinator.topics.revs() == {"x": start, "photos": start + 1, "alerts": start + 1}

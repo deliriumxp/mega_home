@@ -60,19 +60,26 @@ def test_номер_темы_растёт_и_слушатель_узнаёт():
     topics = Topics()
     seen: list[tuple[str, int]] = []
     unsubscribe = topics.subscribe(lambda topic, rev: seen.append((topic, rev)))
-    topics.bump("alerts")
+    first = topics.bump("alerts")
     topics.bump("alerts")
     unsubscribe()
     topics.bump("alerts")
-    assert seen == [("alerts", 1), ("alerts", 2)]
-    assert topics.revs() == {"alerts": 3}
+    assert seen == [("alerts", first), ("alerts", first + 1)]
+    assert topics.revs() == {"alerts": first + 2}
+
+
+def test_отсчёт_со_случайного_смещения_на_каждый_запуск():
+    # С единицы тема, записанная после перезапуска, совпала бы с номером, который телефон помнил до
+    # него, — и смена потерялась бы молча.
+    assert len({Topics().bump("shared/radio") for _ in range(5)}) > 1
 
 
 def test_принятая_запись_документа_сигналит_всем_потокам(coordinator):
     stream = StateStream(coordinator)
     stream.start()
     call(coordinator, "POST", "api/shared/radio-sent", {"rev": 0, "data": {"players": {}}})
-    assert drain(stream) == [("changed", {"topic": "shared/radio-sent", "rev": 1})]
+    [(name, frame)] = drain(stream)
+    assert name == "changed" and frame == {"topic": "shared/radio-sent", "rev": coordinator.topics.revs()["shared/radio-sent"]}
     # Отказ по ревизии ничего не поменял — и сигнала нет.
     call(coordinator, "POST", "api/shared/radio-sent", {"rev": 0, "data": {"players": {}}})
     assert drain(stream) == []
@@ -84,7 +91,7 @@ def test_принятая_запись_документа_сигналит_вс�
 def test_снимок_несёт_номера_тем_для_сверки_после_обрыва(coordinator):
     assert ops.states(coordinator)["revs"] == {}
     call(coordinator, "POST", "api/shared/radio", {"rev": 0, "data": {"favorites": ["1"]}})
-    assert ops.states(coordinator)["revs"] == {"shared/radio": 1}
+    assert set(ops.states(coordinator)["revs"]) == {"shared/radio"}
 
 
 def test_бандл_сменился_тема_app(tmp_path: Path):
@@ -95,4 +102,4 @@ def test_бандл_сменился_тема_app(tmp_path: Path):
     bundle.on_swap = lambda: topics.bump("app")
     assert bundle.on_swap is not None
     bundle.on_swap()
-    assert topics.revs() == {"app": 1}
+    assert set(topics.revs()) == {"app"}
