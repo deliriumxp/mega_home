@@ -301,6 +301,9 @@ def states(coordinator: Any) -> dict[str, Any]:
         # been open for days that the installer added a socket.
         "configVersion": coordinator.version,
         "appVersion": coordinator.bundle.version if coordinator.bundle else None,
+        # Номера тем (`topics.py`): переподключившийся телефон сверяет их и перечитывает то, о чём
+        # сигнал пришёл, пока потока не было; опрос без потока узнаёт смены тем же ответом.
+        "revs": topics.revs() if (topics := getattr(coordinator, "topics", None)) is not None else {},
         "entities": entities,
     }
 

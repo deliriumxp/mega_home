@@ -502,3 +502,19 @@ def test_правило_только_датчику_и_в_нашей_форме(
 def test_дом_без_правил_отвечает_пустым(coordinator):
     # Модуль ещё не поднят (ранний запрос на старте) — пусто, а не падение.
     assert json_of(call(coordinator, "GET", "api/alerts")) == {"alerts": {}}
+
+
+# Записи жильца — темы дома (`core/topics.py`): второй телефон узнаёт потоком, а не перезагрузкой.
+# Сигнал — только принятой записи: снятие несуществующего правила ничего не поменяло.
+def test_записи_жильца_поднимают_темы_дома(coordinator):
+    from mega_home.core.topics import Topics  # noqa: PLC0415
+
+    coordinator.topics = Topics()
+    _with_alerts(coordinator)
+    call(coordinator, "POST", "api/photo/r1", JPEG)
+    call(coordinator, "DELETE", "api/photo/r1")
+    rule = {"op": "gt", "value": 25, "holdSec": 60, "cooldownSec": 900, "enabled": True}
+    call(coordinator, "POST", "api/alert/t-temp", json.dumps(rule).encode())
+    call(coordinator, "DELETE", "api/alert/t-temp")
+    call(coordinator, "DELETE", "api/alert/t-temp")
+    assert coordinator.topics.revs() == {"photos": 2, "alerts": 2}

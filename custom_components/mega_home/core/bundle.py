@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 from time import time
 from typing import Any
@@ -57,6 +58,8 @@ class BundleStore:
         # тишина, в диагностике ничего. Причина стоила разбирательства по
         # скриншотам вместо одного взгляда в лог.
         self.last_error: str | None = None
+        # Активная версия сменилась — тема `app` (`topics.py`): открытые вкладки узнают сразу.
+        self.on_swap: Callable[[], None] | None = None
         # ⚠ Один прогон синхронизации за раз. Её зовут ДВА независимых
         # источника — опрос координатора (раз в 15 минут) и подсказка
         # `app_changed` из живого канала, — а менеджер на каждом переподключении
@@ -182,6 +185,8 @@ class BundleStore:
         self.last_error = None
         LOGGER.info("App bundle updated to %s", self.version)
         await self._env.run(self._prune)
+        if self.on_swap:
+            self.on_swap()
         return True
 
     async def _async_fetch_file(self, staging: Path, item: dict[str, Any]) -> int:

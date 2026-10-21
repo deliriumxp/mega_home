@@ -19,6 +19,8 @@ Events on the stream:
 * `entity`  — one tile whose Home Assistant state changed;
 * `config`  — the installer changed the home; carries the new version, and the
   app rereads the config;
+* `changed` — a topic of the home changed (`topics.py`): `{topic, rev}`, a signal
+  only — the app rereads the fact by its usual request;
 * `ping` — every PING_SECONDS of silence: keeps proxies from closing an idle
   stream and lets the app tell a silent stream from a dead one.
 """
@@ -61,6 +63,7 @@ class StateStream:
         self._ended = False
         self._unsubscribe_config: Any = None
         self._unsubscribe_device: Any = None
+        self._unsubscribe_topics: Any = None
 
     # --- подписка на дом ---
 
@@ -78,14 +81,22 @@ class StateStream:
             if hub is not None
             else None
         )
+        # Темы дома (`topics.py`): записал один телефон — остальные узнают тем же потоком.
+        topics = getattr(self.coordinator, "topics", None)
+        self._unsubscribe_topics = (
+            topics.subscribe(lambda topic, rev: self._put("changed", {"topic": topic, "rev": rev}))
+            if topics is not None
+            else None
+        )
 
     def stop(self) -> None:
-        for unsubscribe in (self._unsubscribe, self._unsubscribe_config, self._unsubscribe_device):
+        for unsubscribe in (self._unsubscribe, self._unsubscribe_config, self._unsubscribe_device, self._unsubscribe_topics):
             if unsubscribe:
                 unsubscribe()
         self._unsubscribe = None
         self._unsubscribe_config = None
         self._unsubscribe_device = None
+        self._unsubscribe_topics = None
 
     def _tiles(self) -> list[dict[str, Any]]:
         return list(self.coordinator.data.get("tiles", []) or [])
