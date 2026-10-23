@@ -79,6 +79,25 @@ def frame_of(path: Path, out: Path, binary: str, nice: str = "") -> int:
     return 0
 
 
+def present(paths: list[Path]) -> set[Path]:
+    """Какие из `paths` есть на диске — по ОДНОМУ листингу на каталог, а не `stat` на каждый путь.
+
+    ⚠ На сетевой папке `stat` — поход по сети: 60 кусков окна спрайта стоили 20 секунд, а листинг
+    каталога дня — один заход (замер на живом доме 2026-10-24).
+    """
+    listed: dict[Path, set[str]] = {}
+    out: set[Path] = set()
+    for path in paths:
+        if path.parent not in listed:
+            try:
+                listed[path.parent] = {entry.name for entry in os.scandir(path.parent)}
+            except OSError:
+                listed[path.parent] = set()
+        if path.name in listed[path.parent]:
+            out.add(path)
+    return out
+
+
 def missing_frames(indexes: list[SegmentIndex], skip: set[Path]) -> list[tuple[SegmentIndex, float, Path]]:
     """Куски без кадра у каждой камеры — из самого свежего её дня, где такие есть, свежие сначала;
     пусто — кадры у всех. День за днём, а не весь архив разом: статистика каждого куска на сетевой папке
@@ -88,11 +107,9 @@ def missing_frames(indexes: list[SegmentIndex], skip: set[Path]) -> list[tuple[S
     for index in indexes:
         for name, _first, _last in reversed(index.days()):
             start = float(calendar.timegm(time.strptime(name, "%Y-%m-%d")))
-            found = [
-                (index, begin, path)
-                for begin, _length, path in reversed(index.between(start, start + DAY_S))
-                if day_of(begin) == name and path not in skip and not path.with_suffix(".jpg").is_file()
-            ]
+            pieces = [(begin, path) for begin, _length, path in reversed(index.between(start, start + DAY_S)) if day_of(begin) == name]
+            have = present([path.with_suffix(".jpg") for _begin, path in pieces])
+            found = [(index, begin, path) for begin, path in pieces if path not in skip and path.with_suffix(".jpg") not in have]
             if found:
                 out.extend(found)
                 break
@@ -132,7 +149,8 @@ def slot_frames(index: SegmentIndex, start: float) -> list[Path | None]:
     """Кадр каждого слота: кусок, покрывающий `start + i·SLOT_S`, иначе начавшийся в слоте, иначе
     пусто. Кусок без кадра в счёт не идёт — слот возьмёт соседний кусок или останется пустым."""
     found = [(b, n, p.with_suffix(".jpg")) for b, n, p in index.between(start, start + WINDOW_S)]
-    found = [(b, n, p) for b, n, p in found if p.is_file()]
+    have = present([p for _b, _n, p in found])
+    found = [(b, n, p) for b, n, p in found if p in have]
     slots: list[Path | None] = []
     for moment in (start + i * SLOT_S for i in range(COLS * ROWS)):
         covering = next((p for b, n, p in found if b <= moment < b + n), None)

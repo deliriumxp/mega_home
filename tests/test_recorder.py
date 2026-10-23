@@ -472,3 +472,38 @@ def test_без_раздела_записи_нет(tmp_path: Path) -> None:
     assert host.spawned == ["mega_home: служба записи", "mega_home: запись камер"]
     assert recorder.state()["enabled"] is False
     assert os.listdir(tmp_path) == []
+
+
+def test_ключевой_кадр_до_метки_и_один_листинг_вместо_stat(tmp_path: Path) -> None:
+    """`inpoint` встаёт на ключевой кадр, а не между ними: копия потока всё равно начнётся с него, и
+    `startMs` обязан назвать это время. Наличие кадров куска — один листинг каталога."""
+    from mega_home.core.recorder_api import _keyframe_before
+    from mega_home.core.recorder_frames import present
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not shutil.which("ffprobe"):
+        pytest.skip("нужны ffmpeg и ffprobe")
+    clip = tmp_path / "c.mkv"
+    import subprocess
+
+    subprocess.run(
+        [ffmpeg, "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=10", "-t", "12", "-c:v", "libx264",
+         "-g", "40", "-keyint_min", "40", "-sc_threshold", "0", "-pix_fmt", "yuv420p", str(clip)],
+        check=True,
+    )
+
+    class _Env:
+        async def run(self, func, *args):
+            return func(*args)
+
+    class _Rec:
+        env = _Env()
+
+    snapped = asyncio.run(_keyframe_before(_Rec(), clip, 6.3))
+    assert snapped == pytest.approx(4.0, abs=0.01)
+    assert asyncio.run(_keyframe_before(_Rec(), clip, 8.0)) == pytest.approx(8.0, abs=0.01)
+    # Нечитаемый файл — прежнее поведение: метка как есть.
+    assert asyncio.run(_keyframe_before(_Rec(), tmp_path / "нет.mkv", 6.3)) == 6.3
+
+    (tmp_path / "a.jpg").write_bytes(b"x")
+    assert present([tmp_path / "a.jpg", tmp_path / "b.jpg", tmp_path / "нет" / "c.jpg"]) == {tmp_path / "a.jpg"}
