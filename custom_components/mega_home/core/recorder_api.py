@@ -24,6 +24,7 @@ from aiohttp import web
 from . import services, storage
 from .go2rtc_embed import PLAYLIST_INPUT
 from .recorder import SERVICE, day_of
+from .recorder_frames import sprite_for
 
 if TYPE_CHECKING:
     from .recorder import Recorder
@@ -46,6 +47,7 @@ async def start_api(recorder: Recorder) -> web.AppRunner:
     app.router.add_get("/segments", _segments)
     app.router.add_post("/playlist", _playlist)
     app.router.add_get("/frame", _frame)
+    app.router.add_get("/sprite", _sprite)
     app.router.add_get("/disks", _disks)
     app.router.add_get("/folders", _folders)
     app.router.add_post("/folders", _make_folder)
@@ -259,3 +261,17 @@ async def _frame(request: web.Request) -> web.Response:
         raise web.HTTPNotFound(text='{"error": "кадр не извлёкся"}', content_type="application/json")
     # Запись под меткой не меняется — кадр можно держать в кэше браузера.
     return web.Response(body=image, content_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+
+async def _sprite(request: web.Request) -> web.Response:
+    """Спрайт 10-минутного окна под меткой `at` (мс) — превью под пальцем на шкале
+    (`recorder_frames.sprite_for`). Сборка — ffmpeg, под тем же `_FRAMES`, что и `/frame`.
+    Закрытое окно не меняется — держится в кэше браузера; текущее дописывается — `no-store`."""
+    recorder: Recorder = request.app[_RECORDER]
+    camera, _ = await _index(request)
+    at = _number(request, "at") / 1000
+    async with _FRAMES:
+        image, closed = await sprite_for(recorder, camera, at)
+    if not image:
+        raise web.HTTPNotFound(text='{"error": "кадров в окне нет"}', content_type="application/json")
+    return web.Response(body=image, content_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600" if closed else "no-store"})

@@ -43,6 +43,7 @@ from . import services, storage
 from .const import LOGGER
 from .go2rtc_embed import API_PORT, RTSP_PORT
 from .host import Host
+from .recorder_frames import frame_of, tools as frame_tools
 from .recorder_index import SegmentIndex, clean, day_of, epoch_of, segment_name
 
 SERVICE = "recorder"
@@ -163,6 +164,8 @@ class _Camera:
         self.last_saved = 0.0
         self.saved = 0
         self.dropped = 0
+        # Кадр превью не снялся при живом ffmpeg — сказано в журнал (один раз на камеру, не на кусок).
+        self._frame_warned = False
         self._tail: deque[str] = deque(maxlen=8)
         # Готовые куски по списку ffmpeg: имя → длительность; прочитанная часть списка — смещением.
         self._listed: dict[str, float] = {}
@@ -304,8 +307,13 @@ class _Camera:
         target = self.index.root / day_of(start) / segment_name(start, int(length * 1000))
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(path), str(target))
+        # Кадр — в объёме куска: лимит «локального диска» считает и его.
+        frame = self.rec.extract_frame(target, target.with_suffix(".jpg"), self.rec.ffmpeg, self.rec.nice) if self.rec.ffmpeg else 0
+        if not frame and self.rec.ffmpeg and not self._frame_warned:
+            self._frame_warned = True
+            LOGGER.warning("Запись %s: кадр превью из %s не снялся — у шкалы архива не будет превью кусков", self.spec.id, target.name)
         # В индекс — после переноса: сорвавшийся перенос не оставляет в нём куска, которого нет.
-        self.index.add(start, length, size)
+        self.index.add(start, length, size + frame)
         self.saved += 1
         self.last_saved = start + length
 
@@ -397,6 +405,9 @@ class Recorder:
         self._supervisor: asyncio.Task[None] | None = None
         # Идущая проба хранилища (монтирование и каталог): вторая поверх висящей не заводится.
         self._checking: asyncio.Future[str] | None = None
+        # ffmpeg для кадров превью (пусто — кадров нет, куски пишутся); снятие кадра — шов спек.
+        self.ffmpeg, self.nice = "", ""
+        self.extract_frame: Callable[[Path, Path, str, str], int] = frame_of
 
     def apply(self, config: dict[str, Any] | None) -> None:
         # ⚠ Служба на петле — всегда, а не только при записи: папку хранилища выбирают ДО записи.
@@ -503,6 +514,7 @@ class Recorder:
         ram = await self.env.run(self._ram_cache, sum(1 for s in self._specs if s.motion_mode))
         disk = self.storage / ".cache"
         await self.env.run(lambda: disk.mkdir(exist_ok=True))
+        self.ffmpeg, self.nice = await self.env.run(frame_tools)
         self.cameras = {
             spec.id: _Camera(self, spec, ram if spec.motion_mode and ram is not None else disk) for spec in self._specs
         }

@@ -56,6 +56,14 @@ def segment_name(begin: float, length_ms: int) -> str:
     return f"{time.strftime('%H%M%S', time.gmtime(begin))}-{length_ms}.mkv"
 
 
+def _frame_size(segment: Path) -> int:
+    """Кадр превью куска (`recorder_frames.frame_of`) — тот же стержень, `.jpg`; нет — 0."""
+    try:
+        return segment.with_suffix(".jpg").stat().st_size
+    except OSError:
+        return 0
+
+
 def scan_day(folder: Path) -> list[Segment]:
     """Куски каталога дня по именам — только при загрузке индекса."""
     out: list[Segment] = []
@@ -98,7 +106,7 @@ class SegmentIndex:
                 day.begins.append(begin)
                 day.lengths.append(int(length * 1000))
                 if sizes:
-                    day.size += path.stat().st_size
+                    day.size += path.stat().st_size + _frame_size(path)
             if len(day.begins):
                 days[folder.name] = day
         with self._lock:
@@ -188,7 +196,7 @@ class SegmentIndex:
 
 
 def clean(storage: Path, cameras: list[Any], now: float, limit: int = 0) -> None:
-    """По сроку камеры — каталоги дней целиком; по месту и по лимиту объёма (`limit`, байты:
+    """По сроку камеры — каталоги дней целиком (с кадрами и `sprites/`); по месту и по лимиту объёма (`limit`, байты:
     «локальный диск») — самые старые куски всех камер. `cameras` — `_Camera` записи (`spec`, `index`)."""
     for camera in cameras:
         camera.index.ensure(bool(limit))
@@ -210,8 +218,10 @@ def clean(storage: Path, cameras: list[Any], now: float, limit: int = 0) -> None
             break
         camera = oldest[1]
         for begin, _length, path in camera.index.oldest(60):
-            size = path.stat().st_size if path.is_file() else 0
+            # Кусок уходит вместе с кадром превью: в индексе их объём один.
+            size = (path.stat().st_size if path.is_file() else 0) + _frame_size(path)
             path.unlink(missing_ok=True)
+            path.with_suffix(".jpg").unlink(missing_ok=True)
             emptied = camera.index.forget(begin, size)
             if emptied is not None:
                 shutil.rmtree(camera.index.root / emptied, ignore_errors=True)
