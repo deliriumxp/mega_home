@@ -17,9 +17,19 @@ from pathlib import Path
 from aiohttp.test_utils import TestClient, TestServer
 
 from fake_host import FakeHost
+import pytest
+
 from mega_home.core import recorder as rec
-from mega_home.core import services
+from mega_home.core import services, storage
 from mega_home.core.recorder_api import start_api
+
+
+@pytest.fixture(autouse=True)
+def _one_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Таблица монтирований — машина с одним диском: временная папка тестов бывает в tmpfs, а
+    tmpfs для дома — ФС контейнера, под запись не годная (`storage.disk_kind`)."""
+    monkeypatch.setattr(storage, "mounted", lambda: {"/": ("/dev/sda1", "ext4"), "/proc": ("proc", "proc")})
+
 
 SECTION = {
     "storage": "/media/video",
@@ -61,14 +71,21 @@ def test_раздел_берёт_только_полные_камеры_с_бе�
 def test_хранилище_без_диска_не_пишется() -> None:
     # Свой каталог: путь хранилища — только латиница (уходит в ffconcat и строку go2rtc), а в
     # `tmp_path` pytest — имя теста кириллицей.
-    folder = Path(tempfile.mkdtemp(prefix="rec-")) / "video"
-    assert "нет каталога" in rec.storage_problem(folder)
+    # «Диск настроек» — `/proc`: заведомо другое устройство, чем каталог во временной папке.
+    folder, other = Path(tempfile.mkdtemp(prefix="rec-")) / "video", Path("/proc")
+    assert "нет каталога" in rec.storage_problem(folder, other)
     folder.mkdir()
-    assert "не смонтирован" in rec.storage_problem(folder)
-    (folder / rec.STORAGE_MARK).touch()
-    assert rec.storage_problem(folder) == ""
-    assert "абсолютный" in rec.storage_problem(Path("video"))
-    assert "абсолютный" in rec.storage_problem(Path("/media/vid'eo#x"))
+    assert rec.storage_problem(folder, other) == ""
+    # Тот же диск, что настройки дома, — флеш контроллера: только явно, «локальный диск».
+    assert "системном диске" in rec.storage_problem(folder, folder.parent)
+    assert rec.storage_problem(folder, folder.parent, local=True) == ""
+    # Диск монтирует дом — путь обязан быть внутри смонтированной точки.
+    assert "не смонтирован" in rec.storage_problem(folder, other, mounted_at=folder.parent)
+    assert "не смонтирован" in rec.storage_problem(folder, other, mounted_at=Path("/elsewhere"))
+    # Точка, куда дом сам монтирует, — не «папка контроллера»: пропал диск — писали бы на флеш.
+    assert "точка, куда дом сам подключает" in rec.storage_problem(storage.MOUNT_POINT / "video", other)
+    assert "абсолютный" in rec.storage_problem(Path("video"), other)
+    assert "абсолютный" in rec.storage_problem(Path("/media/vid'eo#x"), other)
 
 
 def test_окно_движения_с_запасом_до_и_после(tmp_path: Path) -> None:
@@ -106,23 +123,38 @@ def test_смены_считаются_только_в_сообщениях_те
     assert camera.windows[-1][:2] == [1010, None]
 
 
+def test_движение_своей_детекции_открывает_и_закрывает_окно(tmp_path: Path) -> None:
+    """Событие дома (`motion.py`) без текста: данные одной строкой JSON — та же сверка подстрок."""
+    camera = _camera(tmp_path, events="motion", on=('"state":"start"',), off=('"state":"stop"',))
+    own = {"access": "onvif-aa", "source": "motion", "event": "motion"}
+    camera.on_event({**own, "at": 1000, "data": {"state": "start", "share": 0.012}})
+    assert camera.windows[-1][:2] == [1000, None]
+    camera.on_event({**own, "at": 1040, "data": {"share": 0.02, "state": "stop"}})
+    assert camera.windows[-1][:2] == [1000, 1040]
+
+
 def test_сторож_останавливает_запись_без_диска_и_поднимает_с_ним() -> None:
     folder = Path(tempfile.mkdtemp(prefix="rec-"))
     recorder = rec.Recorder(FakeHost(folder), lambda _listener: (lambda: None))
     recorder._specs = rec.camera_specs({**SECTION, "storage": str(folder)})  # noqa: SLF001
     recorder.storage = folder
 
-    async def scenario() -> tuple[str, int, str, int]:
+    async def scenario() -> tuple[str, int, str, int, str]:
+        # Хранилище на том же диске, что настройки дома (`FakeHost.path`), — системный диск.
         await recorder._check()  # noqa: SLF001
         without = (recorder.why, len(recorder.cameras))
-        (folder / rec.STORAGE_MARK).touch()
+        recorder.local = True
+        await recorder._check()  # noqa: SLF001
+        no_limit = recorder.why
+        recorder.limit = 1024**3
         await recorder._check()  # noqa: SLF001
         with_disk = (recorder.why, len(recorder.cameras))
         await recorder._stop_all()  # noqa: SLF001
-        return (*without, *with_disk)
+        return (*without, *with_disk, no_limit)
 
-    why_without, cams_without, why_with, cams_with = asyncio.run(scenario())
-    assert "не смонтирован" in why_without and cams_without == 0
+    why_without, cams_without, why_with, cams_with, no_limit = asyncio.run(scenario())
+    assert "системном диске" in why_without and cams_without == 0
+    assert "только с лимитом" in no_limit
     assert why_with == "" and cams_with == 1
 
 
@@ -150,6 +182,17 @@ def test_индекс_и_уборка_по_сроку(tmp_path: Path) -> None:
     assert [(b, n) for b, n, _p in found] == [(now - 60, 10.0)]
     rec.clean(tmp_path, [_camera(tmp_path)], now)
     assert not old.exists() and fresh.exists()
+
+
+def test_лимит_локального_диска_убирает_старое(tmp_path: Path) -> None:
+    now = rec.epoch_of("20261023T120000")
+    assert now is not None
+    pieces = [_segment(tmp_path, "onvif-aa", now - 3600 * h) for h in (50, 30, 1)]
+    for piece in pieces:
+        piece.write_bytes(b"x" * 1000)
+    rec.clean(tmp_path, [_camera(tmp_path)], now, limit=2500)
+    # Сверх лимита — самые старые сутки первыми, свежие остаются.
+    assert [p.exists() for p in pieces] == [False, True, True]
 
 
 def test_служба_отдаёт_дни_участки_и_список(tmp_path: Path) -> None:
@@ -207,6 +250,7 @@ def test_без_раздела_записи_нет(tmp_path: Path) -> None:
     recorder = rec.Recorder(host, lambda _listener: (lambda: None))
     recorder.apply({"recorder": None})
     recorder.apply({"recorder": None})
-    assert host.spawned == ["mega_home: запись камер"]
+    # Служба — сразу и одна (хранилище выбирают до записи), раздел без смены — не пересобирается.
+    assert host.spawned == ["mega_home: служба записи", "mega_home: запись камер"]
     assert recorder.state()["enabled"] is False
     assert os.listdir(tmp_path) == []

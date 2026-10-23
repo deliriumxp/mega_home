@@ -37,6 +37,10 @@ class Service:
     # Что учётка службы НЕ даёт вызывающему: `(what, value)` — `"path"` запроса или `"frame"`
     # сокета; причина отказа словами или `None`. Ставит регистрирующий, как учётку.
     guard: Callable[[str, str], str | None] | None = None
+    # Что недоступно БАНДЛУ жильца (локальная дверь, пересылка менеджером, сессии) — та же форма
+    # `(what, value)`. Операции самого менеджера идут мимо: подключение хранилища и создание папок
+    # у службы записи — дело инсталлятора, а не телефона с ключом устройства.
+    bundle_guard: Callable[[str, str], str | None] | None = None
 
 
 REGISTRY: dict[str, Service] = {}
@@ -74,9 +78,10 @@ def register(
     headers: dict[str, str] | None = None,
     ws_open: Callable[[Any], Awaitable[None]] | None = None,
     guard: Callable[[str, str], str | None] | None = None,
+    bundle_guard: Callable[[str, str], str | None] | None = None,
 ) -> None:
     """Служба поднялась: доступна для `connect` по имени."""
-    REGISTRY[name] = Service(port, tls, dict(headers or {}), ws_open, guard)
+    REGISTRY[name] = Service(port, tls, dict(headers or {}), ws_open, guard, bundle_guard)
 
 def unregister(name: str) -> None:
     """Служба остановлена: адрес по имени больше не резолвится."""

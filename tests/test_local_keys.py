@@ -88,7 +88,11 @@ def test_подделка_и_мусор_не_проходят() -> None:
 
 
 class _Coordinator:
-    data = {"version": "v", "rooms": [], "house": {"local": {"secret": "s3cret"}, "ha": {"token": "t"}}}
+    data = {
+        "version": "v", "rooms": [], "house": {"local": {"secret": "s3cret"}, "ha": {"token": "t"}},
+        "recorder": {"storage": "/mnt/mega-home/storage", "cameras": [{"id": "c"}],
+                     "mount": {"type": "cifs", "source": "//nas/v", "user": "u", "pass": "nas-pass"}},
+    }
     routes: list[str] = []
     bundle = None
 
@@ -98,3 +102,5 @@ def test_раздел_house_не_уходит_браузеру() -> None:
     answer = ops.config(_Coordinator())
     assert "house" not in answer
     assert "s3cret" not in repr(answer) and "'t'" not in repr(answer)
+    # Учётка сетевой папки записи — тоже дому: бандлу из раздела записи нужны камеры.
+    assert "nas-pass" not in repr(answer) and answer["recorder"]["cameras"] == [{"id": "c"}]

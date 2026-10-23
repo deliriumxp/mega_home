@@ -12,8 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-AUTH_TYPES = ("none", "basic", "digest")
-EVENT_TYPES = ("webhook", "poll", "stream", "mqtt", "tcp", "tcpServer", "udp", "ws")
+AUTH_TYPES = ("none", "basic", "digest", "wsse")
+EVENT_TYPES = ("webhook", "poll", "stream", "mqtt", "tcp", "tcpServer", "udp", "ws", "motion")
 CALL_TIMEOUT = 30.0
 MAX_TIMEOUT = 600.0
 
@@ -22,6 +22,8 @@ class AuthSpec:
     type: str = "none"
     user: str = ""
     password: str = ""
+    # Запрос часов устройства для подписи `wsse` (`wsse.py`): путь, тело, пути полей даты.
+    clock: dict[str, Any] | None = None
 
 @dataclass
 class DeviceDescriptor:
@@ -50,6 +52,7 @@ def _auth_of(block: Any) -> AuthSpec:
         type=kind if kind in AUTH_TYPES else "none",
         user=str(block.get("user") or ""),
         password=str(block.get("pass") or ""),
+        clock=block.get("clock") if isinstance(block.get("clock"), dict) else None,
     )
 
 def descriptor_of(block: Any) -> DeviceDescriptor | None:

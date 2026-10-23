@@ -7,7 +7,8 @@
   * курсор опроса — `carry: {имя: путь}`: поле ответа становится значением
     шаблона следующего запроса (`since`, `lastUpdateId`, адрес подписки);
   * `setup` — запрос ДО цикла (создать подписку у камеры протоколом
-    PullPoint, поднять сессию UniFi) с теми же `carry`;
+    PullPoint, поднять сессию UniFi) с теми же `carry`; `renew` — продление сессии
+    раз в `every`, `teardown` — её закрытие перед новым входом и на остановке;
   * `steps` у `ws`/`tcp` — вход внутри соединения: послать шаблон, забрать поля
     ответа (`capture`) — Shelly Gen2 с паролем, TCP с вызовом-ответом;
   * `keepalive: {every, send}` — прикладной ping, без которого устройство рвёт
@@ -17,8 +18,9 @@
 
 ⚠ Шаблоны пишет только менеджер: бандл в источник событий не попадает никак.
 
-⚠ Авторизация — только `basic`/`digest`, как у `connect`: учётка — поля
-описания устройства, дом ничего не вычисляет (`templating.py`). Раньше вход шёл
+⚠ Авторизация — `basic`/`digest`/`wsse`, как у `connect`: учётка — поля
+описания устройства, шаблоны ничего не вычисляют (`templating.py`); подпись
+стандартных схем ставит общий клиент (`connect.http_send`). Раньше вход шёл
 через универсальную дверь (`gateway.py`, снесена) с сессиями и вычисляемыми
 шаблонами — здесь дом сам держит `aiohttp.ClientSession` на источник.
 """
@@ -33,14 +35,20 @@ from urllib.parse import quote, urlencode, urlsplit
 
 import aiohttp
 
+from . import wsse
 from .connect import http_send
 from .const import LOGGER
 from .devices import DeviceDescriptor
-from .templating import pick, render
+from .templating import parsed, pick, render
 
 MIN_PAUSE_S = 1.0
 IDLE_S = 120.0
 MAX_CHUNK = 64 * 1024
+# Закрытие сессии устройства не держит остановку источника дольше этого.
+TEARDOWN_S = 5.0
+# Вход после закрытия сессии: столько попыток с такой паузой при отказе соединения.
+SETUP_TRIES = 4
+SETUP_RETRY_S = 2.0
 
 def body_of(raw: bytes) -> dict[str, Any]:
     try:
@@ -61,50 +69,6 @@ def delimiter(spec: dict[str, Any], default: bytes) -> bytes:
     except ValueError:
         value = default
     return value or default
-
-def parsed(payload: bytes) -> Any:
-    """Тело ответа данными для `carry` и `resetup`: JSON, иначе XML, иначе None.
-
-    ⚠ XML — словарём по ЛОКАЛЬНЫМ именам элементов, без пространств имён
-    (`Envelope.Body.<Ответ>.<Поле>`): префиксы у устройств разные (`SOAP-ENV:`,
-    `env:`, `s:`) при одном смысле, а путь пишет менеджер один на всех. Атрибуты
-    не берутся; повторённый элемент — список. Толкования здесь нет: тот же путь
-    через точку, что у JSON (`templating.pick`).
-    """
-    if not payload:
-        return None
-    text = payload.decode("utf-8", "ignore").strip()
-    try:
-        return json.loads(text)
-    except ValueError:
-        pass
-    if not text.startswith("<"):
-        return None
-    from xml.etree import ElementTree  # noqa: PLC0415 — только у XML-устройств
-
-    try:
-        root = ElementTree.fromstring(text)
-    except ElementTree.ParseError:
-        return None
-    return {_local(root.tag): _xml_node(root)}
-
-def _local(tag: str) -> str:
-    return tag.rsplit("}", 1)[-1]
-
-def _xml_node(element: Any) -> Any:
-    children = list(element)
-    if not children:
-        return (element.text or "").strip()
-    out: dict[str, Any] = {}
-    for child in children:
-        key, value = _local(child.tag), _xml_node(child)
-        if key not in out:
-            out[key] = value
-        elif isinstance(out[key], list):
-            out[key].append(value)
-        else:
-            out[key] = [out[key], value]
-    return out
 
 def carry(values: dict[str, Any], spec: dict[str, Any], payload: bytes) -> None:
     """Поля ответа → значения шаблонов следующих запросов (`carry: {имя: путь}`)."""
@@ -184,6 +148,7 @@ def _call(descriptor: DeviceDescriptor, block: dict[str, Any], values: dict[str,
         "body": raw,
         "basic": aiohttp.BasicAuth(auth.user, auth.password) if auth.type == "basic" else None,
         "digest": (auth.user, auth.password) if auth.type == "digest" else None,
+        "wsse": wsse.Credentials(auth.user, auth.password, auth.clock) if auth.type == "wsse" else None,
     }
 
 async def split(reader: Any, sep: bytes, emit: Any, idle: float) -> None:
@@ -252,48 +217,118 @@ async def poll(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[s
     # семантика опроса, не вендорский код — вендора решает менеджер строкой
     # `path`/`equals`.
     resetup = spec.get("resetup") if isinstance(spec.get("resetup"), dict) else None
+    # ⚠ `renew` и `teardown` — продление и закрытие сессии устройства (подписка PullPoint:
+    # `Renew`, `Unsubscribe` WS-BaseNotification, как у интеграции камер HA). Без закрытия брошенная
+    # подписка живёт у устройства до своего срока, а их число ограничено: стенд Tapo держит ОДНУ,
+    # и после перезапуска дома события молчали бы до десяти минут.
+    renew_block = spec.get("renew") if isinstance(spec.get("renew"), dict) else None
+    teardown_block = spec.get("teardown") if isinstance(spec.get("teardown"), dict) else None
+    opened = False
     async with _session(descriptor) as session:
+        async def do_teardown() -> None:
+            nonlocal opened
+            if teardown_block is None or not opened:
+                return
+            opened = False
+            try:
+                await asyncio.wait_for(_request(session, descriptor, teardown_block, values), TEARDOWN_S)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                LOGGER.debug("Источник %s/%s: закрыть сессию не вышло: %s", descriptor.id, source, type(err).__name__)
+
         async def do_setup() -> None:
+            nonlocal opened, renewed_at
             if setup_block is None:
                 return
-            _, _, setup_payload = await _request(session, descriptor, setup_block, values)
-            carry(values, setup_block, setup_payload)
-
-        await do_setup()
-        pause = seconds(spec.get("pause"), MIN_PAUSE_S, MIN_PAUSE_S)
-        # ⚠ Одинаковый ответ подряд гасится только у КОРОТКОГО опроса (или по
-        # `changesOnly`): у долгого два одинаковых ответа — два события (два
-        # нажатия звонка), и второе пропадало бы.
-        long_poll = spec.get("longPoll") is True
-        changes_only = spec.get("changesOnly", not long_poll) is True
-        last: tuple[int, bytes] | None = None
-        loop = asyncio.get_running_loop()
-        # Право войти сразу, если самый первый ответ уже скажет «нет сессии».
-        last_resetup = loop.time() - pause
-        while True:
-            started = loop.time()
-            status, kind, payload = await _request(session, descriptor, spec, values)
-            if resetup is not None and setup_block is not None and _resetup_matches(resetup, status, payload):
-                # Отказ сессии — не событие жильцу (это состояние опроса, а не
-                # устройства), и без него самого дом просто повторит запрос.
-                if loop.time() - last_resetup >= pause:
-                    last_resetup = loop.time()
-                    await do_setup()
+            await do_teardown()
+            # ⚠ Устройство, только что закрывшее сессию, бывает не готово секунды (стенд Tapo после
+            # `Unsubscribe` отказывает в соединении или отвечает на вход 400): повтор здесь, а не
+            # опрос с пустым адресом и перезапуск источника с предупреждением на каждом перезаходе.
+            for attempt in range(SETUP_TRIES):
+                try:
+                    status, _, setup_payload = await _request(session, descriptor, setup_block, values)
+                except aiohttp.ClientConnectionError:
+                    if attempt == SETUP_TRIES - 1:
+                        raise
                 else:
-                    # Вход не чаще `pause` — защита от горячего цикла, если
-                    # устройство отвечает «нет сессии» и после входа.
-                    await asyncio.sleep(pause)
-                continue
-            carry(values, spec, payload)
-            if _wanted(spec, payload) and (not changes_only or (status, payload) != last):
-                last = (status, payload)
-                ctx.emit(descriptor, source, spec, "response", {"status": status, "contentType": kind, **body_of(payload)})
-            # ⚠ Долгий опрос без паузы — только пока устройство ДЕРЖИТ запрос. Ответ
-            # быстрее секунды или отказ (401 после смены пароля, 404) без паузы
-            # превращался в горячий цикл: дом долбил устройство и слал событие на
-            # каждый ответ.
-            quick = loop.time() - started < MIN_PAUSE_S
-            await asyncio.sleep(pause if not long_poll or quick or status >= 400 else 0)
+                    if status < 400:
+                        break
+                    if attempt == SETUP_TRIES - 1:
+                        raise ConnectionError(f"устройство отклонило вход ({status})")
+                await asyncio.sleep(SETUP_RETRY_S)
+            carry(values, setup_block, setup_payload)
+            opened, renewed_at = True, loop.time()
+
+        async def maybe_renew() -> None:
+            """Продление — МЕЖДУ запросами опроса, а не своей задачей: устройство, которое держит
+            один запрос за раз, не ждёт продления до конца долгого опроса."""
+            nonlocal renewed_at
+            if renew_block is None or not opened or loop.time() - renewed_at < renew_every:
+                return
+            renewed_at = loop.time()
+            try:
+                await _request(session, descriptor, renew_block, values)
+            except Exception as err:  # noqa: BLE001 — отказ продления ловит сам опрос (истёкшая сессия → resetup)
+                LOGGER.debug("Источник %s/%s: продление не прошло: %s", descriptor.id, source, type(err).__name__)
+
+        loop = asyncio.get_running_loop()
+        renew_every = seconds((renew_block or {}).get("every"), 300.0, 5.0)
+        renewed_at = loop.time()
+        try:
+            await _poll_loop(ctx, session, descriptor, source, spec, values, do_setup, maybe_renew, setup_block, resetup)
+        finally:
+            await do_teardown()
+
+async def _poll_loop(
+    ctx: Any, session: aiohttp.ClientSession, descriptor: DeviceDescriptor, source: str, spec: dict[str, Any],
+    values: dict[str, Any], do_setup: Any, maybe_renew: Any, setup_block: dict[str, Any] | None,
+    resetup: dict[str, Any] | None,
+) -> None:
+    await do_setup()
+    pause = seconds(spec.get("pause"), MIN_PAUSE_S, MIN_PAUSE_S)
+    # ⚠ Одинаковый ответ подряд гасится только у КОРОТКОГО опроса (или по
+    # `changesOnly`): у долгого два одинаковых ответа — два события (два
+    # нажатия звонка), и второе пропадало бы.
+    long_poll = spec.get("longPoll") is True
+    changes_only = spec.get("changesOnly", not long_poll) is True
+    last: tuple[int, bytes] | None = None
+    loop = asyncio.get_running_loop()
+    # Право войти сразу, если самый первый ответ уже скажет «нет сессии».
+    last_resetup = loop.time() - pause
+    while True:
+        await maybe_renew()
+        started = loop.time()
+        try:
+            status, kind, payload = await _request(session, descriptor, spec, values)
+        except aiohttp.ClientConnectionError:
+            # Обрыв посреди сессии — сессии больше нет (стенд Tapo перезапускает службу событий
+            # через секунды после `Unsubscribe`): вход заново с его повторами. Устройство пропало —
+            # вход упадёт сам, и источник перезапустится с растущей паузой (`listeners._forever`).
+            if setup_block is None:
+                raise
+            await asyncio.sleep(pause)
+            await do_setup()
+            continue
+        if resetup is not None and setup_block is not None and _resetup_matches(resetup, status, payload):
+            # Отказ сессии — не событие жильцу (это состояние опроса, а не
+            # устройства), и без него самого дом просто повторит запрос.
+            if loop.time() - last_resetup >= pause:
+                last_resetup = loop.time()
+                await do_setup()
+            else:
+                # Вход не чаще `pause` — защита от горячего цикла, если
+                # устройство отвечает «нет сессии» и после входа.
+                await asyncio.sleep(pause)
+            continue
+        carry(values, spec, payload)
+        if _wanted(spec, payload) and (not changes_only or (status, payload) != last):
+            last = (status, payload)
+            ctx.emit(descriptor, source, spec, "response", {"status": status, "contentType": kind, **body_of(payload)})
+        # ⚠ Долгий опрос без паузы — только пока устройство ДЕРЖИТ запрос. Ответ
+        # быстрее секунды или отказ (401 после смены пароля, 404) без паузы
+        # превращался в горячий цикл: дом долбил устройство и слал событие на
+        # каждый ответ.
+        quick = loop.time() - started < MIN_PAUSE_S
+        await asyncio.sleep(pause if not long_poll or quick or status >= 400 else 0)
 
 async def stream(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[str, Any]) -> None:
     import re
