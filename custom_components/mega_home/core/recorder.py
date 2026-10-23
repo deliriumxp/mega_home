@@ -12,7 +12,7 @@
 
 ⚠ Куски — Matroska по 10 с без перекодирования: звук камер бывает A-law, а MP4 его не
 несёт (замер стенда — «Could not find tag for codec pcm_alaw»). Время в имени — UTC,
-длительность — в имени готового куска: индекс записи есть сам каталог, базы нет.
+длительность — в имени готового куска; индекс записи ведёт `recorder_index.py` в памяти.
 
 ⚠ «По движению» — по образцу Frigate и предзаписи регистраторов (движение — от камеры или своей
 детекцией, `motion.py`, одним путём через концентратор событий): кусок ждёт в кэше, пока не
@@ -35,7 +35,6 @@ import shutil
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
@@ -44,27 +43,29 @@ from . import services, storage
 from .const import LOGGER
 from .go2rtc_embed import API_PORT, RTSP_PORT
 from .host import Host
+from .recorder_index import SegmentIndex, clean, day_of, epoch_of, segment_name
 
 SERVICE = "recorder"
 SEGMENT_S = 10
 SCAN_S = 2.0
 RESTART_S = 10.0
 CLEAN_EVERY_S = 60.0
-# Меньше свободного — удаляются самые старые куски всех камер, не дожидаясь срока. У системного
-# диска с лимитом планка ниже: на маленьком флеше 2 ГБ свободного недостижимы, и уборка стирала бы
-# архив каждую минуту — объём там держит лимит.
-MIN_FREE_BYTES = 2 * 1024**3
-LIMITED_MIN_FREE_BYTES = 256 * 1024**2
 # Проба хранилища (монтирование, каталог) не держит сторож дольше: пропавший NAS отвечает отказом
 # только через повторы ядра.
 STORAGE_CHECK_S = 90.0
 # Камера, не сказавшая «движение кончилось», не держит окно вечно.
 MAX_MOTION_S = 300.0
+# ⚠ Готовых кусков нет дольше этого при живом ffmpeg — поток встал (камера пропала, а go2rtc держит
+# соединение без данных): ffmpeg на RTSP ждёт чтения без срока, и запись молча стояла бы до
+# перезапуска HA. Перезапуск процесса — тем же путём, что после его падения.
+STALL_S = 90.0
 RAM_DIR = Path("/dev/shm")
 # Кэш «по движению» на камеру: запас до события плюс кусок в работе (~4 Мбит/с, с запасом).
 RAM_PER_CAMERA = 64 * 1024**2
+# Список готовых кусков ведёт сам ffmpeg (`-segment_list`, CSV «файл,начало,конец»): длительность
+# куска и «кусок закрыт» без ffprobe на каждый кусок и без догадки «последний ещё пишется».
+SEGMENT_LIST = "segments.csv"
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-SEGMENT_NAME = re.compile(r"^(\d{6})-(\d+)\.mkv$")
 # Путь хранилища уходит строкой в список ffconcat (`file '…'`) и в источник go2rtc (`#` — разделитель).
 _PATH = re.compile(r"^/[A-Za-z0-9_./-]+$")
 
@@ -85,9 +86,11 @@ class CameraSpec:
     on: tuple[str, ...]
     off: tuple[str, ...]
     # Ответ режется на сообщения по `split`; смены считаются только в сообщениях, где есть одна
-    # из подстрок `require` (тема движения) — `State` несут и темы «темно», «закрыли объектив».
+    # из подстрок `require` (тема движения) — `State` несут и темы «темно», «закрыли объектив»;
+    # сообщение с любой из подстрок `skip` — не смена (первичное состояние подписки).
     split: str
     require: tuple[str, ...]
+    skip: tuple[str, ...] = ()
 
 
 def camera_specs(section: Any) -> list[CameraSpec]:
@@ -99,6 +102,7 @@ def camera_specs(section: Any) -> list[CameraSpec]:
         if not raw.get("stream") or not raw.get("source"):
             continue
         motion = raw.get("motion") if isinstance(raw.get("motion"), dict) else {}
+        words = lambda key: tuple(str(s) for s in motion.get(key) or [] if s)  # noqa: E731
         out.append(
             CameraSpec(
                 id=str(raw["id"]),
@@ -110,10 +114,11 @@ def camera_specs(section: Any) -> list[CameraSpec]:
                 post_s=float(raw.get("postSec") or 20),
                 access=str(motion.get("access") or ""),
                 events=str(motion.get("source") or ""),
-                on=tuple(str(s) for s in motion.get("on") or [] if s),
-                off=tuple(str(s) for s in motion.get("off") or [] if s),
+                on=words("on"),
+                off=words("off"),
                 split=str(motion.get("split") or ""),
-                require=tuple(str(s) for s in motion.get("require") or [] if s),
+                require=words("require"),
+                skip=words("skip"),
             )
         )
     return out
@@ -147,52 +152,22 @@ def storage_problem(path: Path, reference: Path, local: bool = False, mounted_at
     return ""
 
 
-def epoch_of(stamp: str) -> float | None:
-    """`YYYYMMDDTHHMMSS` (UTC, имя куска ffmpeg) → секунды."""
-    try:
-        return datetime(
-            int(stamp[0:4]), int(stamp[4:6]), int(stamp[6:8]),
-            int(stamp[9:11]), int(stamp[11:13]), int(stamp[13:15]), tzinfo=timezone.utc,
-        ).timestamp()
-    except (ValueError, IndexError):
-        return None
-
-
-def day_of(epoch: float) -> str:
-    return time.strftime("%Y-%m-%d", time.gmtime(epoch))
-
-
-def segments_of(root: Path, camera: str, start: float, stop: float) -> list[tuple[float, float, Path]]:
-    """Готовые куски камеры, пересекающие `[start, stop]`: (начало, длительность, файл)."""
-    out: list[tuple[float, float, Path]] = []
-    day = start - 24 * 3600
-    while day <= stop + 24 * 3600:
-        folder = root / camera / day_of(day)
-        day += 24 * 3600
-        if not folder.is_dir():
-            continue
-        for item in folder.iterdir():
-            match = SEGMENT_NAME.match(item.name)
-            begin = epoch_of(f"{folder.name.replace('-', '')}T{match.group(1)}") if match else None
-            if begin is None:
-                continue
-            length = int(match.group(2)) / 1000
-            if begin + length >= start and begin <= stop:
-                out.append((begin, length, item))
-    return sorted(set(out))
-
-
 class _Camera:
     """Одна камера: ffmpeg пишет куски в кэш, разбор раскладывает их в хранилище."""
 
     def __init__(self, recorder: Recorder, spec: CameraSpec, cache: Path) -> None:
         self.rec, self.spec, self.cache = recorder, spec, cache / spec.id
+        self.index = SegmentIndex(recorder.storage / spec.id)
         self.task: asyncio.Task[None] | None = None
         self.why = ""
         self.last_saved = 0.0
         self.saved = 0
         self.dropped = 0
         self._tail: deque[str] = deque(maxlen=8)
+        # Готовые куски по списку ffmpeg: имя → длительность; прочитанная часть списка — смещением.
+        self._listed: dict[str, float] = {}
+        self._list_offset = 0
+        self._last_ready = 0.0
         # Окна движения: [начало, конец или None, последнее «есть движение»] — часы дома.
         self.windows: list[list[float | None]] = []
 
@@ -200,6 +175,8 @@ class _Camera:
         await self.rec.env.run(lambda: self.cache.mkdir(parents=True, exist_ok=True))
         while True:
             try:
+                if not self.index.loaded:
+                    await self.rec.env.run(self.index.load, bool(self.rec.limit))
                 await self._register()
                 await self._record()
             except asyncio.CancelledError:
@@ -228,17 +205,21 @@ class _Camera:
         binary = await self.rec.env.run(shutil.which, "ffmpeg")
         if not binary:
             raise RuntimeError("в системе нет ffmpeg")
+        self._listed, self._list_offset = {}, 0
         proc = await asyncio.create_subprocess_exec(
             binary, "-hide_banner", "-loglevel", "error", "-nostdin",
             "-rtsp_transport", "tcp", "-i", f"rtsp://127.0.0.1:{RTSP_PORT}/{self.spec.stream}",
             "-map", "0:v", "-map", "0:a?", "-c", "copy",
             "-f", "segment", "-segment_time", str(SEGMENT_S), "-segment_format", "matroska",
-            "-reset_timestamps", "1", "-strftime", "1", str(self.cache / "%Y%m%dT%H%M%S.mkv"),
+            "-reset_timestamps", "1", "-strftime", "1",
+            "-segment_list", str(self.cache / SEGMENT_LIST), "-segment_list_type", "csv",
+            str(self.cache / "%Y%m%dT%H%M%S.mkv"),
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE, env={**os.environ, "TZ": "UTC"},
         )
         drain = asyncio.ensure_future(self._drain(proc))
         self.why = ""
+        self._last_ready = time.monotonic()
         try:
             while True:
                 try:
@@ -246,6 +227,9 @@ class _Camera:
                     break
                 except asyncio.TimeoutError:
                     await self._collect()
+                if time.monotonic() - self._last_ready > STALL_S:
+                    proc.terminate()
+                    raise RuntimeError(f"готовых кусков нет дольше {STALL_S:g} с — поток встал")
         finally:
             if proc.returncode is None:
                 proc.terminate()
@@ -263,17 +247,45 @@ class _Camera:
             if text:
                 self._tail.append(text)
 
+    def _read_list(self) -> None:
+        """Дочитать список ffmpeg с прошлого места: строка `файл,начало,конец` на готовый кусок."""
+        path = self.cache / SEGMENT_LIST
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        if size < self._list_offset:
+            self._list_offset = 0
+        if size == self._list_offset:
+            return
+        with path.open("rb") as handle:
+            handle.seek(self._list_offset)
+            chunk = handle.read(size - self._list_offset)
+        # Неполная последняя строка дочитается следующим разом.
+        cut = chunk.rfind(b"\n") + 1
+        self._list_offset += cut
+        for line in chunk[:cut].decode(errors="ignore").splitlines():
+            parts = line.rsplit(",", 2)
+            try:
+                self._listed[Path(parts[0]).name] = max(float(parts[2]) - float(parts[1]), 0.0)
+            except (IndexError, ValueError):
+                continue
+
     async def _collect(self, final: bool = False) -> None:
-        """Готовые куски — в хранилище или в корзину; последний пишется, его не трогаем."""
+        """Готовые куски (по списку ffmpeg) — в хранилище или в корзину. `final` — и тот, что
+        ffmpeg не успел закрыть в список (остановлен): длительность у него спрашивает ffprobe."""
+        await self.rec.env.run(self._read_list)
         files = sorted(await self.rec.env.run(lambda: list(self.cache.glob("*.mkv"))))
-        ready = files if final else files[:-1]
+        ready = files if final else [path for path in files if path.name in self._listed]
+        if ready:
+            self._last_ready = time.monotonic()
         now = time.time()
         for path in ready:
             start = epoch_of(path.stem)
             if start is None:
                 await self.rec.env.run(path.unlink, True)
                 continue
-            length = await self.rec.probe(path)
+            length = self._listed.pop(path.name, 0.0) or await self.rec.probe(path)
             if length <= 0:
                 await self.rec.env.run(path.unlink, True)
                 continue
@@ -288,10 +300,12 @@ class _Camera:
         problem = self.rec.problem()
         if problem:
             raise OSError(problem)
-        folder = self.rec.storage / self.spec.id / day_of(start)
-        folder.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%H%M%S", time.gmtime(start))
-        shutil.move(str(path), str(folder / f"{stamp}-{int(length * 1000)}.mkv"))
+        size = path.stat().st_size
+        target = self.index.root / day_of(start) / segment_name(start, int(length * 1000))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(target))
+        # В индекс — после переноса: сорвавшийся перенос не оставляет в нём куска, которого нет.
+        self.index.add(start, length, size)
         self.saved += 1
         self.last_saved = start + length
 
@@ -317,6 +331,8 @@ class _Camera:
         at = float(frame.get("at") or time.time())
         for message in text.split(self.spec.split) if self.spec.split else [text]:
             if self.spec.require and not any(word in message for word in self.spec.require):
+                continue
+            if any(word in message for word in self.spec.skip):
                 continue
             marks = sorted(
                 [(m.start(), True) for word in self.spec.on for m in re.finditer(re.escape(word), message)]
@@ -521,7 +537,8 @@ class Recorder:
             camera.on_event(frame)
 
     async def probe(self, path: Path) -> float:
-        """Длительность куска по ffprobe; не прочитался — 0 (кусок битый)."""
+        """Длительность куска по ffprobe — только у куска, который ffmpeg не закрыл в список
+        (остановлен посреди); не прочитался — 0 (кусок битый)."""
         binary = await self.env.run(shutil.which, "ffprobe")
         if not binary:
             return float(SEGMENT_S)
@@ -548,57 +565,3 @@ class Recorder:
             "cameras": {cid: camera.state() for cid, camera in self.cameras.items()},
         }
 
-
-# Объём каталога дня по его времени изменения: обход всех кусков архива раз в минуту на флеше
-# контроллера стоил бы секунды; пересчитывается только день, в который легли новые куски.
-_day_sizes: dict[str, tuple[int, int]] = {}
-
-
-def _day_size(day: Path) -> int:
-    stamp = day.stat().st_mtime_ns
-    known = _day_sizes.get(str(day))
-    if known is not None and known[0] == stamp:
-        return known[1]
-    size = sum(item.stat().st_size for item in day.iterdir() if item.is_file())
-    _day_sizes[str(day)] = (stamp, size)
-    return size
-
-
-def clean(storage: Path, cameras: list[_Camera], now: float, limit: int = 0) -> None:
-    """По сроку камеры — каталоги дней целиком; по месту и по лимиту объёма (`limit`, байты:
-    «локальный диск») — самые старые куски всех камер."""
-    for camera in cameras:
-        cutoff = day_of(now - camera.spec.retain_days * 24 * 3600)
-        root = storage / camera.spec.id
-        for day in sorted(root.iterdir()) if root.is_dir() else []:
-            if day.is_dir() and day.name < cutoff:
-                shutil.rmtree(day, ignore_errors=True)
-    used = sum(
-        _day_size(day)
-        for camera in cameras
-        for day in ((storage / camera.spec.id).iterdir() if limit and (storage / camera.spec.id).is_dir() else [])
-        if day.is_dir()
-    )
-    # Шагами по 60 кусков (10 минут записи), не больше полусотни шагов за проход.
-    for _step in range(50):
-        floor = LIMITED_MIN_FREE_BYTES if limit else MIN_FREE_BYTES
-        if shutil.disk_usage(storage).free >= floor and (not limit or used <= limit):
-            break
-        days = sorted(
-            (day.name, day)
-            for camera in cameras
-            for day in ((storage / camera.spec.id).iterdir() if (storage / camera.spec.id).is_dir() else [])
-            if day.is_dir()
-        )
-        if not days:
-            break
-        oldest = days[0][1]
-        for item in sorted(oldest.iterdir())[:60]:
-            used -= item.stat().st_size if item.is_file() else 0
-            item.unlink(missing_ok=True)
-        if not any(oldest.iterdir()):
-            oldest.rmdir()
-    plays = storage / ".cache" / "play"
-    for item in plays.iterdir() if plays.is_dir() else []:
-        if now - item.stat().st_mtime > 6 * 3600:
-            item.unlink(missing_ok=True)

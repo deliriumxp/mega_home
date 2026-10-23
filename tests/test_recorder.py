@@ -22,6 +22,7 @@ import pytest
 from mega_home.core import recorder as rec
 from mega_home.core import services, storage
 from mega_home.core.recorder_api import start_api
+from mega_home.core.recorder_index import SegmentIndex
 
 
 @pytest.fixture(autouse=True)
@@ -178,10 +179,92 @@ def test_индекс_и_уборка_по_сроку(tmp_path: Path) -> None:
     assert now is not None
     old = _segment(tmp_path, "onvif-aa", now - 5 * 24 * 3600)
     fresh = _segment(tmp_path, "onvif-aa", now - 60)
-    found = rec.segments_of(tmp_path, "onvif-aa", now - 120, now)
+    camera = _camera(tmp_path)
+    camera.index.load()
+    found = camera.index.between(now - 120, now)
     assert [(b, n) for b, n, _p in found] == [(now - 60, 10.0)]
-    rec.clean(tmp_path, [_camera(tmp_path)], now)
+    rec.clean(tmp_path, [camera], now)
     assert not old.exists() and fresh.exists()
+    # Уборка ведёт индекс сама: удалённый день из него ушёл, диск заново не читается.
+    assert [name for name, _f, _l in camera.index.days()] == ["2026-10-23"]
+
+
+def test_индекс_в_памяти_ведёт_запись_а_не_перечитывает_диск(tmp_path: Path) -> None:
+    """Каталог читается один раз; новый кусок и уборка правят индекс, запрос диск не трогает."""
+    base = rec.epoch_of("20261023T120000")
+    assert base is not None
+    _segment(tmp_path, "onvif-aa", base)
+    _segment(tmp_path, "onvif-aa", base + 10)
+    index = SegmentIndex(tmp_path / "onvif-aa")
+    index.load()
+    # Кусок, положенный записью, виден без обхода каталога — файла нет вовсе.
+    path = index.add(base + 20, 10.0, 5)
+    assert path == tmp_path / "onvif-aa" / "2026-10-23" / "120020-10000.mkv"
+    assert [b for b, _n, _p in index.between(base + 5, base + 25)] == [base, base + 10, base + 20]
+    # Окно, начатое посреди куска, захватывает его; окно до записи — пусто.
+    assert [b for b, _n, _p in index.between(base + 25, base + 29)] == [base + 20]
+    assert index.between(base - 100, base - 1) == []
+    # Куски через полночь — в двух каталогах дней, но один ответ по порядку.
+    midnight = rec.epoch_of("20261024T000000")
+    assert midnight is not None
+    index.add(midnight - 5, 10.0)
+    index.add(midnight + 5, 10.0)
+    assert [b for b, _n, _p in index.between(midnight - 1, midnight + 1)] == [midnight - 5]
+    assert [name for name, _f, _l in index.days()] == ["2026-10-23", "2026-10-24"]
+    assert [b for b, _n, _p in index.oldest(2)] == [base, base + 10]
+    assert index.forget(base) is None and index.forget(base + 10) is None and index.forget(base + 20) is None
+    assert index.forget(midnight - 5) == "2026-10-23"
+    assert index.day_names() == ["2026-10-24"]
+    # Тот же момент повторно (перезапуск в ту же секунду) — замена, не второй кусок.
+    index.add(midnight + 5, 4.0)
+    assert [n for _b, n, _p in index.between(midnight, midnight + 20)] == [4.0]
+
+
+def test_готовность_и_длительность_куска_по_списку_ffmpeg(tmp_path: Path) -> None:
+    """ffmpeg сам пишет список готовых кусков (`-segment_list`, CSV): кусок берётся, когда он
+    в списке, длительность — оттуда, ffprobe на каждый кусок не зовётся."""
+    # Свой каталог (латиницей — путь хранилища) и «локальный диск» с лимитом: иначе `_save` откажет.
+    folder = Path(tempfile.mkdtemp(prefix="rec-"))
+    camera = _camera(folder, motion_mode=False)
+    camera.rec.local, camera.rec.limit = True, 1024**3
+    camera.cache.mkdir(parents=True)
+    listing = camera.cache / rec.SEGMENT_LIST
+    for stamp in ("20261023T120000", "20261023T120010", "20261023T120020"):
+        (camera.cache / f"{stamp}.mkv").write_bytes(b"x")
+    listing.write_text(f"{camera.cache}/20261023T120000.mkv,0.000000,10.040000\n")
+    probed: list[Path] = []
+
+    async def probe(path: Path) -> float:
+        probed.append(path)
+        return 7.0
+
+    camera.rec.probe = probe  # type: ignore[method-assign]
+    asyncio.run(camera._collect())  # noqa: SLF001
+    day = folder / "onvif-aa" / "2026-10-23"
+    assert sorted(p.name for p in day.iterdir()) == ["120000-10040.mkv"]
+    assert probed == [] and camera.saved == 1
+    # Список дописан — дочитывается с прошлого места; неполная строка ждёт следующего раза.
+    with listing.open("a") as handle:
+        handle.write(f"{camera.cache}/20261023T120010.mkv,10.040000,20.000000\n{camera.cache}/2026")
+    asyncio.run(camera._collect())  # noqa: SLF001
+    assert sorted(p.name for p in day.iterdir()) == ["120000-10040.mkv", "120010-9960.mkv"]
+    # Остановка: кусок, не закрытый в список, измеряет ffprobe.
+    asyncio.run(camera._collect(final=True))  # noqa: SLF001
+    assert [p.name for p in probed] == ["20261023T120020.mkv"]
+    assert "120020-7000.mkv" in {p.name for p in day.iterdir()}
+    assert [b for b, _n, _p in camera.index.between(0, 2e9)] == [rec.epoch_of("20261023T120000"), rec.epoch_of("20261023T120010"), rec.epoch_of("20261023T120020")]
+
+
+def test_первичное_состояние_подписки_окна_не_открывает(tmp_path: Path) -> None:
+    """`PropertyOperation="Initialized"` — состояние на момент входа в подписку, не смена: без
+    `skip` каждый вход (перезапуск дома) с «движения нет» давал окно-точку и 30 с лишней записи."""
+    camera = _camera(tmp_path, split="NotificationMessage", skip=('PropertyOperation="Initialized"',))
+    initial = '<NotificationMessage><Message PropertyOperation="Initialized"><x Name="IsMotion" Value="false"/>'
+    camera.on_event(_frame(initial, 1000))
+    assert camera.windows == []
+    changed = '<NotificationMessage><Message PropertyOperation="Changed"><x Name="IsMotion" Value="true"/>'
+    camera.on_event(_frame(initial + changed, 1010))
+    assert camera.windows[-1][:2] == [1010, None]
 
 
 def test_лимит_локального_диска_убирает_старое(tmp_path: Path) -> None:
