@@ -67,12 +67,21 @@ class EventFiles:
         return True
 
     def on_event(self, frame: dict[str, Any]) -> None:
-        """Опубликовано событие: подходящее правило — фоном, не задерживая его."""
+        """Опубликовано событие: подходящее правило — фоном, не задерживая его.
+
+        `on.contains` — подстроки, одна из которых обязана быть в данных события (текст ответа
+        устройства либо данные одной строкой JSON, как у записи по движению): ответ подписки
+        камеры несёт и «движение кончилось», и чужие темы, а кадр нужен к началу движения.
+        """
         for rule in self._rules:
             on = rule["on"]
-            if all(on.get(k) in (None, frame.get(k)) for k in ("access", "source", "event")):
-                self._env.spawn(self._attach(frame, rule), "mega_home event file")
-                return
+            if not all(on.get(k) in (None, frame.get(k)) for k in ("access", "source", "event")):
+                continue
+            words = on.get("contains")
+            if isinstance(words, list) and words and not any(str(w) in _text_of(frame) for w in words):
+                continue
+            self._env.spawn(self._attach(frame, rule), "mega_home event file")
+            return
 
     async def _fetch(self, request: dict[str, Any]) -> tuple[int, str, bytes]:
         """Ответ запроса правила: кадр камеры плитки — снимком источника, остальное — `connect`.
@@ -144,6 +153,14 @@ class EventFiles:
         stale += [p for p, m in stats if p.name.endswith(".part") and m < part_cutoff]
         for path in stale:
             path.unlink(missing_ok=True)
+
+
+def _text_of(frame: dict[str, Any]) -> str:
+    """Данные события строкой — та же форма, по которой запись ищет подстроки движения (`recorder.py`)."""
+    import json
+
+    data = frame.get("data") if isinstance(frame.get("data"), dict) else {}
+    return str(data.get("text") or "") or json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def _stem(event_id: str) -> str:

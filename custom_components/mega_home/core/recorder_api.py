@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import shutil
 import time
 from typing import TYPE_CHECKING, Any
@@ -24,10 +23,11 @@ from aiohttp import web
 
 from . import services, storage
 from .go2rtc_embed import PLAYLIST_INPUT
-from .recorder import SEGMENT_NAME, SERVICE, day_of, epoch_of, segments_of
+from .recorder import SERVICE, day_of
 
 if TYPE_CHECKING:
     from .recorder import Recorder
+    from .recorder_index import SegmentIndex
 
 # Куски с зазором меньше этого — один участок шкалы (стык кусков ffmpeg — доли секунды).
 JOIN_GAP_S = 1.5
@@ -35,7 +35,6 @@ JOIN_GAP_S = 1.5
 PLAYLIST_S = 3 * 3600
 # Насколько далеко за участком искать продолжение записи.
 NEXT_LOOKUP_S = 2 * 24 * 3600
-_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _RECORDER: web.AppKey[Any] = web.AppKey("recorder")
 _FRAMES = asyncio.Semaphore(2)
 
@@ -75,6 +74,17 @@ def _camera(request: web.Request) -> str:
     return camera
 
 
+async def _index(request: web.Request) -> tuple[str, SegmentIndex]:
+    """Индекс записи камеры (`recorder_index.py`): ответы службы — из памяти, без обхода диска.
+    До первого прохода записи (служба поднята раньше камер) индекс читается здесь, в исполнителе."""
+    recorder: Recorder = request.app[_RECORDER]
+    camera = _camera(request)
+    index = recorder.cameras[camera].index
+    if not index.loaded:
+        await recorder.env.run(index.ensure, bool(recorder.limit))
+    return camera, index
+
+
 def _number(request: web.Request, name: str, default: float | None = None) -> float:
     try:
         return float(request.query[name])
@@ -87,31 +97,17 @@ def _number(request: web.Request, name: str, default: float | None = None) -> fl
 async def _days(request: web.Request) -> web.Response:
     """Дни с записью. `offset` (секунды к UTC) — сутки по стенным часам объекта: каталоги дней
     в хранилище — UTC, и сутки зрителя захватывают два соседних."""
-    recorder: Recorder = request.app[_RECORDER]
-    root = recorder.storage / _camera(request)
+    _camera_id, index = await _index(request)
     offset = _number(request, "offset", 0.0)
-
-    def listing() -> list[str]:
-        days: set[str] = set()
-        for folder in root.iterdir() if root.is_dir() else []:
-            if not folder.is_dir() or not _DAY.match(folder.name):
-                continue
-            stamps = sorted(m.group(1) for m in (SEGMENT_NAME.match(f.name) for f in folder.iterdir()) if m)
-            for stamp in (stamps[:1] + stamps[-1:]) if stamps else []:
-                begin = epoch_of(f"{folder.name.replace('-', '')}T{stamp}")
-                if begin is not None:
-                    days.add(day_of(begin + offset))
-        return sorted(days)
-
-    return web.json_response({"days": await recorder.env.run(listing)})
+    days = {day_of(edge + offset) for _name, first, last in index.days() for edge in (first, last)}
+    return web.json_response({"days": sorted(days)})
 
 
 async def _segments(request: web.Request) -> web.Response:
     """Участки записи в окне `from`..`to` (секунды): `[[начало мс, конец мс], …]`."""
-    recorder: Recorder = request.app[_RECORDER]
-    camera = _camera(request)
+    _camera_id, index = await _index(request)
     start, stop = _number(request, "from"), _number(request, "to")
-    found = await recorder.env.run(segments_of, recorder.storage, camera, start, stop)
+    found = index.between(start, stop)
     merged: list[list[int]] = []
     for begin, length, _path in found:
         if merged and begin * 1000 - merged[-1][1] <= JOIN_GAP_S * 1000:
@@ -134,9 +130,9 @@ async def _playlist(request: web.Request) -> web.Response:
     пустоты в минуты). Через пустоту бандл переходит новым списком с `nextMs`.
     """
     recorder: Recorder = request.app[_RECORDER]
-    camera = _camera(request)
+    camera, index = await _index(request)
     at = _number(request, "at") / 1000
-    found = [s for s in await recorder.env.run(segments_of, recorder.storage, camera, at, at + PLAYLIST_S) if s[0] + s[1] > at]
+    found = [s for s in index.between(at, at + PLAYLIST_S) if s[0] + s[1] > at]
     if not found:
         return web.json_response({"error": "записи после этого момента нет"}, status=404)
     run = [found[0]]
@@ -149,8 +145,7 @@ async def _playlist(request: web.Request) -> web.Response:
         # Пустота длиннее окна списка (по движению — ночь): где запись продолжается, ищем дальше,
         # иначе просмотр стоял бы на последнем кадре, не зная, что дальше записи нет или она есть.
         end = run[-1][0] + run[-1][1]
-        later = await recorder.env.run(segments_of, recorder.storage, camera, end + JOIN_GAP_S, end + NEXT_LOOKUP_S)
-        following = next((s for s in later if s[0] > end + JOIN_GAP_S), None)
+        following = next((s for s in index.between(end + JOIN_GAP_S, end + NEXT_LOOKUP_S) if s[0] > end + JOIN_GAP_S), None)
     inpoint = max(at - run[0][0], 0.0)
     lines = ["ffconcat version 1.0"]
     for index, (_begin, _length, path) in enumerate(run):
@@ -241,10 +236,10 @@ async def _frame(request: web.Request) -> web.Response:
     кадр после неё в пределах минуты, дальше — 404.
     """
     recorder: Recorder = request.app[_RECORDER]
-    camera = _camera(request)
+    _camera_id, index = await _index(request)
     at = _number(request, "at") / 1000
     width = int(min(max(_number(request, "width", 640.0), 64), 1920))
-    found = [s for s in await recorder.env.run(segments_of, recorder.storage, camera, at, at + 60) if s[0] + s[1] > at]
+    found = [s for s in index.between(at, at + 60) if s[0] + s[1] > at]
     binary = await recorder.env.run(shutil.which, "ffmpeg")
     if not found or not binary:
         raise web.HTTPNotFound(text='{"error": "кадра в записи нет"}', content_type="application/json")

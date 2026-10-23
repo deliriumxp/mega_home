@@ -76,6 +76,24 @@ def test_правило_исполняется_один_раз_на_событи
     assert found is not None and found[1] == "image/jpeg" and found[0].read_bytes() == b"\xff\xd8jpeg"
 
 
+def test_правило_с_подстрокой_срабатывает_только_на_начало_движения(tmp_path, monkeypatch) -> None:
+    """Ответ подписки камеры несёт и «кончилось», и чужие темы: кадр — к началу движения."""
+    files, _journal, calls = _files(tmp_path, monkeypatch)
+    rule = {**RULE, "on": {"access": "onvif-aa", "source": "events", "event": "response", "contains": ['Name="IsMotion" Value="true"']}}
+    files.apply({"attachments": [rule]})
+    motion = {"id": "m1", "access": "onvif-aa", "source": "events", "event": "response"}
+    _publish(files, {**motion, "data": {"text": '<x Name="IsMotion" Value="false"/>'}})
+    _publish(files, {**motion, "id": "m2", "data": {"text": '<x Name="IsMotion" Value="true"/>'}})
+    # Событие дома без текста — данные одной строкой JSON, как у записи по движению.
+    own = {**RULE, "on": {"source": "motion", "contains": ['"state":"start"']}}
+    files.apply({"attachments": [own]})
+    _publish(files, {"id": "m3", "access": "onvif-aa", "source": "motion", "event": "motion", "data": {"share": 0.1, "state": "stop"}})
+    _publish(files, {"id": "m4", "access": "onvif-aa", "source": "motion", "event": "motion", "data": {"state": "start", "share": 0.1}})
+    assert len(calls) == 2
+    assert files.find("m1") is None and files.find("m2") is not None
+    assert files.find("m3") is None and files.find("m4") is not None
+
+
 def test_не_get_отвергается(tmp_path) -> None:
     files = ef.EventFiles(FakeHost(tmp_path))
     files.apply({"attachments": [{**RULE, "request": {**RULE["request"], "method": "POST"}}]})
