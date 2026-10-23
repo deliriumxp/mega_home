@@ -19,9 +19,10 @@
 станет ясно, попал ли он в окно движения (запас до и после); не попал — удаляется, и на диск
 или в сеть без движения не пишется ничего. Кэш — в памяти (`/dev/shm`), если её хватает.
 
-⚠ Хранилище проверяется ДО записи: каталог обязан быть точкой монтирования (или нести метку
-`.mega-home-storage`, поставленную человеком) — иначе отвалившийся диск означал бы запись на
-флеш контроллера до его заполнения.
+⚠ Хранилище проверяется ДО записи и перед каждым куском: каталог не на системном диске (диске
+настроек дома), а диск, который монтирует дом (`storage.py`), — смонтирован; иначе отвалившийся
+диск означал бы запись на флеш контроллера до его заполнения. Системный диск — только явно
+(`local`) и с лимитом объёма.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
 
-from . import services
+from . import services, storage
 from .const import LOGGER
 from .go2rtc_embed import API_PORT, RTSP_PORT
 from .host import Host
@@ -53,7 +54,6 @@ CLEAN_EVERY_S = 60.0
 MIN_FREE_BYTES = 2 * 1024**3
 # Камера, не сказавшая «движение кончилось», не держит окно вечно.
 MAX_MOTION_S = 300.0
-STORAGE_MARK = ".mega-home-storage"
 RAM_DIR = Path("/dev/shm")
 # Кэш «по движению» на камеру: запас до события плюс кусок в работе (~4 Мбит/с, с запасом).
 RAM_PER_CAMERA = 64 * 1024**2
@@ -113,16 +113,23 @@ def camera_specs(section: Any) -> list[CameraSpec]:
     return out
 
 
-def storage_problem(path: Path) -> str:
-    """Почему писать сюда нельзя; пусто — можно."""
+def storage_problem(path: Path, reference: Path, local: bool = False, mounted_at: Path | None = None) -> str:
+    """Почему писать сюда нельзя; пусто — можно.
+
+    `reference` — каталог настроек дома: его диск — системный (флеш контроллера). Писать на него
+    можно только явно (`local` — «локальный диск» с лимитом). `mounted_at` — точка, которую
+    смонтировал дом: путь обязан быть внутри неё, иначе пропавший диск означал бы запись на флеш.
+    """
     if not path.is_absolute() or not _PATH.match(str(path)):
         return f"путь хранилища «{path}» — абсолютный, из латиницы, цифр и знаков _ . - /"
+    if mounted_at is not None and (mounted_at != path and mounted_at not in path.parents or not os.path.ismount(mounted_at)):
+        return f"диск хранилища не смонтирован в {mounted_at}"
     if not path.is_dir():
         return f"нет каталога хранилища {path}: подключите диск или сетевую папку"
-    if not os.path.ismount(path) and not (path / STORAGE_MARK).exists():
+    if not local and os.stat(path).st_dev == os.stat(reference).st_dev:
         return (
-            f"по пути {path} не смонтирован диск — запись не идёт, чтобы не заполнить флеш "
-            f"контроллера (каталог без диска: положите в него файл {STORAGE_MARK})"
+            f"папка {path} на системном диске контроллера — запись не идёт, чтобы не заполнить его: "
+            "выберите диск или сетевую папку, либо «Локальный диск» с лимитом"
         )
     if not os.access(path, os.W_OK):
         return f"в {path} нельзя писать"
@@ -267,7 +274,7 @@ class _Camera:
 
     def _save(self, path: Path, start: float, length: float) -> None:
         # ⚠ Перед КАЖДЫМ куском: отвалившийся диск оставляет пустой каталог на флеше контроллера.
-        problem = storage_problem(self.rec.storage)
+        problem = self.rec.problem()
         if problem:
             raise OSError(problem)
         folder = self.rec.storage / self.spec.id / day_of(start)
@@ -352,12 +359,20 @@ class Recorder:
         self._tasks: list[asyncio.Task[None]] = []
         self.cameras: dict[str, _Camera] = {}
         self.storage = Path("/")
+        # Что смонтировать под хранилище (`storage.mount`), разрешён ли системный диск и лимит, байты.
+        self.mount: dict[str, Any] | None = None
+        self.local = False
+        self.limit = 0
         self.why = ""
         self._api: Any = None
+        self._api_task: asyncio.Task[None] | None = None
         self._specs: list[CameraSpec] = []
         self._supervisor: asyncio.Task[None] | None = None
 
     def apply(self, config: dict[str, Any] | None) -> None:
+        # ⚠ Служба на петле — всегда, а не только при записи: папку хранилища выбирают ДО записи.
+        if self._api is None and self._api_task is None:
+            self._api_task = self.env.spawn(self._start_api(), "mega_home: служба записи")
         section = (config or {}).get("recorder") if isinstance((config or {}).get("recorder"), dict) else None
         key = json.dumps(section, sort_keys=True)
         if key == self._key:
@@ -365,18 +380,43 @@ class Recorder:
         self._key = key
         self.env.spawn(self._reconfigure(section), "mega_home: запись камер")
 
+    async def _start_api(self) -> None:
+        from .recorder_api import start_api  # noqa: PLC0415
+
+        self._api = await start_api(self)
+
     async def async_stop(self) -> None:
         self._key = None
         await self._reconfigure(None)
+        task, self._api_task = self._api_task, None
+        if isinstance(task, asyncio.Future) and not task.done():
+            task.cancel()
+        services.unregister(SERVICE)
+        if self._api is not None:
+            await self._api.cleanup()
+            self._api = None
 
     async def _reconfigure(self, section: dict[str, Any] | None) -> None:
         async with self._lock:
             await self._stop_all()
             self._specs = camera_specs(section)
             self.storage = Path(str((section or {}).get("storage") or ""))
+            mount = (section or {}).get("mount") if isinstance((section or {}).get("mount"), dict) else None
+            if self.mount is not None and mount != self.mount:
+                # Хранилище сменили: прежний диск или сетевая папка больше не нужны дому.
+                await self.env.run(storage.unmount, storage.MOUNT_POINT)
+            self.mount = mount
+            self.local = (section or {}).get("local") is True
+            self.limit = int(float((section or {}).get("limitGb") or 0) * 1024**3)
             self.why = ""
             if self._specs:
                 self._supervisor = self.env.spawn(self._supervise(), "mega_home: запись камер, сторож")
+
+    def problem(self) -> str:
+        """Почему писать в хранилище нельзя сейчас; пусто — можно (в исполнителе: файловая система)."""
+        if self.local and not self.limit:
+            return "запись на системный диск — только с лимитом объёма"
+        return storage_problem(self.storage, self.env.path(), self.local, storage.MOUNT_POINT if self.mount else None)
 
     async def _supervise(self) -> None:
         """Сторож записи: раз в минуту — хранилище, камеры и уборка.
@@ -394,7 +434,10 @@ class Recorder:
 
     async def _check(self) -> None:
         async with self._lock:
-            problem = await self.env.run(storage_problem, self.storage)
+            # Диск или сетевая папка дома: смонтировать, если пропали (NAS после сбоя сети, USB
+            # переподключили, контейнер перезапустился — монтирование живёт до его остановки).
+            problem = await self.env.run(storage.mount, self.mount) if self.mount else ""
+            problem = problem or await self.env.run(self.problem)
             if problem:
                 if problem != self.why:
                     LOGGER.warning("Запись камер: %s", problem)
@@ -408,15 +451,12 @@ class Recorder:
             for camera in self.cameras.values():
                 if camera.task is None or camera.task.done():
                     camera.task = self.env.spawn(camera.run(), f"mega_home: запись {camera.spec.id}")
-        await self.env.run(clean, self.storage, list(self.cameras.values()), time.time())
+        await self.env.run(clean, self.storage, list(self.cameras.values()), time.time(), self.limit)
 
     async def _start_cameras(self) -> None:
-        from .recorder_api import start_api  # noqa: PLC0415 — веб-сервер только при записи
-
         ram = await self.env.run(self._ram_cache, sum(1 for s in self._specs if s.motion_mode))
         disk = self.storage / ".cache"
         await self.env.run(lambda: disk.mkdir(exist_ok=True))
-        self._api = await start_api(self)
         self.cameras = {
             spec.id: _Camera(self, spec, ram if spec.motion_mode and ram is not None else disk) for spec in self._specs
         }
@@ -436,10 +476,6 @@ class Recorder:
             except Exception as err:  # noqa: BLE001
                 LOGGER.warning("Запись %s: начатое не сохранилось: %s", camera.spec.id, err)
         self.cameras = {}
-        services.unregister(SERVICE)
-        if self._api is not None:
-            await self._api.cleanup()
-            self._api = None
 
     async def _stop_all(self) -> None:
         supervisor, self._supervisor = self._supervisor, None
@@ -488,23 +524,31 @@ class Recorder:
         return {
             "enabled": self._key not in (None, "null"),
             "storage": str(self.storage) if self._specs else None,
+            "mount": {"type": self.mount.get("type"), "source": self.mount.get("source")} if self.mount else None,
+            "limitGb": round(self.limit / 1024**3, 1) if self.limit else None,
             "cache": sorted({str(c.cache.parent) for c in self.cameras.values()}) or None,
             "why": self.why,
             "cameras": {cid: camera.state() for cid, camera in self.cameras.items()},
         }
 
 
-def clean(storage: Path, cameras: list[_Camera], now: float) -> None:
-    """По сроку камеры — каталоги дней целиком; по месту — самые старые куски всех камер."""
+def clean(storage: Path, cameras: list[_Camera], now: float, limit: int = 0) -> None:
+    """По сроку камеры — каталоги дней целиком; по месту и по лимиту объёма (`limit`, байты:
+    «локальный диск») — самые старые куски всех камер."""
     for camera in cameras:
         cutoff = day_of(now - camera.spec.retain_days * 24 * 3600)
         root = storage / camera.spec.id
         for day in sorted(root.iterdir()) if root.is_dir() else []:
             if day.is_dir() and day.name < cutoff:
                 shutil.rmtree(day, ignore_errors=True)
+    used = sum(
+        item.stat().st_size
+        for camera in cameras
+        for item in ((storage / camera.spec.id).rglob("*.mkv") if limit else [])
+    )
     # Шагами по 60 кусков (10 минут записи), не больше полусотни шагов за проход.
     for _step in range(50):
-        if shutil.disk_usage(storage).free >= MIN_FREE_BYTES:
+        if shutil.disk_usage(storage).free >= MIN_FREE_BYTES and (not limit or used <= limit):
             break
         days = sorted(
             (day.name, day)
@@ -516,6 +560,7 @@ def clean(storage: Path, cameras: list[_Camera], now: float) -> None:
             break
         oldest = days[0][1]
         for item in sorted(oldest.iterdir())[:60]:
+            used -= item.stat().st_size if item.is_file() else 0
             item.unlink(missing_ok=True)
         if not any(oldest.iterdir()):
             oldest.rmdir()

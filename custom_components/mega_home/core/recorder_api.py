@@ -1,7 +1,9 @@
-"""Служба записи на петле (`recorder` в реестре `services.py`): дни, участки, список воспроизведения.
+"""Служба записи на петле (`recorder` в реестре `services.py`): дни, участки, список воспроизведения;
+диски, папки и подключение хранилища для его выбора (`storage.py`).
 
 Бандл и менеджер ходят сюда `connect` по имени службы — внутри дома и снаружи одинаково, без
-нового маршрута двери (закрытый список `docs/home-gateway.md`: процесс и его хранилище).
+нового маршрута двери (закрытый список `docs/home-gateway.md`: процесс и его хранилище). Служба
+поднята всегда, а не только при записи: хранилище выбирают до неё.
 
 ⚠ Воспроизведение — не здесь: служба только пишет список кусков ffconcat с `inpoint` и отдаёт
 готовую строку источника go2rtc (`ffmpeg:<список>#input=playlist`). Поток открывает go2rtc по
@@ -20,7 +22,7 @@ from uuid import uuid4
 
 from aiohttp import web
 
-from . import services
+from . import services, storage
 from .go2rtc_embed import PLAYLIST_INPUT
 from .recorder import SEGMENT_NAME, SERVICE, day_of, epoch_of, segments_of
 
@@ -45,6 +47,11 @@ async def start_api(recorder: Recorder) -> web.AppRunner:
     app.router.add_get("/segments", _segments)
     app.router.add_post("/playlist", _playlist)
     app.router.add_get("/frame", _frame)
+    app.router.add_get("/disks", _disks)
+    app.router.add_get("/folders", _folders)
+    app.router.add_post("/folders", _make_folder)
+    app.router.add_post("/mount", _preview_mount)
+    app.router.add_delete("/mount", _preview_unmount)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", 0).start()
@@ -161,6 +168,52 @@ async def _playlist(request: web.Request) -> web.Response:
             "createdAt": round(time.time(), 3),
         }
     )
+
+
+def _refused(text: str) -> web.Response:
+    return web.json_response({"error": text}, status=400)
+
+
+async def _disks(request: web.Request) -> web.Response:
+    """Разделы с файловой системой — USB-диск под запись выбирают по UUID (`storage.disks`)."""
+    recorder: Recorder = request.app[_RECORDER]
+    return web.json_response({"disks": await recorder.env.run(storage.disks)})
+
+
+async def _folders(request: web.Request) -> web.Response:
+    """Папки каталога хранения с диском каждой (системный ли, свободно, всего) — выбор папки."""
+    recorder: Recorder = request.app[_RECORDER]
+    try:
+        return web.json_response(await recorder.env.run(storage.folders, request.query.get("path", ""), recorder.env.path()))
+    except (ValueError, OSError) as err:
+        return _refused(str(err))
+
+
+async def _make_folder(request: web.Request) -> web.Response:
+    recorder: Recorder = request.app[_RECORDER]
+    body = await request.json()
+    try:
+        created = await recorder.env.run(storage.make_folder, str(body.get("path") or ""), str(body.get("name") or ""))
+    except (ValueError, OSError) as err:
+        return _refused(str(err))
+    return web.json_response({"path": created})
+
+
+async def _preview_mount(request: web.Request) -> web.Response:
+    """Подключить диск или сетевую папку ДЛЯ ВЫБОРА папки — в свою точку (`PREVIEW_POINT`), не
+    трогая идущую запись; учётка — в теле, не в адресе. Ответ — папки подключённого."""
+    recorder: Recorder = request.app[_RECORDER]
+    body = await request.json()
+    problem = await recorder.env.run(storage.mount, body if isinstance(body, dict) else {}, storage.PREVIEW_POINT)
+    if problem:
+        return _refused(problem)
+    return web.json_response(await recorder.env.run(storage.folders, str(storage.PREVIEW_POINT), recorder.env.path()))
+
+
+async def _preview_unmount(request: web.Request) -> web.Response:
+    recorder: Recorder = request.app[_RECORDER]
+    await recorder.env.run(storage.unmount, storage.PREVIEW_POINT)
+    return web.json_response({"ok": True})
 
 
 async def _frame(request: web.Request) -> web.Response:
