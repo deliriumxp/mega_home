@@ -363,10 +363,10 @@ def test_connect_доезжает_и_снаружи_тем_же_переносо
     """
     from mega_home.core import connect as connect_mod
 
-    calls: list[dict] = []
+    calls: list[tuple[dict, bool]] = []
 
-    async def fake_perform(payload):
-        calls.append(payload)
+    async def fake_perform(payload, bundle=False):
+        calls.append((payload, bundle))
         return {"status": 200, "headers": {}, "body": "ok"}
 
     monkeypatch.setattr(connect_mod, "perform", fake_perform)
@@ -374,7 +374,8 @@ def test_connect_доезжает_и_снаружи_тем_же_переносо
     body = json.dumps({"kind": "http", "host": "192.168.1.9", "port": 80, "path": "/x"}).encode()
     answer = call(coordinator, "POST", "api/connect", body)
 
-    assert calls == [{"kind": "http", "host": "192.168.1.9", "port": 80, "path": "/x"}]
+    # Через дверь зовёт бандл — запреты бандла у служб в силе (`Service.bundle_guard`).
+    assert calls == [({"kind": "http", "host": "192.168.1.9", "port": 80, "path": "/x"}, True)]
     assert json_of(answer) == {"status": 200, "headers": {}, "body": "ok"}
 
 

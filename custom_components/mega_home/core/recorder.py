@@ -50,8 +50,14 @@ SEGMENT_S = 10
 SCAN_S = 2.0
 RESTART_S = 10.0
 CLEAN_EVERY_S = 60.0
-# Меньше свободного — удаляются самые старые куски всех камер, не дожидаясь срока.
+# Меньше свободного — удаляются самые старые куски всех камер, не дожидаясь срока. У системного
+# диска с лимитом планка ниже: на маленьком флеше 2 ГБ свободного недостижимы, и уборка стирала бы
+# архив каждую минуту — объём там держит лимит.
 MIN_FREE_BYTES = 2 * 1024**3
+LIMITED_MIN_FREE_BYTES = 256 * 1024**2
+# Проба хранилища (монтирование, каталог) не держит сторож дольше: пропавший NAS отвечает отказом
+# только через повторы ядра.
+STORAGE_CHECK_S = 90.0
 # Камера, не сказавшая «движение кончилось», не держит окно вечно.
 MAX_MOTION_S = 300.0
 RAM_DIR = Path("/dev/shm")
@@ -124,9 +130,14 @@ def storage_problem(path: Path, reference: Path, local: bool = False, mounted_at
         return f"путь хранилища «{path}» — абсолютный, из латиницы, цифр и знаков _ . - /"
     if mounted_at is not None and (mounted_at != path and mounted_at not in path.parents or not os.path.ismount(mounted_at)):
         return f"диск хранилища не смонтирован в {mounted_at}"
+    if mounted_at is None and storage.MOUNT_POINT.parent in path.parents:
+        return f"{path} — точка, куда дом сам подключает диск: выберите USB-диск или сетевую папку видом хранилища"
     if not path.is_dir():
         return f"нет каталога хранилища {path}: подключите диск или сетевую папку"
-    if not local and os.stat(path).st_dev == os.stat(reference).st_dev:
+    disk = storage.disk_kind(path, reference)
+    if disk == "container":
+        return f"папка {path} внутри контейнера Home Assistant — пропадёт при его обновлении: выберите диск"
+    if disk == "system" and not local:
         return (
             f"папка {path} на системном диске контроллера — запись не идёт, чтобы не заполнить его: "
             "выберите диск или сетевую папку, либо «Локальный диск» с лимитом"
@@ -371,7 +382,8 @@ class Recorder:
 
     def apply(self, config: dict[str, Any] | None) -> None:
         # ⚠ Служба на петле — всегда, а не только при записи: папку хранилища выбирают ДО записи.
-        if self._api is None and self._api_task is None:
+        # Не поднялась (порт, ошибка) — новая попытка на следующем конфиге.
+        if self._api is None and (self._api_task is None or self._api_task.done()):
             self._api_task = self.env.spawn(self._start_api(), "mega_home: служба записи")
         section = (config or {}).get("recorder") if isinstance((config or {}).get("recorder"), dict) else None
         key = json.dumps(section, sort_keys=True)
@@ -395,6 +407,8 @@ class Recorder:
         if self._api is not None:
             await self._api.cleanup()
             self._api = None
+        # Подключённое для выбора папки — дому больше не нужно (рабочее хранилище живёт до контейнера).
+        await self.env.run(storage.unmount, storage.PREVIEW_POINT)
 
     async def _reconfigure(self, section: dict[str, Any] | None) -> None:
         async with self._lock:
@@ -436,8 +450,11 @@ class Recorder:
         async with self._lock:
             # Диск или сетевая папка дома: смонтировать, если пропали (NAS после сбоя сети, USB
             # переподключили, контейнер перезапустился — монтирование живёт до его остановки).
-            problem = await self.env.run(storage.mount, self.mount) if self.mount else ""
-            problem = problem or await self.env.run(self.problem)
+            try:
+                problem = await asyncio.wait_for(self.env.run(storage.mount, self.mount), STORAGE_CHECK_S) if self.mount else ""
+                problem = problem or await asyncio.wait_for(self.env.run(self.problem), STORAGE_CHECK_S)
+            except asyncio.TimeoutError:
+                problem = "хранилище не отвечает (сетевая папка недоступна?)"
             if problem:
                 if problem != self.why:
                     LOGGER.warning("Запись камер: %s", problem)
@@ -532,6 +549,21 @@ class Recorder:
         }
 
 
+# Объём каталога дня по его времени изменения: обход всех кусков архива раз в минуту на флеше
+# контроллера стоил бы секунды; пересчитывается только день, в который легли новые куски.
+_day_sizes: dict[str, tuple[int, int]] = {}
+
+
+def _day_size(day: Path) -> int:
+    stamp = day.stat().st_mtime_ns
+    known = _day_sizes.get(str(day))
+    if known is not None and known[0] == stamp:
+        return known[1]
+    size = sum(item.stat().st_size for item in day.iterdir() if item.is_file())
+    _day_sizes[str(day)] = (stamp, size)
+    return size
+
+
 def clean(storage: Path, cameras: list[_Camera], now: float, limit: int = 0) -> None:
     """По сроку камеры — каталоги дней целиком; по месту и по лимиту объёма (`limit`, байты:
     «локальный диск») — самые старые куски всех камер."""
@@ -542,13 +574,15 @@ def clean(storage: Path, cameras: list[_Camera], now: float, limit: int = 0) -> 
             if day.is_dir() and day.name < cutoff:
                 shutil.rmtree(day, ignore_errors=True)
     used = sum(
-        item.stat().st_size
+        _day_size(day)
         for camera in cameras
-        for item in ((storage / camera.spec.id).rglob("*.mkv") if limit else [])
+        for day in ((storage / camera.spec.id).iterdir() if limit and (storage / camera.spec.id).is_dir() else [])
+        if day.is_dir()
     )
     # Шагами по 60 кусков (10 минут записи), не больше полусотни шагов за проход.
     for _step in range(50):
-        if shutil.disk_usage(storage).free >= MIN_FREE_BYTES and (not limit or used <= limit):
+        floor = LIMITED_MIN_FREE_BYTES if limit else MIN_FREE_BYTES
+        if shutil.disk_usage(storage).free >= floor and (not limit or used <= limit):
             break
         days = sorted(
             (day.name, day)

@@ -76,8 +76,13 @@ def test_диски_разделы_и_целые_без_разделов(tmp_pat
     assert found["mmcblk0p1"]["system"] and not found["sda1"]["system"]
 
 
+PLAIN_DISK = {"/": ("/dev/sda1", "ext4"), "/proc": ("proc", "proc")}
+
+
 @pytest.fixture
 def roots(monkeypatch: pytest.MonkeyPatch) -> Path:
+    # Таблица монтирований — как у машины с одним диском: временная папка тестов бывает в tmpfs.
+    monkeypatch.setattr(storage, "mounted", lambda: dict(PLAIN_DISK))
     base = Path(tempfile.mkdtemp(prefix="roots-"))
     (base / "media" / "usb" / "video").mkdir(parents=True)
     (base / "media" / ".hidden").mkdir()
@@ -101,6 +106,19 @@ def test_обзор_папок_только_в_каталогах_хранени
             storage.folders(bad, roots)
 
 
+def test_системный_диск_и_фс_контейнера(tmp_path: Path) -> None:
+    """Ревью 2026-10-23: `/mnt` образа HA — overlay контейнера, а подтом btrfs того же раздела
+    имеет своё устройство — ни то ни другое не «свой диск»."""
+    folder = Path(tempfile.mkdtemp(prefix="kind-"))
+    as_overlay = {"/": ("overlay", "overlay"), "/proc": ("proc", "proc")}
+    assert storage.disk_kind(folder, Path("/proc"), as_overlay) == "container"
+    # Папка и настройки — на одном разделе (`/dev/mmcblk0p6`), хоть устройства (`st_dev`) и разные.
+    subvolumes = {"/": ("/dev/mmcblk0p6", "btrfs"), "/proc": ("/dev/mmcblk0p6", "btrfs")}
+    assert storage.disk_kind(folder, Path("/proc"), subvolumes) == "system"
+    assert storage.disk_kind(folder, Path("/proc"), PLAIN_DISK) == ""
+    assert storage.disk_kind(folder, folder, PLAIN_DISK) == "system"
+
+
 def test_новая_папка_латиницей_и_только_в_хранении(roots: Path) -> None:
     created = storage.make_folder(str(roots / "media" / "usb"), "cams-2026")
     assert Path(created).is_dir()
@@ -116,7 +134,10 @@ def test_параметры_монтирования(monkeypatch: pytest.MonkeyP
     # Адрес — цифрами (`ip=`): ядро без `mount.cifs` имя не разрешит; запятая пароля удвоена.
     assert (device, fstype) == ("//192.168.1.5/video/cams", "cifs")
     assert data == "username=nas,password=a,,b,ip=192.168.1.5,vers=3.0,uid=0"
-    assert storage._plan("nfs", "192.168.1.6:/export/video", {}) == ("192.168.1.6:/export/video", "nfs4", "vers=4.1,addr=192.168.1.6")  # noqa: SLF001
+    # NFS — `soft` с конечными повторами: пропавший NAS не вешает сторож и остановку HA.
+    assert storage._plan("nfs", "192.168.1.6:/export/video", {}) == (  # noqa: SLF001
+        "192.168.1.6:/export/video", "nfs4", "vers=4.1,soft,timeo=100,retrans=3,addr=192.168.1.6"
+    )
     monkeypatch.setattr(storage, "disks", lambda: [{"device": "sda1", "type": "exfat", "uuid": "1234-5678"}])
     assert storage._plan("usb", "UUID=1234-5678", {}) == ("/dev/sda1", "exfat", "")  # noqa: SLF001
     for kind, source in (("cifs", "nas/video"), ("nfs", "nas"), ("usb", "UUID=0000"), ("ftp", "x")):
@@ -187,3 +208,21 @@ def test_служба_отдаёт_папки_и_подключает_для_в�
     # Подключение для выбора — в свою точку, не в точку записи; пароль ушёл телом.
     assert ok["path"] == str(roots / "mnt") and mounts[-1][1] == roots / "mnt"
     assert os.path.isdir(made["path"])
+
+
+def test_хранилище_настраивает_только_менеджер() -> None:
+    """Ревью 2026-10-23: служба записи доступна и бандлу по ключу устройства — диски, папки и
+    подключение ему закрыты (вызов и сессия), архив — открыт; менеджеру — всё."""
+    from mega_home.core import connect, recorder_api
+    from mega_home.core.ops_base import OpError
+
+    services.register(rec.SERVICE, 1, bundle_guard=recorder_api._installer_only)  # noqa: SLF001
+    try:
+        for path in ("/mount", "/folders?path=/media", "/disks"):
+            with pytest.raises(OpError, match="инсталлятор"):
+                connect.with_service({"host": rec.SERVICE, "path": path}, bundle=True)
+            assert connect.with_service({"host": rec.SERVICE, "path": path})["host"] == rec.SERVICE
+            assert connect.refused({"host": rec.SERVICE}, "path", path)
+        assert connect.with_service({"host": rec.SERVICE, "path": "/days?camera=x"}, bundle=True)
+    finally:
+        services.unregister(rec.SERVICE)

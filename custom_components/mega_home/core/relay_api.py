@@ -137,7 +137,7 @@ async def dispatch(
     if path == "api/connect" and method == "POST":
         # Единственный контракт транспорта наружу — тот же код, что у операции
         # канала (`ops.py`, `op == "connect"`): ответы не должны разъезжаться.
-        return _json(await ops.connect(_json_body(body)))
+        return _json(await ops.connect(_json_body(body), bundle=True))
     if path == "api/connect" and method == "GET":
         # ⚠ ТОТ ЖЕ путь и тот же контракт, другой способ ПОТРЕБИТЬ ответ: тело
         # адресата уезжает как есть, с его типом, — кадр и файл браузер берёт

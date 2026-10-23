@@ -35,6 +35,10 @@ PREVIEW_POINT = Path("/mnt/mega-home/preview")
 # Где показывать папки: каталоги хранения, а не система (`/config` — настройки HA на флеше).
 ROOTS = (Path("/media"), Path("/mnt"), Path("/share"), Path("/data"), Path("/srv"))
 _NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+# Файловые системы самого контейнера: запись туда ложится в его слой на флеше и пропадает, когда
+# контейнер пересоздают (обновление HA), — под запись не годятся никогда (ревью 2026-10-23: `/mnt`
+# и `/srv` образа HA — overlay, а их устройство не совпадает с диском `/config`).
+_CONTAINER_FS = {"overlay", "tmpfs", "ramfs", "rootfs", "aufs", "squashfs", "devtmpfs"}
 # Без исполнения, устройств и времени доступа: видео, а не система.
 _FLAGS = 2 | 4 | 8 | 1024  # MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME
 _SKIP = ("loop", "ram", "zram", "mtdblock", "sr", "fd", "nbd", "dm-")
@@ -109,7 +113,8 @@ def superblock(device: Path) -> dict[str, str] | None:
 
 def disks(sys_block: Path = Path("/sys/class/block"), dev: Path = Path("/dev")) -> list[dict[str, Any]]:
     """Разделы с файловой системой: имя, размер, тип, UUID, метка, съёмный ли, занят ли системой."""
-    used = {source for point, (source, _kind) in mounted().items() if not point.startswith(str(MOUNT_POINT))}
+    # Свои точки дома (запись и обзор) диск системным не делают: его же и выбирают.
+    used = {source for point, (source, _kind) in mounted().items() if not point.startswith(str(MOUNT_POINT.parent))}
     out: list[dict[str, Any]] = []
     for entry in sorted(sys_block.iterdir()) if sys_block.is_dir() else []:
         name = entry.name
@@ -135,9 +140,23 @@ def _read_int(path: Path) -> int:
         return 0
 
 
-def system_device(reference: Path) -> int:
-    """Устройство, на котором лежат настройки дома: запись туда — запись на флеш контроллера."""
-    return os.stat(reference).st_dev
+def mount_of(path: Path, points: dict[str, tuple[str, str]]) -> tuple[str, str]:
+    """(источник, тип ФС) монтирования, в котором лежит путь: самая длинная точка-предок."""
+    real = os.path.realpath(path)
+    best = max((p for p in points if real == p or real.startswith(p.rstrip("/") + "/")), key=len, default="/")
+    return points.get(best, ("", ""))
+
+
+def disk_kind(path: Path, reference: Path, points: dict[str, tuple[str, str]] | None = None) -> str:
+    """`container` — ФС самого контейнера; `system` — диск настроек дома (`reference`): то же
+    устройство или тот же раздел (подтом btrfs, привязка того же раздела в другой каталог);
+    пусто — свой диск."""
+    points = mounted() if points is None else points
+    source, kind = mount_of(path, points)
+    if kind in _CONTAINER_FS:
+        return "container"
+    same_partition = source.startswith("/dev/") and source == mount_of(reference, points)[0]
+    return "system" if same_partition or os.stat(path).st_dev == os.stat(reference).st_dev else ""
 
 
 def allowed(path: Path) -> bool:
@@ -147,16 +166,18 @@ def allowed(path: Path) -> bool:
 
 
 def folders(path: str, reference: Path) -> dict[str, Any]:
-    """Подпапки `path` (пусто — корни хранения) с диском каждой: системный ли, свободно и всего."""
-    system = system_device(reference)
+    """Подпапки `path` (пусто — корни хранения) с диском каждой: системный ли, ФС ли самого
+    контейнера (такую не выбрать), свободно и всего."""
     points = mounted()
 
     def describe(folder: Path) -> dict[str, Any]:
         usage = shutil.disk_usage(folder)
         source, kind = points.get(str(folder), ("", ""))
+        disk = disk_kind(folder, reference, points)
         return {
-            "path": str(folder), "name": folder.name or str(folder), "system": os.stat(folder).st_dev == system,
-            "free": usage.free, "total": usage.total, **({"mount": source, "fs": kind} if source else {}),
+            "path": str(folder), "name": folder.name or str(folder), "system": disk == "system",
+            "container": disk == "container", "free": usage.free, "total": usage.total,
+            **({"mount": source, "fs": kind} if source else {}),
         }
 
     if not path:
@@ -233,5 +254,9 @@ def _plan(kind: str, source: str, spec: dict[str, Any]) -> tuple[str, str, str]:
         if not found:
             raise ValueError("папка NFS — в виде сервер:/путь")
         address = socket.gethostbyname(found.group(1))
-        return f"{address}:{found.group(2)}", "nfs4", ",".join(["vers=4.1", f"addr={address}", *options])
+        # ⚠ `soft` с конечными повторами: у `hard` (умолчание ядра) пропавший NAS вешал бы навсегда
+        # каждый вызов к точке — сторож записи и остановку HA (ревью 2026-10-23). 10 с × 3.
+        return f"{address}:{found.group(2)}", "nfs4", ",".join(
+            ["vers=4.1", "soft", "timeo=100", "retrans=3", f"addr={address}", *options]
+        )
     raise ValueError(f"неизвестный вид хранилища «{kind}»")

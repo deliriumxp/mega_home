@@ -17,9 +17,19 @@ from pathlib import Path
 from aiohttp.test_utils import TestClient, TestServer
 
 from fake_host import FakeHost
+import pytest
+
 from mega_home.core import recorder as rec
-from mega_home.core import services
+from mega_home.core import services, storage
 from mega_home.core.recorder_api import start_api
+
+
+@pytest.fixture(autouse=True)
+def _one_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Таблица монтирований — машина с одним диском: временная папка тестов бывает в tmpfs, а
+    tmpfs для дома — ФС контейнера, под запись не годная (`storage.disk_kind`)."""
+    monkeypatch.setattr(storage, "mounted", lambda: {"/": ("/dev/sda1", "ext4"), "/proc": ("proc", "proc")})
+
 
 SECTION = {
     "storage": "/media/video",
@@ -72,6 +82,8 @@ def test_хранилище_без_диска_не_пишется() -> None:
     # Диск монтирует дом — путь обязан быть внутри смонтированной точки.
     assert "не смонтирован" in rec.storage_problem(folder, other, mounted_at=folder.parent)
     assert "не смонтирован" in rec.storage_problem(folder, other, mounted_at=Path("/elsewhere"))
+    # Точка, куда дом сам монтирует, — не «папка контроллера»: пропал диск — писали бы на флеш.
+    assert "точка, куда дом сам подключает" in rec.storage_problem(storage.MOUNT_POINT / "video", other)
     assert "абсолютный" in rec.storage_problem(Path("video"), other)
     assert "абсолютный" in rec.storage_problem(Path("/media/vid'eo#x"), other)
 

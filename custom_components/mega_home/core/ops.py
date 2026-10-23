@@ -148,14 +148,14 @@ async def run(coordinator: Any, op: str, payload: dict[str, Any] | None) -> Any:
         return await updater(str(wanted) if isinstance(wanted, str) and wanted else None)
     raise OpError("Неизвестная операция", HTTPStatus.NOT_FOUND)
 
-async def connect(payload: dict[str, Any]) -> dict[str, Any]:
+async def connect(payload: dict[str, Any], bundle: bool = False) -> dict[str, Any]:
     """Единственный контракт транспорта наружу (`docs/plan-thin-gateway.md`).
 
     Один примитив на TCP, UDP, HTTP и WebSocket вместо глагола на каждый класс
     устройства — исполнение живёт в `connect.py`, здесь только точка входа,
-    общая с локальным маршрутом `api/connect` (`relay_api.py`).
+    общая с локальным маршрутом `api/connect` (`relay_api.py`, `bundle` — зовёт бандл).
     """
-    return await connect_mod.perform(payload)
+    return await connect_mod.perform(payload, bundle)
 
 async def connect_resource(payload: dict[str, Any]) -> tuple[int, str, bytes, str]:
     """Тот же `connect`, но ответ — РЕСУРС для браузера (`connect.resource`).
@@ -234,9 +234,13 @@ def config(coordinator: Any) -> dict[str, Any]:
 
     # ⚠ `house` — раздел ТОЛЬКО для дома (секрет ключей, учётка Home Assistant):
     # тело `config` уходит браузеру жильца, обеим дверям. Замок —
-    # `tests/test_local_keys.py`.
+    # `tests/test_local_keys.py`. То же у `recorder.mount` — учётка сетевой папки NAS: бандлу из
+    # раздела записи нужны только камеры.
+    data = coordinator.data or {}
+    recorder = data.get("recorder") if isinstance(data.get("recorder"), dict) else None
     return {
-        **{k: v for k, v in (coordinator.data or {}).items() if k != "house"},
+        **{k: v for k, v in data.items() if k != "house"},
+        **({"recorder": {k: v for k, v in recorder.items() if k != "mount"}} if recorder else {}),
         "integration": {
             "version": INTEGRATION_VERSION,
             "appVersion": coordinator.bundle.version if coordinator.bundle else None,

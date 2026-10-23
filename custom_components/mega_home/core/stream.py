@@ -284,7 +284,8 @@ class Streams:
         # — у `connect` она отвергала `0.0.0.0` и зарезервированное, здесь
         # список был свой.
         try:
-            req = connect_mod.with_service(req)
+            # Сессии — дорога бандла (своя дверь или пересылка менеджером): запреты бандла в силе.
+            req = connect_mod.with_service(req, bundle=True)
             host, port = connect_mod.resolve_address(req)
             # Голому сокету имя — проверенным адресом (`connect.socket_target`); у ws и http это
             # делает соединитель aiohttp. UDP-сокет сессии — IPv4, как у одиночного вызова.

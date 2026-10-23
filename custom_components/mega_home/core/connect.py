@@ -47,16 +47,17 @@ KINDS = ("tcp", "udp", "http", "ws")
 # ответ принадлежит этому жильцу, общим кэшам по пути в нём делать нечего.
 RESOURCE_CACHE = "private, max-age=30"
 
-async def perform(payload: dict[str, Any]) -> dict[str, Any]:
+async def perform(payload: dict[str, Any], bundle: bool = False) -> dict[str, Any]:
     """Выполнить один вызов `connect`. Отказ ДОМА — `OpError`; ответ адресата
-    с любым статусом — данные (`status` в ответе), толкует его вызывающий."""
+    с любым статусом — данные (`status` в ответе), толкует его вызывающий. `bundle` — зовёт
+    бандл жильца, а не сам менеджер (`with_service`)."""
     if not isinstance(payload, dict):
         raise OpError("Ожидается объект запроса")
     if payload.get("stream") is True:
         raise OpError(
             "Держать соединение — форма Upgrade того же api/connect, а не флаг", 501
         )
-    payload = with_service(payload)
+    payload = with_service(payload, bundle)
     kind = str(payload.get("kind") or "")
     # Обработка ответа (`reduce.py`) — разбор описания ДО вызова: ошибка в нём не
     # должна стоить источнику мегабайтов истории.
@@ -110,7 +111,7 @@ async def resource(payload: dict[str, Any]) -> tuple[int, str, bytes, str]:
     # Данные из интернета — коду, `POST` (`perform`); картинки интернета браузер берёт сам.
     if is_name(str(payload.get("host") or "").strip()) and services.entry(str(payload.get("host") or "").strip()) is None:
         raise OpError("Ресурсом отдаётся устройство объекта или служба дома; интернет — данными коду (POST)", 403)
-    answer = await _http(with_service({**payload, "method": "GET"}))
+    answer = await _http(with_service({**payload, "method": "GET"}, bundle=True))
     raw = (
         base64.b64decode(answer["bodyBase64"])
         if answer.get("bodyBase64") is not None
@@ -127,11 +128,12 @@ async def resource(payload: dict[str, Any]) -> tuple[int, str, bytes, str]:
     # ходить второй раз в тот же период обновления плитки.
     return int(answer.get("status") or 200), content_type, raw, RESOURCE_CACHE
 
-def with_service(payload: dict[str, Any]) -> dict[str, Any]:
+def with_service(payload: dict[str, Any], bundle: bool = False) -> dict[str, Any]:
     """Вызов к службе дома получает то, что служба знает о себе: TLS и учётку.
 
     ⚠ Заголовки службы ПЕРЕБИВАЮТ заголовки вызывающего — учётку службы ставит
-    дом (`services.Service`), чужой `Authorization` к ней не доедет.
+    дом (`services.Service`), чужой `Authorization` к ней не доедет. `bundle` — вызов бандла
+    жильца (дверь, пересылка менеджером, сессия): к нему ещё и `bundle_guard` службы.
     """
     service = services.entry(str(payload.get("host") or "").strip())
     if service is None:
@@ -144,6 +146,7 @@ def with_service(payload: dict[str, Any]) -> dict[str, Any]:
         for item in (payload.get("messages") if isinstance(payload.get("messages"), list) else [])
     ]:
         reason = service.guard(what, value) if service.guard else None
+        reason = reason or (service.bundle_guard(what, value) if bundle and service.bundle_guard else None)
         if reason:
             raise OpError(reason, 403)
     headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
@@ -154,9 +157,14 @@ def with_service(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 def refused(payload: dict[str, Any], what: str, value: str) -> str | None:
-    """Причина отказа службы на кадр открытой сессии; `None` — пропустить (`Service.guard`)."""
+    """Причина отказа службы на кадр открытой сессии; `None` — пропустить (`Service.guard`, а сессия —
+    дорога бандла, поэтому и `bundle_guard`)."""
     service = services.entry(str(payload.get("host") or "").strip())
-    return service.guard(what, value) if service is not None and service.guard else None
+    if service is None:
+        return None
+    return (service.guard(what, value) if service.guard else None) or (
+        service.bundle_guard(what, value) if service.bundle_guard else None
+    )
 
 async def open_ws(payload: dict[str, Any], socket_: Any) -> None:
     """Рукопожатие службы на только что открытом сокете — до кадров вызывающего."""

@@ -55,8 +55,16 @@ async def start_api(recorder: Recorder) -> web.AppRunner:
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", 0).start()
-    services.register(SERVICE, int(runner.addresses[0][1]))
+    services.register(SERVICE, int(runner.addresses[0][1]), bundle_guard=_installer_only)
     return runner
+
+
+def _installer_only(what: str, value: str) -> str | None:
+    """Диски, папки и подключение хранилища — только менеджеру (инсталлятору): телефон с ключом
+    устройства не монтирует сетевые папки ядром дома и не создаёт папки на его дисках."""
+    if what == "path" and value.split("?", 1)[0] in ("/disks", "/folders", "/mount"):
+        return "хранилище записи настраивает инсталлятор через менеджер"
+    return None
 
 
 def _camera(request: web.Request) -> str:
@@ -174,6 +182,16 @@ def _refused(text: str) -> web.Response:
     return web.json_response({"error": text}, status=400)
 
 
+async def _body(request: web.Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        raise web.HTTPBadRequest(text='{"error": "тело — объект JSON"}', content_type="application/json")
+    return body
+
+
 async def _disks(request: web.Request) -> web.Response:
     """Разделы с файловой системой — USB-диск под запись выбирают по UUID (`storage.disks`)."""
     recorder: Recorder = request.app[_RECORDER]
@@ -191,7 +209,7 @@ async def _folders(request: web.Request) -> web.Response:
 
 async def _make_folder(request: web.Request) -> web.Response:
     recorder: Recorder = request.app[_RECORDER]
-    body = await request.json()
+    body = await _body(request)
     try:
         created = await recorder.env.run(storage.make_folder, str(body.get("path") or ""), str(body.get("name") or ""))
     except (ValueError, OSError) as err:
@@ -203,8 +221,7 @@ async def _preview_mount(request: web.Request) -> web.Response:
     """Подключить диск или сетевую папку ДЛЯ ВЫБОРА папки — в свою точку (`PREVIEW_POINT`), не
     трогая идущую запись; учётка — в теле, не в адресе. Ответ — папки подключённого."""
     recorder: Recorder = request.app[_RECORDER]
-    body = await request.json()
-    problem = await recorder.env.run(storage.mount, body if isinstance(body, dict) else {}, storage.PREVIEW_POINT)
+    problem = await recorder.env.run(storage.mount, await _body(request), storage.PREVIEW_POINT)
     if problem:
         return _refused(problem)
     return web.json_response(await recorder.env.run(storage.folders, str(storage.PREVIEW_POINT), recorder.env.path()))
