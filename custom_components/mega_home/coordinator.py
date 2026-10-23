@@ -92,6 +92,8 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # SIP-мост домофонии (`sip_bridge.py`). Включается конфигом объекта;
         # координатор только отдаёт ему свежий конфиг.
         self.sip_bridge: Any = None
+        # Запись камер (`core/recorder.py`): раздел `recorder` конфига объекта.
+        self.recorder: Any = None
         # События устройств (`device_events.py`) и их источники по описаниям
         # доступов (`listeners.py`). Ставятся снаружи вместе с дверью.
         self.events: Any = None
@@ -323,6 +325,13 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.event_sources.apply(self.accesses.descriptors())
             except Exception as err:  # noqa: BLE001 — события не роняют синхронизацию
                 LOGGER.warning("События устройств: конфиг не применился: %s", err)
+        if self.recorder and config:
+            # Запись — тем же путём и из тех же двух ветвей: упавшая камера иначе ждала бы
+            # смены конфига. Повтор того же раздела запись не трогает (`Recorder.apply`).
+            try:
+                self.recorder.apply(config)
+            except Exception as err:  # noqa: BLE001 — запись не роняет синхронизацию
+                LOGGER.warning("Запись камер: конфиг не применился: %s", err)
         if not self.sip_bridge or not config:
             return
         try:

@@ -29,7 +29,7 @@ import asyncio
 import base64
 import json
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 import aiohttp
 
@@ -62,15 +62,56 @@ def delimiter(spec: dict[str, Any], default: bytes) -> bytes:
         value = default
     return value or default
 
+def parsed(payload: bytes) -> Any:
+    """Тело ответа данными для `carry` и `resetup`: JSON, иначе XML, иначе None.
+
+    ⚠ XML — словарём по ЛОКАЛЬНЫМ именам элементов, без пространств имён
+    (`Envelope.Body.<Ответ>.<Поле>`): префиксы у устройств разные (`SOAP-ENV:`,
+    `env:`, `s:`) при одном смысле, а путь пишет менеджер один на всех. Атрибуты
+    не берутся; повторённый элемент — список. Толкования здесь нет: тот же путь
+    через точку, что у JSON (`templating.pick`).
+    """
+    if not payload:
+        return None
+    text = payload.decode("utf-8", "ignore").strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    if not text.startswith("<"):
+        return None
+    from xml.etree import ElementTree  # noqa: PLC0415 — только у XML-устройств
+
+    try:
+        root = ElementTree.fromstring(text)
+    except ElementTree.ParseError:
+        return None
+    return {_local(root.tag): _xml_node(root)}
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+def _xml_node(element: Any) -> Any:
+    children = list(element)
+    if not children:
+        return (element.text or "").strip()
+    out: dict[str, Any] = {}
+    for child in children:
+        key, value = _local(child.tag), _xml_node(child)
+        if key not in out:
+            out[key] = value
+        elif isinstance(out[key], list):
+            out[key].append(value)
+        else:
+            out[key] = [out[key], value]
+    return out
+
 def carry(values: dict[str, Any], spec: dict[str, Any], payload: bytes) -> None:
     """Поля ответа → значения шаблонов следующих запросов (`carry: {имя: путь}`)."""
     fields = spec.get("carry")
     if not isinstance(fields, dict):
         return
-    try:
-        data = json.loads(payload.decode("utf-8", "ignore")) if payload else None
-    except ValueError:
-        data = None
+    data = parsed(payload)
     for name, path in fields.items():
         found = pick(data, str(path))
         if found:
@@ -121,6 +162,15 @@ def _call(descriptor: DeviceDescriptor, block: dict[str, Any], values: dict[str,
     elif isinstance(body, str) and body:
         raw = render(body, values).encode()
     path = render(str(block.get("path") or "/"), values)
+    port = descriptor.port
+    if path.startswith(("http://", "https://")):
+        # Адрес, который устройство выдало ответом (подписка PullPoint: полный URL
+        # в `carry`), — берётся путь, а порт — только у ТОГО ЖЕ хоста (сервис событий
+        # камеры бывает на своём порту): чужой адрес из ответа дом не открывает.
+        parts = urlsplit(path)
+        if parts.hostname == descriptor.host and parts.port:
+            port = parts.port
+        path = f"{parts.path or '/'}{'?' + parts.query if parts.query else ''}"
     if isinstance(block.get("params"), dict):
         query = urlencode(_render_obj(block["params"], values), quote_via=quote)
         path = f"{path}{'&' if '?' in path else '?'}{query}" if query else path
@@ -129,7 +179,7 @@ def _call(descriptor: DeviceDescriptor, block: dict[str, Any], values: dict[str,
     return {
         "method": str(block.get("method") or "GET").upper(),
         "path": path,
-        "url": f"{'https' if descriptor.tls else 'http'}://{descriptor.host}:{descriptor.port}{path}",
+        "url": f"{'https' if descriptor.tls else 'http'}://{descriptor.host}:{port}{path}",
         "headers": headers,
         "body": raw,
         "basic": aiohttp.BasicAuth(auth.user, auth.password) if auth.type == "basic" else None,
@@ -165,14 +215,32 @@ async def _request(
     async with await http_send(session, call, aiohttp.ClientTimeout(total=total)) as response:
         return response.status, response.content_type, await response.read()
 
-def _resetup_matches(resetup: dict[str, Any], payload: bytes) -> bool:
-    """Ответ говорит «сессия умерла» (`resetup.path` == `resetup.equals`)."""
-    try:
-        data = json.loads(payload.decode("utf-8", "ignore")) if payload else None
-    except ValueError:
-        data = None
-    found = pick(data, str(resetup.get("path", "")))
-    return found is not None and str(found) == str(resetup.get("equals"))
+def _resetup_matches(resetup: dict[str, Any], status: int, payload: bytes) -> bool:
+    """Ответ говорит «сессия умерла»: код ответа не ниже `resetup.status` либо
+    поле `resetup.path` равно `resetup.equals`.
+
+    ⚠ `status` — у подписок, которые устройство хоронит отказом: истёкшая
+    подписка PullPoint отвечает SOAP Fault с кодом 400/500, и без перехода к
+    `setup` дом долбил бы мёртвый адрес вечно.
+    """
+    floor = resetup.get("status")
+    if isinstance(floor, int) and not isinstance(floor, bool) and status >= floor:
+        return True
+    if "path" not in resetup:
+        return False
+    return pick(parsed(payload), str(resetup.get("path", ""))) == str(resetup.get("equals"))
+
+def _wanted(spec: dict[str, Any], payload: bytes) -> bool:
+    """Публиковать ли ответ: `onlyIf.contains` — подстрока, без которой ответ тишина.
+
+    ⚠ У длинного опроса с метками в теле (`CurrentTime` PullPoint) каждый пустой
+    ответ отличен от прошлого, и `changesOnly` его не гасит: хранилище ленты
+    (`device_store.py`) за часы вытесняло бы настоящие события пустыми.
+    """
+    rule = spec.get("onlyIf")
+    if not isinstance(rule, dict) or not rule.get("contains"):
+        return True
+    return str(rule["contains"]).encode() in payload
 
 async def poll(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[str, Any]) -> None:
     values = base_values(descriptor)
@@ -205,7 +273,7 @@ async def poll(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[s
         while True:
             started = loop.time()
             status, kind, payload = await _request(session, descriptor, spec, values)
-            if resetup is not None and setup_block is not None and _resetup_matches(resetup, payload):
+            if resetup is not None and setup_block is not None and _resetup_matches(resetup, status, payload):
                 # Отказ сессии — не событие жильцу (это состояние опроса, а не
                 # устройства), и без него самого дом просто повторит запрос.
                 if loop.time() - last_resetup >= pause:
@@ -217,7 +285,7 @@ async def poll(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[s
                     await asyncio.sleep(pause)
                 continue
             carry(values, spec, payload)
-            if not changes_only or (status, payload) != last:
+            if _wanted(spec, payload) and (not changes_only or (status, payload) != last):
                 last = (status, payload)
                 ctx.emit(descriptor, source, spec, "response", {"status": status, "contentType": kind, **body_of(payload)})
             # ⚠ Долгий опрос без паузы — только пока устройство ДЕРЖИТ запрос. Ответ
