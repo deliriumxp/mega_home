@@ -28,12 +28,10 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import os
 import re
 import shutil
-import subprocess
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -45,6 +43,7 @@ from . import services, storage
 from .const import LOGGER
 from .go2rtc_embed import API_PORT, RTSP_PORT
 from .host import Host
+from .recorder_frames import frame_of, tools as frame_tools
 from .recorder_index import SegmentIndex, clean, day_of, epoch_of, segment_name
 
 SERVICE = "recorder"
@@ -67,8 +66,6 @@ RAM_PER_CAMERA = 64 * 1024**2
 # Список готовых кусков ведёт сам ffmpeg (`-segment_list`, CSV «файл,начало,конец»): длительность
 # куска и «кусок закрыт» без ffprobe на каждый кусок и без догадки «последний ещё пишется».
 SEGMENT_LIST = "segments.csv"
-# Кадр превью к куску — слот спрайта шкалы архива (160 × 90 у 16:9).
-FRAME_WIDTH = 160
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # Путь хранилища уходит строкой в список ffconcat (`file '…'`) и в источник go2rtc (`#` — разделитель).
 _PATH = re.compile(r"^/[A-Za-z0-9_./-]+$")
@@ -156,25 +153,6 @@ def storage_problem(path: Path, reference: Path, local: bool = False, mounted_at
     return ""
 
 
-def frame_of(path: Path, out: Path, binary: str) -> int:
-    """Кадр превью из сохранённого куска — первый ключевой, уменьшенный; размер файла или 0.
-
-    Из файла, а не вторым ffmpeg на поток: второго потребителя потока и его сторожа нет, кадр есть
-    ровно у сохранённых кусков, работа — один декод ключевого кадра в 10 с (`-skip_frame nokey`), и
-    та под `nice`, чтобы не отнимать процессор у записи. Блокирует — зовётся из исполнителя (`_save`).
-    """
-    command = ["nice", "-n", "10", binary, "-hide_banner", "-loglevel", "error", "-nostdin", "-skip_frame", "nokey"]
-    command += ["-i", str(path), "-frames:v", "1", "-vf", f"scale={FRAME_WIDTH}:-2", "-q:v", "6", "-y", str(out)]
-    with contextlib.suppress(OSError, subprocess.SubprocessError):
-        subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=True)
-        if size := out.stat().st_size:
-            return size
-    # Недописанный кадр не оставляем: спрайт взял бы битый файл, а объём его не учёл бы.
-    with contextlib.suppress(OSError):
-        out.unlink(missing_ok=True)
-    return 0
-
-
 class _Camera:
     """Одна камера: ffmpeg пишет куски в кэш, разбор раскладывает их в хранилище."""
 
@@ -186,6 +164,8 @@ class _Camera:
         self.last_saved = 0.0
         self.saved = 0
         self.dropped = 0
+        # Кадр превью не снялся при живом ffmpeg — сказано в журнал (один раз на камеру, не на кусок).
+        self._frame_warned = False
         self._tail: deque[str] = deque(maxlen=8)
         # Готовые куски по списку ffmpeg: имя → длительность; прочитанная часть списка — смещением.
         self._listed: dict[str, float] = {}
@@ -328,7 +308,10 @@ class _Camera:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(path), str(target))
         # Кадр — в объёме куска: лимит «локального диска» считает и его.
-        frame = self.rec.extract_frame(target, target.with_suffix(".jpg"), self.rec.ffmpeg) if self.rec.ffmpeg else 0
+        frame = self.rec.extract_frame(target, target.with_suffix(".jpg"), self.rec.ffmpeg, self.rec.nice) if self.rec.ffmpeg else 0
+        if not frame and self.rec.ffmpeg and not self._frame_warned:
+            self._frame_warned = True
+            LOGGER.warning("Запись %s: кадр превью из %s не снялся — у шкалы архива не будет превью кусков", self.spec.id, target.name)
         # В индекс — после переноса: сорвавшийся перенос не оставляет в нём куска, которого нет.
         self.index.add(start, length, size + frame)
         self.saved += 1
@@ -423,8 +406,8 @@ class Recorder:
         # Идущая проба хранилища (монтирование и каталог): вторая поверх висящей не заводится.
         self._checking: asyncio.Future[str] | None = None
         # ffmpeg для кадров превью (пусто — кадров нет, куски пишутся); снятие кадра — шов спек.
-        self.ffmpeg = ""
-        self.extract_frame: Callable[[Path, Path, str], int] = frame_of
+        self.ffmpeg, self.nice = "", ""
+        self.extract_frame: Callable[[Path, Path, str, str], int] = frame_of
 
     def apply(self, config: dict[str, Any] | None) -> None:
         # ⚠ Служба на петле — всегда, а не только при записи: папку хранилища выбирают ДО записи.
@@ -531,7 +514,7 @@ class Recorder:
         ram = await self.env.run(self._ram_cache, sum(1 for s in self._specs if s.motion_mode))
         disk = self.storage / ".cache"
         await self.env.run(lambda: disk.mkdir(exist_ok=True))
-        self.ffmpeg = await self.env.run(shutil.which, "ffmpeg") or ""
+        self.ffmpeg, self.nice = await self.env.run(frame_tools)
         self.cameras = {
             spec.id: _Camera(self, spec, ram if spec.motion_mode and ram is not None else disk) for spec in self._specs
         }

@@ -57,7 +57,7 @@ def segment_name(begin: float, length_ms: int) -> str:
 
 
 def _frame_size(segment: Path) -> int:
-    """Кадр превью куска (`recorder.frame_of`) — тот же стержень, `.jpg`; нет — 0."""
+    """Кадр превью куска (`recorder_frames.frame_of`) — тот же стержень, `.jpg`; нет — 0."""
     try:
         return segment.with_suffix(".jpg").stat().st_size
     except OSError:
