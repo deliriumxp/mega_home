@@ -159,6 +159,36 @@ def test_сторож_останавливает_запись_без_диска_
     assert why_with == "" and cams_with == 1
 
 
+def test_висящая_проба_хранилища_не_плодит_потоков(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ревью хранилища 2026-10-23: `mount(2)` к пропавшему NAS держит поток исполнителя минутами;
+    сторож раз в минуту не заводит вторую пробу поверх висящей, а говорит «не отвечает»."""
+    folder = Path(tempfile.mkdtemp(prefix="rec-"))
+    recorder = rec.Recorder(FakeHost(folder), lambda _listener: (lambda: None))
+    recorder._specs = rec.camera_specs({**SECTION, "storage": str(folder)})  # noqa: SLF001
+    recorder.storage, recorder.mount = folder, {"type": "nfs", "source": "10.0.0.9:/v"}
+    started: list[int] = []
+    gate = asyncio.Event()
+
+    async def hanging(func, *args):  # noqa: ANN001, ANN201
+        started.append(1)
+        await gate.wait()
+        return ""
+
+    monkeypatch.setattr(recorder.env, "run", hanging)
+    monkeypatch.setattr(rec, "STORAGE_CHECK_S", 0.01)
+
+    async def scenario() -> tuple[int, str]:
+        await recorder._check()  # noqa: SLF001
+        await recorder._check()  # noqa: SLF001
+        why = recorder.why
+        gate.set()
+        await asyncio.sleep(0)
+        return len(started), why
+
+    count, why = asyncio.run(scenario())
+    assert count == 1 and "не отвечает" in why
+
+
 def test_незакрытое_окно_закрывается_сроком(tmp_path: Path) -> None:
     camera = _camera(tmp_path)
     camera.on_event(_frame('IsMotion" Value="true', 1000))

@@ -395,6 +395,8 @@ class Recorder:
         self._api_task: asyncio.Task[None] | None = None
         self._specs: list[CameraSpec] = []
         self._supervisor: asyncio.Task[None] | None = None
+        # Идущая проба хранилища (монтирование и каталог): вторая поверх висящей не заводится.
+        self._checking: asyncio.Future[str] | None = None
 
     def apply(self, config: dict[str, Any] | None) -> None:
         # ⚠ Служба на петле — всегда, а не только при записи: папку хранилища выбирают ДО записи.
@@ -462,15 +464,26 @@ class Recorder:
                 LOGGER.warning("Запись камер: проверка не прошла: %s", err)
             await asyncio.sleep(CLEAN_EVERY_S)
 
+    def _storage_check(self) -> str:
+        """Смонтировать, если пропало, и проверить каталог — одним блокирующим вызовом (исполнитель)."""
+        problem = storage.mount(self.mount) if self.mount else ""
+        return problem or self.problem()
+
     async def _check(self) -> None:
         async with self._lock:
             # Диск или сетевая папка дома: смонтировать, если пропали (NAS после сбоя сети, USB
             # переподключили, контейнер перезапустился — монтирование живёт до его остановки).
+            # ⚠ Проба — ОДНА за раз: `mount(2)` к пропавшему NAS держит поток исполнителя минутами, а
+            # срок ожидания его не снимает. Новая проба каждую минуту поверх висящей исчерпала бы
+            # пул потоков HA — не только запись (ревью хранилища 2026-10-23).
+            if self._checking is None or self._checking.done():
+                self._checking = asyncio.ensure_future(self.env.run(self._storage_check))
             try:
-                problem = await asyncio.wait_for(self.env.run(storage.mount, self.mount), STORAGE_CHECK_S) if self.mount else ""
-                problem = problem or await asyncio.wait_for(self.env.run(self.problem), STORAGE_CHECK_S)
+                problem = await asyncio.wait_for(asyncio.shield(self._checking), STORAGE_CHECK_S)
             except asyncio.TimeoutError:
                 problem = "хранилище не отвечает (сетевая папка недоступна?)"
+            except Exception as err:  # noqa: BLE001 — отказ ФС (stat по мёртвой точке) — это причина, не падение
+                problem = f"хранилище не отвечает: {err}"
             if problem:
                 if problem != self.why:
                     LOGGER.warning("Запись камер: %s", problem)
