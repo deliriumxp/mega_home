@@ -57,7 +57,7 @@ RAM_DIR = Path("/dev/shm")
 # Кэш «по движению» на камеру: запас до события плюс кусок в работе (~4 Мбит/с, с запасом).
 RAM_PER_CAMERA = 64 * 1024**2
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_NAME = re.compile(r"^(\d{6})-(\d+)\.mkv$")
+SEGMENT_NAME = re.compile(r"^(\d{6})-(\d+)\.mkv$")
 
 
 @dataclass(frozen=True)
@@ -145,7 +145,7 @@ def segments_of(root: Path, camera: str, start: float, stop: float) -> list[tupl
         if not folder.is_dir():
             continue
         for item in folder.iterdir():
-            match = _NAME.match(item.name)
+            match = SEGMENT_NAME.match(item.name)
             begin = epoch_of(f"{folder.name.replace('-', '')}T{match.group(1)}") if match else None
             if begin is None:
                 continue

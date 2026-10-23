@@ -124,30 +124,37 @@ def test_служба_отдаёт_дни_участки_и_список(tmp_pat
     recorder.storage = tmp_path
     recorder.cameras = {"onvif-aa": _camera(tmp_path)}
 
-    async def scenario() -> tuple[dict, dict, dict, int, int]:
+    async def scenario() -> tuple[dict, dict, dict, int, int, dict, int]:
         runner = await start_api(recorder)
         try:
             port = services.resolve(rec.SERVICE)
             assert port
             async with TestClient(TestServer(runner.app)) as client:
                 days = await (await client.get("/days?camera=onvif-aa")).json()
+                # Сутки зрителя UTC+13 (полдень UTC — уже следующие местные сутки).
+                local = await (await client.get("/days?camera=onvif-aa&offset=46800")).json()
+                frame = (await client.get(f"/frame?camera=onvif-aa&at={int((base + 3600) * 1000)}")).status
                 segments = await (await client.get(f"/segments?camera=onvif-aa&from={base}&to={base + 120}")).json()
                 play = await (await client.post(f"/playlist?camera=onvif-aa&at={int((base + 15) * 1000)}")).json()
                 missing = (await client.post(f"/playlist?camera=onvif-aa&at={int((base + 3600) * 1000)}")).status
                 foreign = (await client.get("/days?camera=chuzhaya")).status
-                return days, segments, play, missing, foreign
+                return days, segments, play, missing, foreign, local, frame
         finally:
             await runner.cleanup()
             services.unregister(rec.SERVICE)
 
-    days, segments, play, missing, foreign = asyncio.run(scenario())
+    days, segments, play, missing, foreign, local, frame = asyncio.run(scenario())
     assert days == {"days": ["2026-10-23"]}
     ms = int(base * 1000)
     # Три куска подряд — один участок, кусок через 30 с пустоты — второй.
     assert segments == {"segments": [[ms, ms + 30_000], [ms + 60_000, ms + 70_000]]}
     assert play["startMs"] == ms + 15_000
     assert play["parts"][0] == [ms + 15_000, 5_000]
-    assert len(play["parts"]) == 3
+    # Список — только непрерывный участок; где запись продолжается — `nextMs`.
+    assert len(play["parts"]) == 2
+    assert play["nextMs"] == ms + 60_000
+    assert local == {"days": ["2026-10-24"]}
+    assert frame == 404
     path = play["source"].split("ffmpeg:", 1)[1].split("#", 1)[0]
     text = Path(path).read_text()
     assert text.startswith("ffconcat version 1.0\n") and "inpoint 5.000" in text
