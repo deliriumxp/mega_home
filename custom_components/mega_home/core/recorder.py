@@ -58,6 +58,8 @@ RAM_DIR = Path("/dev/shm")
 RAM_PER_CAMERA = 64 * 1024**2
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SEGMENT_NAME = re.compile(r"^(\d{6})-(\d+)\.mkv$")
+# Путь хранилища уходит строкой в список ffconcat (`file '…'`) и в источник go2rtc (`#` — разделитель).
+_PATH = re.compile(r"^/[A-Za-z0-9_./-]+$")
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,10 @@ class CameraSpec:
     events: str
     on: tuple[str, ...]
     off: tuple[str, ...]
+    # Ответ режется на сообщения по `split`; смены считаются только в сообщениях, где есть одна
+    # из подстрок `require` (тема движения) — `State` несут и темы «темно», «закрыли объектив».
+    split: str
+    require: tuple[str, ...]
 
 
 def camera_specs(section: Any) -> list[CameraSpec]:
@@ -99,6 +105,8 @@ def camera_specs(section: Any) -> list[CameraSpec]:
                 events=str(motion.get("source") or ""),
                 on=tuple(str(s) for s in motion.get("on") or [] if s),
                 off=tuple(str(s) for s in motion.get("off") or [] if s),
+                split=str(motion.get("split") or ""),
+                require=tuple(str(s) for s in motion.get("require") or [] if s),
             )
         )
     return out
@@ -106,8 +114,8 @@ def camera_specs(section: Any) -> list[CameraSpec]:
 
 def storage_problem(path: Path) -> str:
     """Почему писать сюда нельзя; пусто — можно."""
-    if not path.is_absolute():
-        return f"путь хранилища «{path}» должен быть абсолютным"
+    if not path.is_absolute() or not _PATH.match(str(path)):
+        return f"путь хранилища «{path}» — абсолютный, из латиницы, цифр и знаков _ . - /"
     if not path.is_dir():
         return f"нет каталога хранилища {path}: подключите диск или сетевую папку"
     if not os.path.ismount(path) and not (path / STORAGE_MARK).exists():
@@ -160,6 +168,7 @@ class _Camera:
 
     def __init__(self, recorder: Recorder, spec: CameraSpec, cache: Path) -> None:
         self.rec, self.spec, self.cache = recorder, spec, cache / spec.id
+        self.task: asyncio.Task[None] | None = None
         self.why = ""
         self.last_saved = 0.0
         self.saved = 0
@@ -179,7 +188,12 @@ class _Camera:
             except Exception as err:  # noqa: BLE001 — камера не роняет запись остальных
                 self.why = f"запись не идёт: {err}"
                 LOGGER.warning("Запись %s: %s", self.spec.id, err)
-            await self._collect(final=True)
+            # ⚠ Дописать начатое — тоже внутри защиты: отказ диска (ENOSPC, EIO, EROFS) иначе
+            # ронял бы задачу камеры насовсем, и записи не было бы до перезапуска HA.
+            try:
+                await self._collect(final=True)
+            except Exception as err:  # noqa: BLE001
+                self.why = f"кусок не сохранился: {err}"
             await asyncio.sleep(RESTART_S)
 
     async def _register(self) -> None:
@@ -251,6 +265,10 @@ class _Camera:
                 await self.rec.env.run(path.unlink, True)
 
     def _save(self, path: Path, start: float, length: float) -> None:
+        # ⚠ Перед КАЖДЫМ куском: отвалившийся диск оставляет пустой каталог на флеше контроллера.
+        problem = storage_problem(self.rec.storage)
+        if problem:
+            raise OSError(problem)
         folder = self.rec.storage / self.spec.id / day_of(start)
         folder.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%H%M%S", time.gmtime(start))
@@ -266,23 +284,40 @@ class _Camera:
         return False
 
     def on_event(self, frame: dict[str, Any]) -> None:
-        """Ответ источника событий: последнее слово в теле решает — началось или кончилось."""
+        """Ответ источника событий: смены «началось/кончилось» по порядку, каждая — своим шагом.
+
+        ⚠ Не «последнее слово решает»: короткое движение между двумя опросами приходит одним
+        ответом «началось, кончилось», и по последнему слову окна не было бы вовсе.
+        """
         if frame.get("access") != self.spec.access or frame.get("source") != self.spec.events:
             return
         data = frame.get("data") if isinstance(frame.get("data"), dict) else {}
         text = str(data.get("text") or "")
         at = float(frame.get("at") or time.time())
-        on = max((text.rfind(s) for s in self.spec.on), default=-1)
-        off = max((text.rfind(s) for s in self.spec.off), default=-1)
+        for message in text.split(self.spec.split) if self.spec.split else [text]:
+            if self.spec.require and not any(word in message for word in self.spec.require):
+                continue
+            marks = sorted(
+                [(m.start(), True) for word in self.spec.on for m in re.finditer(re.escape(word), message)]
+                + [(m.start(), False) for word in self.spec.off for m in re.finditer(re.escape(word), message)]
+            )
+            for _pos, on in marks:
+                self._step(on, at)
+        self._expire(at)
+
+    def _step(self, on: bool, at: float) -> None:
         open_ = self.windows[-1] if self.windows and self.windows[-1][1] is None else None
-        if on > off:
+        if on:
             if open_ is None:
                 self.windows.append([at, None, at])
             else:
                 open_[2] = at
-        elif off > on and open_ is not None:
+        elif open_ is not None:
             open_[1] = at
-        self._expire(at)
+        else:
+            # «Кончилось» без открытого окна — движение уложилось между опросами: окно-точка,
+            # запас до и после сохранит его куски.
+            self.windows.append([at, at, at])
 
     def _expire(self, now: float) -> None:
         for window in self.windows:
@@ -314,9 +349,10 @@ class Recorder:
         self._tasks: list[asyncio.Task[None]] = []
         self.cameras: dict[str, _Camera] = {}
         self.storage = Path("/")
-        self.cache = Path("/")
         self.why = ""
         self._api: Any = None
+        self._specs: list[CameraSpec] = []
+        self._supervisor: asyncio.Task[None] | None = None
 
     def apply(self, config: dict[str, Any] | None) -> None:
         section = (config or {}).get("recorder") if isinstance((config or {}).get("recorder"), dict) else None
@@ -333,54 +369,94 @@ class Recorder:
     async def _reconfigure(self, section: dict[str, Any] | None) -> None:
         async with self._lock:
             await self._stop_all()
-            specs = camera_specs(section)
-            if not section or not specs:
-                self.why = ""
-                return
-            self.storage = Path(str(section.get("storage") or ""))
-            self.why = await self.env.run(storage_problem, self.storage)
-            if self.why:
-                LOGGER.warning("Запись камер: %s", self.why)
-                return
-            self.cache = await self.env.run(self._cache_dir, sum(1 for s in specs if s.motion_mode))
-            from .recorder_api import start_api  # noqa: PLC0415 — веб-сервер только при записи
+            self._specs = camera_specs(section)
+            self.storage = Path(str((section or {}).get("storage") or ""))
+            self.why = ""
+            if self._specs:
+                self._supervisor = self.env.spawn(self._supervise(), "mega_home: запись камер, сторож")
 
-            self._api = await start_api(self)
-            self.cameras = {spec.id: _Camera(self, spec, self.cache) for spec in specs}
-            self._unsubscribe = self._subscribe(self._on_event)
+    async def _supervise(self) -> None:
+        """Сторож записи: раз в минуту — хранилище, камеры и уборка.
+
+        ⚠ Без него запись не переживала бы ничего: конфиг приходит раз в 15 минут и только
+        при смене, а диск отваливается (NAS после сбоя сети HA сам не монтирует), монтируется
+        позже старта HA, и задача камеры может упасть.
+        """
+        while True:
+            try:
+                await self._check()
+            except Exception as err:  # noqa: BLE001 — сторож не умирает от одного прохода
+                LOGGER.warning("Запись камер: проверка не прошла: %s", err)
+            await asyncio.sleep(CLEAN_EVERY_S)
+
+    async def _check(self) -> None:
+        async with self._lock:
+            problem = await self.env.run(storage_problem, self.storage)
+            if problem:
+                if problem != self.why:
+                    LOGGER.warning("Запись камер: %s", problem)
+                self.why = problem
+                # Писать некуда — камеры стоят; начатое в кэше не переносим на флеш.
+                await self._stop_cameras(collect=False)
+                return
+            self.why = ""
+            if not self.cameras:
+                await self._start_cameras()
             for camera in self.cameras.values():
-                self._tasks.append(self.env.spawn(camera.run(), f"mega_home: запись {camera.spec.id}"))
-            self._tasks.append(self.env.spawn(self._clean_loop(), "mega_home: уборка записи"))
+                if camera.task is None or camera.task.done():
+                    camera.task = self.env.spawn(camera.run(), f"mega_home: запись {camera.spec.id}")
+        await self.env.run(clean, self.storage, list(self.cameras.values()), time.time())
 
-    async def _stop_all(self) -> None:
+    async def _start_cameras(self) -> None:
+        from .recorder_api import start_api  # noqa: PLC0415 — веб-сервер только при записи
+
+        ram = await self.env.run(self._ram_cache, sum(1 for s in self._specs if s.motion_mode))
+        disk = self.storage / ".cache"
+        await self.env.run(lambda: disk.mkdir(exist_ok=True))
+        self._api = await start_api(self)
+        self.cameras = {
+            spec.id: _Camera(self, spec, ram if spec.motion_mode and ram is not None else disk) for spec in self._specs
+        }
+        self._unsubscribe = self._subscribe(self._on_event)
+
+    async def _stop_cameras(self, collect: bool) -> None:
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
-        tasks, self._tasks = self._tasks, []
+        tasks = [c.task for c in self.cameras.values() if c.task is not None]
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        for camera in self.cameras.values():
-            await camera._collect(final=True)  # noqa: SLF001 — дописать начатое до остановки
+        await asyncio.gather(*[t for t in tasks if isinstance(t, asyncio.Future)], return_exceptions=True)
+        for camera in self.cameras.values() if collect else []:
+            try:
+                await camera._collect(final=True)  # noqa: SLF001 — дописать начатое до остановки
+            except Exception as err:  # noqa: BLE001
+                LOGGER.warning("Запись %s: начатое не сохранилось: %s", camera.spec.id, err)
         self.cameras = {}
         services.unregister(SERVICE)
         if self._api is not None:
             await self._api.cleanup()
             self._api = None
 
-    def _cache_dir(self, motion_cameras: int) -> Path:
-        """Кэш кусков: память, если её хватает камерам «по движению», иначе само хранилище.
+    async def _stop_all(self) -> None:
+        supervisor, self._supervisor = self._supervisor, None
+        if supervisor is not None:
+            supervisor.cancel()
+            if isinstance(supervisor, asyncio.Future):
+                await asyncio.gather(supervisor, return_exceptions=True)
+        await self._stop_cameras(collect=True)
 
-        ⚠ Для постоянной записи — всегда хранилище: перенос внутри одной файловой системы —
-        переименование, а из памяти — копия каждого куска.
+    def _ram_cache(self, motion_cameras: int) -> Path | None:
+        """Кэш камер «по движению» в памяти, если её хватает; нет — их кэш на диске хранилища.
+
+        ⚠ Постоянная запись — всегда кэш на диске хранилища: перенос внутри одной файловой
+        системы — переименование, а из памяти — копия каждого куска.
         """
-        if motion_cameras and RAM_DIR.is_dir():
-            free = shutil.disk_usage(RAM_DIR).free
-            if free >= motion_cameras * RAM_PER_CAMERA:
-                path = RAM_DIR / "mega_home_rec"
-                path.mkdir(exist_ok=True)
-                return path
-        path = self.storage / ".cache"
+        if not motion_cameras or not RAM_DIR.is_dir():
+            return None
+        if shutil.disk_usage(RAM_DIR).free < motion_cameras * RAM_PER_CAMERA:
+            return None
+        path = RAM_DIR / "mega_home_rec"
         path.mkdir(exist_ok=True)
         return path
 
@@ -405,20 +481,11 @@ class Recorder:
                 proc.kill()
             return 0.0
 
-    async def _clean_loop(self) -> None:
-        while True:
-            try:
-                await self.env.run(clean, self.storage, list(self.cameras.values()), time.time())
-            except Exception as err:  # noqa: BLE001 — уборка не роняет запись
-                LOGGER.warning("Запись камер: уборка не прошла: %s", err)
-            await asyncio.sleep(CLEAN_EVERY_S)
-
     def state(self) -> dict[str, Any]:
-        enabled = self._key not in (None, "null")
         return {
-            "enabled": enabled,
-            "storage": str(self.storage) if self.cameras else None,
-            "cache": str(self.cache) if self.cameras else None,
+            "enabled": self._key not in (None, "null"),
+            "storage": str(self.storage) if self._specs else None,
+            "cache": sorted({str(c.cache.parent) for c in self.cameras.values()}) or None,
             "why": self.why,
             "cameras": {cid: camera.state() for cid, camera in self.cameras.items()},
         }

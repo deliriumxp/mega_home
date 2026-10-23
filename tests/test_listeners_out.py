@@ -254,6 +254,9 @@ def test_полный_адрес_в_path_даёт_только_путь_на_х�
     call = lo._call(_descriptor(), {"path": "{carry.a}"}, {"carry.a": "http://evil.example:9/x/y?id=3"})
     assert call["path"] == "/x/y?id=3"
     assert call["url"] == "http://10.0.0.1:8080/x/y?id=3"
+    # Тот же хост на своём порту (сервис событий камеры) — порт из ответа.
+    same = lo._call(_descriptor(), {"path": "{carry.a}"}, {"carry.a": "http://10.0.0.1:8899/onvif/sub?id=1"})
+    assert same["url"] == "http://10.0.0.1:8899/onvif/sub?id=1"
 
 
 def test_pullpoint_адрес_из_xml_тишина_не_публикуется_отказ_входит_заново(monkeypatch) -> None:

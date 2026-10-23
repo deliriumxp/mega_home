@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -57,14 +58,17 @@ def test_раздел_берёт_только_полные_камеры_с_бе�
     assert rec.camera_specs(None) == []
 
 
-def test_хранилище_без_диска_не_пишется(tmp_path: Path) -> None:
-    folder = tmp_path / "video"
+def test_хранилище_без_диска_не_пишется() -> None:
+    # Свой каталог: путь хранилища — только латиница (уходит в ffconcat и строку go2rtc), а в
+    # `tmp_path` pytest — имя теста кириллицей.
+    folder = Path(tempfile.mkdtemp(prefix="rec-")) / "video"
     assert "нет каталога" in rec.storage_problem(folder)
     folder.mkdir()
     assert "не смонтирован" in rec.storage_problem(folder)
     (folder / rec.STORAGE_MARK).touch()
     assert rec.storage_problem(folder) == ""
-    assert "абсолютным" in rec.storage_problem(Path("video"))
+    assert "абсолютный" in rec.storage_problem(Path("video"))
+    assert "абсолютный" in rec.storage_problem(Path("/media/vid'eo#x"))
 
 
 def test_окно_движения_с_запасом_до_и_после(tmp_path: Path) -> None:
@@ -81,12 +85,45 @@ def test_окно_движения_с_запасом_до_и_после(tmp_path
     assert not camera.wanted(1200, 1210, now=1210)
 
 
-def test_последнее_слово_в_пачке_решает(tmp_path: Path) -> None:
+def test_короткое_движение_в_одном_ответе_сохраняется(tmp_path: Path) -> None:
+    """«Началось, кончилось» одним ответом (движение между двумя опросами) — окно-точка с запасом."""
     camera = _camera(tmp_path)
     camera.on_event(_frame('IsMotion" Value="true … IsMotion" Value="false', 1000))
-    assert camera.windows == []
-    camera.on_event(_frame('IsMotion" Value="false … IsMotion" Value="true', 1000))
+    assert camera.windows == [[1000, 1000, 1000]]
+    assert camera.wanted(985, 995, now=1100)
+    camera.on_event(_frame('IsMotion" Value="false … IsMotion" Value="true', 1050))
     assert camera.windows[-1][1] is None
+
+
+def test_смены_считаются_только_в_сообщениях_темы_движения(tmp_path: Path) -> None:
+    """`State` несут и «темно», и «закрыли объектив»: без темы движения окна нет."""
+    camera = _camera(tmp_path, split="NotificationMessage", require=("/Motion<", "MotionAlarm<"))
+    dark = '<NotificationMessage><Topic>tns1:VideoSource/ImageTooDark</Topic><x Name="IsMotion" Value="true"/>'
+    camera.on_event(_frame(dark, 1000))
+    assert camera.windows == []
+    motion = '<NotificationMessage><Topic>tns1:VideoSource/MotionAlarm</Topic><x Name="IsMotion" Value="true"/>'
+    camera.on_event(_frame(dark + motion, 1010))
+    assert camera.windows[-1][:2] == [1010, None]
+
+
+def test_сторож_останавливает_запись_без_диска_и_поднимает_с_ним() -> None:
+    folder = Path(tempfile.mkdtemp(prefix="rec-"))
+    recorder = rec.Recorder(FakeHost(folder), lambda _listener: (lambda: None))
+    recorder._specs = rec.camera_specs({**SECTION, "storage": str(folder)})  # noqa: SLF001
+    recorder.storage = folder
+
+    async def scenario() -> tuple[str, int, str, int]:
+        await recorder._check()  # noqa: SLF001
+        without = (recorder.why, len(recorder.cameras))
+        (folder / rec.STORAGE_MARK).touch()
+        await recorder._check()  # noqa: SLF001
+        with_disk = (recorder.why, len(recorder.cameras))
+        await recorder._stop_all()  # noqa: SLF001
+        return (*without, *with_disk)
+
+    why_without, cams_without, why_with, cams_with = asyncio.run(scenario())
+    assert "не смонтирован" in why_without and cams_without == 0
+    assert why_with == "" and cams_with == 1
 
 
 def test_незакрытое_окно_закрывается_сроком(tmp_path: Path) -> None:
@@ -118,13 +155,13 @@ def test_индекс_и_уборка_по_сроку(tmp_path: Path) -> None:
 def test_служба_отдаёт_дни_участки_и_список(tmp_path: Path) -> None:
     base = rec.epoch_of("20261023T120000")
     assert base is not None
-    for offset in (0, 10, 20, 60):
+    for offset in (0, 10, 20, 60, 6 * 3600):
         _segment(tmp_path, "onvif-aa", base + offset)
     recorder = rec.Recorder(FakeHost(tmp_path), lambda _listener: (lambda: None))
     recorder.storage = tmp_path
     recorder.cameras = {"onvif-aa": _camera(tmp_path)}
 
-    async def scenario() -> tuple[dict, dict, dict, int, int, dict, int]:
+    async def scenario() -> tuple[dict, dict, dict, int, int, dict, int, dict]:
         runner = await start_api(recorder)
         try:
             port = services.resolve(rec.SERVICE)
@@ -136,18 +173,21 @@ def test_служба_отдаёт_дни_участки_и_список(tmp_pat
                 frame = (await client.get(f"/frame?camera=onvif-aa&at={int((base + 3600) * 1000)}")).status
                 segments = await (await client.get(f"/segments?camera=onvif-aa&from={base}&to={base + 120}")).json()
                 play = await (await client.post(f"/playlist?camera=onvif-aa&at={int((base + 15) * 1000)}")).json()
-                missing = (await client.post(f"/playlist?camera=onvif-aa&at={int((base + 3600) * 1000)}")).status
+                missing = (await client.post(f"/playlist?camera=onvif-aa&at={int((base + 7 * 3600) * 1000)}")).status
+                # После участка — пустота длиннее окна списка: продолжение всё равно названо.
+                night = await (await client.post(f"/playlist?camera=onvif-aa&at={int((base + 65) * 1000)}")).json()
                 foreign = (await client.get("/days?camera=chuzhaya")).status
-                return days, segments, play, missing, foreign, local, frame
+                return days, segments, play, missing, foreign, local, frame, night
         finally:
             await runner.cleanup()
             services.unregister(rec.SERVICE)
 
-    days, segments, play, missing, foreign, local, frame = asyncio.run(scenario())
+    days, segments, play, missing, foreign, local, frame, night = asyncio.run(scenario())
+    assert night["nextMs"] == int((base + 6 * 3600) * 1000)
     assert days == {"days": ["2026-10-23"]}
     ms = int(base * 1000)
     # Три куска подряд — один участок, кусок через 30 с пустоты — второй.
-    assert segments == {"segments": [[ms, ms + 30_000], [ms + 60_000, ms + 70_000]]}
+    assert segments["segments"][:2] == [[ms, ms + 30_000], [ms + 60_000, ms + 70_000]]
     assert play["startMs"] == ms + 15_000
     assert play["parts"][0] == [ms + 15_000, 5_000]
     # Список — только непрерывный участок; где запись продолжается — `nextMs`.

@@ -162,11 +162,14 @@ def _call(descriptor: DeviceDescriptor, block: dict[str, Any], values: dict[str,
     elif isinstance(body, str) and body:
         raw = render(body, values).encode()
     path = render(str(block.get("path") or "/"), values)
+    port = descriptor.port
     if path.startswith(("http://", "https://")):
         # Адрес, который устройство выдало ответом (подписка PullPoint: полный URL
-        # в `carry`), — берётся только путь: хост и порт остаются из описания
-        # устройства, чужой адрес из ответа дом не открывает.
+        # в `carry`), — берётся путь, а порт — только у ТОГО ЖЕ хоста (сервис событий
+        # камеры бывает на своём порту): чужой адрес из ответа дом не открывает.
         parts = urlsplit(path)
+        if parts.hostname == descriptor.host and parts.port:
+            port = parts.port
         path = f"{parts.path or '/'}{'?' + parts.query if parts.query else ''}"
     if isinstance(block.get("params"), dict):
         query = urlencode(_render_obj(block["params"], values), quote_via=quote)
@@ -176,7 +179,7 @@ def _call(descriptor: DeviceDescriptor, block: dict[str, Any], values: dict[str,
     return {
         "method": str(block.get("method") or "GET").upper(),
         "path": path,
-        "url": f"{'https' if descriptor.tls else 'http'}://{descriptor.host}:{descriptor.port}{path}",
+        "url": f"{'https' if descriptor.tls else 'http'}://{descriptor.host}:{port}{path}",
         "headers": headers,
         "body": raw,
         "basic": aiohttp.BasicAuth(auth.user, auth.password) if auth.type == "basic" else None,

@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 JOIN_GAP_S = 1.5
 # Сколько записи вперёд кладётся в один список: дальше — новый список перемоткой.
 PLAYLIST_S = 3 * 3600
+# Насколько далеко за участком искать продолжение записи.
+NEXT_LOOKUP_S = 2 * 24 * 3600
 _DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _RECORDER: web.AppKey[Any] = web.AppKey("recorder")
 _FRAMES = asyncio.Semaphore(2)
@@ -128,6 +130,12 @@ async def _playlist(request: web.Request) -> web.Response:
             break
         run.append(piece)
     following = found[len(run)] if len(found) > len(run) else None
+    if following is None:
+        # Пустота длиннее окна списка (по движению — ночь): где запись продолжается, ищем дальше,
+        # иначе просмотр стоял бы на последнем кадре, не зная, что дальше записи нет или она есть.
+        end = run[-1][0] + run[-1][1]
+        later = await recorder.env.run(segments_of, recorder.storage, camera, end + JOIN_GAP_S, end + NEXT_LOOKUP_S)
+        following = next((s for s in later if s[0] > end + JOIN_GAP_S), None)
     inpoint = max(at - run[0][0], 0.0)
     lines = ["ffconcat version 1.0"]
     for index, (_begin, _length, path) in enumerate(run):
