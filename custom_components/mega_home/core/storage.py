@@ -214,7 +214,10 @@ def mount(spec: dict[str, Any], target: Path = MOUNT_POINT) -> str:
     except (ValueError, OSError) as err:
         return str(err)
     current = mounted().get(str(target))
-    if current is not None and current[0] == device:
+    # ⚠ Без хвостовой «/»: ядро показывает источник в /proc/mounts без неё, а настройка менеджера
+    # может её содержать — с ложным несовпадением сторож записи (раз в минуту) отмонтировал бы
+    # рабочий NAS посреди записи.
+    if current is not None and current[0].rstrip("/") == device.rstrip("/"):
         return ""
     if current is not None:
         unmount(target)

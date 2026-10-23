@@ -176,6 +176,20 @@ def test_монтирование_и_отказ_ядра_словами(tmp_path
     assert done.calls == []
 
 
+def test_уже_смонтированная_папка_с_косой_чертой_на_конце_не_перемонтируется(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # ⚠ Ядро показывает источник в /proc/mounts без хвостовой «/», а сторож записи зовёт `mount`
+    # раз в минуту: с хвостом в настройке сравнение было ложным, и дом каждую минуту отмонтировал
+    # NAS посреди записи («диск хранилища не смонтирован», пропавшие куски).
+    point = tmp_path / "point"
+    libc = _FakeLibc(0)
+    monkeypatch.setattr(storage, "_libc", lambda: libc)
+    monkeypatch.setattr(storage, "mounted", lambda: {str(point): ("//10.0.0.2/demo/rectest", "cifs")})
+    monkeypatch.setattr(storage.socket, "gethostbyname", lambda host: host)
+    for source in ("//10.0.0.2/demo/rectest/", "//10.0.0.2/demo/rectest//", "//10.0.0.2/demo/rectest"):
+        assert storage.mount({"type": "cifs", "source": source}, point) == ""
+    assert libc.calls == []
+
+
 def test_служба_отдаёт_папки_и_подключает_для_выбора(roots: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     recorder = rec.Recorder(FakeHost(roots), lambda _listener: (lambda: None))
     mounts: list[tuple[dict, Path]] = []
