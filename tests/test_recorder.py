@@ -285,6 +285,81 @@ def test_готовность_и_длительность_куска_по_спи
     assert [b for b, _n, _p in camera.index.between(0, 2e9)] == [rec.epoch_of("20261023T120000"), rec.epoch_of("20261023T120010"), rec.epoch_of("20261023T120020")]
 
 
+def _saving_camera(folder: Path) -> rec._Camera:  # noqa: SLF001
+    """Камера постоянной записи на «локальном диске» с лимитом: иначе `_save` откажет."""
+    camera = _camera(folder, motion_mode=False)
+    camera.rec.local, camera.rec.limit, camera.rec.ffmpeg = True, 1024**3, "/usr/bin/ffmpeg"
+    camera.cache.mkdir(parents=True)
+    return camera
+
+
+def test_кадр_к_куску_лежит_рядом_и_учтён_в_объёме() -> None:
+    """Кадр превью снимается из сохранённого куска, лежит рядом тем же именем и входит в объём
+    дня — лимит «локального диска» считает и кадры."""
+    folder = Path(tempfile.mkdtemp(prefix="rec-"))
+    camera = _saving_camera(folder)
+    piece = camera.cache / "20261023T120000.mkv"
+    piece.write_bytes(b"x" * 5000)
+    calls: list[tuple[Path, Path, str]] = []
+
+    def extract(path: Path, out: Path, binary: str) -> int:
+        calls.append((path, out, binary))
+        out.write_bytes(b"j" * 1234)
+        return 1234
+
+    camera.rec.extract_frame = extract
+    start = rec.epoch_of("20261023T120000")
+    assert start is not None
+    camera._save(piece, start, 10.0)  # noqa: SLF001
+    target = folder / "onvif-aa" / "2026-10-23" / "120000-10000.mkv"
+    assert target.is_file() and target.with_suffix(".jpg").stat().st_size == 1234
+    assert calls == [(target, target.with_suffix(".jpg"), "/usr/bin/ffmpeg")]
+    assert camera.index.size() == 5000 + 1234
+
+
+def test_кусок_сохраняется_без_кадра() -> None:
+    """Кадр не извлёкся (или ffmpeg нет) — кусок всё равно в архиве, слот спрайта просто пуст."""
+    folder = Path(tempfile.mkdtemp(prefix="rec-"))
+    camera = _saving_camera(folder)
+    start = rec.epoch_of("20261023T120000")
+    assert start is not None
+    camera.rec.extract_frame = lambda _path, _out, _binary: 0
+    (camera.cache / "a.mkv").write_bytes(b"x" * 10)
+    camera._save(camera.cache / "a.mkv", start, 10.0)  # noqa: SLF001
+    camera.rec.ffmpeg = ""
+    camera.rec.extract_frame = lambda _path, _out, _binary: pytest.fail("без ffmpeg кадр не снимается")
+    (camera.cache / "b.mkv").write_bytes(b"x" * 10)
+    camera._save(camera.cache / "b.mkv", start + 10, 10.0)  # noqa: SLF001
+    day = folder / "onvif-aa" / "2026-10-23"
+    assert sorted(p.name for p in day.iterdir()) == ["120000-10000.mkv", "120010-10000.mkv"]
+    assert camera.saved == 2 and camera.index.size() == 20
+
+
+def test_уборка_сносит_кадры_и_спрайты_дня(tmp_path: Path) -> None:
+    now = rec.epoch_of("20261023T120000")
+    assert now is not None
+    old = _segment(tmp_path, "onvif-aa", now - 5 * 24 * 3600)
+    old.with_suffix(".jpg").write_bytes(b"j")
+    sprites = old.parent / "sprites"
+    sprites.mkdir()
+    (sprites / "0010.jpg").write_bytes(b"s")
+    rec.clean(tmp_path, [_camera(tmp_path)], now)
+    assert not old.parent.exists()
+    # По лимиту: кадры уходят вместе с кусками и входят в объём после перезапуска (индекс с диска).
+    # Кусков больше шага уборки (60) — день не пустеет, и каталог дня кадры не уносит.
+    pieces = [_segment(tmp_path, "onvif-aa", now - 3600 + 10 * i) for i in range(61)]
+    for piece in pieces:
+        piece.write_bytes(b"x" * 100)
+        piece.with_suffix(".jpg").write_bytes(b"j" * 100)
+    camera = _camera(tmp_path)
+    camera.index.load(sizes=True)
+    assert camera.index.size() == 61 * 200
+    rec.clean(tmp_path, [camera], now, limit=61 * 200 - 1)
+    assert [p.with_suffix(".jpg").exists() for p in pieces] == [False] * 60 + [True]
+    assert [p.exists() for p in pieces] == [False] * 60 + [True]
+    assert camera.index.size() == 200
+
+
 def test_первичное_состояние_подписки_окна_не_открывает(tmp_path: Path) -> None:
     """`PropertyOperation="Initialized"` — состояние на момент входа в подписку, не смена: без
     `skip` каждый вход (перезапуск дома) с «движения нет» давал окно-точку и 30 с лишней записи."""
