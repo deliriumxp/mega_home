@@ -200,3 +200,92 @@ def test_апостроф_в_пути_кадра_не_ломает_список(
     _jpeg(frame, "white")
     image = compose([frame] + [None] * 59, FFMPEG, folder / "work")
     assert _probe(image) == (1600, 540) and _brightness(image, 0) > 200
+
+
+def test_досъёмка_находит_куски_без_кадра_день_за_днём_свежие_сначала(tmp_path: Path) -> None:
+    """Куски, записанные без кадра (до 0.5.26), — из самого свежего дня, где такие есть, свежие
+    сначала; снятые и пропущенные (`skip`) не возвращаются; у всех есть — пусто."""
+    day_old, day_new = time.mktime((2026, 10, 21, 12, 0, 0, 0, 0, 0)), time.mktime((2026, 10, 23, 12, 0, 0, 0, 0, 0))
+    old_a, old_b = _segment(tmp_path, day_old), _segment(tmp_path, day_old + 10)
+    new_a, new_b, new_c = _segment(tmp_path, day_new), _segment(tmp_path, day_new + 10), _segment(tmp_path, day_new + 20)
+    new_b.with_suffix(".jpg").write_bytes(b"j")
+    index = SegmentIndex(tmp_path / "cam")
+    index.load()
+
+    found = frames_mod.missing_frames([index], set())
+    assert [path for _index, _begin, path in found] == [new_c, new_a]
+    assert all(found_index is index for found_index, _begin, _path in found)
+    new_a.with_suffix(".jpg").write_bytes(b"j")
+    assert [p for _i, _b, p in frames_mod.missing_frames([index], {new_c})] == [old_b, old_a]
+    for path in (new_c, old_a, old_b):
+        path.with_suffix(".jpg").write_bytes(b"j")
+    assert frames_mod.missing_frames([index], set()) == []
+
+
+def test_досъёмка_по_одному_с_паузой_в_объём_дня_и_без_повтора_сорвавшегося(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Кадры снимаются по одному с паузой между ними, входят в объём дня; кадр, который не снялся, в
+    этом запуске не пробуется снова; когда кадры у всех — длинная пауза."""
+    base = time.mktime((2026, 10, 23, 12, 0, 0, 0, 0, 0))
+    pieces = [_segment(tmp_path, base + 10 * i) for i in range(3)]
+    index = SegmentIndex(tmp_path / "cam")
+    index.load(sizes=True)
+    before = index.size()
+    shots: list[Path] = []
+
+    def fake_frame(path: Path, out: Path, binary: str, nice: str) -> int:
+        shots.append(path)
+        assert (binary, nice) == ("/usr/bin/ffmpeg", "")
+        if path == pieces[1]:
+            return 0
+        out.write_bytes(b"j" * 7)
+        return 7
+
+    monkeypatch.setattr(frames_mod, "frame_of", fake_frame)
+    sleeps: list[float] = []
+
+    async def run(func, *args):  # noqa: ANN001, ANN202
+        return func(*args)
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        if sleeps.count(frames_mod.BACKFILL_IDLE_S) == 2:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(frames_mod.backfill(lambda: [index], lambda: ("/usr/bin/ffmpeg", ""), run, sleep))
+    assert shots == [pieces[2], pieces[1], pieces[0]]  # свежие сначала, сорвавшийся — один раз
+    assert sleeps == [frames_mod.BACKFILL_PAUSE_S] * 3 + [frames_mod.BACKFILL_IDLE_S] * 2
+    assert pieces[0].with_suffix(".jpg").is_file() and not pieces[1].with_suffix(".jpg").exists()
+    assert index.size() == before + 14
+
+
+def test_досъёмка_ждёт_ffmpeg_и_живёт_с_камерами() -> None:
+    """Без ffmpeg кадров не снимаем — ждём; задача досъёмки заводится со стартом камер и
+    снимается с их остановкой."""
+    sleeps: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        raise asyncio.CancelledError
+
+    async def run(func, *args):  # noqa: ANN001, ANN202
+        pytest.fail("без ffmpeg исполнитель не нужен")
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(frames_mod.backfill(lambda: [], lambda: ("", ""), run, sleep))
+    assert sleeps == [frames_mod.BACKFILL_IDLE_S]
+
+    folder = Path(tempfile.mkdtemp(prefix="rec-"))
+    host = FakeHost(folder)
+    recorder = rec.Recorder(host, lambda _listener: (lambda: None))
+    recorder._specs = rec.camera_specs({"storage": str(folder), "cameras": [{"id": "cam", "stream": "s", "source": "rtsp://x"}]})  # noqa: SLF001
+    recorder.storage = folder
+
+    async def scenario() -> tuple[bool, bool]:
+        await recorder._start_cameras()  # noqa: SLF001
+        started = recorder._frames is not None  # noqa: SLF001
+        await recorder._stop_cameras(collect=False)  # noqa: SLF001
+        return started, recorder._frames is None  # noqa: SLF001
+
+    assert asyncio.run(scenario()) == (True, True)
+    assert "mega_home: кадры к кускам записи" in host.spawned

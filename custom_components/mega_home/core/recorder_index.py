@@ -133,6 +133,13 @@ class SegmentIndex:
             day.size += size
         return self._path(name, begin, length_ms)
 
+    def account(self, begin: float, size: int) -> None:
+        """Кадр, снятый к куску позже сохранения (`recorder_frames.backfill`), — в объём его дня."""
+        with self._lock:
+            day = self._days.get(day_of(begin))
+            if day is not None:
+                day.size += size
+
     def days(self) -> list[tuple[str, float, float]]:
         """Дни с записью: (имя дня UTC, первое начало, последнее начало)."""
         with self._lock:

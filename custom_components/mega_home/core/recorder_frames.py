@@ -18,13 +18,14 @@
 
 from __future__ import annotations
 
+import calendar
 import contextlib
 import os
 import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from uuid import uuid4
 
 from .recorder_index import SegmentIndex, day_of
@@ -35,6 +36,11 @@ if TYPE_CHECKING:
 # Ширина кадра — ширина слота спрайта (160 × 90 у 16:9).
 FRAME_WIDTH = 160
 FRAME_TIMEOUT_S = 10
+# Досъёмка кадров к кускам без них (`backfill`): пауза между кадрами и между проходами, когда кадры
+# у всех. По одному с паузой — запись и показ идут на том же контроллере одновременно.
+BACKFILL_PAUSE_S = 0.5
+BACKFILL_IDLE_S = 600.0
+DAY_S = 86_400
 WINDOW_S, SLOT_S, COLS, ROWS, SLOT_W, SLOT_H = 600, 10, 10, 6, 160, 90
 # Окно закрыто, когда его конец старше этого. Кадр последнего куска окна появляется позже конца
 # окна на `pre_s` (10 с по умолчанию: кусок ждёт решения о движении) + `SEGMENT_S` (длина куска)
@@ -71,6 +77,51 @@ def frame_of(path: Path, out: Path, binary: str, nice: str = "") -> int:
     with contextlib.suppress(OSError):
         part.unlink(missing_ok=True)
     return 0
+
+
+def missing_frames(indexes: list[SegmentIndex], skip: set[Path]) -> list[tuple[SegmentIndex, float, Path]]:
+    """Куски без кадра у каждой камеры — из самого свежего её дня, где такие есть, свежие сначала;
+    пусто — кадры у всех. День за днём, а не весь архив разом: статистика каждого куска на сетевой папке
+    стоит времени, и день — ровно то, что обходится за один заход. `skip` — куски, у которых кадр не
+    снялся: второй раз в этом запуске не пробуем."""
+    out: list[tuple[SegmentIndex, float, Path]] = []
+    for index in indexes:
+        for name, _first, _last in reversed(index.days()):
+            start = float(calendar.timegm(time.strptime(name, "%Y-%m-%d")))
+            found = [
+                (index, begin, path)
+                for begin, _length, path in reversed(index.between(start, start + DAY_S))
+                if day_of(begin) == name and path not in skip and not path.with_suffix(".jpg").is_file()
+            ]
+            if found:
+                out.extend(found)
+                break
+    return out
+
+
+async def backfill(
+    indexes: Callable[[], list[SegmentIndex]],
+    tools: Callable[[], tuple[str, str]],
+    run: Callable[..., Awaitable[Any]],
+    sleep: Callable[[float], Awaitable[None]],
+) -> None:
+    """Кадры к кускам, записанным без них (запись до 0.5.26, сорвавшиеся снимки) — по одному, с паузой,
+    свежие сначала: спрайт нужен прежде всего у последних суток. Без ffmpeg — ждём: его ищут на старте
+    камер. Кадр в объём дня — как у снятого при сохранении (`SegmentIndex.account`)."""
+    skip: set[Path] = set()
+    while True:
+        binary, nice = tools()
+        pending = await run(missing_frames, indexes(), skip) if binary else []
+        if not pending:
+            await sleep(BACKFILL_IDLE_S)
+            continue
+        for index, begin, path in pending:
+            size = await run(frame_of, path, path.with_suffix(".jpg"), binary, nice)
+            if size:
+                index.account(begin, size)
+            else:
+                skip.add(path)
+            await sleep(BACKFILL_PAUSE_S)
 
 
 def window_start(at: float) -> float:

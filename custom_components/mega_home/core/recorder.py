@@ -43,7 +43,7 @@ from . import services, storage
 from .const import LOGGER
 from .go2rtc_embed import API_PORT, RTSP_PORT
 from .host import Host
-from .recorder_frames import frame_of, tools as frame_tools
+from .recorder_frames import backfill, frame_of, tools as frame_tools
 from .recorder_index import SegmentIndex, clean, day_of, epoch_of, segment_name
 
 SERVICE = "recorder"
@@ -403,6 +403,8 @@ class Recorder:
         self._api_task: asyncio.Task[None] | None = None
         self._specs: list[CameraSpec] = []
         self._supervisor: asyncio.Task[None] | None = None
+        # Досъёмка кадров к кускам без них (`recorder_frames.backfill`) — пока камеры запущены.
+        self._frames: asyncio.Task[None] | None = None
         # Идущая проба хранилища (монтирование и каталог): вторая поверх висящей не заводится.
         self._checking: asyncio.Future[str] | None = None
         # ffmpeg для кадров превью (пусто — кадров нет, куски пишутся); снятие кадра — шов спек.
@@ -519,12 +521,19 @@ class Recorder:
             spec.id: _Camera(self, spec, ram if spec.motion_mode and ram is not None else disk) for spec in self._specs
         }
         self._unsubscribe = self._subscribe(self._on_event)
+        self._frames = self.env.spawn(
+            backfill(lambda: [c.index for c in self.cameras.values()], lambda: (self.ffmpeg, self.nice), self.env.run, asyncio.sleep),
+            "mega_home: кадры к кускам записи",
+        )
 
     async def _stop_cameras(self, collect: bool) -> None:
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
         tasks = [c.task for c in self.cameras.values() if c.task is not None]
+        if self._frames is not None:
+            tasks.append(self._frames)
+            self._frames = None
         for task in tasks:
             task.cancel()
         await asyncio.gather(*[t for t in tasks if isinstance(t, asyncio.Future)], return_exceptions=True)
