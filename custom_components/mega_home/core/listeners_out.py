@@ -240,19 +240,23 @@ async def poll(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[s
             if setup_block is None:
                 return
             await do_teardown()
-            # ⚠ Устройство, только что закрывшее сессию, бывает недоступно секунды (стенд Tapo после
-            # `Unsubscribe` ~3 с отказывает в соединении): повтор здесь, а не перезапуск источника
-            # с предупреждением в журнале на каждом перезаходе.
+            # ⚠ Устройство, только что закрывшее сессию, бывает не готово секунды (стенд Tapo после
+            # `Unsubscribe` отказывает в соединении или отвечает на вход 400): повтор здесь, а не
+            # опрос с пустым адресом и перезапуск источника с предупреждением на каждом перезаходе.
             for attempt in range(SETUP_TRIES):
                 try:
                     status, _, setup_payload = await _request(session, descriptor, setup_block, values)
-                    break
                 except aiohttp.ClientConnectionError:
                     if attempt == SETUP_TRIES - 1:
                         raise
-                    await asyncio.sleep(SETUP_RETRY_S)
+                else:
+                    if status < 400:
+                        break
+                    if attempt == SETUP_TRIES - 1:
+                        raise ConnectionError(f"устройство отклонило вход ({status})")
+                await asyncio.sleep(SETUP_RETRY_S)
             carry(values, setup_block, setup_payload)
-            opened, renewed_at = status < 400, loop.time()
+            opened, renewed_at = True, loop.time()
 
         async def maybe_renew() -> None:
             """Продление — МЕЖДУ запросами опроса, а не своей задачей: устройство, которое держит
@@ -293,7 +297,17 @@ async def _poll_loop(
     while True:
         await maybe_renew()
         started = loop.time()
-        status, kind, payload = await _request(session, descriptor, spec, values)
+        try:
+            status, kind, payload = await _request(session, descriptor, spec, values)
+        except aiohttp.ClientConnectionError:
+            # Обрыв посреди сессии — сессии больше нет (стенд Tapo перезапускает службу событий
+            # через секунды после `Unsubscribe`): вход заново с его повторами. Устройство пропало —
+            # вход упадёт сам, и источник перезапустится с растущей паузой (`listeners._forever`).
+            if setup_block is None:
+                raise
+            await asyncio.sleep(pause)
+            await do_setup()
+            continue
         if resetup is not None and setup_block is not None and _resetup_matches(resetup, status, payload):
             # Отказ сессии — не событие жильцу (это состояние опроса, а не
             # устройства), и без него самого дом просто повторит запрос.

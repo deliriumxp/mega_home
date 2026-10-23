@@ -350,7 +350,7 @@ def _renew_run(monkeypatch, setup_status: int) -> list[str]:  # noqa: ANN001
     monkeypatch.setattr(lo, "_request", fake_request)
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(lo, "seconds", lambda value, default, low=0.1: float(value) if value is not None else default)
-    with pytest.raises(_Done):
+    with pytest.raises((_Done, ConnectionError)):
         asyncio.run(lo.poll(_Ctx(), _descriptor(), "events", spec))
     return log
 
@@ -358,11 +358,13 @@ def _renew_run(monkeypatch, setup_status: int) -> list[str]:  # noqa: ANN001
 def test_продление_между_запросами_опроса_и_только_открытой_подписки(monkeypatch) -> None:
     """Не своей задачей: камера с одним запросом за раз не держит продление до конца долгого опроса."""
     assert _renew_run(monkeypatch, 200) == ["setup", "renew 7", "pull", "renew 7", "pull", "renew 7"]
-    assert "renew 7" not in _renew_run(monkeypatch, 500)
+    # Вход отклонён и после повторов — источник падает с причиной, без опроса и продления пустого адреса.
+    assert _renew_run(monkeypatch, 500) == ["setup"] * lo.SETUP_TRIES
 
 
 def test_вход_повторяется_пока_устройство_поднимает_службу(monkeypatch) -> None:
-    """После `Unsubscribe` стенд Tapo ~3 с отказывает в соединении — вход ждёт, а не роняет источник."""
+    """После `Unsubscribe` стенд Tapo секунды отказывает в соединении или отвечает на вход 400 — вход
+    ждёт, а не роняет источник."""
     import aiohttp
 
     tries = 0
@@ -371,8 +373,10 @@ def test_вход_повторяется_пока_устройство_подн�
         nonlocal tries
         if block is _PULL_SPEC["setup"]:
             tries += 1
-            if tries < 3:
+            if tries == 1:
                 raise aiohttp.ClientConnectionError("refused")
+            if tries == 2:
+                return 400, "application/soap+xml", b"<Fault/>"
             return 200, "application/soap+xml", _CREATE
         raise _Done
 
@@ -384,3 +388,32 @@ def test_вход_повторяется_пока_устройство_подн�
     with pytest.raises(_Done):
         asyncio.run(lo.poll(_Ctx(), _descriptor(), "events", _PULL_SPEC))
     assert tries == 3
+
+
+def test_обрыв_посреди_сессии_входит_заново(monkeypatch) -> None:
+    """Устройство перезапустило службу между входом и опросом — новый вход, источник жив."""
+    import aiohttp
+
+    log: list[str] = []
+    setups = 0
+
+    async def fake_request(session, descriptor, block, values):  # noqa: ANN001
+        nonlocal setups
+        if block is _PULL_SPEC["setup"]:
+            setups += 1
+            log.append(f"setup{setups}")
+            return 200, "application/soap+xml", _CREATE.replace(b"id=0", f"id={setups}".encode())
+        if setups == 1:
+            log.append("drop")
+            raise aiohttp.ServerDisconnectedError()
+        log.append("pull " + lo._call(descriptor, block, values)["path"].rsplit("=", 1)[1])
+        raise _Done
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(lo, "_request", fake_request)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    with pytest.raises(_Done):
+        asyncio.run(lo.poll(_Ctx(), _descriptor(), "events", _PULL_SPEC))
+    assert log == ["setup1", "drop", "setup2", "pull 2"]
