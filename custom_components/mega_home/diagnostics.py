@@ -77,6 +77,8 @@ async def async_get_config_entry_diagnostics(
         # уезжала в журнал Home Assistant уровнем debug — то есть инсталлятору
         # оставалось слово «не поднят» без продолжения (живой отчёт 2026-09-13).
         "go2rtc": _go2rtc_state(),
+        # Запись камер: хранилище, кэш и у каждой камеры — почему не пишется, сколько сохранено.
+        "recorder": coordinator.recorder.state() if getattr(coordinator, "recorder", None) else None,
         # SIP-мост домофонии: включён ли конфигом, поднят ли, почему нет, сколько
         # шла установка пакетов (повторяется после каждого обновления образа HA).
         "sip_bridge": (

@@ -243,6 +243,8 @@ def config(coordinator: Any) -> dict[str, Any]:
             "routes": list(getattr(coordinator, "routes", [])),
             "devices": _devices(coordinator),
             "go2rtc": media,
+            # Запись камер (`recorder.py`): «почему не пишется» видят инсталлятор и бандл.
+            "recorder": coordinator.recorder.state() if getattr(coordinator, "recorder", None) else None,
             # Поднятые службы транспорта и есть ли у вызова к ним учётка дома: «служба
             # `ha` с учёткой» — ответ на «доступен ли бандлу API источника» (расписания).
             "services": {

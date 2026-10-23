@@ -207,3 +207,83 @@ def test_поток_событий_умеет_digest() -> None:
 
     events = asyncio.run(scenario())
     assert [event["text"] for event in events] == ["ok None", "событие"]
+
+
+# --- Подписка PullPoint (ONVIF) — ответы стенда 2026-10-23, камера TR-D2153IR6v2 ---
+
+_CREATE = (
+    b'<?xml version="1.0" encoding="UTF-8"?><SOAP-ENV:Envelope'
+    b' xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope"'
+    b' xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:wsa5="http://www.w3.org/2005/08/addressing">'
+    b"<SOAP-ENV:Body><tev:CreatePullPointSubscriptionResponse><tev:SubscriptionReference>"
+    b"<wsa5:Address>http://192.168.88.202:80/onvif/event_service/subscription?id=0</wsa5:Address>"
+    b"</tev:SubscriptionReference></tev:CreatePullPointSubscriptionResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>"
+)
+_EMPTY = b"<e:Envelope xmlns:e='x'><e:Body><PullMessagesResponse><CurrentTime>t1</CurrentTime></PullMessagesResponse></e:Body></e:Envelope>"
+_MOTION = (
+    b"<e:Envelope xmlns:e='x'><e:Body><PullMessagesResponse><NotificationMessage>"
+    b'<Topic>tns1:RuleEngine/CellMotionDetector/Motion</Topic><Message><SimpleItem Name="IsMotion" Value="true"/>'
+    b"</Message></NotificationMessage></PullMessagesResponse></e:Body></e:Envelope>"
+)
+_FAULT = b"<e:Envelope xmlns:e='x'><e:Body><e:Fault><e:Code>e:Sender</e:Code></e:Fault></e:Body></e:Envelope>"
+
+_PULL_SPEC = {
+    "setup": {
+        "method": "POST",
+        "path": "/onvif/event_service",
+        "carry": {"address": "Envelope.Body.CreatePullPointSubscriptionResponse.SubscriptionReference.Address"},
+    },
+    "method": "POST",
+    "path": "{carry.address}",
+    "resetup": {"status": 400},
+    "onlyIf": {"contains": "NotificationMessage"},
+    "longPoll": True,
+    "pause": 5,
+}
+
+
+def test_xml_разбирается_по_локальным_именам() -> None:
+    data = lo.parsed(_CREATE)
+    address = "Envelope.Body.CreatePullPointSubscriptionResponse.SubscriptionReference.Address"
+    assert lo.pick(data, address) == "http://192.168.88.202:80/onvif/event_service/subscription?id=0"
+    assert lo.parsed(b"not xml or json") is None
+    assert lo.parsed(b"<broken") is None
+
+
+def test_полный_адрес_в_path_даёт_только_путь_на_хост_описания() -> None:
+    call = lo._call(_descriptor(), {"path": "{carry.a}"}, {"carry.a": "http://evil.example:9/x/y?id=3"})
+    assert call["path"] == "/x/y?id=3"
+    assert call["url"] == "http://10.0.0.1:8080/x/y?id=3"
+
+
+def test_pullpoint_адрес_из_xml_тишина_не_публикуется_отказ_входит_заново(monkeypatch) -> None:
+    paths: list[str] = []
+    setups = 0
+    answers = [(200, _EMPTY), (200, _MOTION), (500, _FAULT), (200, _MOTION)]
+
+    async def fake_request(session, descriptor, block, values):  # noqa: ANN001
+        nonlocal setups
+        if block is _PULL_SPEC["setup"]:
+            setups += 1
+            return 200, "application/soap+xml", _CREATE.replace(b"id=0", f"id={setups}".encode())
+        paths.append(lo._call(descriptor, block, values)["path"])
+        if not answers:
+            raise _Done
+        status, body = answers.pop(0)
+        return status, "application/soap+xml", body
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(lo, "_request", fake_request)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    ctx = _Ctx()
+    with pytest.raises(_Done):
+        asyncio.run(lo.poll(ctx, _descriptor(), "events", _PULL_SPEC))
+
+    assert setups == 2
+    assert paths[:3] == ["/onvif/event_service/subscription?id=1"] * 3
+    assert paths[3] == "/onvif/event_service/subscription?id=2"
+    # Пустой ответ и отказ — не события; два движения — два события.
+    assert [("IsMotion" in e["text"]) for e in ctx.events] == [True, True]

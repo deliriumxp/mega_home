@@ -261,6 +261,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     if coordinator.data:
         sip_bridge.apply(coordinator.data)
 
+    # Запись камер (`core/recorder.py`): раздел `recorder` конфига объекта. Движение берёт
+    # из того же концентратора событий, что лента жильца.
+    from .core.recorder import Recorder
+
+    coordinator.recorder = Recorder(coordinator.env, coordinator.events.subscribe)
+    if coordinator.data:
+        coordinator.recorder.apply(coordinator.data)
+
     async def _on_stop(_event: Any) -> None:
         await _async_stop_processes(coordinator)
 
@@ -342,4 +350,7 @@ async def _async_stop_processes(coordinator: MegaHomeCoordinator) -> None:
         await sources.stop()
     if coordinator.sip_bridge is not None:
         await coordinator.sip_bridge.async_stop()
+    # Запись — до go2rtc: ffmpeg читает его RTSP, и начатый кусок дописывается в хранилище.
+    if getattr(coordinator, "recorder", None) is not None:
+        await coordinator.recorder.async_stop()
     await go2rtc_embed.async_stop()
