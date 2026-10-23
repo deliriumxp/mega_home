@@ -7,13 +7,18 @@
 
 ⚠ Воспроизведение — не здесь: служба только пишет список кусков ffconcat с `inpoint` и отдаёт
 готовую строку источника go2rtc (`ffmpeg:<список>#input=playlist`). Поток открывает go2rtc по
-переговорам бандла, как живую камеру; перемотка — новый список (замер 2026-10-23: первый кадр
-встаёт на ключевой кадр не дальше 0,2 с до метки, стык кусков без шва).
+переговорам бандла, как живую камеру; перемотка — новый список (стык кусков без шва).
+
+⚠ Поток идёт копированием, а копия начинается с КЛЮЧЕВОГО кадра не позже `inpoint`: у камер с
+GOP в 3–4 с видео встаёт на секунды раньше метки (замер на живом доме 2026-10-24: 1–3 с). Поэтому
+`inpoint` ставится на сам ключевой кадр (`_keyframe_before`), а `startMs` называет его время: игла
+бандла встаёт туда, где видео на самом деле началось.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import time
 from typing import TYPE_CHECKING, Any
@@ -37,7 +42,14 @@ PLAYLIST_S = 3 * 3600
 # Насколько далеко за участком искать продолжение записи.
 NEXT_LOOKUP_S = 2 * 24 * 3600
 _RECORDER: web.AppKey[Any] = web.AppKey("recorder")
+# ⚠ Три разных очереди: кадр под пальцем не должен стоять за сборкой спрайта окна (по сети она идёт
+# секундами), а список воспроизведения — за тем и другим.
 _FRAMES = asyncio.Semaphore(2)
+_SPRITES = asyncio.Semaphore(1)
+_PROBES = asyncio.Semaphore(2)
+# Сколько до метки смотрим назад в поисках ключевого кадра: больше типичного GOP камеры.
+KEYFRAME_LOOKBACK_S = 12.0
+KEYFRAME_TIMEOUT_S = 5
 
 
 async def start_api(recorder: Recorder) -> web.AppRunner:
@@ -119,6 +131,38 @@ async def _segments(request: web.Request) -> web.Response:
     return web.json_response({"segments": merged})
 
 
+async def _keyframe_before(recorder: Recorder, path: Any, offset: float) -> float:
+    """Время (секунды от начала куска) ближайшего ключевого кадра не позже `offset`; не нашли
+    или ffprobe нет — сам `offset`: список играется с ближайшего ключевого кадра и так.
+
+    ⚠ Ошибка тут — не отказ списка: время старта станет приблизительным, как было раньше.
+    """
+    binary = await recorder.env.run(shutil.which, "ffprobe")
+    if not binary:
+        return offset
+    low = max(offset - KEYFRAME_LOOKBACK_S, 0.0)
+    async with _PROBES:
+        proc = await asyncio.create_subprocess_exec(
+            binary, "-v", "error", "-select_streams", "v:0", "-read_intervals", f"{low:.3f}%{offset + 0.5:.3f}",
+            "-show_entries", "frame=pts_time,key_frame:format=start_time", "-of", "json", str(path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), KEYFRAME_TIMEOUT_S)
+            answer = json.loads(out.decode() or "{}")
+        except (asyncio.TimeoutError, ValueError):
+            if proc.returncode is None:
+                proc.kill()
+            return offset
+    try:
+        start = float((answer.get("format") or {}).get("start_time") or 0.0)
+        keys = [float(f["pts_time"]) - start for f in answer.get("frames", []) if f.get("key_frame") == 1 and "pts_time" in f]
+    except (TypeError, ValueError):
+        return offset
+    before = [k for k in keys if k <= offset + 0.05]
+    return max(max(before), 0.0) if before else offset
+
+
 async def _playlist(request: web.Request) -> web.Response:
     """Список воспроизведения с метки `at` (мс): НЕПРЕРЫВНЫЙ участок записи, первый кусок — с
     `inpoint`.
@@ -149,10 +193,12 @@ async def _playlist(request: web.Request) -> web.Response:
         end = run[-1][0] + run[-1][1]
         following = next((s for s in index.between(end + JOIN_GAP_S, end + NEXT_LOOKUP_S) if s[0] > end + JOIN_GAP_S), None)
     inpoint = max(at - run[0][0], 0.0)
+    if inpoint > 0:
+        inpoint = await _keyframe_before(recorder, run[0][2], inpoint)
     lines = ["ffconcat version 1.0"]
-    for index, (_begin, _length, path) in enumerate(run):
+    for number, (_begin, _length, path) in enumerate(run):
         lines.append(f"file '{path}'")
-        if index == 0 and inpoint > 0:
+        if number == 0 and inpoint > 0:
             lines.append(f"inpoint {inpoint:.3f}")
     folder = recorder.storage / ".cache" / "play"
     target = folder / f"{camera}-{uuid4().hex}.ffconcat"
@@ -265,12 +311,12 @@ async def _frame(request: web.Request) -> web.Response:
 
 async def _sprite(request: web.Request) -> web.Response:
     """Спрайт 10-минутного окна под меткой `at` (мс) — превью под пальцем на шкале
-    (`recorder_frames.sprite_for`). Сборка — ffmpeg, под тем же `_FRAMES`, что и `/frame`.
+    (`recorder_frames.sprite_for`). Сборка — ffmpeg, под своей очередью `_SPRITES`: `/frame` за ней не стоит.
     Закрытое окно не меняется — держится в кэше браузера; текущее дописывается — `no-store`."""
     recorder: Recorder = request.app[_RECORDER]
     camera, _ = await _index(request)
     at = _number(request, "at") / 1000
-    async with _FRAMES:
+    async with _SPRITES:
         image, closed = await sprite_for(recorder, camera, at)
     if not image:
         raise web.HTTPNotFound(text='{"error": "кадров в окне нет"}', content_type="application/json")
