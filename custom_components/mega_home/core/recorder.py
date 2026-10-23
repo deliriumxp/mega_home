@@ -14,7 +14,8 @@
 несёт (замер стенда — «Could not find tag for codec pcm_alaw»). Время в имени — UTC,
 длительность — в имени готового куска: индекс записи есть сам каталог, базы нет.
 
-⚠ «По движению» — по образцу Frigate и предзаписи регистраторов: кусок ждёт в кэше, пока не
+⚠ «По движению» — по образцу Frigate и предзаписи регистраторов (движение — от камеры или своей
+детекцией, `motion.py`, одним путём через концентратор событий): кусок ждёт в кэше, пока не
 станет ясно, попал ли он в окно движения (запас до и после); не попал — удаляется, и на диск
 или в сеть без движения не пишется ничего. Кэш — в памяти (`/dev/shm`), если её хватает.
 
@@ -292,7 +293,9 @@ class _Camera:
         if frame.get("access") != self.spec.access or frame.get("source") != self.spec.events:
             return
         data = frame.get("data") if isinstance(frame.get("data"), dict) else {}
-        text = str(data.get("text") or "")
+        # Ответ устройства — его текст; событие дома (своя детекция, `motion.py`) — данные одной
+        # строкой JSON без пробелов: подстроки `on`/`off` менеджер пишет под эту форму.
+        text = str(data.get("text") or "") or json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         at = float(frame.get("at") or time.time())
         for message in text.split(self.spec.split) if self.spec.split else [text]:
             if self.spec.require and not any(word in message for word in self.spec.require):

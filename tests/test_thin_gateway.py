@@ -130,11 +130,11 @@ FORBIDDEN_WORDS = (
 
 
 def test_ядро_без_вендорских_слов() -> None:
-    """Замок 1 плана. Исключения — `sip_*.py` (`panel`/`call`) и `digest.py`
-    (стандарт HTTP RFC 7616, не вендор: `md5`/`sha256`/`nonce` там законны)."""
+    """Замок 1 плана. Исключения — `sip_*.py` (`panel`/`call`), `digest.py` (стандарт HTTP
+    RFC 7616) и `wsse.py` (OASIS WSS UsernameToken Profile 1.0): не вендор, `nonce` там законен."""
     offences: list[str] = []
     for path in CORE_MODULES:
-        if path.name.startswith("sip_") or path.name == "digest.py":
+        if path.name.startswith("sip_") or path.name in ("digest.py", "wsse.py"):
             continue
         text = path.read_text("utf-8").lower()
         for word in FORBIDDEN_WORDS:
@@ -363,6 +363,15 @@ def test_размер_ядра_не_растёт_прикладной_логик
     считать движением, решает менеджер. Замер — 7 232. Правки ревью того же выпуска (сторож
     хранилища раз в минуту: пропавший диск останавливает запись, вернувшийся — поднимает;
     смены движения по порядку и по теме сообщения) — 7 274, планка 7 300.
+
+    ⚠ 7 300 → 7 650 (2026-10-23, пачка 0.5.24), оси три, все — решение заказчика того дня («добавить в
+    дом всё, что нужно, чтобы работало без костылей, и сразу свою детекцию движения»):
+    (1) личность и учётка — WS-Security UsernameToken у общего клиента по часам устройства (`wsse.py`,
+    ~95 строк; разбор XML переехал в `templating.parsed`, не копией); (2) время жизни подписки у
+    слушателя — `renew`/`teardown` (~35): устройство держит ограниченное число подписок;
+    (3) процесс закрытого списка — своя детекция движения (`motion.py`, ~180): ffmpeg на
+    дополнительный поток своего go2rtc и счёт кадра numpy по образцу Frigate. Что смотреть и
+    насколько чувствительно, решает менеджер данными. Замер — 7 608.
     """
     total = sum(len([l for l in _code(path).splitlines() if l.strip()]) for path in CORE_MODULES)
-    assert total <= 7300
+    assert total <= 7650

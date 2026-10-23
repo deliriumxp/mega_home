@@ -27,7 +27,7 @@ from urllib.parse import unquote
 import aiohttp
 from aiohttp.abc import AbstractResolver
 
-from . import digest, services
+from . import digest, services, wsse
 from . import reduce as reduce_mod
 from .ops_base import OpError
 
@@ -326,6 +326,7 @@ def prepare_http(payload: dict[str, Any]) -> dict[str, Any]:
     tls = payload.get("tls") is True
     basic: aiohttp.BasicAuth | None = None
     digest_creds: tuple[str, str] | None = None
+    signer: wsse.Credentials | None = None
     auth = payload.get("auth") if isinstance(payload.get("auth"), dict) else None
     if auth:
         auth_type = str(auth.get("type") or "")
@@ -334,8 +335,10 @@ def prepare_http(payload: dict[str, Any]) -> dict[str, Any]:
             basic = aiohttp.BasicAuth(user, secret)
         elif auth_type == "digest":
             digest_creds = (user, secret)
+        elif auth_type == "wsse":
+            signer = wsse.Credentials(user, secret, auth.get("clock") if isinstance(auth.get("clock"), dict) else None)
         elif auth_type and auth_type != "none":
-            raise OpError("auth.type — basic или digest")
+            raise OpError("auth.type — basic, digest или wsse")
     return {
         "method": method,
         "path": path,
@@ -345,6 +348,7 @@ def prepare_http(payload: dict[str, Any]) -> dict[str, Any]:
         "timeout": _timeout(payload),
         "basic": basic,
         "digest": digest_creds,
+        "wsse": signer,
         # Соединитель — `client_for`: адрес по имени проверяется DNS-запросом, а он асинхронный.
         "host": host,
         "port": port,
@@ -369,11 +373,19 @@ async def http_send(
     `Authorization`. Второй круг дом делает сам, чтобы вызывающему на другом
     конце канала не гонять их через менеджер — RFC 7616 это стандарт HTTP, не
     вендор (`digest.py`). Подписывается `call["path"]` — путь СО строкой запроса.
+
+    WS-Security UsernameToken (`wsse.py`) — подпись в теле SOAP, свежая на каждый запрос, по часам
+    устройства; отказ подписанному запросу забывает сдвиг часов.
     """
     method, url, body, headers = call["method"], call["url"], call["body"] or None, call["headers"]
+    signer = call.get("wsse")
+    if signer is not None and body:
+        body = wsse.sign(body, signer, await wsse.offset(session, call, signer))
     response = await session.request(
         method, url, data=body, headers=headers, auth=call["basic"], allow_redirects=False, timeout=timeout
     )
+    if signer is not None and response.status >= 400:
+        wsse.forget(call, signer)
     if not call["digest"] or response.status != 401:
         return response
     try:

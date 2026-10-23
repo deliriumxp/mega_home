@@ -290,3 +290,57 @@ def test_pullpoint_адрес_из_xml_тишина_не_публикуется_
     assert paths[3] == "/onvif/event_service/subscription?id=2"
     # Пустой ответ и отказ — не события; два движения — два события.
     assert [("IsMotion" in e["text"]) for e in ctx.events] == [True, True]
+
+
+def test_подписка_закрывается_перед_новым_входом_и_на_остановке(monkeypatch) -> None:
+    """Устройство держит одну подписку (стенд `.90.147`): брошенная мешала бы новой до своего
+    срока. Закрытие — по адресу ЗАКРЫВАЕМОЙ подписки, до входа и в конце работы источника."""
+    spec = {**_PULL_SPEC, "teardown": {"method": "POST", "path": "{carry.address}"}}
+    log: list[str] = []
+    setups = 0
+    answers = [(200, _MOTION), (500, _FAULT), (200, _MOTION)]
+
+    async def fake_request(session, descriptor, block, values):  # noqa: ANN001
+        nonlocal setups
+        if block is spec["setup"]:
+            setups += 1
+            log.append(f"setup{setups}")
+            return 200, "application/soap+xml", _CREATE.replace(b"id=0", f"id={setups}".encode())
+        if block is spec["teardown"]:
+            log.append("teardown " + lo._call(descriptor, block, values)["path"].rsplit("=", 1)[1])
+            return 200, "application/soap+xml", b"<ok/>"
+        if not answers:
+            raise _Done
+        status, body = answers.pop(0)
+        return status, "application/soap+xml", body
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(lo, "_request", fake_request)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    with pytest.raises(_Done):
+        asyncio.run(lo.poll(_Ctx(), _descriptor(), "events", spec))
+    assert log == ["setup1", "teardown 1", "setup2", "teardown 2"]
+
+
+def test_продление_идёт_по_адресу_открытой_подписки(monkeypatch) -> None:
+    block = {"every": 1, "method": "POST", "path": "{carry.address}"}
+    sent: list[str] = []
+    opened = [False, True, True]
+
+    async def fake_request(session, descriptor, request_block, values):  # noqa: ANN001
+        sent.append(lo._call(descriptor, request_block, values)["path"])
+        return 200, "", b""
+
+    async def fake_sleep(_delay: float) -> None:
+        if not opened:
+            raise _Done
+
+    monkeypatch.setattr(lo, "_request", fake_request)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    values = {"carry.address": "http://10.0.0.1:8080/sub?id=7"}
+    with pytest.raises(_Done):
+        asyncio.run(lo._renew(None, _descriptor(), block, values, lambda: opened.pop(0)))  # noqa: SLF001
+    # Закрытая сессия не продлевается; открытая — каждый период.
+    assert sent == ["/sub?id=7", "/sub?id=7"]

@@ -6,7 +6,8 @@
     тогда источник опознаётся по адресу устройства. Ответ — `reply` описания;
   * `tcpServer` — устройство само подключается к дому по TCP (сырые события);
   * `udp`       — датаграммы на порт дома, в том числе мультикаст (`group`);
-  * исходящие `poll`, `stream`, `ws`, `mqtt`, `tcp` — `listeners_out.py`.
+  * исходящие `poll`, `stream`, `ws`, `mqtt`, `tcp` — `listeners_out.py`;
+  * `motion`    — своя детекция движения по потоку камеры у своего go2rtc (`motion.py`).
 ⚠ Опрос и поток — только если у вендора нет push-подписки (`docs/vendor-integrations.md`).
 
 ⚠ Входящие — только с адреса устройства из конфига: порты смотрят в LAN без
@@ -109,7 +110,7 @@ class Listeners:
             return
         workers = {
             "poll": out.poll, "stream": out.stream, "ws": out.ws, "mqtt": out.mqtt, "tcp": out.tcp,
-            "tcpServer": _tcp_server, "udp": _udp,
+            "tcpServer": _tcp_server, "udp": _udp, "motion": _motion,
         }
         worker = workers.get(kind)
         if worker is None:
@@ -251,6 +252,12 @@ class Listeners:
 # --- входящий TCP и UDP -------------------------------------------------------
 # Та же сигнатура, что у исходящих источников (`listeners_out.py`): таблица
 # `workers` в `_start_source` — единственное место, где виды различаются.
+
+
+async def _motion(ctx: Listeners, descriptor: DeviceDescriptor, source: str, spec: dict[str, Any]) -> None:
+    from .motion import motion  # noqa: PLC0415 — numpy и ffmpeg только у домов с детекцией
+
+    await motion(ctx, descriptor, source, spec)
 
 
 def _port(spec: dict[str, Any]) -> int | None:

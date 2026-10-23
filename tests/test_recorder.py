@@ -106,6 +106,16 @@ def test_смены_считаются_только_в_сообщениях_те
     assert camera.windows[-1][:2] == [1010, None]
 
 
+def test_движение_своей_детекции_открывает_и_закрывает_окно(tmp_path: Path) -> None:
+    """Событие дома (`motion.py`) без текста: данные одной строкой JSON — та же сверка подстрок."""
+    camera = _camera(tmp_path, events="motion", on=('"state":"start"',), off=('"state":"stop"',))
+    own = {"access": "onvif-aa", "source": "motion", "event": "motion"}
+    camera.on_event({**own, "at": 1000, "data": {"state": "start", "share": 0.012}})
+    assert camera.windows[-1][:2] == [1000, None]
+    camera.on_event({**own, "at": 1040, "data": {"share": 0.02, "state": "stop"}})
+    assert camera.windows[-1][:2] == [1000, 1040]
+
+
 def test_сторож_останавливает_запись_без_диска_и_поднимает_с_ним() -> None:
     folder = Path(tempfile.mkdtemp(prefix="rec-"))
     recorder = rec.Recorder(FakeHost(folder), lambda _listener: (lambda: None))
