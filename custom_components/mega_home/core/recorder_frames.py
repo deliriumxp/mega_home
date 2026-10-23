@@ -36,7 +36,12 @@ if TYPE_CHECKING:
 FRAME_WIDTH = 160
 FRAME_TIMEOUT_S = 10
 WINDOW_S, SLOT_S, COLS, ROWS, SLOT_W, SLOT_H = 600, 10, 10, 6, 160, 90
-CLOSED_AFTER_S = 30  # окно закрыто: его конец старше этого — куски дописаны
+# Окно закрыто, когда его конец старше этого. Кадр последнего куска окна появляется позже конца
+# окна на `pre_s` (10 с по умолчанию: кусок ждёт решения о движении) + `SEGMENT_S` (длина куска)
+# + `FRAME_TIMEOUT_S` (снятие кадра под `nice`); остальное — запас на очередь исполнителя и проход
+# по готовым кускам. Короче — спрайт без последних слотов лёг бы на диск насовсем.
+# ⚠ Бандл держит то же число (`SPRITE_CLOSED_AFTER_MS`, `clip-sprite.ts` менеджера).
+CLOSED_AFTER_S = 120
 SPRITE_TIMEOUT_S = 15
 # Кадр вписывается в слот с чёрными полями (16:9 — без полей), 60 кадров — одна сетка.
 _TILE = f"scale={SLOT_W}:{SLOT_H}:force_original_aspect_ratio=decrease,pad={SLOT_W}:{SLOT_H}:(ow-iw)/2:(oh-ih)/2,tile={COLS}x{ROWS}"
@@ -117,13 +122,18 @@ def compose(frames: list[Path | None], binary: str, work: Path) -> bytes:
             part.unlink(missing_ok=True)
     listing = work / f"list-{uuid4().hex}.txt"
     try:
-        listing.write_text("".join(f"file '{frame or blank}'\n" for frame in frames), encoding="utf-8")
+        # ⚠ Путь в кавычках списка concat: `'` внутри экранируется как `'\''` (правило ffmpeg).
+        listing.write_text("".join(f"file '{_quoted(frame or blank)}'\n" for frame in frames), encoding="utf-8")
         tile = ["-vf", _TILE, "-frames:v", "1", "-q:v", "5", "-f", "image2", "-c:v", "mjpeg", "pipe:1"]
         # Камера сменила размер посреди окна — фильтры не пересобираются: кадр другого размера
         # растянется в слот, но соседние слоты не пропадут.
         return _ffmpeg([*head, "-reinit_filter", "0", "-f", "concat", "-safe", "0", "-i", str(listing), *tile])
     finally:
         listing.unlink(missing_ok=True)
+
+
+def _quoted(path: Path) -> str:
+    return str(path).replace("'", "'\\''")
 
 
 def _sprite(index: SegmentIndex, start: float, closed: bool) -> bytes:

@@ -22,7 +22,8 @@ import pytest
 from mega_home.core import recorder as rec
 from mega_home.core import services, storage
 from mega_home.core.recorder_api import start_api
-from mega_home.core.recorder_frames import compose, slot_frames, sprite_for, sprite_path, window_start
+from mega_home.core import recorder_frames as frames_mod
+from mega_home.core.recorder_frames import CLOSED_AFTER_S, compose, slot_frames, sprite_for, sprite_path, window_start
 from mega_home.core.recorder_index import SegmentIndex
 
 FFMPEG = shutil.which("ffmpeg") or ""
@@ -170,3 +171,32 @@ def test_закрытое_окно_кладётся_в_кэш_а_текущее_
     # Второй взгляд на закрытое окно — из файла, без сборки.
     cached.write_bytes(b"\xff\xd8cached")
     assert asyncio.run(sprite_for(recorder, "cam", past + 599)) == (b"\xff\xd8cached", True)
+
+
+@needs_ffmpeg
+def test_окно_закрыто_только_через_CLOSED_AFTER_S(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ⚠ Кадр последнего куска приходит позже конца окна (pre_s + кусок + снятие кадра): окно,
+    # закрытое раньше, легло бы на диск без последних слотов.
+    root = Path(tempfile.mkdtemp(prefix="rec-"))
+    start = window_start(time.time() - 3600)
+    _segment(root, start + 590, frame="white")
+    recorder = _recorder(root)
+    recorder.cameras["cam"].index.ensure()
+    end = start + 600
+    monkeypatch.setattr(frames_mod.time, "time", lambda: end + 60)
+    assert CLOSED_AFTER_S > 60
+    image, closed = asyncio.run(sprite_for(recorder, "cam", start))
+    assert image and not closed and not sprite_path(root / "cam", start).exists()
+    monkeypatch.setattr(frames_mod.time, "time", lambda: end + CLOSED_AFTER_S)
+    image, closed = asyncio.run(sprite_for(recorder, "cam", start))
+    assert image and closed and sprite_path(root / "cam", start).exists()
+
+
+@needs_ffmpeg
+def test_апостроф_в_пути_кадра_не_ломает_список(tmp_path: Path) -> None:
+    folder = tmp_path / "it's"
+    folder.mkdir()
+    frame = folder / "a.jpg"
+    _jpeg(frame, "white")
+    image = compose([frame] + [None] * 59, FFMPEG, folder / "work")
+    assert _probe(image) == (1600, 540) and _brightness(image, 0) > 200
