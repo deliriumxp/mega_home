@@ -46,6 +46,9 @@ IDLE_S = 120.0
 MAX_CHUNK = 64 * 1024
 # Закрытие сессии устройства не держит остановку источника дольше этого.
 TEARDOWN_S = 5.0
+# Вход после закрытия сессии: столько попыток с такой паузой при отказе соединения.
+SETUP_TRIES = 4
+SETUP_RETRY_S = 2.0
 
 def body_of(raw: bytes) -> dict[str, Any]:
     try:
@@ -233,37 +236,48 @@ async def poll(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[s
                 LOGGER.debug("Источник %s/%s: закрыть сессию не вышло: %s", descriptor.id, source, type(err).__name__)
 
         async def do_setup() -> None:
-            nonlocal opened
+            nonlocal opened, renewed_at
             if setup_block is None:
                 return
             await do_teardown()
-            status, _, setup_payload = await _request(session, descriptor, setup_block, values)
+            # ⚠ Устройство, только что закрывшее сессию, бывает недоступно секунды (стенд Tapo после
+            # `Unsubscribe` ~3 с отказывает в соединении): повтор здесь, а не перезапуск источника
+            # с предупреждением в журнале на каждом перезаходе.
+            for attempt in range(SETUP_TRIES):
+                try:
+                    status, _, setup_payload = await _request(session, descriptor, setup_block, values)
+                    break
+                except aiohttp.ClientConnectionError:
+                    if attempt == SETUP_TRIES - 1:
+                        raise
+                    await asyncio.sleep(SETUP_RETRY_S)
             carry(values, setup_block, setup_payload)
-            opened = status < 400
+            opened, renewed_at = status < 400, loop.time()
 
-        renewing = asyncio.ensure_future(_renew(session, descriptor, renew_block, values, lambda: opened)) if renew_block else None
+        async def maybe_renew() -> None:
+            """Продление — МЕЖДУ запросами опроса, а не своей задачей: устройство, которое держит
+            один запрос за раз, не ждёт продления до конца долгого опроса."""
+            nonlocal renewed_at
+            if renew_block is None or not opened or loop.time() - renewed_at < renew_every:
+                return
+            renewed_at = loop.time()
+            try:
+                await _request(session, descriptor, renew_block, values)
+            except Exception as err:  # noqa: BLE001 — отказ продления ловит сам опрос (истёкшая сессия → resetup)
+                LOGGER.debug("Источник %s/%s: продление не прошло: %s", descriptor.id, source, type(err).__name__)
+
+        loop = asyncio.get_running_loop()
+        renew_every = seconds((renew_block or {}).get("every"), 300.0, 5.0)
+        renewed_at = loop.time()
         try:
-            await _poll_loop(ctx, session, descriptor, source, spec, values, do_setup, setup_block, resetup)
+            await _poll_loop(ctx, session, descriptor, source, spec, values, do_setup, maybe_renew, setup_block, resetup)
         finally:
-            if renewing is not None:
-                renewing.cancel()
             await do_teardown()
-
-async def _renew(session: aiohttp.ClientSession, descriptor: DeviceDescriptor, block: dict[str, Any], values: dict[str, Any], opened: Any) -> None:
-    """Продлевать сессию устройства раз в `every`, пока она открыта; отказ продления ловит сам опрос."""
-    every = seconds(block.get("every"), 300.0, 5.0)
-    while True:
-        await asyncio.sleep(every)
-        if not opened():
-            continue
-        try:
-            await _request(session, descriptor, block, values)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-            LOGGER.debug("Источник %s: продление не прошло: %s", descriptor.id, type(err).__name__)
 
 async def _poll_loop(
     ctx: Any, session: aiohttp.ClientSession, descriptor: DeviceDescriptor, source: str, spec: dict[str, Any],
-    values: dict[str, Any], do_setup: Any, setup_block: dict[str, Any] | None, resetup: dict[str, Any] | None,
+    values: dict[str, Any], do_setup: Any, maybe_renew: Any, setup_block: dict[str, Any] | None,
+    resetup: dict[str, Any] | None,
 ) -> None:
     await do_setup()
     pause = seconds(spec.get("pause"), MIN_PAUSE_S, MIN_PAUSE_S)
@@ -277,6 +291,7 @@ async def _poll_loop(
     # Право войти сразу, если самый первый ответ уже скажет «нет сессии».
     last_resetup = loop.time() - pause
     while True:
+        await maybe_renew()
         started = loop.time()
         status, kind, payload = await _request(session, descriptor, spec, values)
         if resetup is not None and setup_block is not None and _resetup_matches(resetup, status, payload):

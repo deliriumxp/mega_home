@@ -43,8 +43,10 @@ from .go2rtc_embed import API_PORT, RTSP_PORT
 
 WIDTH, HEIGHT, CELL = 176, 96, 8
 FRAME = WIDTH * HEIGHT
-# Кадров нет дольше — поток встал: перезапуск источника (`listeners._forever`).
+# Кадров нет дольше — поток встал: перезапуск источника (`listeners._forever`). Первый кадр ждём
+# дольше: go2rtc сперва поднимает подключение к камере, ffmpeg разбирает поток.
 IDLE_S = 30.0
+FIRST_FRAME_S = 60.0
 # Окно живое, если оно менялось от кадра к кадру в 2 из 3 последних кадров (см. шапку).
 LIVELY_OF, LIVELY_NEED = 3, 2
 
@@ -73,9 +75,14 @@ class Detector:
         cells = rows.reshape(HEIGHT // CELL, WIDTH // CELL, CELL).sum(axis=2)
         return (cells[:-1, :-1] + cells[1:, :-1] + cells[:-1, 1:] + cells[1:, 1:]) >= self.area
 
-    def detect(self, raw: bytes) -> float:
+    def detect(self, raw: bytes) -> float | None:
+        """Доля изменений; None — кадр-повтор: поток камеры реже `fps`, и ffmpeg дублирует кадры.
+        Повтор нового не говорит (живой кадр отличается хоть шумом матрицы) и не должен считаться
+        вторым кадром движения."""
         np = self.np
         pixels = np.frombuffer(raw, np.uint8).reshape(HEIGHT, WIDTH)
+        if self.previous is not None and np.array_equal(pixels, self.previous[1]):
+            return None
         counts = np.cumsum(np.bincount(pixels[::2, ::2].ravel(), minlength=256))
         low, high = np.searchsorted(counts, counts[-1] * 0.04), np.searchsorted(counts, counts[-1] * 0.96)
         frame = pixels.astype(np.float32)
@@ -96,9 +103,7 @@ class Detector:
         found = self._windows(_grow(dilated, np.bitwise_and))
         spots = int(np.count_nonzero(found))
         share = np.count_nonzero(dilated) / dilated.size
-        # Кадр-повтор (поток камеры реже `fps`, и ffmpeg дублирует кадры) нового не говорит: живой
-        # кадр от прошлого отличается хоть шумом матрицы.
-        if self.previous is not None and not np.array_equal(pixels, self.previous[1]):
+        if self.previous is not None:
             self.lively.append(self._windows(np.abs(frame - self.previous[0]) > self.threshold))
         self.previous = (frame, pixels)
         alive = len(self.lively) == LIVELY_OF and np.count_nonzero(found & (sum(self.lively) >= LIVELY_NEED))
@@ -200,13 +205,16 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
     try:
         assert proc.stdout is not None
         while True:
+            wait = IDLE_S if detector.previous is not None else FIRST_FRAME_S
             try:
-                raw = await asyncio.wait_for(proc.stdout.readexactly(FRAME), IDLE_S)
+                raw = await asyncio.wait_for(proc.stdout.readexactly(FRAME), wait)
             except asyncio.IncompleteReadError as err:
                 raise RuntimeError(f"ffmpeg закончил поток: {' | '.join(tail) or 'без слов'}") from err
             except asyncio.TimeoutError as err:
-                raise ConnectionError(f"нет кадров дольше {IDLE_S:g} с") from err
+                raise ConnectionError(f"нет кадров дольше {wait:g} с") from err
             share = detector.detect(raw)
+            if share is None:
+                continue
             now = loop.time()
             moving = moving + 1 if share else 0
             if share:

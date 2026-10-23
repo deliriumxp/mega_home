@@ -45,11 +45,11 @@ _BASE64 = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-soap-message-secu
 _SECEXT = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
 _UTILITY = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
 _ENVELOPE = re.compile(rb"<((?:[\w.-]+:)?)Envelope[\s>]")
-_HEADER = re.compile(rb"<((?:[\w.-]+:)?)Header\s*>")
+_HEADER = re.compile(rb"<((?:[\w.-]+:)?)Header(?:\s[^>]*?)?(/?)>")
 _BODY = re.compile(rb"<((?:[\w.-]+:)?)Body[\s>/]")
 _CLOCK_FIELDS = ("year", "month", "day", "hour", "minute", "second")
-# Адрес часов (`host:port`) → (сдвиг, до какого момента монотонных часов верить).
-_offsets: dict[str, tuple[float, float]] = {}
+# Адрес часов (`host:port`) → (сдвиг, до какого момента монотонных часов верить, когда спрошен).
+_offsets: dict[str, tuple[float, float, float]] = {}
 
 
 @dataclass(frozen=True)
@@ -82,6 +82,10 @@ def sign(body: bytes, credentials: Credentials, offset: float) -> bytes:
     """
     security = token(credentials.user, credentials.password, offset).encode()
     header = _HEADER.search(body)
+    if header and header.group(2):
+        # Пустая шапка `<s:Header/>` — раскрыть, иначе подпись встала бы второй шапкой.
+        prefix = header.group(1)
+        return body[: header.start()] + b"<" + prefix + b"Header>" + security + b"</" + prefix + b"Header>" + body[header.end() :]
     if header:
         return body[: header.end()] + security + body[header.end() :]
     envelope, found = _ENVELOPE.search(body), _BODY.search(body)
@@ -128,11 +132,20 @@ async def offset(session: aiohttp.ClientSession, call: dict[str, Any], credentia
             found = offset_of(await answer.read(), clock, time.time())
     except (aiohttp.ClientError, asyncio.TimeoutError):
         found = None
-    _offsets[key] = (found or 0.0, time.monotonic() + (OFFSET_TTL_S if found is not None else RETRY_S))
+    now = time.monotonic()
+    _offsets[key] = (found or 0.0, now + (OFFSET_TTL_S if found is not None else RETRY_S), now)
     return found or 0.0
 
 
 def forget(call: dict[str, Any], credentials: Credentials) -> None:
-    """Устройство отказало подписанному запросу: часы переспросить на следующем."""
-    if isinstance(credentials.clock, dict) and credentials.clock.get("path"):
-        _offsets.pop(urlsplit(_clock_url(call, credentials.clock)).netloc, None)
+    """Устройство отказало подписанному запросу: часы переспросить на следующем.
+
+    ⚠ Не чаще `RETRY_S`: отказ бывает и не про подпись (истёкшая подписка — 400 штатно, раз в
+    десять минут), и тогда каждый следующий запрос сперва ходил бы за часами.
+    """
+    if not isinstance(credentials.clock, dict) or not credentials.clock.get("path"):
+        return
+    key = urlsplit(_clock_url(call, credentials.clock)).netloc
+    known = _offsets.get(key)
+    if known is not None and time.monotonic() - known[2] >= RETRY_S:
+        _offsets.pop(key, None)

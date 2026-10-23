@@ -77,7 +77,10 @@ def test_повтор_кадра_не_гасит_движение() -> None:
     frames = []
     for i in range(20):
         frames += [_frame(spot_x=10 + i * 6)] * 3
-    assert any(_run(detector, frames)[6:])
+    shares = _run(detector, frames)
+    assert any(shares[6:])
+    # Повтор — не кадр: порог «два кадра движения подряд» одним настоящим кадром не набрать.
+    assert shares[1] is None and shares[2] is None
 
 
 def test_маска_закрывает_мигающий_блик() -> None:

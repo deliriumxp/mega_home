@@ -113,8 +113,9 @@ def test_без_запроса_часов_подпись_по_часам_дом�
     assert asyncio.run(scenario()) == (200, 400)
 
 
-def test_отказ_забывает_сдвиг_и_следующий_запрос_спрашивает_часы_заново() -> None:
+def test_отказ_забывает_сдвиг_и_следующий_запрос_спрашивает_часы_заново(monkeypatch) -> None:
     """Камера перезагрузилась и потеряла время: один отказ, дальше подпись снова сходится."""
+    monkeypatch.setattr(wsse, "RETRY_S", 0.0)
     camera = _Camera(skew=0)
 
     async def scenario() -> list[int]:
@@ -125,6 +126,21 @@ def test_отказ_забывает_сдвиг_и_следующий_запро
 
     assert asyncio.run(scenario()) == [200, 400, 200]
     assert camera.clock_calls == 2
+
+
+def test_отказы_подряд_спрашивают_часы_не_чаще_минуты() -> None:
+    """Истёкшая подписка штатно отвечает 400 — часы не переспрашиваются перед каждым запросом."""
+    camera = _Camera(skew=0)
+
+    async def scenario() -> None:
+        async with TestServer(camera.app()) as server:
+            await _pull(server.port)
+            camera.skew = 3600
+            for _ in range(3):
+                await _pull(server.port)
+
+    asyncio.run(scenario())
+    assert camera.clock_calls == 1
 
 
 def test_одиночный_connect_подписывает_тем_же_клиентом() -> None:
@@ -154,6 +170,11 @@ def test_подпись_встаёт_в_шапку_конверта() -> None:
     existing = wsse.sign(b"<s:Envelope><s:Header><a/></s:Header><s:Body/></s:Envelope>", credentials, 0)
     assert existing.count(b"<s:Header>") == 1 and existing.index(b"<wsse:Security") < existing.index(b"<a/>")
     assert wsse.sign(b"plain text", credentials, 0) == b"plain text"
+    # Пустая и с атрибутами шапка — подпись в ней, второй шапки нет.
+    empty = wsse.sign(b"<s:Envelope><s:Header/><s:Body/></s:Envelope>", credentials, 0)
+    assert empty.count(b"Header>") == 2 and b"<s:Header/>" not in empty and empty.index(b"<wsse:Security") < empty.index(b"</s:Header>")
+    attributed = wsse.sign(b'<s:Envelope><s:Header xmlns:a="x"><a:To>y</a:To></s:Header><s:Body/></s:Envelope>', credentials, 0)
+    assert attributed.count(b"<s:Header") == 1 and attributed.index(b"<wsse:Security") < attributed.index(b"<a:To>")
 
 
 def test_дайджест_по_формуле_стандарта() -> None:
