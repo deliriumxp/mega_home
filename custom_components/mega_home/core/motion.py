@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import os
 import shutil
 import time
 from collections import deque
@@ -39,11 +40,13 @@ from urllib.parse import quote
 
 import aiohttp
 
-from . import host_load
+from . import host_load, person
 from .const import LOGGER
 from .go2rtc_embed import API_PORT, RTSP_PORT
 
 WIDTH, HEIGHT, CELL = 176, 96, 8
+# Ширина кадра для выреза «человек»: человек на трети высоты — сотня с лишним пикселей, сети хватает.
+PERSON_WIDTH = 640
 FRAME = WIDTH * HEIGHT
 # Кадров нет дольше — поток встал: перезапуск источника (`listeners._forever`). Первый кадр ждём
 # дольше: go2rtc сперва поднимает подключение к камере, ffmpeg разбирает поток.
@@ -70,6 +73,9 @@ class Detector:
         self.moving_frames = 0
         self.previous: Any = None
         self.lively: deque[Any] = deque(maxlen=LIVELY_OF)
+        # Рамка живого движения последнего кадра (пиксели кадра 176×96); None — движения нет. Из неё
+        # вырезается кусок для сети «человек» (`person.py`).
+        self.box: tuple[int, int, int, int] | None = None
 
     def _windows(self, mask: Any) -> Any:
         """Окна 16×16 с шагом 8, где точек маски не меньше `area`."""
@@ -108,7 +114,10 @@ class Detector:
         if self.previous is not None:
             self.lively.append(self._windows(np.abs(frame - self.previous[0]) > self.threshold))
         self.previous = (frame, pixels)
-        alive = len(self.lively) == LIVELY_OF and np.count_nonzero(found & (sum(self.lively) >= LIVELY_NEED))
+        live = found & (sum(self.lively) >= LIVELY_NEED) if len(self.lively) == LIVELY_OF else None
+        alive = live is not None and np.count_nonzero(live)
+        rows, cols = np.nonzero(live) if alive else ((), ())
+        self.box = (int(cols.min()) * CELL, int(rows.min()) * CELL, int(cols.max()) * CELL + 2 * CELL, int(rows.max()) * CELL + 2 * CELL) if alive else None
         if share < 0.05 and spots <= 4:
             self.calibrating = False
         if share > self.lightning:
@@ -119,6 +128,8 @@ class Detector:
         self.moving_frames = self.moving_frames + 1 if spots else 0
         if not spots or self.moving_frames >= 10:
             self.background += (frame - self.background) * rate
+        if self.calibrating:
+            self.box = None
         return 0.0 if self.calibrating or not alive else float(share)
 
 
@@ -189,21 +200,49 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
     ffmpeg, nice = await loop.run_in_executor(None, lambda: (shutil.which("ffmpeg"), shutil.which("nice")))
     if not ffmpeg:
         raise RuntimeError("в системе нет ffmpeg")
-    command = [
+    # Движение публикуется, если описание не сказало иначе: у камеры, чьё движение приходит от неё
+    # самой, детекция дома нужна только ради людей (`motionEvents: false`), и строк движения дважды нет.
+    publish = spec.get("motionEvents") is not False
+    watch, model = await _person_setup(loop, np, spec)
+    ffmpeg_args = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-rtsp_transport", "tcp",
         "-threads", "1", "-skip_loop_filter", "all", "-flags2", "+fast",
         "-i", f"rtsp://127.0.0.1:{RTSP_PORT}/{stream}", "-an", "-sn", "-dn",
-        "-vf", f"fps={fps:g},scale={WIDTH}:{HEIGHT}:flags=area,format=gray,gblur=sigma=1:steps=1",
-        "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
     ]
+    small = f"fps={fps:g},scale={WIDTH}:{HEIGHT}:flags=area,format=gray,gblur=sigma=1:steps=1"
+    pipe_out = -1
+    # Крупный кадр — каждый `ratio`-й маленький: оба режет `fps` от одного начала (`_person_pairs`).
+    ratio = max(round(fps * watch.every), 1) if watch is not None else 1
+    if watch is None:
+        ffmpeg_args += ["-vf", small, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
+    else:
+        # Кадр для выреза — вторым выходом того же декодера: подключение и декод одни. Цветной (сеть
+        # учена на RGB), крупнее кадра движения (человек в 176×96 — десятки пикселей) и в своих
+        # пропорциях; BMP — потому что размер кадра камеры заранее не известен, а заголовок его несёт.
+        pipe_in, pipe_out = os.pipe()
+        ffmpeg_args += [
+            "-filter_complex",
+            f"[0:v]split=2[m][p];[m]{small}[small];[p]fps={fps / ratio:g},scale={PERSON_WIDTH}:-2:flags=area[big]",
+            "-map", "[small]", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+            # ⚠ Номер дескриптора в ffmpeg — тот же, что у нас: `pass_fds` его сохраняет.
+            "-map", "[big]", "-f", "image2pipe", "-c:v", "bmp", "-pix_fmt", "bgr24", f"pipe:{pipe_out}",
+        ]
     proc = await asyncio.create_subprocess_exec(
-        *([nice, "-n", "10"] if nice else []), *command,
+        *([nice, "-n", "10"] if nice else []), *ffmpeg_args,
         stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        **({"pass_fds": (pipe_out,)} if watch is not None else {}),
     )
+    big: deque[tuple[int, Any]] = deque(maxlen=4)
+    boxes: deque[tuple[int, Any]] = deque(maxlen=4 * ratio)
+    index = -1
+    frames_task: asyncio.Future[None] | None = None
+    if watch is not None:
+        os.close(pipe_out)
+        frames_task = asyncio.ensure_future(_person_frames(loop, np, pipe_in, big))
     tail: deque[str] = deque(maxlen=6)
     drain = asyncio.ensure_future(_drain(proc, tail))
-    # Нагрузка (`host_load`): ffmpeg детекции и счёт кадра — одна строка камеры. `nice` исполняет
-    # ffmpeg на своём pid.
+    # Нагрузка (`host_load`): ffmpeg детекции, счёт кадра и сети «человек» — одна строка камеры.
+    # `nice` исполняет ffmpeg на своём pid.
     load_key = f"motion:{descriptor.id}"
     host_load.track(load_key, proc.pid)
     moving, peak, last_motion = 0, 0.0, 0.0
@@ -223,6 +262,10 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
             began = time.thread_time()
             share = detector.detect(raw)
             host_load.spent(load_key, time.thread_time() - began)
+            index += 1
+            if watch is not None:
+                # Повтор кадра — тоже кадр потока: номер растёт, рамка — прежняя.
+                boxes.append((index, detector.box if share != 0.0 else None))
             if share is None:
                 continue
             now = loop.time()
@@ -231,20 +274,97 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
                 last_motion, peak = now, max(peak, share)
             if not active and moving >= need:
                 active = True
-                ctx.emit(descriptor, source, spec, "motion", {"state": "start", "share": round(share, 4)})
+                if publish:
+                    ctx.emit(descriptor, source, spec, "motion", {"state": "start", "share": round(share, 4)})
             elif active and now - last_motion >= off_s:
                 active = False
-                ctx.emit(descriptor, source, spec, "motion", {"state": "stop", "share": round(peak, 4)})
+                if publish:
+                    ctx.emit(descriptor, source, spec, "motion", {"state": "stop", "share": round(peak, 4)})
                 peak = 0.0
+                if watch is not None and watch.end():
+                    ctx.emit(descriptor, source, spec, "person", {"person": "stop"})
+            for frame, box in _person_pairs(big, boxes, ratio, index) if watch is not None else ():
+                if not (active and box and watch.due(now)):
+                    continue
+                value, spent = await loop.run_in_executor(None, _person_score, np, model, frame, box)
+                # Счёт сети — в строке камеры, как счёт кадра; пишется в цикле событий (`host_load.spent`).
+                host_load.spent(load_key, spent)
+                if watch.seen(value, now):
+                    # ⚠ Своё имя события и свой ключ данных (`person`, а не `state`): запись по движению
+                    # (`recorder.py`) и лента ловят движение подстрокой `"state":"start"`.
+                    ctx.emit(descriptor, source, spec, "person", {"person": "start", "score": round(value, 3)})
     finally:
-        if active:
+        if active and publish:
             # Источник встал посреди движения: окно записи и метка ленты не висят открытыми.
             ctx.emit(descriptor, source, spec, "motion", {"state": "stop", "share": round(peak, 4)})
+        if watch is not None and watch.end():
+            ctx.emit(descriptor, source, spec, "person", {"person": "stop"})
+        if frames_task is not None:
+            frames_task.cancel()
         drain.cancel()
         host_load.untrack(load_key, proc.pid)
         if proc.returncode is None:
             proc.kill()
             await proc.wait()
+
+
+async def _person_setup(loop: asyncio.AbstractEventLoop, np: Any, spec: dict[str, Any]) -> tuple[Any, Any]:
+    """Сеть «человек» по описанию (`person: {every, threshold, frames}`); нет раздела или весов — (None, None):
+    без людей движение работает как прежде."""
+    options = spec.get("person")
+    if not isinstance(options, dict):
+        return None, None
+    try:
+        model = await loop.run_in_executor(None, person.load, np)
+    except (OSError, KeyError, ValueError) as err:
+        LOGGER.warning("Сеть «человек» не загрузилась, детекция людей выключена: %s", err)
+        return None, None
+    watch = person.PersonWatch(
+        every=_number(options, "every", 1.0, 0.2, 10.0),
+        threshold=_number(options, "threshold", 0.5, 0.05, 0.99),
+        frames=int(_number(options, "frames", 2, 1, 10)),
+    )
+    return watch, model
+
+
+async def _person_frames(loop: asyncio.AbstractEventLoop, np: Any, fd: int, big: deque[tuple[int, Any]]) -> None:
+    """Кадры для выреза из второй трубы ffmpeg с их номерами. ⚠ Читать ВСЕГДА: кадр крупнее буфера трубы,
+    и непрочитанная труба остановила бы ffmpeg, а с ним и движение."""
+    reader = asyncio.StreamReader(limit=2**24)
+    transport, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), os.fdopen(fd, "rb", 0))
+    try:
+        number = 0
+        while True:
+            big.append((number, await person.read_bmp(np, reader)))
+            number += 1
+    except (asyncio.IncompleteReadError, ValueError):
+        return
+    finally:
+        transport.close()
+
+
+def _person_pairs(big: deque[tuple[int, Any]], boxes: deque[tuple[int, Any]], ratio: int, index: int) -> list[tuple[Any, Any]]:
+    """Крупные кадры, чей маленький двойник уже разобран, — с рамкой движения ТОГО ЖЕ момента.
+
+    ⚠ По номеру, а не по времени прихода: два выхода одного ffmpeg приходят пачками (пять маленьких и
+    крупный разом, проба 2026-10-24), а идущий человек за секунду уходит на сотню пикселей — вырез из
+    кадра другого момента мимо (0,13 вместо 0,9). Оба выхода режет `fps` от первого кадра: крупный № j —
+    тот же момент, что маленький № j·ratio."""
+    known = dict(boxes)
+    out = []
+    while big and big[0][0] * ratio <= index:
+        number, frame = big.popleft()
+        out.append((frame, known.get(number * ratio)))
+    return out
+
+
+def _person_score(np: Any, model: Any, frame: Any, box: tuple[int, int, int, int]) -> tuple[float, float]:
+    """Рамка движения (кадр 176×96) → пиксели крупного кадра → уверенность сети и время потока (в исполнителе)."""
+    began = time.thread_time()
+    height, width = frame.shape[:2]
+    sx, sy = width / WIDTH, height / HEIGHT
+    value = person.score(np, model, frame, (box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy))
+    return value, time.thread_time() - began
 
 
 async def _drain(proc: asyncio.subprocess.Process, tail: deque[str]) -> None:
