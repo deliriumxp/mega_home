@@ -208,7 +208,10 @@ def clean(storage: Path, cameras: list[Any], now: float, limit: int = 0) -> None
     for camera in cameras:
         camera.index.ensure(bool(limit))
         cutoff = day_of(now - camera.spec.retain_days * 24 * 3600)
-        for name in camera.index.day_names():
+        # ⚠ И каталоги с диска, а не только дни индекса: в сутках без движения лежат одни кадры превью
+        # (`_Camera._preview_only`) — индекс таких суток не знает, и они жили бы вечно.
+        on_disk = [p.name for p in camera.index.root.iterdir() if p.is_dir() and _DAY.match(p.name)] if camera.index.root.is_dir() else []
+        for name in sorted(set(camera.index.day_names()) | set(on_disk)):
             if name < cutoff:
                 shutil.rmtree(camera.index.root / name, ignore_errors=True)
                 camera.index.drop_day(name)
