@@ -22,14 +22,18 @@ from fake_host import FakeHost
 class _Stdout:
     def __init__(self, lines: list[bytes]) -> None:
         self._lines = list(lines)
+        # Процесс вышел: труба закрыта, чтение кончается.
+        self.eof = False
 
     def __aiter__(self):  # noqa: ANN204
         return self
 
     async def __anext__(self) -> bytes:
-        if not self._lines:
+        while not self._lines:
+            if self.eof:
+                raise StopAsyncIteration
             # Живой go2rtc не закрывает stdout — держим читателя, как в жизни.
-            await asyncio.sleep(3600)
+            await asyncio.sleep(0)
         return self._lines.pop(0)
 
 
@@ -145,27 +149,72 @@ def _fake_launch(monkeypatch, proc: _Proc, *, ready: bool = True) -> None:
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
 
 
-def test_сирота_усыновляется_а_не_уступает_чужому(monkeypatch):
-    """Свой go2rtc прошлого запуска, переживший нечистую остановку HA, держит
-    порты — и «порт занят» раньше означал «уступи чужому аддону»: объект
-    оставался с «не поднят go2rtc» до ребута (2026-09-12, два обновления
-    подряд). Отвечает НАШ API на петле — усыновляем, переговоры идут."""
+def test_сирота_снимается_и_поднимается_свой(monkeypatch):
+    """⚠ Свой go2rtc прошлого запуска HA пишет лог в трубу, которую читал умерший процесс HA: Go
+    выходит по SIGPIPE на первой же строке (объект 2026-10-24: «усыновлён», девять сессий камер —
+    и через минуту после старта HA ни одной камеры до следующего перезапуска). Поэтому сирота
+    не усыновляется, а снимается по pid (имя нашего конфига в командной строке), и поднимается
+    свой процесс с живой трубой."""
+    proc = _Proc()
+    _fake_launch(monkeypatch, proc)
 
-    async def alive(hass):  # noqa: ANN001, ANN202
+    async def alive(_env):  # noqa: ANN202
         return True
 
-    def _must_not_start(*_args):
-        pytest.fail("усыновление не должно поднимать новый процесс")
-
     monkeypatch.setattr(embed, "_api_alive", alive)
-    monkeypatch.setattr(embed.shutil, "which", _must_not_start)
-    # pid усыновлённого — по имени нашего конфига в командной строке (`host_load.find`).
     markers: list[str] = []
     monkeypatch.setattr(host_load, "find", lambda marker: markers.append(marker) or 777)
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(embed.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(embed, "_gone", lambda pid: bool(signals))
 
     assert asyncio.run(embed.async_start(FakeHost())) is True
-    assert embed.is_running() is True
-    assert markers == [embed.CONFIG_PREFIX] and host_load._owners["go2rtc"] == 777  # noqa: SLF001
+    assert markers == [embed.CONFIG_PREFIX]
+    assert signals == [(777, embed.signal.SIGTERM)]
+    assert embed.is_running() is True and host_load._owners["go2rtc"] == 4321  # noqa: SLF001
+
+
+def test_сирота_без_процесса_не_даёт_поднять_свой_и_ждёт_повтора(monkeypatch):
+    """API отвечает, а процесса с нашим конфигом не видно (чужое пространство pid): снять его
+    нечем, и поднимать второй поверх занятых портов бессмысленно — причина в паспорте, повтор."""
+
+    async def alive(_env):  # noqa: ANN202
+        return True
+
+    monkeypatch.setattr(embed, "_api_alive", alive)
+    monkeypatch.setattr(host_load, "find", lambda _marker: None)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _must_not_launch)
+
+    env = FakeHost()
+    assert asyncio.run(embed.async_start(env)) is False
+    assert "прошлого запуска" in embed.state()["why"]
+    assert env.spawned == ["mega_home go2rtc: повтор старта"]
+
+
+def test_смерть_во_время_работы_снимает_службу_и_перезапускает(monkeypatch):
+    """⚠ Процесс умер после старта — служба не должна оставаться в реестре: `connect` камер
+    упирался в закрытый порт («ClientConnectorError»), и просмотр лежал до перезапуска HA."""
+    from mega_home.core import services
+
+    proc = _Proc([b"12:48:35.000 WRN something\n"])
+    _fake_launch(monkeypatch, proc)
+
+    async def scenario() -> FakeHost:
+        env = FakeHost()
+        assert await embed.async_start(env) is True
+        assert services.resolve("go2rtc") == embed.API_PORT
+        proc.returncode = 2
+        proc.stdout.eof = True
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return env
+
+    env = asyncio.run(scenario())
+    assert embed.is_running() is False
+    assert services.resolve("go2rtc") is None
+    assert "go2rtc" not in host_load._owners  # noqa: SLF001
+    assert "(2)" in embed.state()["why"] and "WRN something" in embed.state()["why"]
+    assert env.spawned == ["mega_home go2rtc: перезапуск после падения"]
 
 
 def test_проба_порта_не_спотыкается_о_time_wait():

@@ -21,19 +21,27 @@
   (`state()["why"]` → `integration.go2rtc.why`), а старт повторяем в фоне:
   помеха бывает временной. Штатного пути видео у HA за нами больше нет —
   переговоры ведёт бандл только с нашей службой (`docs/plan-thin-gateway.md`).
-* **но сначала — СИРОТА (0.2.44).** Отвечающий на НАШЕМ API-порте (1985,
-  только петля) — это наш же процесс прошлого запуска, переживший нечистую
-  остановку HA. Уступить его «чужому аддону» — значит после каждого такого
-  рестарта навсегда остаться с «не поднят go2rtc». Усыновляем: конфиг наш,
-  порты его, переговоры продолжаются без единого разрыва.
+* **но сначала — СИРОТА.** Отвечающий на НАШЕМ API-порте (1985, только петля)
+  — это наш же процесс прошлого запуска, переживший перезапуск HA в том же
+  контейнере. Уступить его «чужому аддону» — значит после каждого такого
+  рестарта навсегда остаться с «не поднят go2rtc». ⚠ И не усыновлять: его
+  stdout — труба в умерший процесс HA, и Go выходит по SIGPIPE на первой же
+  строке лога (объект 2026-10-24: через минуту после старта HA, на первых
+  сессиях камер). Снимаем по pid и поднимаем свой — как любой супервизор;
+* **смерть во время работы — не до перезапуска HA.** Читатель лога видит конец
+  трубы: служба снимается из реестра (иначе `connect` упирается в закрытый
+  порт), причина с хвостом лога — в журнал и паспорт, старт — обычным повтором.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
+import signal
 import socket
 import tempfile
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -89,7 +97,10 @@ CONFIG_PREFIX = "mega_home_go2rtc_"
 # помеха длилась минуту (TIME_WAIT прежнего запуска), а отказ жил до ребута.
 RETRY_EVERY = 20.0
 RETRY_ATTEMPTS = 15
+# Сколько ждём выхода сироты после SIGTERM и затем после SIGKILL.
+ORPHAN_STOP_S = 5.0
 
+_env: Host | None = None
 _proc: asyncio.subprocess.Process | None = None
 _drain: asyncio.Task[None] | None = None
 _retry: asyncio.Task[None] | None = None
@@ -100,27 +111,22 @@ _log: deque[str] = deque(maxlen=LOG_TAIL)
 
 async def async_start(env: Host) -> bool:
     """Поднять свой go2rtc. False — не поднят, причина в `state()["why"]`."""
-    global _proc, _tmp, _ready, _why
+    global _env, _proc, _tmp, _ready, _why
 
     if is_running():
         return True
-    # ⚠ СИРОТА — раньше проверки портов. Свой go2rtc прошлого запуска HA,
-    # переживший нечистую остановку, держит и API, и медиа-порт. Уступить его
-    # «чужому аддону» значило бы навсегда остаться с «не поднят go2rtc»:
-    # живой факт 2026-09-12 — два обновления подряд, и камера мертва до
-    # ребута объекта. Отвечает НАШ API на петле — усыновляем, а не уступаем.
+    _env = env
+    # ⚠ СИРОТА — раньше проверки портов: свой go2rtc прошлого запуска HA держит и API, и
+    # медиа-порт (живой факт 2026-09-12 — уступка «чужому аддону» оставила камеру мёртвой до
+    # ребута). Снимается, а не усыновляется: без читателя трубы он умрёт сам на первой строке лога.
     if await _api_alive(env):
-        _ready = True
-        _why = ""
-        services.register("go2rtc", API_PORT)
-        # pid без handle — по имени нашего конфига в командной строке; не нашли — строки нагрузки нет.
-        host_load.track("go2rtc", await env.run(host_load.find, CONFIG_PREFIX))
-        LOGGER.info(
-            "Усыновлён go2rtc прошлого запуска (%s): порты его, конфиг наш — "
-            "переговоры идут через него",
-            URL,
-        )
-        return True
+        problem = await env.run(_stop_orphan)
+        if problem:
+            _why = problem
+            LOGGER.warning("%s", _why)
+            _schedule_retry(env)
+            return False
+        LOGGER.info("Снят go2rtc прошлого запуска HA (%s): поднимаем свой", URL)
     binary = await env.run(shutil.which, "go2rtc")
     if not binary:
         _why = "в системе нет go2rtc: запись и удалённая камера не заработают"
@@ -195,12 +201,7 @@ async def _retry_start(env: Host, attempts: int = RETRY_ATTEMPTS) -> bool:
 
 
 async def async_stop() -> None:
-    """Снять процесс и убрать за собой. Зовётся при выгрузке и остановке HA.
-
-    ⚠ Усыновлённый процесс НЕ снимается — мы его не поднимали и handle на
-    него не имеем. Он переживёт выгрузку, продолжит держать медиа-порт и
-    будет усыновлён следующим стартом: камеры при перезапуске HA не мигают.
-    """
+    """Снять процесс и убрать за собой. Зовётся при выгрузке и остановке HA."""
     global _proc, _tmp, _drain, _ready, _retry
 
     _ready = False
@@ -242,13 +243,8 @@ def is_running() -> bool:
     продолжает работать, и переговоры уходили бы на путь без единого
     кандидата. Поэтому здесь и флаг готовности, поставленный только после
     ответа его API.
-
-    ⚠ УСЫНОВЛЁННЫЙ (`_proc is None`) жив по факту ответа API при старте:
-    своего handle у него нет, тихая смерть посреди работы обнаружится только
-    упавшей переговоркой — и лечится перезапуском HA, который усыновит или
-    поднимет заново. Редкий случай: усыновляемый уже пережил часы работы.
     """
-    return _ready and (_proc is None or _proc.returncode is None)
+    return _ready and _proc is not None and _proc.returncode is None
 
 
 def log_tail() -> list[str]:
@@ -269,8 +265,6 @@ def state() -> dict[str, Any]:
     """Состояние своего go2rtc для диагностики записи объекта."""
     return {
         "running": is_running(),
-        # `adopted` — процесс прошлого запуска Home Assistant, взятый под себя.
-        "adopted": _ready and _proc is None,
         "why": "" if is_running() else _why,
         "api": URL,
         "media_port": WEBRTC_PORT,
@@ -315,10 +309,62 @@ async def _read_output() -> None:
             if text:
                 _log.append(text)
                 LOGGER.debug("go2rtc: %s", text)
+        # Конец трубы — процесс вышел. Остановка снимает читателя ДО процесса, сюда не доходя.
+        await proc.wait()
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 - чтение лога не должно ронять интеграцию
         LOGGER.debug("go2rtc output reader stopped", exc_info=True)
+        return
+    _exited(proc)
+
+
+def _exited(proc: asyncio.subprocess.Process) -> None:
+    """Поднятый процесс умер посреди работы. Смерть при старте разбирает сам `async_start`."""
+    global _ready, _why
+
+    if proc is not _proc or not _ready or _env is None:
+        return
+    _ready = False
+    services.unregister("go2rtc")
+    host_load.untrack("go2rtc", proc.pid)
+    _why = f"go2rtc завершился ({proc.returncode}) во время работы. Его лог: {' | '.join(_log) or 'пусто'}"
+    LOGGER.warning("%s", _why)
+    _env.spawn(_after_exit(_env), "mega_home go2rtc: перезапуск после падения")
+
+
+async def _after_exit(env: Host) -> None:
+    await async_stop()
+    _schedule_retry(env)
+
+
+def _gone(pid: int) -> bool:
+    """Процесса нет или он зомби: порты он уже отпустил (`proc(5)`, поле состояния)."""
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return True
+    return text[text.rindex(")") + 2 :][:1] in ("Z", "X")
+
+
+def _stop_orphan() -> str:
+    """Снять свой go2rtc прошлого запуска HA (в исполнителе); пусто — снят."""
+    pid = host_load.find(CONFIG_PREFIX)
+    if pid is None:
+        return f"на {URL} отвечает go2rtc прошлого запуска HA, а его процесса не видно — снимет перезапуск контейнера HA"
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return ""
+        except OSError as err:
+            return f"go2rtc прошлого запуска HA (pid {pid}) не снялся: {err}"
+        deadline = time.monotonic() + ORPHAN_STOP_S
+        while time.monotonic() < deadline:
+            if _gone(pid):
+                return ""
+            time.sleep(0.1)
+    return f"go2rtc прошлого запуска HA (pid {pid}) не завершился"
 
 
 async def _await_api(env: Host) -> bool:
