@@ -427,6 +427,11 @@ def test_размер_ядра_не_растёт_прикладной_логик
     записи по образцу Frigate (`recorder_preview.py`, ~200; `/previews` и `/preview` службы, ~40) ВМЕСТО кадров к
     кускам, их досъёмки и спрайтов (`recorder_frames.py` снят, −210): сборка спрайта по запросу стоила 15–18 с
     на окно при сетевой папке, превью под пальцем не успевало никогда. Замер — 8 742; планка — замер плюс 40.
+    ⚠ 8 782 → 8 986 (2026-10-24, ветка `feat/person-detection`), пункт 2 — процесс детекции: сеть «человек
+    есть / нет» на вырезе движения (`person.py`, ~120: исполнитель MobileNet на numpy — `onnxruntime` и OpenCV
+    в образ HA не ставятся, вырез, BMP из трубы ffmpeg, счёт окна), второй выход того же декодера и кадр с
+    рамкой одного момента (`motion.py`, ~70). Решение заказчика того дня (менеджер:
+    `docs/superpowers/specs/2026-10-24-person-detection-design.md`). Замер — 8 946; планка — замер плюс 40.
     """
     total = sum(len([l for l in _code(path).splitlines() if l.strip()]) for path in CORE_MODULES)
-    assert total <= 8782
+    assert total <= 8986
