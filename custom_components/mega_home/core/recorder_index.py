@@ -56,14 +56,6 @@ def segment_name(begin: float, length_ms: int) -> str:
     return f"{time.strftime('%H%M%S', time.gmtime(begin))}-{length_ms}.mkv"
 
 
-def _frame_size(segment: Path) -> int:
-    """Кадр превью куска (`recorder_frames.frame_of`) — тот же стержень, `.jpg`; нет — 0."""
-    try:
-        return segment.with_suffix(".jpg").stat().st_size
-    except OSError:
-        return 0
-
-
 def scan_day(folder: Path) -> list[Segment]:
     """Куски каталога дня по именам — только при загрузке индекса."""
     out: list[Segment] = []
@@ -115,10 +107,10 @@ class SegmentIndex:
                 day.begins.append(begin)
                 day.lengths.append(int(length * 1000))
                 if sizes:
-                    day.size += path.stat().st_size + _frame_size(path)
+                    day.size += path.stat().st_size
             if sizes and len(day.begins):
-                # Спрайты окон и заглушка (`recorder_frames`) — тоже объём дня: лимит считает всё, что лежит.
-                day.size += sum(item.stat().st_size for item in (folder / "sprites").glob("*.jpg"))
+                # Превью-видео дня (`recorder_preview.py`) — тоже объём: лимит считает всё, что лежит.
+                day.size += sum(item.stat().st_size for item in (folder / "preview").glob("*.mp4"))
             if len(day.begins):
                 days[folder.name] = day
         with self._lock:
@@ -149,8 +141,7 @@ class SegmentIndex:
         return self._path(name, begin, length_ms)
 
     def account(self, begin: float, size: int) -> None:
-        """Кадр, снятый к куску позже сохранения (`recorder_frames.backfill`), спрайт окна (снятый — с
-        минусом) — в объём его дня."""
+        """Кусок превью-видео (`recorder_preview.py`) — в объём его дня."""
         with self._lock:
             day = self._days.get(day_of(begin))
             if day is not None:
@@ -247,18 +238,19 @@ class SegmentIndex:
 
 
 def clean(storage: Path, cameras: list[Any], now: float, limit: int = 0) -> None:
-    """По сроку камеры — каталоги дней целиком (с кадрами и `sprites/`); по месту и по лимиту объёма (`limit`, байты:
-    «локальный диск») — самые старые куски всех камер. `cameras` — `_Camera` записи (`spec`, `index`)."""
+    """По сроку камеры — каталоги дней целиком (с `preview/`); по месту и по лимиту объёма (`limit`, байты:
+    «локальный диск») — самые старые куски всех камер. `cameras` — `_Camera` записи (`spec`, `index`, `previews`)."""
     for camera in cameras:
         camera.index.ensure(bool(limit))
         cutoff = day_of(now - camera.spec.retain_days * 24 * 3600)
-        # ⚠ И каталоги с диска, а не только дни индекса: в сутках без движения лежат одни кадры превью
-        # (`_Camera._preview_only`) — индекс таких суток не знает, и они жили бы вечно.
+        # ⚠ И каталоги с диска, а не только дни индекса: в сутках без движения лежит одно превью-видео
+        # (оно пишется всегда) — индекс кусков таких суток не знает, и они жили бы вечно.
         on_disk = [p.name for p in camera.index.root.iterdir() if p.is_dir() and _DAY.match(p.name)] if camera.index.root.is_dir() else []
         for name in sorted(set(camera.index.day_names()) | set(on_disk)):
             if name < cutoff:
                 shutil.rmtree(camera.index.root / name, ignore_errors=True)
                 camera.index.drop_day(name)
+                camera.previews.drop_day(name)
     # Шагами по 60 кусков (10 минут записи), не больше полусотни шагов за проход.
     for _step in range(50):
         floor = LIMITED_MIN_FREE_BYTES if limit else MIN_FREE_BYTES
@@ -272,13 +264,13 @@ def clean(storage: Path, cameras: list[Any], now: float, limit: int = 0) -> None
             break
         camera = oldest[1]
         for begin, _length, path in camera.index.oldest(60):
-            # Кусок уходит вместе с кадром превью: в индексе их объём один.
-            size = (path.stat().st_size if path.is_file() else 0) + _frame_size(path)
+            size = path.stat().st_size if path.is_file() else 0
             path.unlink(missing_ok=True)
-            path.with_suffix(".jpg").unlink(missing_ok=True)
             emptied = camera.index.forget(begin, size)
             if emptied is not None:
+                # Сутки без кусков — и без их превью: каталог уходит целиком.
                 shutil.rmtree(camera.index.root / emptied, ignore_errors=True)
+                camera.previews.drop_day(emptied)
     plays = storage / ".cache" / "play"
     for item in plays.iterdir() if plays.is_dir() else []:
         if now - item.stat().st_mtime > 6 * 3600:

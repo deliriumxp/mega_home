@@ -28,14 +28,12 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import os
 import re
 import shutil
 import time
 from collections import deque
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
@@ -44,8 +42,10 @@ from . import host_load, services, storage
 from .const import LOGGER
 from .go2rtc_embed import API_PORT, RTSP_PORT
 from .host import Host
-from .recorder_frames import backfill, frame_of, tools as frame_tools
 from .recorder_index import SegmentIndex, clean, day_of, epoch_of, segment_name
+from .recorder_preview import PreviewIndex, PreviewWriter, sweep_legacy
+# Раздел конфига и годность хранилища — `recorder_spec.py`; здесь под прежними именами для службы и спек.
+from .recorder_spec import CameraSpec, camera_specs, storage_problem  # noqa: F401
 
 SERVICE = "recorder"
 SEGMENT_S = 10
@@ -67,91 +67,6 @@ RAM_PER_CAMERA = 64 * 1024**2
 # Список готовых кусков ведёт сам ffmpeg (`-segment_list`, CSV «файл,начало,конец»): длительность
 # куска и «кусок закрыт» без ffprobe на каждый кусок и без догадки «последний ещё пишется».
 SEGMENT_LIST = "segments.csv"
-_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-# Путь хранилища уходит строкой в список ffconcat (`file '…'`) и в источник go2rtc (`#` — разделитель).
-_PATH = re.compile(r"^/[A-Za-z0-9_./-]+$")
-
-
-@dataclass(frozen=True)
-class CameraSpec:
-    """Камера раздела `recorder`: всё — данные менеджера."""
-
-    id: str
-    stream: str
-    source: str
-    motion_mode: bool
-    retain_days: int
-    pre_s: float
-    post_s: float
-    access: str
-    events: str
-    on: tuple[str, ...]
-    off: tuple[str, ...]
-    # Ответ режется на сообщения по `split`; смены считаются только в сообщениях, где есть одна
-    # из подстрок `require` (тема движения) — `State` несут и темы «темно», «закрыли объектив»;
-    # сообщение с любой из подстрок `skip` — не смена (первичное состояние подписки).
-    split: str
-    require: tuple[str, ...]
-    skip: tuple[str, ...] = ()
-
-
-def camera_specs(section: Any) -> list[CameraSpec]:
-    """Камеры раздела; неполная или с чужими символами в id — пропускается (id — имя каталога)."""
-    out: list[CameraSpec] = []
-    for raw in (section or {}).get("cameras") or []:
-        if not isinstance(raw, dict) or not _ID.match(str(raw.get("id", ""))):
-            continue
-        if not raw.get("stream") or not raw.get("source"):
-            continue
-        motion = raw.get("motion") if isinstance(raw.get("motion"), dict) else {}
-        words = lambda key: tuple(str(s) for s in motion.get(key) or [] if s)  # noqa: E731
-        out.append(
-            CameraSpec(
-                id=str(raw["id"]),
-                stream=str(raw["stream"]),
-                source=str(raw["source"]),
-                motion_mode=raw.get("mode") == "motion",
-                retain_days=max(int(raw.get("retainDays") or 7), 1),
-                pre_s=float(raw.get("preSec") or 10),
-                post_s=float(raw.get("postSec") or 20),
-                access=str(motion.get("access") or ""),
-                events=str(motion.get("source") or ""),
-                on=words("on"),
-                off=words("off"),
-                split=str(motion.get("split") or ""),
-                require=words("require"),
-                skip=words("skip"),
-            )
-        )
-    return out
-
-
-def storage_problem(path: Path, reference: Path, local: bool = False, mounted_at: Path | None = None) -> str:
-    """Почему писать сюда нельзя; пусто — можно.
-
-    `reference` — каталог настроек дома: его диск — системный (флеш контроллера). Писать на него
-    можно только явно (`local` — «локальный диск» с лимитом). `mounted_at` — точка, которую
-    смонтировал дом: путь обязан быть внутри неё, иначе пропавший диск означал бы запись на флеш.
-    """
-    if not path.is_absolute() or not _PATH.match(str(path)):
-        return f"путь хранилища «{path}» — абсолютный, из латиницы, цифр и знаков _ . - /"
-    if mounted_at is not None and (mounted_at != path and mounted_at not in path.parents or not os.path.ismount(mounted_at)):
-        return f"диск хранилища не смонтирован в {mounted_at}"
-    if mounted_at is None and storage.MOUNT_POINT.parent in path.parents:
-        return f"{path} — точка, куда дом сам подключает диск: выберите USB-диск или сетевую папку видом хранилища"
-    if not path.is_dir():
-        return f"нет каталога хранилища {path}: подключите диск или сетевую папку"
-    disk = storage.disk_kind(path, reference)
-    if disk == "container":
-        return f"папка {path} внутри контейнера Home Assistant — пропадёт при его обновлении: выберите диск"
-    if disk == "system" and not local:
-        return (
-            f"папка {path} на системном диске контроллера — запись не идёт, чтобы не заполнить его: "
-            "выберите диск или сетевую папку, либо «Локальный диск» с лимитом"
-        )
-    if not os.access(path, os.W_OK):
-        return f"в {path} нельзя писать"
-    return ""
 
 
 class _Camera:
@@ -165,8 +80,6 @@ class _Camera:
         self.last_saved = 0.0
         self.saved = 0
         self.dropped = 0
-        # Кадр превью не снялся при живом ffmpeg — сказано в журнал (один раз на камеру, не на кусок).
-        self._frame_warned = False
         self._tail: deque[str] = deque(maxlen=8)
         # Готовые куски по списку ffmpeg: имя → длительность; прочитанная часть списка — смещением.
         self._listed: dict[str, float] = {}
@@ -174,6 +87,10 @@ class _Camera:
         self._last_ready = 0.0
         # Окна движения: [начало, конец или None, последнее «есть движение»] — часы дома.
         self.windows: list[list[float | None]] = []
+        # Превью-видео камеры (`recorder_preview.py`): свой процесс, свой индекс.
+        self.previews = PreviewIndex(recorder.storage / spec.id)
+        self.preview = PreviewWriter(self)
+        self.preview_task: asyncio.Task[None] | None = None
 
     async def run(self) -> None:
         await self.rec.env.run(lambda: self.cache.mkdir(parents=True, exist_ok=True))
@@ -299,7 +216,6 @@ class _Camera:
                 await self.rec.env.run(self._save, path, start, length)
             elif start + length + self.spec.pre_s < now - SEGMENT_S or final:
                 self.dropped += 1
-                await self.rec.env.run(self._preview_only, path, start, length)
                 await self.rec.env.run(path.unlink, True)
 
     def _save(self, path: Path, start: float, length: float) -> None:
@@ -311,32 +227,10 @@ class _Camera:
         target = self.index.root / day_of(start) / segment_name(start, int(length * 1000))
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(path), str(target))
-        # Кадр — в объёме куска: лимит «локального диска» считает и его.
-        frame = self.rec.extract_frame(target, target.with_suffix(".jpg"), self.rec.ffmpeg, self.rec.nice) if self.rec.ffmpeg else 0
-        if not frame and self.rec.ffmpeg and not self._frame_warned:
-            self._frame_warned = True
-            LOGGER.warning("Запись %s: кадр превью из %s не снялся — у шкалы архива не будет превью кусков", self.spec.id, target.name)
         # В индекс — после переноса: сорвавшийся перенос не оставляет в нём куска, которого нет.
-        self.index.add(start, length, size + frame)
+        self.index.add(start, length, size)
         self.saved += 1
         self.last_saved = start + length
-
-    def _preview_only(self, path: Path, start: float, length: float) -> None:
-        """Кусок без движения не хранится, но его кадр превью — да (решение заказчика 2026-10-24: протяжка
-        поверх пустых мест показывает хотя бы грубую картинку пропущенного, как превью-поток Frigate).
-        Кадр лежит в каталоге дня тем же именем, что у куска, но без `.mkv`: индекс его не видит (это не
-        запись — перемотки туда нет), спрайт берёт по имени (`recorder_frames.slot_frames`).
-
-        ⚠ Не на «локальном диске» с лимитом: такой кадр не входит в объём индекса, а там объём держит лимит.
-        ⚠ Хранилище — перед каждым кадром, как у куска (`_save`): иначе отвалившийся диск до прохода
-        сторожа получал бы каталоги дней с кадрами на флеше контроллера.
-        """
-        if not self.rec.ffmpeg or self.rec.limit or self.rec.problem():
-            return
-        target = self.index.root / day_of(start) / segment_name(start, int(length * 1000))
-        with contextlib.suppress(OSError):
-            target.parent.mkdir(parents=True, exist_ok=True)
-            self.rec.extract_frame(path, target.with_suffix(".jpg"), self.rec.ffmpeg, self.rec.nice)
 
     def wanted(self, start: float, stop: float, now: float) -> bool:
         """Попал ли кусок в окно движения с запасом до и после."""
@@ -400,6 +294,7 @@ class _Camera:
             "dropped": self.dropped,
             "lastSaved": round(self.last_saved, 3) or None,
             "motion": bool(self.windows and self.windows[-1][1] is None),
+            "preview": self.preview.why,
         }
 
 
@@ -424,13 +319,10 @@ class Recorder:
         self._api_task: asyncio.Task[None] | None = None
         self._specs: list[CameraSpec] = []
         self._supervisor: asyncio.Task[None] | None = None
-        # Досъёмка кадров к кускам без них (`recorder_frames.backfill`) — пока камеры запущены.
-        self._frames: asyncio.Task[None] | None = None
+        # Уборка кадров и спрайтов прежних версий (`recorder_preview.sweep_legacy`) — раз на запуск камер.
+        self._sweep: asyncio.Task[None] | None = None
         # Идущая проба хранилища (монтирование и каталог): вторая поверх висящей не заводится.
         self._checking: asyncio.Future[str] | None = None
-        # ffmpeg для кадров превью (пусто — кадров нет, куски пишутся); снятие кадра — шов спек.
-        self.ffmpeg, self.nice = "", ""
-        self.extract_frame: Callable[[Path, Path, str, str], int] = frame_of
 
     def apply(self, config: dict[str, Any] | None) -> None:
         # ⚠ Служба на петле — всегда, а не только при записи: папку хранилища выбирают ДО записи.
@@ -531,36 +423,43 @@ class Recorder:
             for camera in self.cameras.values():
                 if camera.task is None or camera.task.done():
                     camera.task = self.env.spawn(camera.run(), f"mega_home: запись {camera.spec.id}")
+                if camera.preview_task is None or camera.preview_task.done():
+                    camera.preview_task = self.env.spawn(camera.preview.run(), f"mega_home: превью {camera.spec.id}")
         await self.env.run(clean, self.storage, list(self.cameras.values()), time.time(), self.limit)
 
     async def _start_cameras(self) -> None:
         ram = await self.env.run(self._ram_cache, sum(1 for s in self._specs if s.motion_mode))
         disk = self.storage / ".cache"
         await self.env.run(lambda: disk.mkdir(exist_ok=True))
-        self.ffmpeg, self.nice = await self.env.run(frame_tools)
         self.cameras = {
             spec.id: _Camera(self, spec, ram if spec.motion_mode and ram is not None else disk) for spec in self._specs
         }
         self._unsubscribe = self._subscribe(self._on_event)
-        self._frames = self.env.spawn(
-            backfill(lambda: [c.index for c in self.cameras.values()], lambda: (self.ffmpeg, self.nice), self.env.run, asyncio.sleep),
-            "mega_home: кадры к кускам записи",
-        )
+        roots = [camera.index.root for camera in self.cameras.values()]
+        self._sweep = self.env.spawn(self._sweep_legacy(roots), "mega_home: уборка кадров прежних версий")
+
+    async def _sweep_legacy(self, roots: list[Path]) -> None:
+        for root in roots:
+            try:
+                await self.env.run(sweep_legacy, root)
+            except OSError as err:
+                LOGGER.warning("Запись: прежние кадры превью в %s не убраны: %s", root, err)
 
     async def _stop_cameras(self, collect: bool) -> None:
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
-        tasks = [c.task for c in self.cameras.values() if c.task is not None]
-        if self._frames is not None:
-            tasks.append(self._frames)
-            self._frames = None
+        tasks = [t for c in self.cameras.values() for t in (c.task, c.preview_task) if t is not None]
+        if self._sweep is not None:
+            tasks.append(self._sweep)
+            self._sweep = None
         for task in tasks:
             task.cancel()
         await asyncio.gather(*[t for t in tasks if isinstance(t, asyncio.Future)], return_exceptions=True)
         for camera in self.cameras.values() if collect else []:
             try:
                 await camera._collect(final=True)  # noqa: SLF001 — дописать начатое до остановки
+                await self.env.run(camera.preview.collect, True)
             except Exception as err:  # noqa: BLE001
                 LOGGER.warning("Запись %s: начатое не сохранилось: %s", camera.spec.id, err)
         self.cameras = {}

@@ -112,7 +112,7 @@ def test_метка_кэша_ресурса_своя_у_службы_запис�
             ("192.168.1.9", {"Cache-Control": "max-age=86400"}, connect_mod.RESOURCE_CACHE),
         ):
             answers.append({"status": 200, "headers": {"Content-Type": "image/jpeg", **headers}, "body": "x"})
-            got = asyncio.run(connect_mod.resource({"kind": "http", "host": host, "port": 80, "path": "/sprite"}))
+            got = asyncio.run(connect_mod.resource({"kind": "http", "host": host, "port": 80, "path": "/preview"}))
             assert got[3] == cache, host
     finally:
         services.unregister("recorder")

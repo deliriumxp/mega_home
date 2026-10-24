@@ -23,7 +23,6 @@ import pytest
 from mega_home.core import recorder as rec
 from mega_home.core import services, storage
 from mega_home.core.recorder_api import start_api
-from mega_home.core.recorder_frames import frame_of
 from mega_home.core.recorder_index import SegmentIndex
 
 
@@ -322,107 +321,28 @@ def test_готовность_и_длительность_куска_по_спи
     assert [b for b, _n, _p in camera.index.between(0, 2e9)] == [rec.epoch_of("20261023T120000"), rec.epoch_of("20261023T120010"), rec.epoch_of("20261023T120020")]
 
 
-def _saving_camera(folder: Path) -> rec._Camera:  # noqa: SLF001
-    """Камера постоянной записи на «локальном диске» с лимитом: иначе `_save` откажет."""
-    camera = _camera(folder, motion_mode=False)
-    camera.rec.local, camera.rec.limit = True, 1024**3
-    camera.rec.ffmpeg, camera.rec.nice = "/usr/bin/ffmpeg", "/usr/bin/nice"
-    camera.cache.mkdir(parents=True)
-    return camera
-
-
-def test_кадр_к_куску_лежит_рядом_и_учтён_в_объёме() -> None:
-    """Кадр превью снимается из сохранённого куска, лежит рядом тем же именем и входит в объём
-    дня — лимит «локального диска» считает и кадры."""
-    folder = Path(tempfile.mkdtemp(prefix="rec-"))
-    camera = _saving_camera(folder)
-    piece = camera.cache / "20261023T120000.mkv"
-    piece.write_bytes(b"x" * 5000)
-    calls: list[tuple[Path, Path, str, str]] = []
-
-    def extract(path: Path, out: Path, binary: str, nice: str) -> int:
-        calls.append((path, out, binary, nice))
-        out.write_bytes(b"j" * 1234)
-        return 1234
-
-    camera.rec.extract_frame = extract
-    start = rec.epoch_of("20261023T120000")
-    assert start is not None
-    camera._save(piece, start, 10.0)  # noqa: SLF001
-    target = folder / "onvif-aa" / "2026-10-23" / "120000-10000.mkv"
-    assert target.is_file() and target.with_suffix(".jpg").stat().st_size == 1234
-    assert calls == [(target, target.with_suffix(".jpg"), "/usr/bin/ffmpeg", "/usr/bin/nice")]
-    assert camera.index.size() == 5000 + 1234
-
-
-def test_кусок_сохраняется_без_кадра(caplog: pytest.LogCaptureFixture) -> None:
-    """Кадр не извлёкся (или ffmpeg нет) — кусок всё равно в архиве, слот спрайта просто пуст;
-    «превью нет» сказано в журнал один раз на камеру, а не на каждый кусок."""
-    folder = Path(tempfile.mkdtemp(prefix="rec-"))
-    camera = _saving_camera(folder)
-    start = rec.epoch_of("20261023T120000")
-    assert start is not None
-    camera.rec.extract_frame = lambda _path, _out, _binary, _nice: 0
-    for offset, name in ((0, "a"), (10, "b")):
-        (camera.cache / f"{name}.mkv").write_bytes(b"x" * 10)
-        camera._save(camera.cache / f"{name}.mkv", start + offset, 10.0)  # noqa: SLF001
-    assert len([r for r in caplog.records if "кадр превью" in r.getMessage()]) == 1
-    camera.rec.ffmpeg = ""
-    camera.rec.extract_frame = lambda _path, _out, _binary, _nice: pytest.fail("без ffmpeg кадр не снимается")
-    (camera.cache / "c.mkv").write_bytes(b"x" * 10)
-    camera._save(camera.cache / "c.mkv", start + 20, 10.0)  # noqa: SLF001
-    day = folder / "onvif-aa" / "2026-10-23"
-    assert sorted(p.name for p in day.iterdir()) == ["120000-10000.mkv", "120010-10000.mkv", "120020-10000.mkv"]
-    assert camera.saved == 3 and camera.index.size() == 30
-
-
-def _fake_ffmpeg(folder: Path, body: str, code: int) -> str:
-    """Подставной ffmpeg: пишет `body` в последний аргумент (файл вывода) и выходит с `code`."""
-    script = folder / "ffmpeg"
-    script.write_text(f'#!/bin/sh\nfor a; do last="$a"; done\nprintf \'{body}\' > "$last"\nexit {code}\n')
-    script.chmod(0o755)
-    return str(script)
-
-
-def test_кадр_пишется_целиком_или_не_остаётся(tmp_path: Path) -> None:
-    """ffmpeg пишет во временное имя; удачный снимок переименовывается в `.jpg`, сорвавшийся
-    (код ошибки, пустой файл, нет программы) не оставляет ни кадра, ни временного файла."""
-    piece, out = tmp_path / "120000-10000.mkv", tmp_path / "120000-10000.jpg"
-    piece.write_bytes(b"x")
-    leftovers = lambda: sorted(p.name for p in tmp_path.iterdir() if p != piece and p.name != "ffmpeg")  # noqa: E731
-    assert frame_of(piece, out, _fake_ffmpeg(tmp_path, "half", 1)) == 0 and leftovers() == []
-    assert frame_of(piece, out, _fake_ffmpeg(tmp_path, "", 0)) == 0 and leftovers() == []
-    assert frame_of(piece, out, str(tmp_path / "nothing")) == 0 and leftovers() == []
-    # Без `nice` кадр снимается, а не пропадает; с ним — тоже.
-    assert frame_of(piece, out, _fake_ffmpeg(tmp_path, "jpeg!", 0)) == 5 and leftovers() == [out.name]
-    out.unlink()
-    nice = shutil.which("nice") or ""
-    assert frame_of(piece, out, _fake_ffmpeg(tmp_path, "jpeg!!", 0), nice) == 6 and out.read_bytes() == b"jpeg!!"
-
-
-def test_уборка_сносит_кадры_и_спрайты_дня(tmp_path: Path) -> None:
+def test_уборка_сносит_превью_дня_и_считает_его_в_объёме(tmp_path: Path) -> None:
     now = rec.epoch_of("20261023T120000")
     assert now is not None
     old = _segment(tmp_path, "onvif-aa", now - 5 * 24 * 3600)
-    old.with_suffix(".jpg").write_bytes(b"j")
-    sprites = old.parent / "sprites"
-    sprites.mkdir()
-    (sprites / "0010.jpg").write_bytes(b"s")
-    rec.clean(tmp_path, [_camera(tmp_path)], now)
-    assert not old.parent.exists()
-    # По лимиту: кадры уходят вместе с кусками и входят в объём после перезапуска (индекс с диска).
-    # Кусков больше шага уборки (60) — день не пустеет, и каталог дня кадры не уносит.
+    (old.parent / "preview").mkdir()
+    (old.parent / "preview" / "120000-600000.mp4").write_bytes(b"p")
+    camera = _camera(tmp_path)
+    camera.previews.load()
+    assert camera.previews.between(0, 2e9)
+    rec.clean(tmp_path, [camera], now)
+    assert not old.parent.exists() and camera.previews.between(0, 2e9) == []
+    # Объём дня после перезапуска (индекс с диска) — куски и превью дня: лимит считает всё, что лежит.
     pieces = [_segment(tmp_path, "onvif-aa", now - 3600 + 10 * i) for i in range(61)]
     for piece in pieces:
         piece.write_bytes(b"x" * 100)
-        piece.with_suffix(".jpg").write_bytes(b"j" * 100)
+    (pieces[0].parent / "preview").mkdir()
+    (pieces[0].parent / "preview" / "110000-600000.mp4").write_bytes(b"p" * 50)
     camera = _camera(tmp_path)
     camera.index.load(sizes=True)
-    assert camera.index.size() == 61 * 200
-    rec.clean(tmp_path, [camera], now, limit=61 * 200 - 1)
-    assert [p.with_suffix(".jpg").exists() for p in pieces] == [False] * 60 + [True]
+    assert camera.index.size() == 61 * 100 + 50
+    rec.clean(tmp_path, [camera], now, limit=61 * 100)
     assert [p.exists() for p in pieces] == [False] * 60 + [True]
-    assert camera.index.size() == 200
 
 
 def test_первичное_состояние_подписки_окна_не_открывает(tmp_path: Path) -> None:
@@ -561,11 +481,10 @@ def test_без_раздела_записи_нет(tmp_path: Path) -> None:
     assert os.listdir(tmp_path) == []
 
 
-def test_ключевой_кадр_до_метки_и_один_листинг_вместо_stat(tmp_path: Path) -> None:
+def test_ключевой_кадр_до_метки(tmp_path: Path) -> None:
     """`inpoint` встаёт на ключевой кадр, а не между ними: копия потока всё равно начнётся с него, и
-    `startMs` обязан назвать это время. Наличие кадров куска — один листинг каталога."""
+    `startMs` обязан назвать это время."""
     from mega_home.core.recorder_api import _keyframe_before
-    from mega_home.core.recorder_frames import present
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg or not shutil.which("ffprobe"):
@@ -592,54 +511,14 @@ def test_ключевой_кадр_до_метки_и_один_листинг_в
     # Нечитаемый файл — прежнее поведение: метка как есть.
     assert asyncio.run(_keyframe_before(_Rec(), tmp_path / "нет.mkv", 6.3)) == 6.3
 
-    (tmp_path / "a.jpg").write_bytes(b"x")
-    assert present([tmp_path / "a.jpg", tmp_path / "b.jpg", tmp_path / "нет" / "c.jpg"]) == {tmp_path / "a.jpg"}
 
-
-def test_кусок_без_движения_оставляет_кадр_превью_и_он_идёт_в_спрайт(tmp_path: Path) -> None:
-    """Решение заказчика 2026-10-24: превью пишется всегда — протяжка поверх пустых мест показывает
-    грубую картинку пропущенного. Сам кусок не хранится, индекс его не видит; спрайт берёт кадр по имени."""
-    from mega_home.core import recorder_frames as frames
-
-    folder = Path(tempfile.mkdtemp(prefix="rec-"))
-    camera = _saving_camera(folder)
-    camera.rec.local, camera.rec.limit = False, 0
-    piece = camera.cache / "20261023T120010.mkv"
-    piece.write_bytes(b"x")
-
-    def extract(path: Path, out: Path, binary: str, nice: str) -> int:
-        out.write_bytes(b"j" * 10)
-        return 10
-
-    camera.rec.extract_frame = extract
-    start = rec.epoch_of("20261023T120010")
-    assert start is not None
-    frame = folder / "onvif-aa" / "2026-10-23" / "120010-10000.jpg"
-    # Хранилище — перед каждым кадром, как у куска: диск пропал — ни каталога дня, ни кадра (флеш).
-    camera.rec.problem = lambda: "диск хранилища не смонтирован"  # type: ignore[method-assign]
-    camera._preview_only(piece, start, 10.0)  # noqa: SLF001
-    assert not frame.parent.exists()
-    camera.rec.problem = lambda: ""  # type: ignore[method-assign]
-    camera._preview_only(piece, start, 10.0)  # noqa: SLF001
-    assert frame.is_file()
-    assert camera.index.between(start, start + 10) == []
-    frames._LISTED.clear()  # noqa: SLF001
-    window = frames.window_start(start)
-    slots = frames.slot_frames(camera.index, window)
-    assert slots[1] == frame and slots[0] is None
-
-    # «Локальный диск» с лимитом — такого кадра нет: в объём индекса он не входит.
-    camera.rec.limit = 10**9
-    frame.unlink()
-    camera._preview_only(piece, start, 10.0)  # noqa: SLF001
-    assert not frame.exists()
-
-
-def test_сутки_из_одних_кадров_превью_уходят_по_сроку(tmp_path: Path) -> None:
+def test_сутки_из_одного_превью_уходят_по_сроку(tmp_path: Path) -> None:
+    """Превью пишется всегда, и у суток без движения кусков нет: индекс кусков их не знает, а уборка
+    по сроку обязана снести и их."""
     now = rec.epoch_of("20261023T120000")
     assert now is not None
-    day = tmp_path / "onvif-aa" / "2026-10-17"
+    day = tmp_path / "onvif-aa" / "2026-10-17" / "preview"
     day.mkdir(parents=True)
-    (day / "120000-10000.jpg").write_bytes(b"j")
+    (day / "120000-600000.mp4").write_bytes(b"p")
     rec.clean(tmp_path, [_camera(tmp_path)], now)
-    assert not day.exists()
+    assert not day.parent.exists()

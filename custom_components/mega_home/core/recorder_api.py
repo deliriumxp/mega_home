@@ -29,7 +29,7 @@ from aiohttp import web
 from . import services, storage
 from .go2rtc_embed import PLAYLIST_INPUT
 from .recorder import SERVICE, day_of
-from .recorder_frames import sprite_for
+from .recorder_preview import whole_fragments
 
 if TYPE_CHECKING:
     from .recorder import Recorder
@@ -45,10 +45,8 @@ NEXT_LOOKUP_S = 2 * 24 * 3600
 # суток бандла (23:59:59 перед сутками без записи) иначе уехал бы через них в следующие.
 FORWARD_S = 24 * 3600
 _RECORDER: web.AppKey[Any] = web.AppKey("recorder")
-# ⚠ Три разных очереди: кадр под пальцем не должен стоять за сборкой спрайта окна (по сети она идёт
-# секундами), а список воспроизведения — за тем и другим.
+# ⚠ Две разных очереди: список воспроизведения не стоит за кадрами под пальцем.
 _FRAMES = asyncio.Semaphore(2)
-_SPRITES = asyncio.Semaphore(1)
 _PROBES = asyncio.Semaphore(2)
 # Сколько до метки смотрим назад в поисках ключевого кадра: больше типичного GOP камеры.
 KEYFRAME_LOOKBACK_S = 12.0
@@ -62,7 +60,8 @@ async def start_api(recorder: Recorder) -> web.AppRunner:
     app.router.add_get("/segments", _segments)
     app.router.add_post("/playlist", _playlist)
     app.router.add_get("/frame", _frame)
-    app.router.add_get("/sprite", _sprite)
+    app.router.add_get("/previews", _previews)
+    app.router.add_get("/preview", _preview)
     app.router.add_get("/disks", _disks)
     app.router.add_get("/folders", _folders)
     app.router.add_post("/folders", _make_folder)
@@ -71,7 +70,7 @@ async def start_api(recorder: Recorder) -> web.AppRunner:
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", 0).start()
-    # Метка кэша — своя (`Service.own_cache`): закрытый спрайт и кадр под меткой не меняются, текущее окно — да.
+    # Метка кэша — своя (`Service.own_cache`): закрытый кусок превью и кадр под меткой не меняются, идущий — да.
     services.register(SERVICE, int(runner.addresses[0][1]), bundle_guard=_installer_only, own_cache=True)
     return runner
 
@@ -325,16 +324,49 @@ async def _frame(request: web.Request) -> web.Response:
     return web.Response(body=image, content_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
 
 
-async def _sprite(request: web.Request) -> web.Response:
-    """Спрайт 10-минутного окна под меткой `at` (мс) — превью под пальцем на шкале
-    (`recorder_frames.sprite_for`). Сборка — ffmpeg, под своей очередью `_SPRITES`: `/frame` за ней не стоит.
-    Закрытое окно с кадрами у всей записи не меняется — держится в кэше браузера; текущее дописывается,
-    а у неполного кадры ещё доснимаются — `no-store`."""
+async def _preview_index(request: web.Request) -> Any:
     recorder: Recorder = request.app[_RECORDER]
-    camera, _ = await _index(request)
-    at = _number(request, "at") / 1000
-    async with _SPRITES:
-        image, lasting = await sprite_for(recorder, camera, at)
-    if not image:
-        raise web.HTTPNotFound(text='{"error": "кадров в окне нет"}', content_type="application/json")
-    return web.Response(body=image, content_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600" if lasting else "no-store"})
+    camera = recorder.cameras[_camera(request)]
+    if not camera.previews.loaded:
+        await recorder.env.run(camera.previews.load)
+    return camera
+
+
+async def _previews(request: web.Request) -> web.Response:
+    """Куски превью-видео в окне `from`..`to` (секунды): `[[начало мс, конец мс], …]` и идущий
+    (`live`: `[начало мс, конец мс по последней записи]` или null) — `recorder_preview.py`."""
+    camera = await _preview_index(request)
+    start, stop = _number(request, "from"), _number(request, "to")
+    pieces = [[int(b * 1000), int((b + n) * 1000)] for b, n in camera.previews.between(start, stop)]
+    current = await camera.rec.env.run(camera.preview.current)
+    live = None
+    if current is not None:
+        stamp = await camera.rec.env.run(lambda: current[1].stat().st_mtime)
+        if stamp > start and current[0] < stop:
+            live = [int(current[0] * 1000), int(stamp * 1000)]
+    return web.json_response({"previews": pieces, "live": live})
+
+
+async def _preview(request: web.Request) -> web.Response:
+    """Кусок превью-видео с началом `start` (мс) — mp4 целиком. Закрытый не меняется — сутки в кэше
+    браузера; идущий — до последнего целого фрагмента (`whole_fragments`) и `no-store`."""
+    camera = await _preview_index(request)
+    start = _number(request, "start") / 1000
+    path = camera.previews.path(start)
+    current = None if path else await camera.rec.env.run(camera.preview.current)
+    if current is not None and abs(current[0] - start) < 0.001:
+        data = whole_fragments(await camera.rec.env.run(current[1].read_bytes))
+        cache = "no-store"
+    else:
+        data = await camera.rec.env.run(_read, path) if path else b""
+        cache = "private, max-age=86400"
+    if not data:
+        raise web.HTTPNotFound(text='{"error": "превью нет"}', content_type="application/json")
+    return web.Response(body=data, content_type="video/mp4", headers={"Cache-Control": cache})
+
+
+def _read(path: Any) -> bytes:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return b""
