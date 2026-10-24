@@ -41,6 +41,9 @@ JOIN_GAP_S = 1.5
 PLAYLIST_S = 3 * 3600
 # Насколько далеко за участком искать продолжение записи.
 NEXT_LOOKUP_S = 2 * 24 * 3600
+# Насколько вперёд от метки в пустоте искать запись (`_playlist`): сутки. Не дальше — край прошлых
+# суток бандла (23:59:59 перед сутками без записи) иначе уехал бы через них в следующие.
+FORWARD_S = 24 * 3600
 _RECORDER: web.AppKey[Any] = web.AppKey("recorder")
 # ⚠ Три разных очереди: кадр под пальцем не должен стоять за сборкой спрайта окна (по сети она идёт
 # секундами), а список воспроизведения — за тем и другим.
@@ -68,14 +71,16 @@ async def start_api(recorder: Recorder) -> web.AppRunner:
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", 0).start()
-    services.register(SERVICE, int(runner.addresses[0][1]), bundle_guard=_installer_only)
+    # Метка кэша — своя (`Service.own_cache`): закрытый спрайт и кадр под меткой не меняются, текущее окно — да.
+    services.register(SERVICE, int(runner.addresses[0][1]), bundle_guard=_installer_only, own_cache=True)
     return runner
 
 
 def _installer_only(what: str, value: str) -> str | None:
     """Диски, папки и подключение хранилища — только менеджеру (инсталлятору): телефон с ключом
-    устройства не монтирует сетевые папки ядром дома и не создаёт папки на его дисках."""
-    if what == "path" and value.split("?", 1)[0] in ("/disks", "/folders", "/mount"):
+    устройства не монтирует сетевые папки ядром дома и не создаёт папки на его дисках. Путь сюда
+    приходит уже приведённым (`connect.service_path`)."""
+    if what == "path" and value.split("?", 1)[0].rstrip("/") in ("/disks", "/folders", "/mount"):
         return "хранилище записи настраивает инсталлятор через менеджер"
     return None
 
@@ -174,25 +179,31 @@ async def _playlist(request: web.Request) -> web.Response:
     ⚠ Список кончается на первой пустоте, а не перешагивает её: ffconcat склеил бы участки
     встык, и время проигрывания перестало бы совпадать со временем записи (запись по движению —
     пустоты в минуты). Через пустоту бандл переходит новым списком с `nextMs`.
+
+    ⚠ Метка в пустоте — ближайшая запись, как у регистратора: вперёд в пределах суток
+    (`FORWARD_S`), иначе последний кусок ДО метки с его начала. Так бандл и зовёт без параметра
+    направления: выбор дня в календаре — полночь, а запись по движению начинается к полудню (окно в
+    3 ч отвечало 404); край прошлых суток (`recordedDayEdge`, 23:59:59 — следом пустые сутки,
+    вперёд записи в сутках нет) — конец записи того дня, а не 404.
     """
     recorder: Recorder = request.app[_RECORDER]
     camera, index = await _index(request)
     at = _number(request, "at") / 1000
-    found = [s for s in index.between(at, at + PLAYLIST_S) if s[0] + s[1] > at]
-    if not found:
-        return web.json_response({"error": "записи после этого момента нет"}, status=404)
-    run = [found[0]]
-    for piece in found[1:]:
+    first = index.first_after(at, at + FORWARD_S) or index.last_before(at)
+    if first is None:
+        return web.json_response({"error": "записи у этого момента нет"}, status=404)
+    start = at if first[0] + first[1] > at else first[0]
+    run = [first]
+    for piece in index.between(first[0] + first[1], start + PLAYLIST_S):
+        if piece[0] <= run[-1][0]:
+            continue
         if piece[0] - (run[-1][0] + run[-1][1]) > JOIN_GAP_S:
             break
         run.append(piece)
-    following = found[len(run)] if len(found) > len(run) else None
-    if following is None:
-        # Пустота длиннее окна списка (по движению — ночь): где запись продолжается, ищем дальше,
-        # иначе просмотр стоял бы на последнем кадре, не зная, что дальше записи нет или она есть.
-        end = run[-1][0] + run[-1][1]
-        following = next((s for s in index.between(end + JOIN_GAP_S, end + NEXT_LOOKUP_S) if s[0] > end + JOIN_GAP_S), None)
-    inpoint = max(at - run[0][0], 0.0)
+    # Где запись продолжается — следующий кусок после последнего в списке: за пустотой (по движению —
+    # ночь) или ВПЛОТНУЮ, если список кончился по `PLAYLIST_S` (иначе 10 с записи пропадали каждые 3 ч).
+    following = index.first_after(run[-1][0], run[-1][0] + NEXT_LOOKUP_S, started=True)
+    inpoint = max(start - run[0][0], 0.0)
     if inpoint > 0:
         inpoint = await _keyframe_before(recorder, run[0][2], inpoint)
     lines = ["ffconcat version 1.0"]
@@ -204,10 +215,15 @@ async def _playlist(request: web.Request) -> web.Response:
     target = folder / f"{camera}-{uuid4().hex}.ffconcat"
 
     def write() -> None:
-        folder.mkdir(parents=True, exist_ok=True)
+        # Без `parents`: `.cache` заводит старт камер на проверенном хранилище; пропал диск — каталога нет,
+        # и путь не создаётся на флеше контроллера под точкой монтирования.
+        folder.mkdir(exist_ok=True)
         target.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    await recorder.env.run(write)
+    try:
+        await recorder.env.run(write)
+    except OSError:
+        return web.json_response({"error": "хранилище записи недоступно"}, status=503)
     parts = [[int(b * 1000), int(n * 1000)] for b, n, _p in run]
     parts[0] = [int((run[0][0] + inpoint) * 1000), int((run[0][1] - inpoint) * 1000)]
     return web.json_response(
@@ -312,12 +328,13 @@ async def _frame(request: web.Request) -> web.Response:
 async def _sprite(request: web.Request) -> web.Response:
     """Спрайт 10-минутного окна под меткой `at` (мс) — превью под пальцем на шкале
     (`recorder_frames.sprite_for`). Сборка — ffmpeg, под своей очередью `_SPRITES`: `/frame` за ней не стоит.
-    Закрытое окно не меняется — держится в кэше браузера; текущее дописывается — `no-store`."""
+    Закрытое окно с кадрами у всей записи не меняется — держится в кэше браузера; текущее дописывается,
+    а у неполного кадры ещё доснимаются — `no-store`."""
     recorder: Recorder = request.app[_RECORDER]
     camera, _ = await _index(request)
     at = _number(request, "at") / 1000
     async with _SPRITES:
-        image, closed = await sprite_for(recorder, camera, at)
+        image, lasting = await sprite_for(recorder, camera, at)
     if not image:
         raise web.HTTPNotFound(text='{"error": "кадров в окне нет"}', content_type="application/json")
-    return web.Response(body=image, content_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600" if closed else "no-store"})
+    return web.Response(body=image, content_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600" if lasting else "no-store"})

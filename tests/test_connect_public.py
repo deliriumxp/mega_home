@@ -89,6 +89,36 @@ def test_ресурс_браузеру_не_из_интернета():
     assert refused.value.status == 403
 
 
+def test_метка_кэша_ресурса_своя_у_службы_записи_и_двери_у_прочих(monkeypatch):
+    """Ревью 2026-10-24: дверь подменяла `Cache-Control` службы записи на 30 с — закрытый спрайт
+    (`max-age=3600`) и кадр под меткой контроллер собирал заново. Служба с `own_cache` — её метка;
+    без метки в ответе и у прочих служб и устройств — дверная (кадр «сейчас»)."""
+    from mega_home.core import services
+
+    answers: list[dict] = []
+
+    async def fake_http(payload, plan=None):
+        return answers.pop(0)
+
+    monkeypatch.setattr(connect_mod, "_http", fake_http)
+    services.register("recorder", 1, own_cache=True)
+    services.register("go2rtc", 2)
+    try:
+        for host, headers, cache in (
+            ("recorder", {"Cache-Control": "private, max-age=3600"}, "private, max-age=3600"),
+            ("recorder", {"cache-control": "no-store"}, "no-store"),
+            ("recorder", {}, connect_mod.RESOURCE_CACHE),
+            ("go2rtc", {"Cache-Control": "max-age=86400"}, connect_mod.RESOURCE_CACHE),
+            ("192.168.1.9", {"Cache-Control": "max-age=86400"}, connect_mod.RESOURCE_CACHE),
+        ):
+            answers.append({"status": 200, "headers": {"Content-Type": "image/jpeg", **headers}, "body": "x"})
+            got = asyncio.run(connect_mod.resource({"kind": "http", "host": host, "port": 80, "path": "/sprite"}))
+            assert got[3] == cache, host
+    finally:
+        services.unregister("recorder")
+        services.unregister("go2rtc")
+
+
 def test_ws_не_идёт_по_перенаправлению(monkeypatch):
     """⚠ Перенаправление на литерал aiohttp соединяет мимо резолвера: имя увело бы дом на loopback."""
 

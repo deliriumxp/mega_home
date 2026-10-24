@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
 
-from . import services, storage
+from . import host_load, services, storage
 from .const import LOGGER
 from .go2rtc_embed import API_PORT, RTSP_PORT
 from .host import Host
@@ -180,7 +180,7 @@ class _Camera:
         while True:
             try:
                 if not self.index.loaded:
-                    await self.rec.env.run(self.index.load, bool(self.rec.limit))
+                    await self.rec.env.run(self.index.ensure, bool(self.rec.limit))
                 await self._register()
                 await self._record()
             except asyncio.CancelledError:
@@ -224,6 +224,7 @@ class _Camera:
         drain = asyncio.ensure_future(self._drain(proc))
         self.why = ""
         self._last_ready = time.monotonic()
+        host_load.track(f"record:{self.spec.id}", proc.pid)
         try:
             while True:
                 try:
@@ -242,6 +243,7 @@ class _Camera:
                 except asyncio.TimeoutError:
                     proc.kill()
             drain.cancel()
+            host_load.untrack(f"record:{self.spec.id}", proc.pid)
         raise RuntimeError(f"ffmpeg завершился ({proc.returncode}): {' | '.join(self._tail) or 'без слов'}")
 
     async def _drain(self, proc: asyncio.subprocess.Process) -> None:
@@ -326,8 +328,10 @@ class _Camera:
         запись — перемотки туда нет), спрайт берёт по имени (`recorder_frames.slot_frames`).
 
         ⚠ Не на «локальном диске» с лимитом: такой кадр не входит в объём индекса, а там объём держит лимит.
+        ⚠ Хранилище — перед каждым кадром, как у куска (`_save`): иначе отвалившийся диск до прохода
+        сторожа получал бы каталоги дней с кадрами на флеше контроллера.
         """
-        if not self.rec.ffmpeg or self.rec.limit:
+        if not self.rec.ffmpeg or self.rec.limit or self.rec.problem():
             return
         target = self.index.root / day_of(start) / segment_name(start, int(length * 1000))
         with contextlib.suppress(OSError):

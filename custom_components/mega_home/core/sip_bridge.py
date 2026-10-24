@@ -53,7 +53,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
-from . import services
+from . import host_load, services
 from .assets import AssetStore
 from .const import LOGGER
 from .host import Host
@@ -342,6 +342,8 @@ class SipBridge:
             self._ready, self._adopted, self._why = True, True, ""
             self._start_calls()
             services.register("asterisk", HTTP_PORT)
+            # Нагрузка: pid без handle — по пути нашего конфига в командной строке (`host_load.find`).
+            host_load.track("sip", await self._env.run(host_load.find, str(self._root / "etc" / "asterisk.conf")))
             LOGGER.info("SIP-мост: усыновлён Asterisk прошлого запуска")
             return
         busy = await self._env.run(_port_busy)
@@ -367,6 +369,7 @@ class SipBridge:
         self._log.clear()
         self._drain = asyncio.ensure_future(self._read_output())
         self._adopted = False
+        host_load.track("sip", self._proc.pid)
         if await self._async_await_listener():
             self._ready, self._why = True, ""
             self._start_calls()
@@ -396,6 +399,7 @@ class SipBridge:
         ready, adopted = self._ready, self._adopted
         self._ready = self._adopted = False
         services.unregister("asterisk")
+        host_load.untrack("sip")
         proc, self._proc = self._proc, None
         if proc is not None and proc.returncode is None:
             try:

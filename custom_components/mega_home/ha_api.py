@@ -38,7 +38,8 @@ REFUSED_TEXT = "Учётки и систему Home Assistant через дом 
 
 
 def guard(what: str, value: str) -> str | None:
-    """Запрет службы `ha` (`services.Service.guard`): путь, тело запроса или кадр сокета."""
+    """Запрет службы `ha` (`services.Service.guard`): путь, тело запроса или кадр сокета. Путь —
+    уже приведённый транспортом (`connect.service_path`): `/%61uth/`, `/api/../auth/` сюда не доходят."""
     if what == "path":
         path = value.split("?", 1)[0].lower()
         return REFUSED_TEXT if any(path.startswith(p) for p in REFUSED_PATHS) else None

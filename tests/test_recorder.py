@@ -252,6 +252,41 @@ def test_индекс_в_памяти_ведёт_запись_а_не_переч
     assert [n for _b, n, _p in index.between(midnight, midnight + 20)] == [4.0]
 
 
+def test_загрузка_индекса_одна_и_не_затирает_добавленное(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ревью 2026-10-24: индекс грузят запись камеры, служба и уборка, каждая в своём потоке; вторая
+    загрузка присваиванием затирала куски, добавленные записью после ЕЁ обхода. Обход один, `add` ждёт его."""
+    import threading
+
+    from mega_home.core import recorder_index
+
+    base = rec.epoch_of("20261023T120000")
+    assert base is not None
+    _segment(tmp_path, "onvif-aa", base)
+    index = SegmentIndex(tmp_path / "onvif-aa")
+    entered, release, scans = threading.Event(), threading.Event(), []
+    real = recorder_index.scan_day
+
+    def slow(folder: Path) -> list:
+        scans.append(folder)
+        entered.set()
+        release.wait(5)
+        return real(folder)
+
+    monkeypatch.setattr(recorder_index, "scan_day", slow)
+    loader = threading.Thread(target=index.ensure)
+    loader.start()
+    assert entered.wait(5)
+    others = [threading.Thread(target=index.ensure), threading.Thread(target=index.add, args=(base + 10, 10.0))]
+    for thread in others:
+        thread.start()
+    time.sleep(0.05)  # вторая загрузка и запись уже ждут первую
+    release.set()
+    for thread in [loader, *others]:
+        thread.join(5)
+    assert len(scans) == 1
+    assert [b for b, _n, _p in index.between(base, base + 20)] == [base, base + 10]
+
+
 def test_готовность_и_длительность_куска_по_списку_ffmpeg(tmp_path: Path) -> None:
     """ffmpeg сам пишет список готовых кусков (`-segment_list`, CSV): кусок берётся, когда он
     в списке, длительность — оттуда, ffprobe на каждый кусок не зовётся."""
@@ -420,9 +455,10 @@ def test_служба_отдаёт_дни_участки_и_список(tmp_pat
         _segment(tmp_path, "onvif-aa", base + offset)
     recorder = rec.Recorder(FakeHost(tmp_path), lambda _listener: (lambda: None))
     recorder.storage = tmp_path
+    (tmp_path / ".cache").mkdir()  # его заводит старт камер (`_start_cameras`)
     recorder.cameras = {"onvif-aa": _camera(tmp_path)}
 
-    async def scenario() -> tuple[dict, dict, dict, int, int, dict, int, dict]:
+    async def scenario() -> tuple[dict, dict, dict, dict, int, dict, int, dict]:
         runner = await start_api(recorder)
         try:
             port = services.resolve(rec.SERVICE)
@@ -434,7 +470,8 @@ def test_служба_отдаёт_дни_участки_и_список(tmp_pat
                 frame = (await client.get(f"/frame?camera=onvif-aa&at={int((base + 3600) * 1000)}")).status
                 segments = await (await client.get(f"/segments?camera=onvif-aa&from={base}&to={base + 120}")).json()
                 play = await (await client.post(f"/playlist?camera=onvif-aa&at={int((base + 15) * 1000)}")).json()
-                missing = (await client.post(f"/playlist?camera=onvif-aa&at={int((base + 7 * 3600) * 1000)}")).status
+                # За концом всей записи — последний кусок с его начала (ближайшая запись), а не 404.
+                missing = await (await client.post(f"/playlist?camera=onvif-aa&at={int((base + 7 * 3600) * 1000)}")).json()
                 # После участка — пустота длиннее окна списка: продолжение всё равно названо.
                 night = await (await client.post(f"/playlist?camera=onvif-aa&at={int((base + 65) * 1000)}")).json()
                 foreign = (await client.get("/days?camera=chuzhaya")).status
@@ -460,7 +497,57 @@ def test_служба_отдаёт_дни_участки_и_список(tmp_pat
     text = Path(path).read_text()
     assert text.startswith("ffconcat version 1.0\n") and "inpoint 5.000" in text
     assert play["source"].endswith("#input=playlist#video=copy#audio=copy")
-    assert missing == 404 and foreign == 404
+    assert missing["startMs"] == ms + 6 * 3600_000 and "nextMs" not in missing and foreign == 404
+
+
+def _playlists(tmp_path: Path, pieces: list[float], *marks: float) -> list[dict]:
+    """Ответы `/playlist` на метки `marks` (секунды) у записи из кусков по 10 с с началами `pieces`."""
+    camera = _camera(tmp_path)
+    for begin in pieces:
+        camera.index.add(begin, 10.0)
+    camera.index.loaded = True
+    recorder = rec.Recorder(FakeHost(tmp_path), lambda _listener: (lambda: None))
+    recorder.storage = tmp_path
+    (tmp_path / ".cache").mkdir(exist_ok=True)
+    recorder.cameras = {"onvif-aa": camera}
+
+    async def scenario() -> list[dict]:
+        runner = await start_api(recorder)
+        try:
+            async with TestClient(TestServer(runner.app)) as client:
+                return [await (await client.post(f"/playlist?camera=onvif-aa&at={int(mark * 1000)}")).json() for mark in marks]
+        finally:
+            await runner.cleanup()
+            services.unregister(rec.SERVICE)
+
+    return asyncio.run(scenario())
+
+
+def test_метка_в_пустоте_ведёт_к_ближайшей_записи_суток(tmp_path: Path) -> None:
+    """Ревью 2026-10-24: список искал запись только на 3 ч вперёд. Выбор дня в календаре (полночь) у
+    записи по движению, начатой к полудню, — 404; край прошлых суток бандла (`recordedDayEdge`, 23:59:59
+    перед сутками без записи) — 404 всегда. Теперь — вперёд в пределах суток, иначе последний кусок до метки."""
+    midnight = rec.epoch_of("20261023T000000")
+    assert midnight is not None
+    morning, evening, after = midnight + 11 * 3600, midnight + 18 * 3600, midnight + 2 * 86400 + 600
+    day, edge, inside = _playlists(tmp_path, [morning, evening, after], midnight, midnight + 86399, morning + 5)
+    assert day["startMs"] == int(morning * 1000) and day["nextMs"] == int(evening * 1000)
+    # Край суток: следующие сутки пусты, через них вперёд не идём — конец записи этого дня.
+    assert edge["startMs"] == int(evening * 1000) and edge["nextMs"] == int(after * 1000)
+    assert inside["startMs"] == int((morning + 5) * 1000)
+
+
+def test_список_по_окну_не_теряет_следующий_кусок(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ревью 2026-10-24: список, кончившийся по `PLAYLIST_S`, называл продолжением кусок ЗА следующим —
+    кусок, начатый впритык, отсекался фильтром «после стыка», и 10 с записи терялись каждые 3 ч."""
+    from mega_home.core import recorder_api
+
+    monkeypatch.setattr(recorder_api, "PLAYLIST_S", 25)
+    base = rec.epoch_of("20261023T120000")
+    assert base is not None
+    [play] = _playlists(tmp_path, [base + 10 * i for i in range(6)], base)
+    assert [part[0] for part in play["parts"]] == [int((base + 10 * i) * 1000) for i in range(3)]
+    assert play["nextMs"] == int((base + 30) * 1000)
 
 
 def test_без_раздела_записи_нет(tmp_path: Path) -> None:
@@ -527,8 +614,13 @@ def test_кусок_без_движения_оставляет_кадр_прев
     camera.rec.extract_frame = extract
     start = rec.epoch_of("20261023T120010")
     assert start is not None
-    camera._preview_only(piece, start, 10.0)  # noqa: SLF001
     frame = folder / "onvif-aa" / "2026-10-23" / "120010-10000.jpg"
+    # Хранилище — перед каждым кадром, как у куска: диск пропал — ни каталога дня, ни кадра (флеш).
+    camera.rec.problem = lambda: "диск хранилища не смонтирован"  # type: ignore[method-assign]
+    camera._preview_only(piece, start, 10.0)  # noqa: SLF001
+    assert not frame.parent.exists()
+    camera.rec.problem = lambda: ""  # type: ignore[method-assign]
+    camera._preview_only(piece, start, 10.0)  # noqa: SLF001
     assert frame.is_file()
     assert camera.index.between(start, start + 10) == []
     frames._LISTED.clear()  # noqa: SLF001

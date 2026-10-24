@@ -238,5 +238,15 @@ def test_хранилище_настраивает_только_менеджер
             assert connect.with_service({"host": rec.SERVICE, "path": path})["host"] == rec.SERVICE
             assert connect.refused({"host": rec.SERVICE}, "path", path)
         assert connect.with_service({"host": rec.SERVICE, "path": "/days?camera=x"}, bundle=True)
+        # Ревью 2026-10-24: запрет сравнивал путь как пришёл, а yarl клиента раскрывает `%6D` и сводит
+        # `..`, фрагмент не уходит вовсе. Путь приводится ДО запрета и уходит в запрос этим видом.
+        for path in ("/%6Dount", "/days/../mount", "/./disks", "//folders?path=/media", "/disks#x", "/disks/", "/mo%75nt?x=1"):
+            with pytest.raises(OpError, match="инсталлятор"):
+                connect.with_service({"host": rec.SERVICE, "path": path}, bundle=True)
+            assert connect.refused({"host": rec.SERVICE}, "path", path)
+        with pytest.raises(OpError, match="дважды"):
+            connect.with_service({"host": rec.SERVICE, "path": "/%256Dount"}, bundle=True)
+        sent = connect.with_service({"host": rec.SERVICE, "path": "/d%61ys/./?camera=a%2Fb#x"}, bundle=True)
+        assert sent["path"] == "/days/?camera=a%2Fb"
     finally:
         services.unregister(rec.SERVICE)

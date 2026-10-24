@@ -12,8 +12,8 @@
 
 Спрайт окна — 10 минут записи сеткой 10 × 6 по 10 с, собирается из этих кадров по запросу службы
 (`/sprite`). Слоты — по ВРЕМЕНИ, а не по порядку кусков: телефон считает слот сам, без индекса, и
-пропавший кадр не сдвигает соседей. Окно в прошлом не меняется — собирается один раз и лежит в
-`<день>/sprites/`; текущее — на лету, без кэша: в него ещё дописываются куски.
+пропавший кадр не сдвигает соседей. Окно в прошлом лежит в `<день>/sprites/` под именем по своим
+кадрам (кадр, снятый позже, — новая сборка); текущее — на лету, без кэша: в него ещё дописываются куски.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import time
+import zlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from uuid import uuid4
@@ -90,8 +91,13 @@ _LISTED: dict[Path, tuple[float, frozenset[str]]] = {}
 
 
 def listing(folder: Path) -> frozenset[str]:
-    """Имена в каталоге — из памяти, если листинг моложе `LISTING_TTL_S`; нет каталога — пусто."""
+    """Имена в каталоге — из памяти, если листинг моложе `LISTING_TTL_S`; нет каталога — пусто.
+    ⚠ Устаревшие листинги уходят на каждом вызове: у постоянной записи это ~17 тыс. имён на сутки
+    камеры, и протяжка по неделе архива держала бы их в памяти HA до перезапуска."""
     now = time.monotonic()
+    for stale, (at, _names) in list(_LISTED.items()):
+        if now - at >= LISTING_TTL_S:
+            _LISTED.pop(stale, None)
     hit = _LISTED.get(folder)
     if hit is not None and now - hit[0] < LISTING_TTL_S:
         return hit[1]
@@ -200,8 +206,21 @@ def slot_frames(index: SegmentIndex, start: float) -> list[Path | None]:
     return slots
 
 
-def sprite_path(root: Path, start: float) -> Path:
-    return root / day_of(start) / "sprites" / f"{time.strftime('%H%M', time.gmtime(start))}.jpg"
+def sprite_path(root: Path, start: float, frames: list[Path | None]) -> Path:
+    """Файл закрытого окна. ⚠ Имя несёт отпечаток кадров слотов: кадр, снятый ПОСЛЕ сборки (досъёмка
+    записанного до 0.5.26 идёт часами, кусок по движению сохраняется с запасом), даёт другое имя, и
+    спрайт с чёрными слотами не остаётся на диске навсегда — «фича покрывает уже записанное»."""
+    mark = zlib.crc32("\n".join(frame.name if frame else "" for frame in frames).encode())
+    return root / day_of(start) / "sprites" / f"{time.strftime('%H%M', time.gmtime(start))}-{mark:08x}.jpg"
+
+
+def complete(index: SegmentIndex, start: float) -> bool:
+    """У каждого куска записи в окне есть кадр — спрайт окна больше не изменится (листинг из памяти)."""
+    return all(
+        path.with_suffix(".jpg").name in listing(path.parent)
+        for begin, length, path in index.between(start, start + WINDOW_S)
+        if begin + length > start and begin < start + WINDOW_S
+    )
 
 
 def _ffmpeg(command: list[str]) -> bytes:
@@ -215,7 +234,12 @@ def compose(frames: list[Path | None], binary: str, work: Path) -> bytes:
     раз на каталог). Ни одного кадра или нет ffmpeg — `b""` без запуска. Блокирует — из исполнителя."""
     if not binary or not any(frames):
         return b""
-    work.mkdir(parents=True, exist_ok=True)
+    try:
+        # ⚠ Без `parents`: каталог дня — там, где лежат кадры. Его нет — диск пропал (листинг кадров
+        # из памяти), и создать путь значило бы писать на флеш контроллера под точкой монтирования.
+        work.mkdir(exist_ok=True)
+    except OSError:
+        return b""
     head = [binary, "-hide_banner", "-loglevel", "error", "-nostdin"]
     blank = work / "blank.jpg"
     if not blank.is_file():
@@ -247,24 +271,58 @@ def _quoted(path: Path) -> str:
     return str(path).replace("'", "'\\''")
 
 
-def _sprite(index: SegmentIndex, start: float, closed: bool) -> bytes:
-    target = sprite_path(index.root, start)
-    if closed:
-        with contextlib.suppress(OSError):
-            return target.read_bytes()
-    image = compose(slot_frames(index, start), shutil.which("ffmpeg") or "", target.parent)
-    if closed and image:
-        part = target.with_name(f"{target.name}.{uuid4().hex}.part")
-        with contextlib.suppress(OSError):
-            part.write_bytes(image)
-            os.replace(part, target)
+def _size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _store(target: Path, image: bytes) -> int:
+    """Спрайт закрытого окна — на диск вместо прежних версий того же окна (и имени до отпечатка);
+    изменение объёма дня, байты."""
+    part, stem = target.with_name(f"{target.name}.{uuid4().hex}.part"), target.name.split("-", 1)[0]
+    try:
+        part.write_bytes(image)
+        os.replace(part, target)
+    except OSError:
         with contextlib.suppress(OSError):
             part.unlink(missing_ok=True)
-    return image
+        return 0
+    grown = len(image)
+    for old in target.parent.glob(f"{stem}*.jpg"):
+        if old != target and (old.name == f"{stem}.jpg" or old.name.startswith(f"{stem}-")):
+            with contextlib.suppress(OSError):
+                size = _size(old)
+                old.unlink()
+                grown -= size
+    return grown
+
+
+def _sprite(index: SegmentIndex, start: float, closed: bool) -> tuple[bytes, bool]:
+    """Спрайт окна и «не изменится»: окно закрыто и у каждого его куска есть кадр. Неполное закрытое
+    окно тоже ложится на диск (имя — по кадрам), но браузеру уходит без долгого кэша."""
+    frames = slot_frames(index, start)
+    if not any(frames):
+        return b"", False
+    lasting = closed and complete(index, start)
+    target = sprite_path(index.root, start, frames)
+    if closed:
+        with contextlib.suppress(OSError):
+            return target.read_bytes(), lasting
+    blank = target.parent / "blank.jpg"
+    had_blank = blank.is_file()
+    image = compose(frames, shutil.which("ffmpeg") or "", target.parent)
+    # Спрайты и заглушка — в объёме дня: лимит «локального диска» считает всё, что лежит.
+    grown = (_store(target, image) if closed and image else 0) + (0 if had_blank else _size(blank))
+    if grown:
+        index.account(start, grown)
+    return image, lasting
 
 
 async def sprite_for(recorder: Recorder, camera: str, at: float) -> tuple[bytes, bool]:
-    """Спрайт окна под `at` (секунды UTC) и закрыто ли оно; пусто — кадров в окне нет."""
+    """Спрайт окна под `at` (секунды UTC) и можно ли его держать в кэше (`_sprite`); пусто — кадров в
+    окне нет."""
     start = window_start(at)
     closed = start + WINDOW_S + CLOSED_AFTER_S <= time.time()
-    return await recorder.env.run(_sprite, recorder.cameras[camera].index, start, closed), closed
+    return await recorder.env.run(_sprite, recorder.cameras[camera].index, start, closed)
