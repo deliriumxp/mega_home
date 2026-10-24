@@ -22,7 +22,7 @@ import re
 import socket
 import ssl
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import aiohttp
 from aiohttp.abc import AbstractResolver
@@ -125,8 +125,12 @@ async def resource(payload: dict[str, Any]) -> tuple[int, str, bytes, str]:
     # ⚠ Метка кэша — НАША и короткая, а не адресата: за дверью живёт кадр
     # «сейчас», и чужой `max-age` (у go2rtc его нет вовсе, у регистратора он
     # про статику) либо заморозил бы картинку, либо не дал бы браузеру не
-    # ходить второй раз в тот же период обновления плитки.
-    return int(answer.get("status") or 200), content_type, raw, RESOURCE_CACHE
+    # ходить второй раз в тот же период обновления плитки. Исключение — служба
+    # дома, которая сама знает срок своего ответа (`Service.own_cache`): закрытый
+    # спрайт записи жил бы 30 с вместо часа, и контроллер собирал бы его снова.
+    service = services.entry(str(payload.get("host") or "").strip())
+    own = next((str(v) for k, v in headers.items() if str(k).lower() == "cache-control"), "") if service and service.own_cache else ""
+    return int(answer.get("status") or 200), content_type, raw, own or RESOURCE_CACHE
 
 def with_service(payload: dict[str, Any], bundle: bool = False) -> dict[str, Any]:
     """Вызов к службе дома получает то, что служба знает о себе: TLS и учётку.
@@ -134,27 +138,36 @@ def with_service(payload: dict[str, Any], bundle: bool = False) -> dict[str, Any
     ⚠ Заголовки службы ПЕРЕБИВАЮТ заголовки вызывающего — учётку службы ставит
     дом (`services.Service`), чужой `Authorization` к ней не доедет. `bundle` — вызов бандла
     жильца (дверь, пересылка менеджером, сессия): к нему ещё и `bundle_guard` службы.
+
+    ⚠ Путь к службе приводится к одному виду ДО запретов и уходит в запрос этим видом
+    (`service_path`): запреты сравнивают то, что служба получит.
     """
     service = services.entry(str(payload.get("host") or "").strip())
     if service is None:
         return payload
+    checked, wire = service_path(str(payload.get("path") or "/"))
     body = payload.get("body") if isinstance(payload.get("body"), str) else ""
     if payload.get("bodyBase64"):
         body = _decode_b64(payload["bodyBase64"], "bodyBase64").decode("utf-8", "replace")
-    for what, value in [("path", str(payload.get("path") or "/")), ("body", body)] + [
+    for what, value in [("path", checked), ("body", body)] + [
         ("frame", item if isinstance(item, str) else json.dumps(item))
         for item in (payload.get("messages") if isinstance(payload.get("messages"), list) else [])
     ]:
-        reason = service.guard(what, value) if service.guard else None
-        reason = reason or (service.bundle_guard(what, value) if bundle and service.bundle_guard else None)
+        reason = _guarded(service, what, value, bundle)
         if reason:
             raise OpError(reason, 403)
     headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
     return {
         **payload,
+        **({"path": wire} if "path" in payload else {}),
         "tls": service.tls or payload.get("tls") is True,
         "headers": {**headers, **service.headers},
     }
+
+def _guarded(service: services.Service, what: str, value: str, bundle: bool) -> str | None:
+    return (service.guard(what, value) if service.guard else None) or (
+        service.bundle_guard(what, value) if bundle and service.bundle_guard else None
+    )
 
 def refused(payload: dict[str, Any], what: str, value: str) -> str | None:
     """Причина отказа службы на кадр открытой сессии; `None` — пропустить (`Service.guard`, а сессия —
@@ -162,9 +175,37 @@ def refused(payload: dict[str, Any], what: str, value: str) -> str | None:
     service = services.entry(str(payload.get("host") or "").strip())
     if service is None:
         return None
-    return (service.guard(what, value) if service.guard else None) or (
-        service.bundle_guard(what, value) if service.bundle_guard else None
-    )
+    if what == "path":
+        try:
+            value = service_path(value)[0]
+        except OpError as err:
+            return err.message
+    return _guarded(service, what, value, True)
+
+# Знаки, которые в пути службы остаются как есть (RFC 3986, `pchar`), — остальное кодируется заново.
+_PATH_SAFE = "/:@!$&'()*+,;=~"
+
+def service_path(path: str) -> tuple[str, str]:
+    """Путь к службе дома: (вид для запретов — раскрытый, вид для запроса — он же, закодированный).
+
+    ⚠ Сравнивать путь «как пришёл» нельзя: клиент (yarl) раскрывает `%6D` → `m` и сводит `.` и `..`,
+    фрагмент `#…` не уходит вовсе, сервер aiohttp раскрывает и `%2F`. Запрет пропускал `/%6Dount`,
+    `/x/../mount`, `/disks#`, `/auth%2Ftoken` — бандл с ключом устройства монтировал бы сетевую папку
+    ядром дома и выпускал себе токен HA (ревью 2026-10-24). Поэтому путь раскрывается целиком, `.`, `..` и
+    пустые звенья сводятся, и РОВНО он уходит в запрос. Строка запроса (`?…`) — как есть: запреты служб
+    смотрят путь, а смысл параметров знает служба. Двойное кодирование — отказ, как у устройств.
+    """
+    head, sep, query = path.split("#", 1)[0].partition("?")
+    _refuse_double_encoded(head)
+    decoded = unquote(head)
+    parts: list[str] = []
+    for part in decoded.split("/"):
+        if part == "..":
+            parts = parts[:-1]
+        elif part not in ("", "."):
+            parts.append(part)
+    clean = "/" + "/".join(parts) + ("/" if parts and decoded.endswith("/") else "")
+    return clean + sep + query, quote(clean, safe=_PATH_SAFE) + sep + query
 
 async def open_ws(payload: dict[str, Any], socket_: Any) -> None:
     """Рукопожатие службы на только что открытом сокете — до кадров вызывающего."""

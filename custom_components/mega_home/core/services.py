@@ -41,6 +41,10 @@ class Service:
     # `(what, value)`. Операции самого менеджера идут мимо: подключение хранилища и создание папок
     # у службы записи — дело инсталлятора, а не телефона с ключом устройства.
     bundle_guard: Callable[[str, str], str | None] | None = None
+    # Служба сама ставит метку кэша своим ответам, и ресурс браузеру (`connect.resource`) её не
+    # подменяет: служба записи знает, что закрытое окно спрайта и кадр под меткой не меняются, а текущее
+    # окно — меняется. У прочих служб метка двери: их ответ — «сейчас» (кадр go2rtc).
+    own_cache: bool = False
 
 
 REGISTRY: dict[str, Service] = {}
@@ -79,9 +83,10 @@ def register(
     ws_open: Callable[[Any], Awaitable[None]] | None = None,
     guard: Callable[[str, str], str | None] | None = None,
     bundle_guard: Callable[[str, str], str | None] | None = None,
+    own_cache: bool = False,
 ) -> None:
     """Служба поднялась: доступна для `connect` по имени."""
-    REGISTRY[name] = Service(port, tls, dict(headers or {}), ws_open, guard, bundle_guard)
+    REGISTRY[name] = Service(port, tls, dict(headers or {}), ws_open, guard, bundle_guard, own_cache)
 
 def unregister(name: str) -> None:
     """Служба остановлена: адрес по имени больше не резолвится."""

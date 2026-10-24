@@ -180,7 +180,7 @@ class _Camera:
         while True:
             try:
                 if not self.index.loaded:
-                    await self.rec.env.run(self.index.load, bool(self.rec.limit))
+                    await self.rec.env.run(self.index.ensure, bool(self.rec.limit))
                 await self._register()
                 await self._record()
             except asyncio.CancelledError:
@@ -326,8 +326,10 @@ class _Camera:
         запись — перемотки туда нет), спрайт берёт по имени (`recorder_frames.slot_frames`).
 
         ⚠ Не на «локальном диске» с лимитом: такой кадр не входит в объём индекса, а там объём держит лимит.
+        ⚠ Хранилище — перед каждым кадром, как у куска (`_save`): иначе отвалившийся диск до прохода
+        сторожа получал бы каталоги дней с кадрами на флеше контроллера.
         """
-        if not self.rec.ffmpeg or self.rec.limit:
+        if not self.rec.ffmpeg or self.rec.limit or self.rec.problem():
             return
         target = self.index.root / day_of(start) / segment_name(start, int(length * 1000))
         with contextlib.suppress(OSError):

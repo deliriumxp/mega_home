@@ -23,7 +23,7 @@ from mega_home.core import recorder as rec
 from mega_home.core import services, storage
 from mega_home.core.recorder_api import start_api
 from mega_home.core import recorder_frames as frames_mod
-from mega_home.core.recorder_frames import CLOSED_AFTER_S, compose, slot_frames, sprite_for, sprite_path, window_start
+from mega_home.core.recorder_frames import CLOSED_AFTER_S, compose, listing, slot_frames, sprite_for, sprite_path, window_start
 from mega_home.core.recorder_index import SegmentIndex
 
 FFMPEG = shutil.which("ffmpeg") or ""
@@ -88,7 +88,10 @@ def test_слоты_по_времени_а_не_по_порядку(tmp_path: Pa
     # 3 — момент 30 с покрыт вторым куском; 10 — кусок есть, кадра нет.
     assert slots[:5] == [first.with_suffix(".jpg"), None, second.with_suffix(".jpg"), second.with_suffix(".jpg"), None]
     assert slots[10] is None and all(s is None for s in slots[4:])
-    assert sprite_path(tmp_path / "cam", start) == tmp_path / "cam" / "2026-10-23" / "sprites" / "1200.jpg"
+    path = sprite_path(tmp_path / "cam", start, slots)
+    assert path.parent == tmp_path / "cam" / "2026-10-23" / "sprites" and path.name.startswith("1200-")
+    # Имя — по кадрам слотов: кадр, снятый позже, даёт другой файл, прежний не отдаётся.
+    assert sprite_path(tmp_path / "cam", start, [*slots[:10], first, *slots[11:]]) != path
 
 
 @needs_ffmpeg
@@ -147,7 +150,7 @@ def test_окно_без_кадров_404_и_без_файла_кэша() -> Non
     _segment(root, start + 5)
     [(status, _cache, body)] = _get(_recorder(root), f"/sprite?camera=cam&at={int((start + 300) * 1000)}")
     assert status == 404 and "кадров в окне нет" in body.decode()
-    assert not sprite_path(root / "cam", start).exists()
+    assert not (root / "cam" / rec.day_of(start) / "sprites").exists()
     [(foreign, _c, _b)] = _get(_recorder(root), f"/sprite?camera=chuzhaya&at={int(start * 1000)}")
     assert foreign == 404
 
@@ -164,13 +167,67 @@ def test_закрытое_окно_кладётся_в_кэш_а_текущее_
     )
     assert closed == 200 and closed_cache == "private, max-age=3600" and _probe(image) == (1600, 540)
     assert current == 200 and current_cache == "no-store" and _probe(live) == (1600, 540)
-    cached = sprite_path(root / "cam", past)
+    [cached] = _sprites(root, past)
     assert cached.read_bytes() == image
-    assert not sprite_path(root / "cam", now).exists()
+    assert [p.name for p in _sprites(root, now)] == []
     assert not list(cached.parent.glob("*.part")) and not list(cached.parent.glob("*.txt"))
     # Второй взгляд на закрытое окно — из файла, без сборки.
     cached.write_bytes(b"\xff\xd8cached")
     assert asyncio.run(sprite_for(recorder, "cam", past + 599)) == (b"\xff\xd8cached", True)
+    # Спрайты и заглушка — в объёме дня (лимит «локального диска» считает всё).
+    blanks = sum(blank.stat().st_size for blank in root.glob("cam/*/sprites/blank.jpg"))
+    assert recorder.cameras["cam"].index.size() == len(image) + blanks
+
+
+def _sprites(root: Path, start: float) -> list[Path]:
+    """Спрайты окна на диске (без заглушки)."""
+    folder = root / "cam" / rec.day_of(start) / "sprites"
+    hhmm = time.strftime("%H%M", time.gmtime(start))
+    return sorted(folder.glob(f"{hhmm}*.jpg")) if folder.is_dir() else []
+
+
+@needs_ffmpeg
+def test_неполный_спрайт_закрытого_окна_пересобирается_когда_кадр_снят() -> None:
+    """Ревью 2026-10-24: спрайт закрытого окна, собранный до досъёмки кадров (запись до 0.5.26) или до
+    позднего кадра, ложился на диск с чёрными слотами НАВСЕГДА. Теперь имя — по кадрам слотов, неполный
+    уходит браузеру без долгого кэша, снятый кадр даёт новую сборку, прежние версии (и имя до отпечатка)
+    уходят с диска."""
+    root = Path(tempfile.mkdtemp(prefix="rec-"))
+    past = window_start(time.time() - 1200)
+    _segment(root, past, frame="white")
+    late = _segment(root, past + 300)
+    recorder = _recorder(root)
+    recorder.cameras["cam"].index.ensure()
+    legacy = root / "cam" / rec.day_of(past) / "sprites" / f"{time.strftime('%H%M', time.gmtime(past))}.jpg"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"\xff\xd8old")
+    [(status, cache, first)] = _get(recorder, f"/sprite?camera=cam&at={int(past * 1000)}")
+    assert status == 200 and cache == "no-store" and first != b"\xff\xd8old" and _brightness(first, 30) < 30
+    assert [p.name for p in _sprites(root, past)] != [legacy.name] and len(_sprites(root, past)) == 1
+    _jpeg(late.with_suffix(".jpg"), "white")
+    frames_mod._LISTED.clear()  # noqa: SLF001 — листинг в памяти живёт 20 с
+    [(status, cache, second)] = _get(recorder, f"/sprite?camera=cam&at={int(past * 1000)}")
+    assert status == 200 and cache == "private, max-age=3600" and _brightness(second, 30) > 200
+    [kept] = _sprites(root, past)
+    assert kept.read_bytes() == second
+
+
+def test_листинги_каталогов_не_копятся_в_памяти(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ревью 2026-10-24: листинг дня — ~17 тыс. имён у постоянной записи, и устаревшие жили до
+    перезапуска HA. Устаревшие уходят на следующем вызове, свежий берётся из памяти."""
+    frames_mod._LISTED.clear()  # noqa: SLF001
+    clock = [1000.0]
+    monkeypatch.setattr(frames_mod.time, "monotonic", lambda: clock[0])
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "a" / "x.jpg").write_bytes(b"j")
+    assert listing(tmp_path / "a") == {"x.jpg"}
+    (tmp_path / "a" / "y.jpg").write_bytes(b"j")
+    assert listing(tmp_path / "a") == {"x.jpg"}
+    clock[0] += frames_mod.LISTING_TTL_S
+    assert listing(tmp_path / "b") == frozenset()
+    assert set(frames_mod._LISTED) == {tmp_path / "b"}  # noqa: SLF001
+    assert listing(tmp_path / "a") == {"x.jpg", "y.jpg"}
 
 
 @needs_ffmpeg
@@ -186,10 +243,10 @@ def test_окно_закрыто_только_через_CLOSED_AFTER_S(monkeypa
     monkeypatch.setattr(frames_mod.time, "time", lambda: end + 60)
     assert CLOSED_AFTER_S > 60
     image, closed = asyncio.run(sprite_for(recorder, "cam", start))
-    assert image and not closed and not sprite_path(root / "cam", start).exists()
+    assert image and not closed and not _sprites(root, start)
     monkeypatch.setattr(frames_mod.time, "time", lambda: end + CLOSED_AFTER_S)
     image, closed = asyncio.run(sprite_for(recorder, "cam", start))
-    assert image and closed and sprite_path(root / "cam", start).exists()
+    assert image and closed and _sprites(root, start)
 
 
 @needs_ffmpeg

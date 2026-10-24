@@ -91,12 +91,21 @@ class SegmentIndex:
         self.root = root
         self._days: dict[str, _Day] = {}
         self._lock = threading.Lock()
+        # ⚠ Обход каталога — один за раз, и `add` его ждёт: загрузку зовут запись камеры, служба (запрос
+        # до первого прохода записи) и уборка, каждая в своём потоке исполнителя. Вторая загрузка
+        # присваиванием затирала куски, добавленные записью после ЕЁ обхода, — до перезапуска HA их не
+        # было в архиве. Кусок, добавленный ДО обхода, обход видит сам: в индекс он идёт после переноса.
+        self._loading = threading.Lock()
         self.loaded = False
 
     def load(self, sizes: bool = False) -> None:
         """Прочитать каталог камеры целиком — один раз при старте записи (в исполнителе).
         `sizes` — объём дней нужен только уборке по лимиту: статистика каждого куска на сетевой папке
         стоит времени, и без лимита её не считаем."""
+        with self._loading:
+            self._load(sizes)
+
+    def _load(self, sizes: bool) -> None:
         days: dict[str, _Day] = {}
         for folder in sorted(self.root.iterdir()) if self.root.is_dir() else []:
             if not folder.is_dir() or not _DAY.match(folder.name):
@@ -107,14 +116,20 @@ class SegmentIndex:
                 day.lengths.append(int(length * 1000))
                 if sizes:
                     day.size += path.stat().st_size + _frame_size(path)
+            if sizes and len(day.begins):
+                # Спрайты окон и заглушка (`recorder_frames`) — тоже объём дня: лимит считает всё, что лежит.
+                day.size += sum(item.stat().st_size for item in (folder / "sprites").glob("*.jpg"))
             if len(day.begins):
                 days[folder.name] = day
         with self._lock:
             self._days, self.loaded = days, True
 
     def ensure(self, sizes: bool = False) -> None:
-        if not self.loaded:
-            self.load(sizes)
+        if self.loaded:
+            return
+        with self._loading:
+            if not self.loaded:
+                self._load(sizes)
 
     def _path(self, day: str, begin: float, length_ms: int) -> Path:
         return self.root / day / segment_name(begin, length_ms)
@@ -122,7 +137,7 @@ class SegmentIndex:
     def add(self, begin: float, length: float, size: int = 0) -> Path:
         """Новый кусок; тот же момент повторно — замена (перезапуск в ту же секунду)."""
         name, length_ms = day_of(begin), int(length * 1000)
-        with self._lock:
+        with self._loading, self._lock:
             day = self._days.setdefault(name, _Day())
             at = bisect_left(day.begins, begin)
             if at < len(day.begins) and day.begins[at] == begin:
@@ -134,11 +149,12 @@ class SegmentIndex:
         return self._path(name, begin, length_ms)
 
     def account(self, begin: float, size: int) -> None:
-        """Кадр, снятый к куску позже сохранения (`recorder_frames.backfill`), — в объём его дня."""
+        """Кадр, снятый к куску позже сохранения (`recorder_frames.backfill`), спрайт окна (снятый — с
+        минусом) — в объём его дня."""
         with self._lock:
             day = self._days.get(day_of(begin))
             if day is not None:
-                day.size += size
+                day.size = max(day.size + size, 0)
 
     def days(self) -> list[tuple[str, float, float]]:
         """Дни с записью: (имя дня UTC, первое начало, последнее начало)."""
@@ -160,6 +176,34 @@ class SegmentIndex:
                     if begin + length_ms / 1000 >= start:
                         out.append((begin, length_ms / 1000, self._path(name, begin, length_ms)))
         return out
+
+    def first_after(self, at: float, until: float, started: bool = False) -> Segment | None:
+        """Первый кусок, который идёт после `at` (кончается позже; `started` — начинается позже) и
+        начинается раньше `until`; нет — `None`. Без сборки списка: окно бывает сутками кусков."""
+        first, last = day_of(at - MAX_SEGMENT_S), day_of(until)
+        with self._lock:
+            for name in sorted(self._days):
+                if name < first or name > last:
+                    continue
+                day = self._days[name]
+                for index in range(bisect_right(day.begins, at) if started else bisect_left(day.begins, at - MAX_SEGMENT_S), len(day.begins)):
+                    begin, length_ms = day.begins[index], day.lengths[index]
+                    if begin >= until:
+                        return None
+                    if started or begin + length_ms / 1000 > at:
+                        return (begin, length_ms / 1000, self._path(name, begin, length_ms))
+        return None
+
+    def last_before(self, at: float) -> Segment | None:
+        """Последний кусок, начавшийся раньше `at`; нет — `None`."""
+        last = day_of(at)
+        with self._lock:
+            for name in sorted((n for n in self._days if n <= last), reverse=True):
+                day = self._days[name]
+                index = bisect_left(day.begins, at) - 1
+                if index >= 0:
+                    return (day.begins[index], day.lengths[index] / 1000, self._path(name, day.begins[index], day.lengths[index]))
+        return None
 
     def oldest(self, count: int) -> list[Segment]:
         """Самые старые куски (из самого старого дня) — уборка по месту и лимиту."""

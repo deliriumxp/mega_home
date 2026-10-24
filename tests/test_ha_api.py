@@ -78,6 +78,13 @@ def test_учётки_и_систему_ha_через_дом_не_меняют()
     ):
         with pytest.raises(OpError, match="не меняют"):
             connect.with_service(call)
+    # Ревью 2026-10-24: тот же запрет в любой записи пути — клиент раскрывает и сводит путь до сервера.
+    for path in ("/%61uth/token", "/api/../auth/token", "/./auth/token", "//auth/token", "/auth%2Ftoken",
+                 "/api/%2e%2e/auth/token", "/api/hass%69o/addons/core_ssh/start", "/API/hassio/x"):
+        with pytest.raises(OpError, match="не меняют"):
+            connect.with_service({"host": "ha", "path": path})
+    # Устройство объекта путь получает как есть: приведение — только у служб дома.
+    assert connect.with_service({"host": "192.168.1.5", "path": "/a/../%61"})["path"] == "/a/../%61"
     # Всё прочее API HA — открыто: редактор автоматизаций, проверка, реестры, службы приборов.
     connect.with_service({"host": "ha", "path": "/api/config/automation/config/sa_1", "body": '{"actions":[{"action":"vacuum.start"}]}'})
     connect.with_service({"host": "ha", "kind": "ws", "messages": [{"id": 1, "type": "validate_config"}, {"id": 2, "type": "call_service", "domain": "vacuum"}]})
