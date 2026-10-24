@@ -14,6 +14,7 @@ import socket
 import pytest
 
 from mega_home.core import go2rtc_embed as embed
+from mega_home.core import host_load
 
 from fake_host import FakeHost
 
@@ -37,6 +38,7 @@ class _Proc:
         self.stdout = _Stdout(lines or [])
         self.returncode: int | None = None
         self.terminated = False
+        self.pid = 4321
 
     def terminate(self) -> None:
         self.terminated = True
@@ -102,7 +104,10 @@ def test_остановка_снимает_процесс_и_читателя(mo
 
     async def scenario() -> None:
         assert await embed.async_start(FakeHost()) is True
+        # Нагрузка контроллера видит go2rtc по pid, пока он жив (`host_load`).
+        assert host_load._owners["go2rtc"] == 4321  # noqa: SLF001
         await embed.async_stop()
+        assert "go2rtc" not in host_load._owners  # noqa: SLF001
         assert proc.terminated is True
         assert embed.is_running() is False
 
@@ -154,9 +159,13 @@ def test_сирота_усыновляется_а_не_уступает_чужо
 
     monkeypatch.setattr(embed, "_api_alive", alive)
     monkeypatch.setattr(embed.shutil, "which", _must_not_start)
+    # pid усыновлённого — по имени нашего конфига в командной строке (`host_load.find`).
+    markers: list[str] = []
+    monkeypatch.setattr(host_load, "find", lambda marker: markers.append(marker) or 777)
 
     assert asyncio.run(embed.async_start(FakeHost())) is True
     assert embed.is_running() is True
+    assert markers == [embed.CONFIG_PREFIX] and host_load._owners["go2rtc"] == 777  # noqa: SLF001
 
 
 def test_проба_порта_не_спотыкается_о_time_wait():

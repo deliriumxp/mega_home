@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 
-from . import services
+from . import host_load, services
 from .const import LOGGER
 from .host import Host
 
@@ -81,6 +81,8 @@ webrtc:
 """
 
 URL = f"http://127.0.0.1:{API_PORT}"
+# Имя временного конфига — по нему же нагрузка находит усыновлённый процесс (`host_load.find`).
+CONFIG_PREFIX = "mega_home_go2rtc_"
 
 # Повторы старта, когда порт занят или API не ответил. ⚠ Одна попытка на весь
 # аптайм — то, что оставило объект без своего go2rtc после обновления 0.4.0:
@@ -111,6 +113,8 @@ async def async_start(env: Host) -> bool:
         _ready = True
         _why = ""
         services.register("go2rtc", API_PORT)
+        # pid без handle — по имени нашего конфига в командной строке; не нашли — строки нагрузки нет.
+        host_load.track("go2rtc", await env.run(host_load.find, CONFIG_PREFIX))
         LOGGER.info(
             "Усыновлён go2rtc прошлого запуска (%s): порты его, конфиг наш — "
             "переговоры идут через него",
@@ -150,6 +154,7 @@ async def async_start(env: Host) -> bool:
 
     _log.clear()
     _start_drain()
+    host_load.track("go2rtc", _proc.pid)
     _ready = await _await_api(env)
     if not _ready:
         _why = (
@@ -200,6 +205,7 @@ async def async_stop() -> None:
 
     _ready = False
     services.unregister("go2rtc")
+    host_load.untrack("go2rtc")
     drain, _drain = _drain, None
     if drain is not None:
         drain.cancel()
@@ -285,7 +291,7 @@ def _ports_busy() -> str:
 
 def _write_config() -> str:
     tmp = tempfile.NamedTemporaryFile(
-        prefix="mega_home_go2rtc_", suffix=".yaml", delete=False
+        prefix=CONFIG_PREFIX, suffix=".yaml", delete=False
     )
     tmp.write(_YAML.encode())
     tmp.close()

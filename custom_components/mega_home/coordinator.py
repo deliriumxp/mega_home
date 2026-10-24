@@ -94,6 +94,8 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.sip_bridge: Any = None
         # Запись камер (`core/recorder.py`): раздел `recorder` конфига объекта.
         self.recorder: Any = None
+        # Нагрузка контроллера (`core/host_load.py`): замер раз в минуту и служба `host`.
+        self.host_load: Any = None
         # События устройств (`device_events.py`) и их источники по описаниям
         # доступов (`listeners.py`). Ставятся снаружи вместе с дверью.
         self.events: Any = None

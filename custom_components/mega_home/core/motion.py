@@ -32,12 +32,14 @@ from __future__ import annotations
 import asyncio
 import importlib
 import shutil
+import time
 from collections import deque
 from typing import Any
 from urllib.parse import quote
 
 import aiohttp
 
+from . import host_load
 from .const import LOGGER
 from .go2rtc_embed import API_PORT, RTSP_PORT
 
@@ -200,6 +202,10 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
     )
     tail: deque[str] = deque(maxlen=6)
     drain = asyncio.ensure_future(_drain(proc, tail))
+    # Нагрузка (`host_load`): ffmpeg детекции и счёт кадра — одна строка камеры. `nice` исполняет
+    # ffmpeg на своём pid.
+    load_key = f"motion:{descriptor.id}"
+    host_load.track(load_key, proc.pid)
     moving, peak, last_motion = 0, 0.0, 0.0
     active = False
     try:
@@ -212,7 +218,11 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
                 raise RuntimeError(f"ffmpeg закончил поток: {' | '.join(tail) or 'без слов'}") from err
             except asyncio.TimeoutError as err:
                 raise ConnectionError(f"нет кадров дольше {wait:g} с") from err
+            # Счёт идёт в процессе дома, а не в ffmpeg. Время ПОТОКА, а не процесса (`process_time`):
+            # тот считал бы и работу других потоков HA, шедшую в эти доли миллисекунды.
+            began = time.thread_time()
             share = detector.detect(raw)
+            host_load.spent(load_key, time.thread_time() - began)
             if share is None:
                 continue
             now = loop.time()
@@ -231,6 +241,7 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
             # Источник встал посреди движения: окно записи и метка ленты не висят открытыми.
             ctx.emit(descriptor, source, spec, "motion", {"state": "stop", "share": round(peak, 4)})
         drain.cancel()
+        host_load.untrack(load_key, proc.pid)
         if proc.returncode is None:
             proc.kill()
             await proc.wait()

@@ -269,6 +269,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     if coordinator.data:
         coordinator.recorder.apply(coordinator.data)
 
+    # Нагрузка контроллера (`core/host_load.py`): процесс дома — сам Home Assistant, ключ `ha`.
+    # Служба `host` — только менеджеру; останов — в `_async_stop_processes`.
+    from .core.host_load import HostLoad
+
+    coordinator.host_load = HostLoad(coordinator.env, "ha")
+    try:
+        await coordinator.host_load.async_start()
+    except OSError as err:  # замер — не повод не поднять дом
+        LOGGER.warning("Нагрузка контроллера не поднялась: %s", err)
+
     async def _on_stop(_event: Any) -> None:
         await _async_stop_processes(coordinator)
 
@@ -354,3 +364,5 @@ async def _async_stop_processes(coordinator: MegaHomeCoordinator) -> None:
     if getattr(coordinator, "recorder", None) is not None:
         await coordinator.recorder.async_stop()
     await go2rtc_embed.async_stop()
+    if getattr(coordinator, "host_load", None) is not None:
+        await coordinator.host_load.async_stop()

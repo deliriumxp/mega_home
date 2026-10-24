@@ -12,6 +12,7 @@ import asyncio
 import numpy as np
 import pytest
 
+from mega_home.core import host_load
 from mega_home.core import motion as mo
 from mega_home.core.devices import DeviceDescriptor
 
@@ -122,6 +123,7 @@ class _Proc:
         self.stderr = asyncio.StreamReader()
         self.stderr.feed_eof()
         self.returncode: int | None = None
+        self.pid = 4242
 
     def kill(self) -> None:
         self.returncode = -9
@@ -157,12 +159,18 @@ def test_источник_говорит_началось_и_кончилось_
         for _ in range(30):
             reader.feed_data(_frame())
             await asyncio.sleep(0.05)
+        # Нагрузка (`host_load`): ffmpeg детекции отмечен ключом камеры, пока жив.
+        assert host_load._owners["motion:cam"] == 4242  # noqa: SLF001
         reader.feed_eof()
         with pytest.raises(RuntimeError, match="ffmpeg закончил поток"):
             await task
 
+    host_load._inside.clear()  # noqa: SLF001
     asyncio.run(scenario())
     assert [(e["kind"], e["state"]) for e in ctx.events] == [("motion", "start"), ("motion", "stop")]
+    # Счёт кадра numpy — в процессе дома, и он записан на ту же камеру; ffmpeg снят с учёта.
+    assert host_load._inside["motion:cam"] > 0 and "motion:cam" not in host_load._owners  # noqa: SLF001
+    host_load._inside.clear()  # noqa: SLF001
     command = started[0]
     assert "rtsp://127.0.0.1:1986/cam_sub" in command and "-skip_loop_filter" in command
     assert any("scale=176:96" in part and "format=gray" in part for part in command)
