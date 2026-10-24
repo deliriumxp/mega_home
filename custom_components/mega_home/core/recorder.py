@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -296,6 +297,7 @@ class _Camera:
                 await self.rec.env.run(self._save, path, start, length)
             elif start + length + self.spec.pre_s < now - SEGMENT_S or final:
                 self.dropped += 1
+                await self.rec.env.run(self._preview_only, path, start, length)
                 await self.rec.env.run(path.unlink, True)
 
     def _save(self, path: Path, start: float, length: float) -> None:
@@ -316,6 +318,21 @@ class _Camera:
         self.index.add(start, length, size + frame)
         self.saved += 1
         self.last_saved = start + length
+
+    def _preview_only(self, path: Path, start: float, length: float) -> None:
+        """Кусок без движения не хранится, но его кадр превью — да (решение заказчика 2026-10-24: протяжка
+        поверх пустых мест показывает хотя бы грубую картинку пропущенного, как превью-поток Frigate).
+        Кадр лежит в каталоге дня тем же именем, что у куска, но без `.mkv`: индекс его не видит (это не
+        запись — перемотки туда нет), спрайт берёт по имени (`recorder_frames.slot_frames`).
+
+        ⚠ Не на «локальном диске» с лимитом: такой кадр не входит в объём индекса, а там объём держит лимит.
+        """
+        if not self.rec.ffmpeg or self.rec.limit:
+            return
+        target = self.index.root / day_of(start) / segment_name(start, int(length * 1000))
+        with contextlib.suppress(OSError):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self.rec.extract_frame(path, target.with_suffix(".jpg"), self.rec.ffmpeg, self.rec.nice)
 
     def wanted(self, start: float, stop: float, now: float) -> bool:
         """Попал ли кусок в окно движения с запасом до и после."""

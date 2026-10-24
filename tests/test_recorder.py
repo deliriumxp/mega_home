@@ -507,3 +507,47 @@ def test_ключевой_кадр_до_метки_и_один_листинг_в
 
     (tmp_path / "a.jpg").write_bytes(b"x")
     assert present([tmp_path / "a.jpg", tmp_path / "b.jpg", tmp_path / "нет" / "c.jpg"]) == {tmp_path / "a.jpg"}
+
+
+def test_кусок_без_движения_оставляет_кадр_превью_и_он_идёт_в_спрайт(tmp_path: Path) -> None:
+    """Решение заказчика 2026-10-24: превью пишется всегда — протяжка поверх пустых мест показывает
+    грубую картинку пропущенного. Сам кусок не хранится, индекс его не видит; спрайт берёт кадр по имени."""
+    from mega_home.core import recorder_frames as frames
+
+    folder = Path(tempfile.mkdtemp(prefix="rec-"))
+    camera = _saving_camera(folder)
+    camera.rec.local, camera.rec.limit = False, 0
+    piece = camera.cache / "20261023T120010.mkv"
+    piece.write_bytes(b"x")
+
+    def extract(path: Path, out: Path, binary: str, nice: str) -> int:
+        out.write_bytes(b"j" * 10)
+        return 10
+
+    camera.rec.extract_frame = extract
+    start = rec.epoch_of("20261023T120010")
+    assert start is not None
+    camera._preview_only(piece, start, 10.0)  # noqa: SLF001
+    frame = folder / "onvif-aa" / "2026-10-23" / "120010-10000.jpg"
+    assert frame.is_file()
+    assert camera.index.between(start, start + 10) == []
+    frames._LISTED.clear()  # noqa: SLF001
+    window = frames.window_start(start)
+    slots = frames.slot_frames(camera.index, window)
+    assert slots[1] == frame and slots[0] is None
+
+    # «Локальный диск» с лимитом — такого кадра нет: в объём индекса он не входит.
+    camera.rec.limit = 10**9
+    frame.unlink()
+    camera._preview_only(piece, start, 10.0)  # noqa: SLF001
+    assert not frame.exists()
+
+
+def test_сутки_из_одних_кадров_превью_уходят_по_сроку(tmp_path: Path) -> None:
+    now = rec.epoch_of("20261023T120000")
+    assert now is not None
+    day = tmp_path / "onvif-aa" / "2026-10-17"
+    day.mkdir(parents=True)
+    (day / "120000-10000.jpg").write_bytes(b"j")
+    rec.clean(tmp_path, [_camera(tmp_path)], now)
+    assert not day.exists()

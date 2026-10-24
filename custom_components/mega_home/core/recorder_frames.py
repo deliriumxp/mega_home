@@ -21,6 +21,7 @@ from __future__ import annotations
 import calendar
 import contextlib
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -28,7 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from uuid import uuid4
 
-from .recorder_index import SegmentIndex, day_of
+from .recorder_index import MAX_SEGMENT_S, SegmentIndex, day_of, epoch_of
 
 if TYPE_CHECKING:
     from .recorder import Recorder
@@ -77,6 +78,48 @@ def frame_of(path: Path, out: Path, binary: str, nice: str = "") -> int:
     with contextlib.suppress(OSError):
         part.unlink(missing_ok=True)
     return 0
+
+
+# Кадр превью в каталоге дня: `HHMMSS-<мс>.jpg` — у сохранённого куска (рядом `.mkv`) и у куска без
+# движения, который не хранится (`_Camera._preview_only`).
+FRAME_NAME = re.compile(r"^(\d{6})-(\d+)\.jpg$")
+# Листинг каталога дня для спрайта живёт столько: на сетевой папке листинг — поход по сети, а окна
+# спрайта при протяжке идут подряд по одному каталогу.
+LISTING_TTL_S = 20.0
+_LISTED: dict[Path, tuple[float, frozenset[str]]] = {}
+
+
+def listing(folder: Path) -> frozenset[str]:
+    """Имена в каталоге — из памяти, если листинг моложе `LISTING_TTL_S`; нет каталога — пусто."""
+    now = time.monotonic()
+    hit = _LISTED.get(folder)
+    if hit is not None and now - hit[0] < LISTING_TTL_S:
+        return hit[1]
+    try:
+        names = frozenset(entry.name for entry in os.scandir(folder))
+    except OSError:
+        names = frozenset()
+    _LISTED[folder] = (now, names)
+    return names
+
+
+def frames_in(root: Path, start: float, stop: float) -> list[tuple[float, float, Path]]:
+    """Кадры превью, чьи куски пересекают `[start, stop)`: (начало, длительность, путь) по порядку.
+
+    ⚠ По именам в каталогах дней, а не по индексу кусков: у куска без движения кадр есть, а куска нет.
+    """
+    out: list[tuple[float, float, Path]] = []
+    for name in sorted({day_of(start - MAX_SEGMENT_S), day_of(stop)}):
+        folder, stamp = root / name, name.replace("-", "")
+        for entry in listing(folder):
+            match = FRAME_NAME.match(entry)
+            begin = epoch_of(f"{stamp}T{match.group(1)}") if match else None
+            if begin is None:
+                continue
+            length = int(match.group(2)) / 1000
+            if begin + length > start and begin < stop:
+                out.append((begin, length, folder / entry))
+    return sorted(out)
 
 
 def present(paths: list[Path]) -> set[Path]:
@@ -147,10 +190,9 @@ def window_start(at: float) -> float:
 
 def slot_frames(index: SegmentIndex, start: float) -> list[Path | None]:
     """Кадр каждого слота: кусок, покрывающий `start + i·SLOT_S`, иначе начавшийся в слоте, иначе
-    пусто. Кусок без кадра в счёт не идёт — слот возьмёт соседний кусок или останется пустым."""
-    found = [(b, n, p.with_suffix(".jpg")) for b, n, p in index.between(start, start + WINDOW_S)]
-    have = present([p for _b, _n, p in found])
-    found = [(b, n, p) for b, n, p in found if p in have]
+    пусто. Кусок без кадра в счёт не идёт — слот возьмёт соседний кусок или останется пустым; кадр куска
+    без движения (сам кусок не хранится) — в счёт идёт."""
+    found = frames_in(index.root, start, start + WINDOW_S)
     slots: list[Path | None] = []
     for moment in (start + i * SLOT_S for i in range(COLS * ROWS)):
         covering = next((p for b, n, p in found if b <= moment < b + n), None)
