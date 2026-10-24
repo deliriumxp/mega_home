@@ -26,7 +26,7 @@ from uuid import uuid4
 
 from aiohttp import web
 
-from . import services, storage
+from . import activity, services, storage
 from .go2rtc_embed import PLAYLIST_INPUT
 from .recorder import SERVICE, day_of
 from .recorder_preview import whole_fragments
@@ -62,6 +62,7 @@ async def start_api(recorder: Recorder) -> web.AppRunner:
     app.router.add_get("/frame", _frame)
     app.router.add_get("/previews", _previews)
     app.router.add_get("/preview", _preview)
+    app.router.add_get("/activity", _activity)
     app.router.add_get("/disks", _disks)
     app.router.add_get("/folders", _folders)
     app.router.add_post("/folders", _make_folder)
@@ -345,6 +346,20 @@ async def _previews(request: web.Request) -> web.Response:
         if stamp > start and current[0] < stop:
             live = [int(current[0] * 1000), int(stamp * 1000)]
     return web.json_response({"previews": pieces, "live": live})
+
+
+async def _activity(request: web.Request) -> web.Response:
+    """Сила движения в окне `from`..`to` (секунды): `[[начало корзины мс, доля], …]` по `step` секунд —
+    записанные ряды суток и ещё не записанные корзины детектора (`activity.py`)."""
+    recorder: Recorder = request.app[_RECORDER]
+    camera = recorder.cameras[_camera(request)]
+    start = _number(request, "from")
+    # Лента спрашивает по суткам; окно шире недели — не её вопрос, и обход дней им не раздуть.
+    stop = min(_number(request, "to"), start + 7 * 86400)
+    days = sorted({day_of(start), day_of(stop)} | {day_of(at) for at in range(int(start), int(stop), 86400)})
+    rows = dict(await recorder.env.run(lambda: [row for day in days for row in activity.read(camera.index.root / day, start, stop)]))
+    rows.update(activity.pending(camera.spec.access, start, stop))
+    return web.json_response({"step": activity.STEP_S, "activity": [[b * 1000, round(v, 4)] for b, v in sorted(rows.items())]})
 
 
 async def _preview(request: web.Request) -> web.Response:

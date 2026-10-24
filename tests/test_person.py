@@ -41,6 +41,24 @@ def test_вырез_квадратный_с_запасом_и_внутри_ка�
     assert right - left == 800 and (top, bottom) == (0, 800)
 
 
+def test_снимок_события_16_9_вокруг_квадрата_сети() -> None:
+    """Кадр ленты — 16:9 и `fill`: квадрат там растянулся бы. Высота — по квадрату, сдвиг внутрь кадра."""
+    assert person.wide((0, 80, 240, 320), 1000, 800) == (0, 80, 426, 320)
+    # Квадрат во всю высоту узкого кадра — снимок не шире кадра.
+    left, top, right, bottom = person.wide((0, 0, 400, 400), 400, 400)
+    assert (left, right) == (0, 400) and bottom - top == 225
+
+
+def test_снимок_события_jpeg_не_шире_заданного() -> None:
+    from PIL import Image
+
+    frame = np.random.default_rng(1).integers(0, 255, (720, 1280, 3), np.uint8)[::-1]
+    body = person.shot(frame, (500.0, 200.0, 700.0, 600.0), 0.2, 320)
+    assert body is not None and body[:2] == b"\xff\xd8"
+    with Image.open(__import__("io").BytesIO(body)) as image:
+        assert image.width == 320 and abs(image.width / image.height - 16 / 9) < 0.02
+
+
 def test_уменьшение_без_pillow_сохраняет_ровный_цвет() -> None:
     image = np.full((300, 500, 3), (10, 120, 250), np.uint8)
     small = person.resize(np, image, 96)
@@ -142,10 +160,20 @@ def test_источник_с_людьми_говорит_человек_один
     kinds = [(e["kind"], e.get("state") or e.get("person")) for e in events]
     assert kinds.count(("person", "start")) == 1 and kinds.count(("person", "stop")) == 1
     assert kinds.index(("motion", "start")) < kinds.index(("person", "start")) < kinds.index(("person", "stop"))
+    # К «человек появился» — свой снимок: крупный участок кадра, где сеть его увидела.
+    start = next(e for e in events if e.get("person") == "start")
+    assert start["file"][0] == "image/jpeg" and start["file"][1][:2] == b"\xff\xd8"
     # Тот же декодер, второй выход — цветной крупный кадр раз в `every`, BMP в отданную трубу.
     graph = command[command.index("-filter_complex") + 1]
     assert "split=2" in graph and "fps=1" in graph and "scale=640:-2" in graph
     assert command[-1].startswith("pipe:") and command[-1] != "pipe:1" and "bmp" in command
+
+
+def test_кадр_выреза_данными_описания(monkeypatch) -> None:
+    """Ширина кадра выреза — из описания (подстройка без релиза), чётная и в пределах."""
+    spec = {"stream": "cam_sub", "offDelay": 1, "person": {"every": 1, "frames": 2, "width": 801}}
+    _events, command = _person_run(monkeypatch, spec, [])
+    assert "scale=800:-2" in command[command.index("-filter_complex") + 1]
 
 
 def test_без_человека_события_нет(monkeypatch) -> None:

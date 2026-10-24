@@ -76,6 +76,24 @@ def test_правило_исполняется_один_раз_на_событи
     assert found is not None and found[1] == "image/jpeg" and found[0].read_bytes() == b"\xff\xd8jpeg"
 
 
+def test_свой_снимок_источника_главнее_правила(tmp_path, monkeypatch) -> None:
+    """Вырез «человек» детекции дома — того самого кадра; снимок камеры правилом был бы позже."""
+    files, journal, calls = _files(tmp_path, monkeypatch)
+
+    async def go() -> None:
+        files.on_event(CALL, ("image/jpeg", b"\xff\xd8own"))
+        files.on_event({**CALL, "id": "e2"}, ("image/jpeg", b"x" * (ef.MAX_BYTES + 1)))
+        await asyncio.gather(*files._env._tasks)  # noqa: SLF001
+
+    asyncio.run(go())
+    assert calls == []
+    assert journal.marks == [("intercom", "e1", {"type": "image/jpeg", "bytes": 5})]
+    found = files.find("e1")
+    assert found is not None and found[0].read_bytes() == b"\xff\xd8own"
+    # Сверх потолка — ни своего, ни правила.
+    assert files.find("e2") is None
+
+
 def test_правило_с_подстрокой_срабатывает_только_на_начало_движения(tmp_path, monkeypatch) -> None:
     """Ответ подписки камеры несёт и «кончилось», и чужие темы: кадр — к началу движения."""
     files, _journal, calls = _files(tmp_path, monkeypatch)

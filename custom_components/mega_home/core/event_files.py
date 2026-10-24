@@ -66,13 +66,18 @@ class EventFiles:
         self._next_prune = monotonic() + PRUNE_EVERY_S
         return True
 
-    def on_event(self, frame: dict[str, Any]) -> None:
+    def on_event(self, frame: dict[str, Any], file: tuple[str, bytes] | None = None) -> None:
         """Опубликовано событие: подходящее правило — фоном, не задерживая его.
 
         `on.contains` — подстроки, одна из которых обязана быть в данных события (текст ответа
         устройства либо данные одной строкой JSON, как у записи по движению): ответ подписки
         камеры несёт и «движение кончилось», и чужие темы, а кадр нужен к началу движения.
+        `file` — вложение, снятое самим источником: правило тогда не исполняется (`EventHub.publish`).
         """
+        if file is not None:
+            if file[1] and len(file[1]) <= MAX_BYTES:
+                self._env.spawn(self._keep(frame, *file), "mega_home event file")
+            return
         for rule in self._rules:
             on = rule["on"]
             if not all(on.get(k) in (None, frame.get(k)) for k in ("access", "source", "event")):
@@ -114,11 +119,13 @@ class EventFiles:
             if len(body) > MAX_BYTES:
                 LOGGER.warning("Вложение к событию %s больше %d байт — не сохраняем", frame.get("event"), MAX_BYTES)
                 return
-            kind = str(rule.get("type") or content_type)
-            await self._env.run(self._save, frame["id"], kind, body)
-            if self._journal is not None:
-                self._journal.mark(frame.get("access"), frame["id"], {"type": kind, "bytes": len(body)})
+            await self._keep(frame, str(rule.get("type") or content_type), body)
             return
+
+    async def _keep(self, frame: dict[str, Any], kind: str, body: bytes) -> None:
+        await self._env.run(self._save, frame["id"], kind, body)
+        if self._journal is not None:
+            self._journal.mark(frame.get("access"), frame["id"], {"type": kind, "bytes": len(body)})
 
     def find(self, event_id: str) -> tuple[Path, str] | None:
         """Файл вложения и его тип; `None` — вложения нет. Блокирует — в executor."""

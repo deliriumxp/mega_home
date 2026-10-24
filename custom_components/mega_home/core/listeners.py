@@ -127,8 +127,11 @@ class Listeners:
     def _run(self, coro: Any, name: str) -> None:
         self._tasks.append(self._env.spawn(coro, f"mega_home events {name}"))
 
-    def emit(self, descriptor: DeviceDescriptor, source: str, spec: dict[str, Any], event: str, data: Any) -> None:
-        self._hub.publish(descriptor.id, source, event, data, local=spec.get("local") is True)
+    def emit(
+        self, descriptor: DeviceDescriptor, source: str, spec: dict[str, Any], event: str, data: Any,
+        file: tuple[str, bytes] | None = None,
+    ) -> None:
+        self._hub.publish(descriptor.id, source, event, data, local=spec.get("local") is True, file=file)
 
     async def stop(self) -> None:
         """Остановить всё и ДОЖДАТЬСЯ: порт 8189 обязан освободиться до новой записи."""

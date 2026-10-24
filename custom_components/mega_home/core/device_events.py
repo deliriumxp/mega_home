@@ -61,8 +61,8 @@ class EventHub:
         # опционально, чтобы демон без диска (`docs/plan-core-without-ha.md`)
         # и тесты этого модуля обходились без него.
         self._store = store
-        # Каждое опубликованное событие — правилам вложений (`event_files.py`).
-        self.on_published: Listener | None = None
+        # Каждое опубликованное событие — правилам вложений (`event_files.py`), со своим файлом источника.
+        self.on_published: Callable[[dict[str, Any], tuple[str, bytes] | None], None] | None = None
 
     def publish(
         self,
@@ -72,8 +72,12 @@ class EventHub:
         data: Any = None,
         local: bool = False,
         ttl: float = BUFFER_TTL_S,
+        file: tuple[str, bytes] | None = None,
     ) -> dict[str, Any]:
         """Событие устройства. `local` — можно ли показать его в локальном контуре.
+
+        `file` — (тип, байты): вложение, которое источник снял сам (вырез «человек» детекции дома,
+        `motion.py`), — оно главнее правила вложения: снимок камеры позже был бы уже не тем моментом.
 
         `ttl` — сколько ждать подтверждения менеджера. Умолчание — минута, предел для звонка;
         уведомлению по датчику (`alerts.py`) нужен час: протечка при моргнувшем интернете обязана
@@ -112,7 +116,7 @@ class EventHub:
         # ⚠ ПОСЛЕ отправки: вложение (`event_files.py`) догоняет событие, а не
         # задерживает его.
         if self.on_published is not None:
-            self.on_published(frame)
+            self.on_published(frame, file)
         return frame
 
     def subscribe(self, listener: Listener) -> Callable[[], None]:

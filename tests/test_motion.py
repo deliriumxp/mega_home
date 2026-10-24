@@ -12,7 +12,7 @@ import asyncio
 import numpy as np
 import pytest
 
-from mega_home.core import host_load
+from mega_home.core import activity, host_load
 from mega_home.core import motion as mo
 from mega_home.core.devices import DeviceDescriptor
 
@@ -113,8 +113,8 @@ class _Ctx:
     def __init__(self) -> None:
         self.events: list[dict] = []
 
-    def emit(self, descriptor, source, spec, kind, payload) -> None:  # noqa: ANN001
-        self.events.append({"kind": kind, **payload})
+    def emit(self, descriptor, source, spec, kind, payload, file=None) -> None:  # noqa: ANN001
+        self.events.append({"kind": kind, **payload, **({"file": file} if file else {})})
 
 
 class _Proc:
@@ -166,8 +166,13 @@ def test_источник_говорит_началось_и_кончилось_
             await task
 
     host_load._inside.clear()  # noqa: SLF001
+    activity._live.clear()  # noqa: SLF001
     asyncio.run(scenario())
     assert [(e["kind"], e["state"]) for e in ctx.events] == [("motion", "start"), ("motion", "stop")]
+    # Сила движения окна — в корзины камеры (`activity.py`) для ленты архива.
+    levels = activity.pending("cam", 0, 1e12)
+    assert levels and all(0 < share <= 1 for _bucket, share in levels)
+    activity._live.clear()  # noqa: SLF001
     # Счёт кадра numpy — в процессе дома, и он записан на ту же камеру; ffmpeg снят с учёта.
     assert host_load._inside["motion:cam"] > 0 and "motion:cam" not in host_load._owners  # noqa: SLF001
     host_load._inside.clear()  # noqa: SLF001

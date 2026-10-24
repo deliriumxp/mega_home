@@ -38,12 +38,12 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
 
-from . import host_load, services, storage
+from . import activity, host_load, services, storage
 from .const import LOGGER
 from .go2rtc_embed import API_PORT, RTSP_PORT
 from .host import Host
 from .recorder_index import SegmentIndex, clean, day_of, epoch_of, segment_name
-from .recorder_preview import PreviewIndex, PreviewWriter, sweep_legacy
+from .recorder_preview import PreviewIndex, PreviewTune, PreviewWriter, sweep_legacy, tune_of
 # Раздел конфига и годность хранилища — `recorder_spec.py`; здесь под прежними именами для службы и спек.
 from .recorder_spec import CameraSpec, camera_specs, storage_problem  # noqa: F401
 
@@ -286,6 +286,13 @@ class _Camera:
         keep = now - self.spec.post_s - 3600
         self.windows = [w for w in self.windows if w[1] is None or float(w[1]) > keep]
 
+    def store_activity(self, rows: list[tuple[int, float]]) -> None:
+        """Корзины силы движения — в `<день>/activity.csv`; уходят вместе с каталогом дня (`clean`)."""
+        if self.rec.problem():
+            return
+        for day in sorted({day_of(bucket) for bucket, _value in rows}):
+            activity.append(self.index.root / day, [row for row in rows if day_of(row[0]) == day])
+
     def state(self) -> dict[str, Any]:
         return {
             "mode": "motion" if self.spec.motion_mode else "continuous",
@@ -314,6 +321,8 @@ class Recorder:
         self.mount: dict[str, Any] | None = None
         self.local = False
         self.limit = 0
+        # Превью-видео (`recorder_preview.PreviewTune`) — данными раздела, как и всё остальное.
+        self.preview = PreviewTune()
         self.why = ""
         self._api: Any = None
         self._api_task: asyncio.Task[None] | None = None
@@ -366,6 +375,7 @@ class Recorder:
             self.mount = mount
             self.local = (section or {}).get("local") is True
             self.limit = int(float((section or {}).get("limitGb") or 0) * 1024**3)
+            self.preview = tune_of((section or {}).get("preview"))
             self.why = ""
             if self._specs:
                 self._supervisor = self.env.spawn(self._supervise(), "mega_home: запись камер, сторож")
@@ -426,6 +436,12 @@ class Recorder:
                 if camera.preview_task is None or camera.preview_task.done():
                     camera.preview_task = self.env.spawn(camera.preview.run(), f"mega_home: превью {camera.spec.id}")
         await self.env.run(clean, self.storage, list(self.cameras.values()), time.time(), self.limit)
+        # Сила движения (`activity.py`): корзины забираются в цикле событий — их пишет детектор, — а
+        # дописываются в ряд суток в исполнителе.
+        for camera in list(self.cameras.values()):
+            rows = activity.take(camera.spec.access, time.time())
+            if rows:
+                await self.env.run(camera.store_activity, rows)
 
     async def _start_cameras(self) -> None:
         ram = await self.env.run(self._ram_cache, sum(1 for s in self._specs if s.motion_mode))

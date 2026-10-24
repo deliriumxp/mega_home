@@ -35,18 +35,21 @@ import os
 import shutil
 import time
 from collections import deque
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import quote
 
 import aiohttp
 
-from . import host_load, person
+from . import activity, host_load, person
 from .const import LOGGER
 from .go2rtc_embed import API_PORT, RTSP_PORT
 
 WIDTH, HEIGHT, CELL = 176, 96, 8
-# Ширина кадра для выреза «человек»: человек на трети высоты — сотня с лишним пикселей, сети хватает.
+# Умолчания раздела `person` описания (менеджер шлёт их данными — подстройка без релиза дома). Ширина
+# кадра для выреза: человек на трети высоты — сотня с лишним пикселей, сети хватает; снимок события —
+# ширина JPEG крупного участка (`person.shot`).
 PERSON_WIDTH = 640
+SHOT_WIDTH = 480
 FRAME = WIDTH * HEIGHT
 # Кадров нет дольше — поток встал: перезапуск источника (`listeners._forever`). Первый кадр ждём
 # дольше: go2rtc сперва поднимает подключение к камере, ffmpeg разбирает поток.
@@ -203,7 +206,7 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
     # Движение публикуется, если описание не сказало иначе: у камеры, чьё движение приходит от неё
     # самой, детекция дома нужна только ради людей (`motionEvents: false`), и строк движения дважды нет.
     publish = spec.get("motionEvents") is not False
-    watch, model = await _person_setup(loop, np, spec)
+    watch, model, tune = await _person_setup(loop, np, spec)
     ffmpeg_args = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-rtsp_transport", "tcp",
         "-threads", "1", "-skip_loop_filter", "all", "-flags2", "+fast",
@@ -222,7 +225,7 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
         pipe_in, pipe_out = os.pipe()
         ffmpeg_args += [
             "-filter_complex",
-            f"[0:v]split=2[m][p];[m]{small}[small];[p]fps={fps / ratio:g},scale={PERSON_WIDTH}:-2:flags=area[big]",
+            f"[0:v]split=2[m][p];[m]{small}[small];[p]fps={fps / ratio:g},scale={tune.width}:-2:flags=area[big]",
             "-map", "[small]", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
             # ⚠ Номер дескриптора в ffmpeg — тот же, что у нас: `pass_fds` его сохраняет.
             "-map", "[big]", "-f", "image2pipe", "-c:v", "bmp", "-pix_fmt", "bgr24", f"pipe:{pipe_out}",
@@ -283,16 +286,25 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
                 peak = 0.0
                 if watch is not None and watch.end():
                     ctx.emit(descriptor, source, spec, "person", {"person": "stop"})
+            if active and share:
+                # Сила движения для ленты архива (`activity.py`) — только внутри окна, как полоса движения.
+                activity.note(descriptor.id, time.time(), share)
             for frame, box in _person_pairs(big, boxes, ratio, index) if watch is not None else ():
                 if not (active and box and watch.due(now)):
                     continue
-                value, spent = await loop.run_in_executor(None, _person_score, np, model, frame, box)
+                value, spent = await loop.run_in_executor(None, _person_score, np, model, frame, box, tune.margin)
                 # Счёт сети — в строке камеры, как счёт кадра; пишется в цикле событий (`host_load.spent`).
                 host_load.spent(load_key, spent)
                 if watch.seen(value, now):
+                    # Снимок события — крупный участок ТОГО кадра, где сеть увидела человека (заказчик
+                    # 2026-10-24): снимок камеры правилом вложения пришёл бы секундами позже.
+                    picture = await loop.run_in_executor(None, _person_shot, frame, box, tune)
                     # ⚠ Своё имя события и свой ключ данных (`person`, а не `state`): запись по движению
                     # (`recorder.py`) и лента ловят движение подстрокой `"state":"start"`.
-                    ctx.emit(descriptor, source, spec, "person", {"person": "start", "score": round(value, 3)})
+                    ctx.emit(
+                        descriptor, source, spec, "person", {"person": "start", "score": round(value, 3)},
+                        file=("image/jpeg", picture) if picture else None,
+                    )
     finally:
         if active and publish:
             # Источник встал посреди движения: окно записи и метка ленты не висят открытыми.
@@ -308,23 +320,37 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
             await proc.wait()
 
 
-async def _person_setup(loop: asyncio.AbstractEventLoop, np: Any, spec: dict[str, Any]) -> tuple[Any, Any]:
-    """Сеть «человек» по описанию (`person: {every, threshold, frames}`); нет раздела или весов — (None, None):
-    без людей движение работает как прежде."""
+class PersonTune(NamedTuple):
+    """Кадр выреза и снимок события — из раздела `person` описания."""
+
+    width: int = PERSON_WIDTH
+    margin: float = person.MARGIN
+    shot: int = SHOT_WIDTH
+
+
+async def _person_setup(loop: asyncio.AbstractEventLoop, np: Any, spec: dict[str, Any]) -> tuple[Any, Any, PersonTune]:
+    """Сеть «человек» по описанию (`person: {every, threshold, frames, width, margin, shot}`); нет раздела или
+    весов — без сети: движение работает как прежде."""
     options = spec.get("person")
     if not isinstance(options, dict):
-        return None, None
+        return None, None, PersonTune()
     try:
         model = await loop.run_in_executor(None, person.load, np)
     except (OSError, KeyError, ValueError) as err:
         LOGGER.warning("Сеть «человек» не загрузилась, детекция людей выключена: %s", err)
-        return None, None
+        return None, None, PersonTune()
     watch = person.PersonWatch(
         every=_number(options, "every", 1.0, 0.2, 10.0),
         threshold=_number(options, "threshold", 0.5, 0.05, 0.99),
         frames=int(_number(options, "frames", 2, 1, 10)),
     )
-    return watch, model
+    # Ширина — чётная: `scale=W:-2` ffmpeg.
+    tune = PersonTune(
+        width=int(_number(options, "width", PERSON_WIDTH, 320, 1920)) // 2 * 2,
+        margin=_number(options, "margin", person.MARGIN, 0.0, 1.0),
+        shot=int(_number(options, "shot", SHOT_WIDTH, 160, 1280)),
+    )
+    return watch, model, tune
 
 
 async def _person_frames(loop: asyncio.AbstractEventLoop, np: Any, fd: int, big: deque[tuple[int, Any]]) -> None:
@@ -358,13 +384,27 @@ def _person_pairs(big: deque[tuple[int, Any]], boxes: deque[tuple[int, Any]], ra
     return out
 
 
-def _person_score(np: Any, model: Any, frame: Any, box: tuple[int, int, int, int]) -> tuple[float, float]:
-    """Рамка движения (кадр 176×96) → пиксели крупного кадра → уверенность сети и время потока (в исполнителе)."""
-    began = time.thread_time()
+def _scaled(frame: Any, box: tuple[int, int, int, int]) -> tuple[float, float, float, float]:
+    """Рамка движения (кадр 176×96) → пиксели крупного кадра."""
     height, width = frame.shape[:2]
     sx, sy = width / WIDTH, height / HEIGHT
-    value = person.score(np, model, frame, (box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy))
+    return box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy
+
+
+def _person_score(np: Any, model: Any, frame: Any, box: tuple[int, int, int, int], margin: float) -> tuple[float, float]:
+    """Уверенность сети и время потока (в исполнителе)."""
+    began = time.thread_time()
+    value = person.score(np, model, frame, _scaled(frame, box), margin)
     return value, time.thread_time() - began
+
+
+def _person_shot(frame: Any, box: tuple[int, int, int, int], tune: PersonTune) -> bytes | None:
+    """JPEG снимка события (в исполнителе); не вышло — None, событие уходит без своего снимка."""
+    try:
+        return person.shot(frame, _scaled(frame, box), tune.margin, tune.shot)
+    except (OSError, ValueError) as err:
+        LOGGER.warning("Снимок «человек» не сжался: %s", err)
+        return None
 
 
 async def _drain(proc: asyncio.subprocess.Process, tail: deque[str]) -> None:

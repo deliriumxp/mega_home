@@ -22,7 +22,9 @@ from mega_home.core import recorder as rec
 from mega_home.core import services, storage
 from mega_home.core.go2rtc_embed import RTSP_PORT
 from mega_home.core.recorder_api import start_api
-from mega_home.core.recorder_preview import PREVIEW_LIST, SWEPT, command, sweep_legacy, whole_fragments
+from mega_home.core.recorder_preview import (
+    PREVIEW_LIST, SWEPT, PreviewTune, command, sweep_legacy, tune_of, whole_fragments,
+)
 
 SECTION = {"storage": "/media/video", "cameras": [{"id": "cam", "stream": "cam_main", "source": "rtsp://u:p@10.0.0.5/main"}]}
 
@@ -59,6 +61,15 @@ def test_команда_берёт_ключевые_кадры_своего_go2r
     assert "movflags=+frag_keyframe+empty_moov+default_base_moof:flush_packets=1" in argv and "libx264" in argv
     assert argv[argv.index("-segment_list") + 1] == f"/c/{PREVIEW_LIST}" and argv[-1] == "/c/preview/%Y%m%dT%H%M%S.mp4"
     assert command("/usr/bin/ffmpeg", "", "cam_main", Path("/c"))[0] == "/usr/bin/ffmpeg"
+
+
+def test_качество_превью_данными_конфига_в_пределах() -> None:
+    """Высота, crf и ключевой кадр — раздел `recorder.preview` менеджера: подстройка без релиза дома."""
+    assert tune_of(None) == PreviewTune(180, 33, 5)
+    assert tune_of({"height": 241, "crf": 99, "gop": "x"}) == PreviewTune(240, 45, 5)
+    argv = command("/usr/bin/ffmpeg", "", "cam_main", Path("/c"), tune_of({"height": 360, "crf": 28, "gop": 10}))
+    assert "scale=-2:360,format=yuv420p" in argv
+    assert argv[argv.index("-crf") + 1] == "28" and argv[argv.index("-g") + 1] == "10"
 
 
 def test_закрытые_куски_по_списку_ffmpeg_уходят_в_хранилище() -> None:

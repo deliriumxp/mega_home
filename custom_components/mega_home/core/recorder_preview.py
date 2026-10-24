@@ -29,7 +29,7 @@ import time
 from bisect import bisect_right
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from . import host_load
 from .const import LOGGER
@@ -42,7 +42,8 @@ if TYPE_CHECKING:
 PREVIEW_S = 600
 PREVIEW_DIR = "preview"
 PREVIEW_LIST = "preview.csv"
-HEIGHT = 180
+# Умолчания раздела `recorder.preview` конфига: менеджер шлёт их данными — подстройка без релиза дома.
+HEIGHT, CRF, GOP = 180, 33, 5
 SCAN_S = 5.0
 RESTART_S = 10.0
 # Идущий кусок не растёт дольше этого — поток встал (тот же сторож, что у записи, `STALL_S`).
@@ -53,13 +54,35 @@ _NAME = re.compile(r"^(\d{6})-(\d+)\.mp4$")
 _DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
-def command(binary: str, nice: str, stream: str, cache: Path) -> list[str]:
+class PreviewTune(NamedTuple):
+    """Высота кадра, качество (`crf` x264) и ключевой кадр каждые `gop` кадров превью."""
+
+    height: int = HEIGHT
+    crf: int = CRF
+    gop: int = GOP
+
+
+def tune_of(raw: Any) -> PreviewTune:
+    """Раздел `preview` конфига записи → значения в пределах; чужое и пропущенное — умолчание."""
+    raw = raw if isinstance(raw, dict) else {}
+
+    def bounded(key: str, default: int, low: int, high: int) -> int:
+        try:
+            return min(max(int(raw.get(key, default)), low), high)
+        except (TypeError, ValueError):
+            return default
+
+    # Высота — чётная: `scale=-2:H` и yuv420p.
+    return PreviewTune(bounded("height", HEIGHT, 90, 720) // 2 * 2, bounded("crf", CRF, 18, 45), bounded("gop", GOP, 1, 30))
+
+
+def command(binary: str, nice: str, stream: str, cache: Path, tune: PreviewTune = PreviewTune()) -> list[str]:
     return [
         *([nice, "-n", "10"] if nice else []), binary, "-hide_banner", "-loglevel", "error", "-nostdin",
         "-rtsp_transport", "tcp", "-use_wallclock_as_timestamps", "1", "-skip_frame", "nokey",
         "-i", f"rtsp://127.0.0.1:{RTSP_PORT}/{stream}", "-copyts", "-map", "0:v:0", "-an",
-        "-vf", f"scale=-2:{HEIGHT},format=yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-        "-crf", "33", "-g", "5", "-bf", "0", "-fps_mode", "passthrough",
+        "-vf", f"scale=-2:{tune.height},format=yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+        "-crf", str(tune.crf), "-g", str(tune.gop), "-bf", "0", "-fps_mode", "passthrough",
         "-f", "segment", "-segment_time", str(PREVIEW_S), "-segment_atclocktime", "1", "-reset_timestamps", "1",
         "-strftime", "1", "-segment_format", "mp4",
         "-segment_format_options", "movflags=+frag_keyframe+empty_moov+default_base_moof:flush_packets=1",
@@ -176,7 +199,7 @@ class PreviewWriter:
             raise RuntimeError("в системе нет ffmpeg")
         self._offset = 0
         proc = await asyncio.create_subprocess_exec(
-            *command(binary, nice or "", self.camera.spec.stream, self.camera.cache),
+            *command(binary, nice or "", self.camera.spec.stream, self.camera.cache, self.camera.rec.preview),
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE, env={**os.environ, "TZ": "UTC"},
         )

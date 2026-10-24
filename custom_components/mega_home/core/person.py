@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +91,37 @@ def square(box: tuple[float, float, float, float], width: int, height: int, marg
     return int(left), int(top), int(left + side), int(top + side)
 
 
+def wide(box: tuple[int, int, int, int], width: int, height: int, aspect: float = 16 / 9) -> tuple[int, int, int, int]:
+    """Рамка снимка «человек» вокруг квадрата сети: пропорции кадра ленты (16:9, `fill` у бандла —
+    квадрат там растянулся бы), высота — по квадрату, сдвинута внутрь кадра."""
+    x0, y0, x1, y1 = box
+    h = min(float(y1 - y0), height, width / aspect)
+    w = h * aspect
+    left = min(max((x0 + x1 - w) / 2, 0), width - w)
+    top = min(max((y0 + y1 - h) / 2, 0), height - h)
+    return int(left), int(top), int(left + w), int(top + h)
+
+
+def shot(frame: Any, box: tuple[float, float, float, float], margin: float, width: int, quality: int = 80) -> bytes | None:
+    """JPEG крупного участка, где сеть увидела человека (в исполнителе); Pillow нет — None, и к событию
+    приложится снимок камеры правилом вложения."""
+    try:
+        from PIL import Image  # noqa: PLC0415 — Pillow есть у HA, ядру без HA не обещан
+    except ImportError:
+        return None
+    height_px, width_px = frame.shape[:2]
+    left, top, right, bottom = wide(square(box, width_px, height_px, margin), width_px, height_px)
+    if right - left < 2 or bottom - top < 2:
+        return None
+    # Копия — непрерывная: кадр из BMP перевёрнут видом (`read_bmp`).
+    image = Image.fromarray(frame[top:bottom, left:right].copy())
+    if image.width > width:
+        image = image.resize((width, round(width * image.height / image.width)), Image.Resampling.BILINEAR)
+    out = io.BytesIO()
+    image.save(out, "JPEG", quality=quality)
+    return out.getvalue()
+
+
 def resize(np: Any, image: Any, size: int) -> Any:
     """Билинейное уменьшение HxWx3 до size×size (без Pillow: ядру он не гарантирован)."""
     h, w = image.shape[:2]
@@ -104,10 +136,10 @@ def resize(np: Any, image: Any, size: int) -> Any:
     return top * (1 - fy) + bottom * fy
 
 
-def score(np: Any, model: dict[str, Any], frame: Any, box: tuple[float, float, float, float]) -> float:
+def score(np: Any, model: dict[str, Any], frame: Any, box: tuple[float, float, float, float], margin: float = MARGIN) -> float:
     """Уверенность «человек» в квадрате вокруг `box` (пиксели кадра `frame`, HxWx3 RGB)."""
     height, width = frame.shape[:2]
-    left, top, right, bottom = square(box, width, height)
+    left, top, right, bottom = square(box, width, height, margin)
     if right - left < 2 or bottom - top < 2:
         return 0.0
     crop = resize(np, frame[top:bottom, left:right], model["size"]) / 255.0
