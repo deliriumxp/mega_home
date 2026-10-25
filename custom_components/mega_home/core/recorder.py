@@ -42,7 +42,8 @@ from . import activity, host_load, services, storage
 from .const import LOGGER
 from .go2rtc_embed import API_PORT, RTSP_PORT
 from .host import Host
-from .recorder_index import SegmentIndex, clean, day_of, epoch_of, segment_name
+from .recorder_cache import RAM_PER_CAMERA, cap_bytes, memory_available, ram_fits, shed  # noqa: F401
+from .recorder_index import MAX_SEGMENT_S, SegmentIndex, clean, day_of, epoch_of, segment_name
 from .recorder_preview import PreviewIndex, PreviewTune, PreviewWriter, sweep_legacy, tune_of
 # Раздел конфига и годность хранилища — `recorder_spec.py`; здесь под прежними именами для службы и спек.
 from .recorder_spec import CameraSpec, camera_specs, storage_problem  # noqa: F401
@@ -62,8 +63,11 @@ MAX_MOTION_S = 300.0
 # перезапуска HA. Перезапуск процесса — тем же путём, что после его падения.
 STALL_S = 90.0
 RAM_DIR = Path("/dev/shm")
-# Кэш «по движению» на камеру: запас до события плюс кусок в работе (~4 Мбит/с, с запасом).
-RAM_PER_CAMERA = 64 * 1024**2
+# ⚠ Перенос куска в хранилище ждёт не дольше этого: сетевая папка с зависшим соединением держит поток
+# исполнителя минутами, а без срока стоял бы весь разбор камеры — и кэш в памяти копился бы часами.
+SAVE_TIMEOUT_S = 120.0
+# Предупреждение о сбросе кэша — не чаще этого, секунд.
+SHED_WARN_S = 60.0
 # Список готовых кусков ведёт сам ffmpeg (`-segment_list`, CSV «файл,начало,конец»): длительность
 # куска и «кусок закрыт» без ffprobe на каждый кусок и без догадки «последний ещё пишется».
 SEGMENT_LIST = "segments.csv"
@@ -84,6 +88,12 @@ class _Camera:
         # Готовые куски по списку ffmpeg: имя → длительность; прочитанная часть списка — смещением.
         self._listed: dict[str, float] = {}
         self._list_offset = 0
+        # Кэш в памяти (`recorder_cache.py`): поток камеры по её кускам (байт/с), сброшенные куски, перенос в работе.
+        self.in_ram = self.cache.is_relative_to(RAM_DIR)
+        self.rate = 0.0
+        self.shed = 0
+        self._shed_warned = 0.0
+        self._saving: asyncio.Future[None] | None = None
         self._last_ready = 0.0
         # Окна движения: [начало, конец или None, последнее «есть движение»] — часы дома.
         self.windows: list[list[float | None]] = []
@@ -139,6 +149,8 @@ class _Camera:
             stderr=asyncio.subprocess.PIPE, env={**os.environ, "TZ": "UTC"},
         )
         drain = asyncio.ensure_future(self._drain(proc))
+        # Предел кэша держит свой цикл: он не ждёт ни сеть, ни разбор кусков (`_collect`).
+        guard = asyncio.ensure_future(self._guard()) if self.in_ram else None
         self.why = ""
         self._last_ready = time.monotonic()
         host_load.track(f"record:{self.spec.id}", proc.pid)
@@ -160,8 +172,31 @@ class _Camera:
                 except asyncio.TimeoutError:
                     proc.kill()
             drain.cancel()
+            if guard is not None:
+                guard.cancel()
             host_load.untrack(f"record:{self.spec.id}", proc.pid)
         raise RuntimeError(f"ffmpeg завершился ({proc.returncode}): {' | '.join(self._tail) or 'без слов'}")
+
+    async def _guard(self) -> None:
+        """Предел кэша в памяти: сверх него самые старые куски сбрасываются, не дожидаясь переносчика.
+
+        ⚠ Отдельный цикл, а не часть `_collect`: тот ждёт хранилище, а память переполняется ровно тогда,
+        когда оно не отвечает (разбор 2026-10-25: 15–17 часов кусков в `/dev/shm`, HA в свопе).
+        """
+        while True:
+            await asyncio.sleep(SCAN_S)
+            cameras = sum(1 for camera in self.rec.cameras.values() if camera.in_ram) or 1
+            horizon = self.spec.pre_s + 2 * SEGMENT_S
+            cap = cap_bytes(self.rate, horizon, cameras, await self.rec.env.run(memory_available))
+            removed = await self.rec.env.run(shed, self.cache, cap)
+            if removed:
+                self.shed += removed
+                if time.monotonic() - self._shed_warned > SHED_WARN_S:
+                    self._shed_warned = time.monotonic()
+                    LOGGER.warning(
+                        "Запись %s: кэш в памяти больше %d МБ — сброшено %d старых кусков (хранилище не успевает)",
+                        self.spec.id, cap // 1024**2, removed,
+                    )
 
     async def _drain(self, proc: asyncio.subprocess.Process) -> None:
         assert proc.stderr is not None
@@ -197,26 +232,78 @@ class _Camera:
     async def _collect(self, final: bool = False) -> None:
         """Готовые куски (по списку ffmpeg) — в хранилище или в корзину. `final` — и тот, что
         ffmpeg не успел закрыть в список (остановлен): длительность у него спрашивает ffprobe."""
+        if self._saving is not None and self._saving.done() and self.why.startswith("хранилище не отвечает"):
+            self.why = ""  # опоздавший перенос вернулся — хранилище снова отвечает
         await self.rec.env.run(self._read_list)
         files = sorted(await self.rec.env.run(lambda: list(self.cache.glob("*.mkv"))))
         ready = files if final else [path for path in files if path.name in self._listed]
         if ready:
             self._last_ready = time.monotonic()
         now = time.time()
+        names = {path.name for path in files}
+        for stale in [name for name in self._listed if name not in names]:
+            del self._listed[stale]
         for path in ready:
             start = epoch_of(path.stem)
             if start is None:
                 await self.rec.env.run(path.unlink, True)
                 continue
-            length = self._listed.pop(path.name, 0.0) or await self.rec.probe(path)
+            length = self._listed.get(path.name, 0.0) or await self.rec.probe(path)
+            if length > MAX_SEGMENT_S:
+                # ⚠ Метки камеры скакнули (обрыв RTP, `bad cseq`): список ffmpeg считает длину по ним, и кусок
+                # в 10 часов лёг бы в индекс (замер 2026-10-25) — окна поиска записи не знают таких.
+                measured = await self.rec.probe(path)
+                if not 0 < measured <= MAX_SEGMENT_S:
+                    LOGGER.warning("Запись %s: кусок %s длиной %.0f с отброшен", self.spec.id, path.name, length)
+                    self._listed.pop(path.name, None)
+                    self.dropped += 1
+                    await self.rec.env.run(path.unlink, True)
+                    continue
+                length = measured
             if length <= 0:
+                self._listed.pop(path.name, None)
                 await self.rec.env.run(path.unlink, True)
                 continue
+            if self.in_ram:
+                self._measure(path, length)
             if not self.spec.motion_mode or self.wanted(start, start + length, now):
-                await self.rec.env.run(self._save, path, start, length)
+                if not await self._save_bounded(path, start, length):
+                    return  # хранилище не отвечает: остальные ждут в кэше, пределом их держит `_guard`
             elif start + length + self.spec.pre_s < now - SEGMENT_S or final:
                 self.dropped += 1
                 await self.rec.env.run(path.unlink, True)
+            else:
+                continue
+            self._listed.pop(path.name, None)
+
+    def _measure(self, path: Path, length: float) -> None:
+        """Поток камеры по её куску, байт/с: от него зависит, сколько памяти нужно кэшу."""
+        try:
+            rate = path.stat().st_size / length
+        except OSError:
+            return
+        self.rate = rate if not self.rate else 0.8 * self.rate + 0.2 * rate
+
+    async def _save_bounded(self, path: Path, start: float, length: float) -> bool:
+        """Перенос куска не дольше `SAVE_TIMEOUT_S`; `False` — хранилище не ответило, кусок остаётся в кэше.
+
+        ⚠ Поток исполнителя, повисший на сети, не снять: пока он не вернулся, второго переноса не
+        заводим — иначе каждый проход съедал бы по потоку из пула HA (как у пробы хранилища, `_check`).
+        """
+        if self._saving is not None and not self._saving.done():
+            return False
+        self._saving = asyncio.ensure_future(self.rec.env.run(self._save, path, start, length))
+        # Результат опоздавшего переноса никто не ждёт: прочесть, чтобы цикл не жаловался.
+        self._saving.add_done_callback(lambda done: done.cancelled() or done.exception())
+        try:
+            await asyncio.wait_for(asyncio.shield(self._saving), SAVE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            self.why = "хранилище не отвечает: куски ждут в кэше"
+            LOGGER.warning("Запись %s: перенос куска %s длится дольше %g с", self.spec.id, path.name, SAVE_TIMEOUT_S)
+            return False
+        if self.why.startswith("хранилище не отвечает"):
+            self.why = ""
+        return True
 
     def _save(self, path: Path, start: float, length: float) -> None:
         # ⚠ Перед КАЖДЫМ куском: отвалившийся диск оставляет пустой каталог на флеше контроллера.
@@ -302,6 +389,7 @@ class _Camera:
             "lastSaved": round(self.last_saved, 3) or None,
             "motion": bool(self.windows and self.windows[-1][1] is None),
             "preview": self.preview.why,
+            "shed": self.shed,
         }
 
 
@@ -496,7 +584,8 @@ class Recorder:
         """
         if not motion_cameras or not RAM_DIR.is_dir():
             return None
-        if shutil.disk_usage(RAM_DIR).free < motion_cameras * RAM_PER_CAMERA:
+        # ⚠ Свободное место `/dev/shm` память не меряет (половина памяти хоста): смотрим, сколько её реально.
+        if not ram_fits(motion_cameras, shutil.disk_usage(RAM_DIR).free):
             return None
         path = RAM_DIR / "mega_home_rec"
         path.mkdir(exist_ok=True)

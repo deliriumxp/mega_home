@@ -522,3 +522,135 @@ def test_сутки_из_одного_превью_уходят_по_сроку(
     (day / "120000-600000.mp4").write_bytes(b"p")
     rec.clean(tmp_path, [_camera(tmp_path)], now)
     assert not day.parent.exists()
+
+
+def test_молодой_кусок_без_движения_не_забывается_и_уходит_когда_созрел(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Объект 192.168.90.250, 2026-10-25: кусок «по движению», закрытый только что и без окна движения,
+    выпадал из списка готовых ДО решения и больше не разбирался — кэш в памяти копил каждый такой кусок
+    до перезапуска ffmpeg (по ~6000 на камеру, 3,1 ГБ, HA в свопе). Теперь он остаётся и уходит, созрев."""
+    camera = _camera(tmp_path)
+    camera.cache.mkdir(parents=True)
+    name = "20261023T120000.mkv"
+    (camera.cache / name).write_bytes(b"x")
+    (camera.cache / rec.SEGMENT_LIST).write_text(f"{camera.cache}/{name},0.000000,10.000000\n")
+    start = rec.epoch_of("20261023T120000") or 0.0
+    monkeypatch.setattr(rec.time, "time", lambda: start + 11)
+    asyncio.run(camera._collect())  # noqa: SLF001
+    assert (camera.cache / name).exists() and camera.dropped == 0
+    monkeypatch.setattr(rec.time, "time", lambda: start + 60)
+    asyncio.run(camera._collect())  # noqa: SLF001
+    assert not (camera.cache / name).exists() and camera.dropped == 1
+    assert camera._listed == {}  # noqa: SLF001
+
+
+def test_перенос_не_ждёт_хранилище_без_срока_и_не_плодит_потоков(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Зависший перенос в сетевую папку не держит весь разбор камеры: куски ждут в кэше, второй перенос
+    поверх висящего не заводится, а вернувшийся — доделывается."""
+    folder = Path(tempfile.mkdtemp(prefix="rec-"))
+    camera = _camera(folder, motion_mode=False)
+    camera.rec.local, camera.rec.limit = True, 1024**3
+    camera.cache.mkdir(parents=True)
+    name = "20261023T120000.mkv"
+    (camera.cache / name).write_bytes(b"x")
+    (camera.cache / rec.SEGMENT_LIST).write_text(f"{camera.cache}/{name},0.000000,10.000000\n")
+    monkeypatch.setattr(rec, "SAVE_TIMEOUT_S", 0.05)
+    started: list[int] = []
+    gate = asyncio.Event()
+    real = camera.rec.env.run
+
+    async def run(func, *args):  # noqa: ANN001, ANN201
+        if getattr(func, "__name__", "") == "_save":
+            started.append(1)
+            await gate.wait()
+        return await real(func, *args)
+
+    camera.rec.env.run = run  # type: ignore[method-assign]
+
+    async def scenario() -> None:
+        await camera._collect()  # noqa: SLF001
+        assert "не отвечает" in camera.why and (camera.cache / name).exists()
+        await camera._collect()  # noqa: SLF001
+        assert len(started) == 1
+        gate.set()
+        await asyncio.sleep(0.05)
+        await camera._collect()  # noqa: SLF001
+
+    asyncio.run(scenario())
+    assert camera.saved == 1 and camera.why == "" and not (camera.cache / name).exists()
+
+
+def test_кусок_с_прыгнувшими_метками_не_ложится_в_индекс(tmp_path: Path) -> None:
+    """Замер 2026-10-25: после обрыва RTP список ffmpeg назвал кусок длиной 10 часов (`002608-35965824.mkv`);
+    окна поиска индекса знают куски до минуты. Длину перемеряет ffprobe; не годится — кусок отбрасывается."""
+    folder = Path(tempfile.mkdtemp(prefix="rec-"))
+    camera = _camera(folder, motion_mode=False)
+    camera.rec.local, camera.rec.limit = True, 1024**3
+    camera.cache.mkdir(parents=True)
+    names = ["20261023T120000.mkv", "20261023T120010.mkv"]
+    for name in names:
+        (camera.cache / name).write_bytes(b"x")
+    (camera.cache / rec.SEGMENT_LIST).write_text("".join(f"{camera.cache}/{n},0.0,35965.8\n" for n in names))
+    answers = iter([9.5, 36000.0])
+
+    async def probe(path: Path) -> float:
+        return next(answers)
+
+    camera.rec.probe = probe  # type: ignore[method-assign]
+    asyncio.run(camera._collect())  # noqa: SLF001
+    day = folder / "onvif-aa" / "2026-10-23"
+    assert [p.name for p in day.iterdir()] == ["120000-9500.mkv"]
+    assert camera.saved == 1 and camera.dropped == 1
+
+
+def test_предел_кэша_считается_по_месту_а_не_задан_числом() -> None:
+    """Железо заранее неизвестно: нужное кэшу — из потока камеры, отдаваемое — из доступной памяти."""
+    from mega_home.core import recorder_cache as cache
+
+    mb = 1024**2
+    # Поток 0,5 МБ/с, кусок ждёт решения 30 с и переноса 30 с, запас на всплески ×3.
+    need = cache.cap_bytes(0.5 * mb, 30, 2, None)
+    assert need == int(0.5 * mb * 60 * cache.BURST)
+    # Поток не промерен — допущение на камеру; памяти не знаем — только оно.
+    assert cache.cap_bytes(0, 30, 2, None) == cache.RAM_PER_CAMERA
+    # Памяти много — решает поток; мало — доля памяти на камеру; совсем мало — пол.
+    assert cache.cap_bytes(0.5 * mb, 30, 2, 64 * 1024 * mb) == need
+    assert cache.cap_bytes(0.5 * mb, 30, 2, 400 * mb) == int(400 * mb * cache.MEMORY_SHARE / 2)
+    assert cache.cap_bytes(0.5 * mb, 30, 2, 100 * mb) == cache.FLOOR
+    assert cache.cap_bytes(1e-3, 1, 2, None) == cache.FLOOR
+
+
+def test_доступная_память_берёт_меньшее_из_хоста_и_лимита(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mega_home.core import recorder_cache as cache
+
+    meminfo, cmax, ccur = tmp_path / "meminfo", tmp_path / "max", tmp_path / "current"
+    meminfo.write_text("MemTotal: 8000000 kB\nMemAvailable:    2048000 kB\n")
+    monkeypatch.setattr(cache, "MEMINFO", meminfo)
+    monkeypatch.setattr(cache, "CGROUP_MAX", cmax)
+    monkeypatch.setattr(cache, "CGROUP_CURRENT", ccur)
+    assert cache.memory_available() == 2048000 * 1024  # лимита нет — `memory.max` не читается
+    cmax.write_text("max\n")
+    assert cache.memory_available() == 2048000 * 1024
+    cmax.write_text(str(1000 * 1024**2))
+    ccur.write_text(str(400 * 1024**2))
+    assert cache.memory_available() == 600 * 1024**2
+    meminfo.unlink()
+    cmax.unlink()
+    assert cache.memory_available() is None
+    # Память есть, но под запуск не хватает — кэш на диске хранилища.
+    meminfo.write_text("MemAvailable: 100000 kB\n")
+    assert cache.ram_fits(2, 10 * 1024**3) is False
+    assert cache.ram_fits(2, 10 * 1024**2) is False  # и `/dev/shm` мал
+
+
+def test_сброс_кэша_держит_предел_и_не_трогает_два_новых_куска(tmp_path: Path) -> None:
+    from mega_home.core import recorder_cache as cache
+
+    for index in range(6):
+        (tmp_path / f"2026102312{index:02d}00.mkv").write_bytes(b"x" * 1000)
+    (tmp_path / "segments.csv").write_text("не кусок")
+    assert cache.shed(tmp_path, 3500) == 3
+    assert sorted(p.name for p in tmp_path.glob("*.mkv")) == [f"2026102312{i:02d}00.mkv" for i in (3, 4, 5)]
+    # Предел меньше двух новых вместе — старше них всё, но двое остаются.
+    assert cache.shed(tmp_path, 10) == 1
+    assert len(list(tmp_path.glob("*.mkv"))) == 2
+    assert cache.shed(tmp_path / "нет", 10) == 0
