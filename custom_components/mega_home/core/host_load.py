@@ -71,6 +71,11 @@ def _pids() -> list[int]:
         return []
 
 
+def pids() -> list[int]:
+    """Номера процессов в `/proc` — сторожам, которым мало собственного pid."""
+    return _pids()
+
+
 def _stat(pid: int) -> tuple[int, int, int, int]:
     """(родитель, старт, своё время, время дождавшихся детей) — такты `SC_CLK_TCK` (`proc(5)`).
     Имя процесса в скобках бывает с пробелами и скобками — поля считаются от ПОСЛЕДНЕЙ «)»."""
@@ -87,6 +92,24 @@ def _table() -> dict[int, tuple[int, int, int, int]]:
         except (OSError, ValueError, IndexError):
             continue  # кончился между листингом и чтением, или не наш (hidepid)
     return out
+
+
+def proc(pid: int) -> tuple[int, int] | None:
+    """(родитель, старт в тактах `SC_CLK_TCK`); None — кончился, не наш или не читается."""
+    try:
+        ppid, start, _own, _kids = _stat(pid)
+        return ppid, start
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def argv(pid: int) -> list[str]:
+    """Аргументы процесса; пусто — не прочли или зомби (у него командной строки уже нет)."""
+    try:
+        raw = (PROC / str(pid) / "cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return []
+    return [part.decode(errors="ignore") for part in raw if part]
 
 
 def find(marker: str) -> int | None:

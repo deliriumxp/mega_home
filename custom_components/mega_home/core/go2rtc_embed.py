@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Any
 
 
-from . import host_load, services
+from . import go2rtc_guard, host_load, services
 from .const import LOGGER
 from .host import Host
 
@@ -104,6 +104,7 @@ _env: Host | None = None
 _proc: asyncio.subprocess.Process | None = None
 _drain: asyncio.Task[None] | None = None
 _retry: asyncio.Task[None] | None = None
+_guard: asyncio.Task[None] | None = None
 _tmp: str | None = None
 _ready = False
 _log: deque[str] = deque(maxlen=LOG_TAIL)
@@ -111,7 +112,7 @@ _log: deque[str] = deque(maxlen=LOG_TAIL)
 
 async def async_start(env: Host) -> bool:
     """Поднять свой go2rtc. False — не поднят, причина в `state()["why"]`."""
-    global _env, _proc, _tmp, _ready, _why
+    global _env, _proc, _tmp, _ready, _why, _guard
 
     if is_running():
         return True
@@ -174,6 +175,7 @@ async def async_start(env: Host) -> bool:
     _why = ""
     services.register("go2rtc", API_PORT)
     LOGGER.info("mega_home go2rtc готов: %s, медиа :%s", URL, WEBRTC_PORT)
+    _guard = env.spawn(go2rtc_guard.run(URL, _proc.pid), "mega_home go2rtc: сторож продюсеров")
     return True
 
 
@@ -202,9 +204,12 @@ async def _retry_start(env: Host, attempts: int = RETRY_ATTEMPTS) -> bool:
 
 async def async_stop() -> None:
     """Снять процесс и убрать за собой. Зовётся при выгрузке и остановке HA."""
-    global _proc, _tmp, _drain, _ready, _retry
+    global _proc, _tmp, _drain, _ready, _retry, _guard
 
     _ready = False
+    guard, _guard = _guard, None
+    if guard is not None and not guard.done():
+        guard.cancel()
     services.unregister("go2rtc")
     host_load.untrack("go2rtc")
     drain, _drain = _drain, None

@@ -214,7 +214,10 @@ def test_смерть_во_время_работы_снимает_службу_�
     assert services.resolve("go2rtc") is None
     assert "go2rtc" not in host_load._owners  # noqa: SLF001
     assert "(2)" in embed.state()["why"] and "WRN something" in embed.state()["why"]
-    assert env.spawned == ["mega_home go2rtc: перезапуск после падения"]
+    assert env.spawned == [
+        "mega_home go2rtc: сторож продюсеров",
+        "mega_home go2rtc: перезапуск после падения",
+    ]
 
 
 def test_проба_порта_не_спотыкается_о_time_wait():
