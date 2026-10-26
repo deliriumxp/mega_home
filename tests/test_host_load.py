@@ -36,14 +36,17 @@ class FakeProc:
         (self.root / "meminfo").write_text("MemTotal:  4000000 kB\nMemFree:  100 kB\nMemAvailable: 3000000 kB\n")
         (self.root / "loadavg").write_text("1.40 0.90 0.50 2/300 4000\n")
 
-    def proc(self, pid: int, ppid: int, start: int, own_s: float, kids_s: float = 0.0, rss_kb: int | None = None, argv: str = "x") -> None:
+    def proc(self, pid: int, ppid: int, start: int, own_s: float, kids_s: float = 0.0, rss_kb: int | None = None, argv: str = "x", tgid: int | None = None) -> None:
         folder = self.root / str(pid)
         folder.mkdir(exist_ok=True)
         own, kids = round(own_s * CLK), round(kids_s * CLK)
         # Имя со скобкой и пробелом — поля считаются от последней «)».
         rest = f"S {ppid} 0 0 0 0 0 0 0 0 0 {own} 0 {kids} 0 20 0 1 0 {start} 0 0"
         (folder / "stat").write_text(f"{pid} (ff mpeg) x) {rest}\n")
-        (folder / "status").write_text("Name:\tx\n" + (f"VmRSS:\t{rss_kb} kB\n" if rss_kb is not None else ""))
+        (folder / "status").write_text(
+            f"Name:\tx\nTgid:\t{tgid if tgid is not None else pid}\nPid:\t{pid}\nThreads:\t1\n"
+            + (f"VmRSS:\t{rss_kb} kB\n" if rss_kb is not None else "")
+        )
         (folder / "cmdline").write_bytes(argv.replace(" ", "\0").encode())
 
     def gone(self, pid: int) -> None:
@@ -78,28 +81,28 @@ def test_дельты_процессора_хоста_и_процессов(proc
     proc.host(busy=1000, idle=9000)
     proc.proc(HA, 1, 10, 100, 5)
     proc.proc(200, HA, 20, 50, rss_kb=60_000)
-    proc.proc(300, 200, 30, 10, rss_kb=20_000)  # ffmpeg воспроизведения — ребёнок go2rtc
-    proc.proc(400, HA, 40, 30, rss_kb=24_000)
-    proc.proc(500, HA, 50, 20, rss_kb=18_000)
+    proc.proc(300, 200, 30, 10, rss_kb=20_000, argv="ffmpeg")  # ffmpeg воспроизведения — ребёнок go2rtc
+    proc.proc(400, HA, 40, 30, rss_kb=24_000, argv="ffmpeg")
+    proc.proc(500, HA, 50, 20, rss_kb=18_000, argv="ffmpeg")
     load = host_load.HostLoad(FakeHost(), "ha")
     assert load.measure(owners, {}, moment=1000.0) is None  # точка отсчёта
 
     proc.host(busy=1000 + 3000, idle=9000 + 9000)
     proc.proc(HA, 1, 10, 112, 5 + 3.6, rss_kb=420_000)
     proc.proc(200, HA, 20, 56, rss_kb=60_000)
-    proc.proc(300, 200, 30, 13, rss_kb=20_000)
-    proc.proc(400, HA, 40, 32.4, rss_kb=24_000)
-    proc.proc(500, HA, 50, 21.2, rss_kb=18_000)
+    proc.proc(300, 200, 30, 13, rss_kb=20_000, argv="ffmpeg")
+    proc.proc(400, HA, 40, 32.4, rss_kb=24_000, argv="ffmpeg")
+    proc.proc(500, HA, 50, 21.2, rss_kb=18_000, argv="ffmpeg")
     proc.proc(600, HA, 70, 1.2, rss_kb=9_000)  # кадр превью: родился после прошлого замера
     sample = load.measure(owners, {"motion:cam-a": 1.2}, moment=1060.0)
 
     assert sample is not None and load.cpus == 2
     assert sample["host"] == {"cpu": 25.0, "memUsed": 1_000_000 * 1024, "memTotal": 4_000_000 * 1024, "load1": 1.4}
     rows = _rows(sample)
-    assert rows["go2rtc"] == {"key": "go2rtc", "cpu": 7.5, "rss": 80_000 * 1024}
-    assert rows["record:cam-a"] == {"key": "record:cam-a", "cpu": 2.0, "rss": 24_000 * 1024}
-    assert rows["motion:cam-a"] == {"key": "motion:cam-a", "cpu": 2.0, "rss": 18_000 * 1024}
-    assert rows["ha"] == {"key": "ha", "cpu": 9.0, "rss": 420_000 * 1024}
+    assert rows["go2rtc"] == {"key": "go2rtc", "cpu": 7.5, "rss": 80_000 * 1024, "maxRss": 60_000 * 1024, "count": 2, "ffmpeg": 1, "threads": 2}
+    assert rows["record:cam-a"] == {"key": "record:cam-a", "cpu": 2.0, "rss": 24_000 * 1024, "maxRss": 24_000 * 1024, "count": 1, "ffmpeg": 1, "threads": 1}
+    assert rows["motion:cam-a"] == {"key": "motion:cam-a", "cpu": 2.0, "rss": 18_000 * 1024, "maxRss": 18_000 * 1024, "count": 1, "ffmpeg": 1, "threads": 1}
+    assert rows["ha"] == {"key": "ha", "cpu": 9.0, "rss": 420_000 * 1024, "maxRss": 420_000 * 1024, "count": 1, "ffmpeg": 0, "threads": 1}
     # Памяти у коротких нет: их строка — время, а не процесс.
     assert rows["frames"] == {"key": "frames", "cpu": 4.0}
     assert set(rows) == {"go2rtc", "record:cam-a", "motion:cam-a", "ha", "frames"}
@@ -230,7 +233,7 @@ def test_proc_недоступен_без_падения(tmp_path: Path, monkeyp
     (tmp_path / "nope" / str(HA) / "status").unlink()
     sample = load.measure({"ha": HA}, {}, moment=300.0)
     assert sample is not None and "cpu" not in sample["host"]
-    assert _rows(sample)["ha"] == {"key": "ha", "cpu": round(100 * 6 / (60 * load.cpus), 2)}
+    assert _rows(sample)["ha"] == {"key": "ha", "cpu": round(100 * 6 / (60 * load.cpus), 2), "count": 1, "ffmpeg": 0}
 
 
 def test_служба_host_только_менеджеру() -> None:
@@ -257,3 +260,25 @@ def test_служба_host_только_менеджеру() -> None:
         assert services.resolve("host") is None
 
     asyncio.run(scenario())
+
+
+def test_поток_не_удваивает_процесс_и_его_память(proc: FakeProc) -> None:
+    """`/proc` перечисляет потоки отдельными pid: их время и RSS — те же, что у процесса.
+    Строка группы обязана считать процесс один раз, иначе память камеры растёт числом потоков."""
+    owners = {"ha": HA, "go2rtc": 200}
+    proc.host(1000, 9000)
+    proc.proc(HA, 1, 10, 10)
+    proc.proc(200, HA, 20, 10, rss_kb=60_000)
+    proc.proc(201, 200, 30, 10, rss_kb=60_000, argv="ffmpeg", tgid=200)  # поток go2rtc
+    load = host_load.HostLoad(FakeHost(), "ha")
+    assert load.measure(owners, {}, moment=1000.0) is None
+
+    proc.host(2000, 18000)
+    proc.proc(HA, 1, 10, 12)
+    proc.proc(200, HA, 20, 12, rss_kb=60_000)
+    proc.proc(201, 200, 30, 12, rss_kb=60_000, argv="ffmpeg", tgid=200)
+    sample = load.measure(owners, {}, moment=1060.0)
+    assert sample is not None
+    row = _rows(sample)["go2rtc"]
+    assert row["count"] == 1 and row["ffmpeg"] == 0 and row["threads"] == 1
+    assert row["rss"] == 60_000 * 1024 and row["maxRss"] == 60_000 * 1024

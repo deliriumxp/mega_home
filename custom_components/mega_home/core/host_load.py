@@ -64,11 +64,29 @@ def spent(key: str, seconds: float) -> None:
     _inside[key] = _inside.get(key, 0.0) + max(seconds, 0.0)
 
 
+def is_process(pid: int) -> bool:
+    """Верхний процесс, а не поток: у потока `Tgid` — pid процесса.
+
+    ⚠ `/proc` перечисляет и потоки отдельными pid; их время и RSS повторяют процесс, и без
+    этой проверки замер считал бы один ffmpeg десятком процессов. Нет `status` — считаем
+    процессом: строку ВРЕМЕНИ терять нельзя, а память у неё всё равно не выдумается.
+    """
+    try:
+        text = (PROC / str(pid) / "status").read_text()
+    except OSError:
+        return True
+    for line in text.splitlines():
+        if line.startswith("Tgid:"):
+            return int(line.split()[1]) == pid
+    return True
+
+
 def _pids() -> list[int]:
     try:
-        return [int(name) for name in os.listdir(PROC) if name.isdigit()]
+        names = [name for name in os.listdir(PROC) if name.isdigit()]
     except OSError:
         return []
+    return [pid for name in names if is_process(pid := int(name))]
 
 
 def pids() -> list[int]:
@@ -112,6 +130,11 @@ def argv(pid: int) -> list[str]:
     return [part.decode(errors="ignore") for part in raw if part]
 
 
+def _is_ffmpeg(pid: int) -> bool:
+    args = argv(pid)
+    return bool(args) and Path(args[0]).name == "ffmpeg"
+
+
 def find(marker: str) -> int | None:
     """Старейший процесс, у которого `marker` в командной строке: pid процесса прошлого запуска HA
     без handle — усыновлённого Asterisk (строка нагрузки) и снимаемого go2rtc (по имени своего
@@ -128,15 +151,22 @@ def find(marker: str) -> int | None:
     return best[1] if best else None
 
 
-def _rss(pid: int) -> int | None:
-    """`VmRSS` в байтах; None — не прочли или у процесса её нет (зомби): памяти не выдумываем."""
+def _status(pid: int) -> tuple[int | None, int | None]:
+    """(`VmRSS` в байтах, потоков); None — не прочли или у процесса их нет (зомби)."""
+    rss = threads = None
     try:
         for line in (PROC / str(pid) / "status").read_text().splitlines():
             if line.startswith("VmRSS:"):
-                return int(line.split()[1]) * 1024
+                rss = int(line.split()[1]) * 1024
+            elif line.startswith("Threads:"):
+                threads = int(line.split()[1])
     except (OSError, ValueError, IndexError):
         pass
-    return None
+    return rss, threads
+
+
+def _rss(pid: int) -> int | None:
+    return _status(pid)[0]
 
 
 def _cpu() -> tuple[tuple[int, int] | None, int]:
@@ -250,18 +280,42 @@ class HostLoad:
         own_pid = owners[self.own]
         groups = _groups(table, {pid: key for key, pid in owners.items() if pid in table})
         ticks = self._ticks(groups, before, table, own_pid)
-        rss: dict[str, int] = {}
+        # ⚠ Чужие дети процесса дома остаются в тиках `frames`, а не в строке `ha`: её счёт — сам HA.
+        members: dict[str, list[int]] = {}
         for pid, key in groups.items():
-            size = _rss(pid) if key != self.own or pid == own_pid else None
-            if size is not None:
-                rss[key] = rss.get(key, 0) + size
+            if key == self.own and pid != own_pid:
+                continue
+            members.setdefault(key, []).append(pid)
+        stats: dict[str, dict[str, Any]] = {}
+        for key, pids in members.items():
+            sizes: list[int] = []
+            threads = ffmpeg = 0
+            for pid in pids:
+                size, count_threads = _status(pid)
+                if size is not None:
+                    sizes.append(size)
+                if count_threads is not None:
+                    threads += count_threads
+                if _is_ffmpeg(pid):
+                    ffmpeg += 1
+            stats[key] = {
+                "count": len(pids),
+                "ffmpeg": ffmpeg,
+                **({"threads": threads} if threads else {}),
+                **({"rss": sum(sizes)} if sizes else {}),
+                **({"maxRss": max(sizes)} if sizes else {}),
+            }
         seconds = {key: value / clk for key, value in ticks.items()}
         for key, value in inside.items():
             seconds[key] = seconds.get(key, 0.0) + value
             if self.own in seconds:
                 seconds[self.own] -= value
         return [
-            {"key": key, "cpu": round(100 * max(value, 0.0) / span, 2), **({"rss": rss[key]} if key in rss else {})}
+            {
+                "key": key,
+                "cpu": round(100 * max(value, 0.0) / span, 2),
+                **(stats.get(key) or {}),
+            }
             for key, value in sorted(seconds.items())
         ]
 
