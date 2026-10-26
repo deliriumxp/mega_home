@@ -91,3 +91,12 @@ def test_без_хранилища_ряд_не_ложится_на_флеш() ->
     camera.rec.local = False
     camera.store_activity([(T0, 0.3)])
     assert not (root / "cam").exists()
+
+
+def test_корзины_у_каждой_камеры_свои() -> None:
+    """Конвейер камеры держит ряд своим экземпляром, а не общим словарём модуля по ключу."""
+    one, two = activity.ActivityBuckets(), activity.ActivityBuckets()
+    one.note(1000.0, 0.3)
+    assert two.pending(0, 2000) == []
+    assert one.pending(0, 2000) == [(1000, 0.3)]
+    assert one.take(1100.0) == [(1000, 0.3)] and one.take(1100.0) == []

@@ -37,7 +37,7 @@ from .go2rtc_embed import RTSP_PORT
 from .recorder_index import day_of, epoch_of
 
 if TYPE_CHECKING:
-    from .recorder import _Camera
+    from .recorder_sink import RecordSink
 
 PREVIEW_S = 600
 PREVIEW_DIR = "preview"
@@ -165,14 +165,82 @@ class PreviewIndex:
         self._days.pop(name, None)
 
 
-class PreviewWriter:
-    """Процесс превью одной камеры: ffmpeg пишет куски в кэш камеры, закрытые уходят в хранилище."""
+class PreviewSink:
+    """Куски превью из кэша камеры — в хранилище, в индекс и в объём дня. Без процесса: куски пишет либо
+    свой процесс превью (`PreviewWriter`, раздел `recorder`), либо выход читателя конвейера (`video_reader.py`)."""
 
-    def __init__(self, camera: _Camera) -> None:
+    def __init__(self, camera: RecordSink) -> None:
         self.camera = camera
         self.cache = camera.cache / PREVIEW_DIR
         self.why = ""
         self._offset = 0
+
+    def current(self) -> tuple[float, Path] | None:
+        """Идущий кусок: самый новый файл кэша (его ещё нет в списке ffmpeg)."""
+        files = sorted(self.cache.glob("*.mp4")) if self.cache.is_dir() else []
+        begin = epoch_of(files[-1].stem) if files else None
+        return (begin, files[-1]) if begin is not None else None
+
+    def collect(self, final: bool) -> None:
+        """Закрытые куски (по списку ffmpeg) — в `<день>/preview/` хранилища, в индекс и в объём дня.
+        `final` — и все оставшиеся в кэше: процесс остановлен, длительность — до последней записи в файл."""
+        listed = self.cache.parent / PREVIEW_LIST
+        lines: list[str] = []
+        try:
+            with listed.open("rb") as handle:
+                handle.seek(self._offset)
+                chunk = handle.read()
+            cut = chunk.rfind(b"\n") + 1
+            self._offset += cut
+            lines = chunk[:cut].decode(errors="ignore").splitlines()
+        except OSError:
+            pass
+        done: list[tuple[Path, float, float]] = []
+        for line in lines:
+            parts = line.rsplit(",", 2)
+            try:
+                path, start, stop = self.cache / Path(parts[0]).name, float(parts[1]), float(parts[2])
+            except (IndexError, ValueError):
+                continue
+            # Метки — часы дома (свой процесс превью, `-copyts`), у первого куска процесса начало с нуля —
+            # оно в имени файла. ⚠ У читателя конвейера часов стены нет вовсе (вход общий с копией записи):
+            # обе метки — время потока, начало — в имени, длина — их разность.
+            begin = start if start > 1e9 else epoch_of(path.stem)
+            length = stop - start if start > 1e9 or stop <= 1e9 else stop - (begin or 0)
+            if begin is not None and length > 0:
+                done.append((path, begin, length))
+        listed_paths = {path for path, _begin, _length in done}
+        for path in sorted(self.cache.glob("*.mp4")) if final and self.cache.is_dir() else []:
+            begin, stop = epoch_of(path.stem), path.stat().st_mtime
+            if path not in listed_paths and begin is not None and stop > begin:
+                done.append((path, begin, stop - begin))
+        for path, begin, length in done:
+            self._store(path, begin, length)
+
+    def _store(self, path: Path, begin: float, length: float) -> None:
+        camera = self.camera
+        if not path.is_file():
+            return
+        if camera.rec.problem():
+            path.unlink(missing_ok=True)
+            return
+        target = camera.previews.root / day_of(begin) / PREVIEW_DIR / piece_name(begin, length)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        size = path.stat().st_size
+        shutil.move(str(path), str(target))
+        camera.previews.add(begin, length)
+        # Объём дня — с превью: лимит «локального диска» считает всё, что лежит.
+        camera.index.account(begin, size)
+
+    def state(self) -> dict[str, Any]:
+        return {"why": self.why}
+
+
+class PreviewWriter(PreviewSink):
+    """Свой процесс превью камеры раздела `recorder`: ffmpeg пишет куски в кэш камеры."""
+
+    def __init__(self, camera: RecordSink) -> None:
+        super().__init__(camera)
         self._reported = ""
         self._started = 0.0
         self._tail: deque[str] = deque(maxlen=6)
@@ -252,63 +320,6 @@ class PreviewWriter:
         current = self.current()
         last = current[1].stat().st_mtime if current is not None else self._started
         return time.time() - max(last, self._started) > STALL_S
-
-    def current(self) -> tuple[float, Path] | None:
-        """Идущий кусок: самый новый файл кэша (его ещё нет в списке ffmpeg)."""
-        files = sorted(self.cache.glob("*.mp4")) if self.cache.is_dir() else []
-        begin = epoch_of(files[-1].stem) if files else None
-        return (begin, files[-1]) if begin is not None else None
-
-    def collect(self, final: bool) -> None:
-        """Закрытые куски (по списку ffmpeg) — в `<день>/preview/` хранилища, в индекс и в объём дня.
-        `final` — и все оставшиеся в кэше: процесс остановлен, длительность — до последней записи в файл."""
-        listed = self.cache.parent / PREVIEW_LIST
-        lines: list[str] = []
-        try:
-            with listed.open("rb") as handle:
-                handle.seek(self._offset)
-                chunk = handle.read()
-            cut = chunk.rfind(b"\n") + 1
-            self._offset += cut
-            lines = chunk[:cut].decode(errors="ignore").splitlines()
-        except OSError:
-            pass
-        done: list[tuple[Path, float, float]] = []
-        for line in lines:
-            parts = line.rsplit(",", 2)
-            try:
-                path, start, stop = self.cache / Path(parts[0]).name, float(parts[1]), float(parts[2])
-            except (IndexError, ValueError):
-                continue
-            # Первый кусок процесса список называет с нуля — его начало в имени файла.
-            begin = start if start > 1e9 else epoch_of(path.stem)
-            if begin is not None and stop > begin:
-                done.append((path, begin, stop - begin))
-        listed_paths = {path for path, _begin, _length in done}
-        for path in sorted(self.cache.glob("*.mp4")) if final and self.cache.is_dir() else []:
-            begin, stop = epoch_of(path.stem), path.stat().st_mtime
-            if path not in listed_paths and begin is not None and stop > begin:
-                done.append((path, begin, stop - begin))
-        for path, begin, length in done:
-            self._store(path, begin, length)
-
-    def _store(self, path: Path, begin: float, length: float) -> None:
-        camera = self.camera
-        if not path.is_file():
-            return
-        if camera.rec.problem():
-            path.unlink(missing_ok=True)
-            return
-        target = camera.previews.root / day_of(begin) / PREVIEW_DIR / piece_name(begin, length)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        size = path.stat().st_size
-        shutil.move(str(path), str(target))
-        camera.previews.add(begin, length)
-        # Объём дня — с превью: лимит «локального диска» считает всё, что лежит.
-        camera.index.account(begin, size)
-
-    def state(self) -> dict[str, Any]:
-        return {"why": self.why}
 
 
 def sweep_legacy(root: Path) -> None:

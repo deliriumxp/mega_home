@@ -21,29 +21,44 @@ FILE = "activity.csv"
 # Час корзин на камеру — дольше запись не забирать не может (сторож раз в минуту).
 MAX_BUCKETS = 360
 
-_live: dict[str, dict[int, float]] = {}
+class ActivityBuckets:
+    """Корзины одной камеры. Конвейер камеры (`video_pipeline.py`) держит свой экземпляр; функции модуля
+    ниже — тот же ряд по ключу для детекции слушателем (`motion.py`, раздел `recorder`)."""
+
+    def __init__(self) -> None:
+        self._buckets: dict[int, float] = {}
+
+    def note(self, at: float, share: float) -> None:
+        """Доля изменений кадра в момент `at` (секунды UTC) — в корзину, если больше прежней."""
+        bucket = int(at // STEP_S) * STEP_S
+        if share > self._buckets.get(bucket, 0.0):
+            self._buckets[bucket] = share
+        while len(self._buckets) > MAX_BUCKETS:
+            del self._buckets[min(self._buckets)]
+
+    def take(self, now: float) -> list[tuple[int, float]]:
+        """Закрытые корзины (конец не позже `now`) — по порядку, из памяти вон."""
+        done = sorted(b for b in self._buckets if b + STEP_S <= now)
+        return [(b, self._buckets.pop(b)) for b in done]
+
+    def pending(self, start: float, stop: float) -> list[tuple[int, float]]:
+        """Корзины в памяти (идущая и ещё не записанные) в отрезке — ответ службы их добавляет."""
+        return sorted((b, v) for b, v in self._buckets.items() if start - STEP_S < b < stop)
+
+
+_live: dict[str, ActivityBuckets] = {}
 
 
 def note(key: str, at: float, share: float) -> None:
-    """Доля изменений кадра в момент `at` (секунды UTC) — в корзину, если больше прежней."""
-    buckets = _live.setdefault(key, {})
-    bucket = int(at // STEP_S) * STEP_S
-    if share > buckets.get(bucket, 0.0):
-        buckets[bucket] = share
-    while len(buckets) > MAX_BUCKETS:
-        del buckets[min(buckets)]
+    _live.setdefault(key, ActivityBuckets()).note(at, share)
 
 
 def take(key: str, now: float) -> list[tuple[int, float]]:
-    """Закрытые корзины камеры (конец не позже `now`) — по порядку, из памяти вон."""
-    buckets = _live.get(key) or {}
-    done = sorted(b for b in buckets if b + STEP_S <= now)
-    return [(b, buckets.pop(b)) for b in done]
+    return _live[key].take(now) if key in _live else []
 
 
 def pending(key: str, start: float, stop: float) -> list[tuple[int, float]]:
-    """Корзины в памяти (идущая и ещё не записанные) в отрезке — ответ службы их добавляет."""
-    return sorted((b, v) for b, v in (_live.get(key) or {}).items() if start - STEP_S < b < stop)
+    return _live[key].pending(start, stop) if key in _live else []
 
 
 def append(day_dir: Path, rows: list[tuple[int, float]]) -> None:

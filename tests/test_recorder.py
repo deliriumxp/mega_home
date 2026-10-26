@@ -21,7 +21,7 @@ from fake_host import FakeHost
 import pytest
 
 from mega_home.core import recorder as rec
-from mega_home.core import services, storage
+from mega_home.core import recorder_sink, services, storage
 from mega_home.core.recorder_api import start_api
 from mega_home.core.recorder_index import SegmentIndex
 
@@ -123,6 +123,15 @@ def test_смены_считаются_только_в_сообщениях_те
     motion = '<NotificationMessage><Topic>tns1:VideoSource/MotionAlarm</Topic><x Name="IsMotion" Value="true"/>'
     camera.on_event(_frame(dark + motion, 1010))
     assert camera.windows[-1][:2] == [1010, None]
+
+
+def test_смена_своей_детекции_открывает_и_закрывает_окно_вызовом(tmp_path: Path) -> None:
+    """Конвейер камеры (`video_pipeline.py`) зовёт запись прямо, без подстрок в событии концентратора."""
+    sink = _camera(tmp_path)
+    sink.motion(True, 1000.0)
+    sink.motion(False, 1030.0)
+    assert sink.windows == [[1000.0, 1030.0, 1000.0]]
+    assert sink.wanted(985.0, 995.0, 1100.0) and not sink.wanted(1060.0, 1070.0, 1100.0)
 
 
 def test_движение_своей_детекции_открывает_и_закрывает_окно(tmp_path: Path) -> None:
@@ -553,7 +562,7 @@ def test_перенос_не_ждёт_хранилище_без_срока_и_н
     name = "20261023T120000.mkv"
     (camera.cache / name).write_bytes(b"x")
     (camera.cache / rec.SEGMENT_LIST).write_text(f"{camera.cache}/{name},0.000000,10.000000\n")
-    monkeypatch.setattr(rec, "SAVE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(recorder_sink, "SAVE_TIMEOUT_S", 0.05)
     started: list[int] = []
     gate = asyncio.Event()
     real = camera.rec.env.run

@@ -101,6 +101,17 @@ def test_закрытые_куски_по_списку_ffmpeg_уходят_в_х
     assert "102000-277000.mp4" in {p.name for p in day.iterdir()} and not live.exists()
 
 
+def test_список_без_часов_стены_длина_по_меткам_потока() -> None:
+    """Выход превью у читателя конвейера идёт без `-use_wallclock_as_timestamps` (вход общий с копией
+    записи): список называет метки потока, начало куска — в имени, длина — конец минус начало."""
+    root = Path(tempfile.mkdtemp(prefix="pv-"))
+    camera = _camera(root)
+    (camera.preview.cache / "20261024T100000.mp4").write_bytes(b"m" * 10)
+    (camera.cache / PREVIEW_LIST).write_text("20261024T100000.mp4,12.500000,612.500000\n")
+    camera.preview.collect(False)
+    assert [p.name for p in (root / "cam" / "2026-10-24" / "preview").iterdir()] == ["100000-600000.mp4"]
+
+
 def test_без_хранилища_кусок_не_ложится_на_флеш() -> None:
     root = Path(tempfile.mkdtemp(prefix="pv-"))
     camera = _camera(root)
