@@ -743,6 +743,9 @@ def test_служба_открывает_двигает_и_закрывает_с
             async with TestClient(TestServer(runner.app)) as client:
                 opened = await (await client.post(f"/sessions?camera=onvif-aa&at={int((base + 5) * 1000)}")).json()
                 moved = await (await client.post(f"/sessions/{opened['id']}/seek?at={int((base + 15) * 1000)}")).json()
+                # ⚠ Записи за меткой нет — НЕ 404: 404 у перемотки значит «сессии нет», и бандл открыл бы новую.
+                void = (await client.post(f"/sessions/{opened['id']}/seek?at=1000")).status
+                assert void == 416
                 paused = (await client.post(f"/sessions/{opened['id']}/pause")).status
                 closed = (await client.delete(f"/sessions/{opened['id']}")).status
                 gone = await (await client.post(f"/sessions/{opened['id']}/seek?at=1")).json()

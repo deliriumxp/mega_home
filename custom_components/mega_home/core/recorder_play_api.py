@@ -2,7 +2,8 @@
 
 Контракт с бандлом (`home-playback.ts` менеджера) и менеджером (кадр маски, кадр события):
   * `POST /sessions?camera&at=<мс UTC>` → `{"id", "stream", "startMs"}` | 404 — записи у метки нет;
-  * `POST /sessions/{id}/seek?at=<мс>` → `{"startMs"}` | 404 `{"error": "сессии нет"}` — бандл откроет новую;
+  * `POST /sessions/{id}/seek?at=<мс>` → `{"startMs"}` | 404 `{"error": "сессии нет"}` — бандл откроет новую |
+    416 — записи у метки нет (сессия играет прежнее место);
   * `POST /sessions/{id}/pause` → `{"ok": true}`; `DELETE /sessions/{id}` → `{"ok": true}`;
   * `GET /sessions/{id}.ts` — поток сессии; читает только свой go2rtc на петле (`recorder_api._installer_only`
     закрывает его телефону: поток идёт к нему WebRTC, а не дверью);
@@ -40,7 +41,8 @@ def add_routes(app: web.Application, recorder: Recorder) -> None:
         except KeyError:
             return web.json_response(_NO_SESSION, status=404)
         except LookupError as err:
-            return web.json_response({"error": str(err)}, status=404)
+            # ⚠ Не 404: у перемотки 404 значит «сессии нет», и бандл открыл бы новую на той же пустой метке.
+            return web.json_response({"error": str(err)}, status=416)
         return web.json_response({"startMs": int(start * 1000)})
 
     async def pause(request: web.Request) -> web.Response:
