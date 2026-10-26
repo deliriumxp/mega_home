@@ -188,6 +188,27 @@ async def _keyframe_before(recorder: Recorder, path: Any, offset: float) -> floa
 keyframe_before = _keyframe_before
 
 
+async def has_audio(recorder: Recorder, path: Any) -> bool:
+    """Есть ли в куске хоть один пакет звука. ⚠ У камер с динамиком и микрофоном дорожка объявлена всегда, а
+    пакетов может не быть вовсе (EYEPLUS, 2026-10-27). Не узнали — звук есть: так играли и раньше."""
+    binary = await recorder.env.run(shutil.which, "ffprobe")
+    if not binary:
+        return True
+    async with _PROBES:
+        proc = await asyncio.create_subprocess_exec(
+            binary, "-v", "error", "-select_streams", "a:0", "-read_intervals", "%+#1",
+            "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), KEYFRAME_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            if proc.returncode is None:
+                proc.kill()
+            return True
+    return proc.returncode != 0 or bool(out.strip())
+
+
 async def _playlist(request: web.Request) -> web.Response:
     """Список воспроизведения с метки `at` (мс): НЕПРЕРЫВНЫЙ участок записи, первый кусок — с
     `inpoint`.

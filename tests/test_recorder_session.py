@@ -60,6 +60,7 @@ class _Proc:
     def __init__(self, argv: tuple[str, ...]) -> None:
         self.argv = list(argv)
         self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
         self.returncode: int | None = None
         self.pid = 5151
 
@@ -67,6 +68,7 @@ class _Proc:
         if self.returncode is None:
             self.returncode = -9
             self.stdout.feed_eof()
+            self.stderr.feed_eof()
 
     def terminate(self) -> None:
         self.kill()
@@ -82,7 +84,7 @@ class _Proc:
 class _World:
     """Запись камеры (куски в индексе), подменённые ffmpeg, go2rtc и часы."""
 
-    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gaps: bool = False) -> None:
+    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gaps: bool = False, audio: bool = True) -> None:
         self.go2rtc = _Go2rtc()
         self.recorder = rec.Recorder(FakeHost(tmp_path, self.go2rtc), lambda _listener: (lambda: None))
         self.recorder.storage = tmp_path
@@ -105,7 +107,10 @@ class _World:
             self.procs.append(_Proc(argv))
             return self.procs[-1]
 
-        self.sessions = rs.PlaybackSessions(self.recorder, lambda: 4321, spawn=spawn, keyframe=keyframe)
+        async def has_audio(_recorder: Any, _path: Any) -> bool:
+            return audio
+
+        self.sessions = rs.PlaybackSessions(self.recorder, lambda: 4321, spawn=spawn, keyframe=keyframe, audio=has_audio)
 
 
 def _value(argv: list[str], flag: str) -> str:
@@ -157,6 +162,70 @@ def test_звук_всегда_в_opus_и_дорожка_необязатель�
     assert _value(argv, "-c:a") == "libopus" and "0:a:0?" in argv and _value(argv, "-c:v") == "copy"
     assert argv[argv.index("-f", argv.index("-c:a")) + 1] == "mpegts" and argv[-1] == "pipe:1"
     assert argv.index("-re") < argv.index("-i")
+    # Дорожка звука объявлена, а пакетов в ней нет (EYEPLUS): ffmpeg ждал бы звук до первого байта ~30 с.
+    silent = rs.session_command("ffmpeg", Path("/tmp/l.ffconcat"), 0.0, audio=False)
+    assert "-an" in silent and "0:a:0?" not in silent and "libopus" not in silent
+
+
+def test_запись_с_пустым_звуком_играется_без_звука(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    world = _World(tmp_path, monkeypatch, audio=False)
+
+    async def scenario() -> list[str]:
+        sid, _stream, _start = await world.sessions.open("onvif-aa", BASE + 25)
+        client, _response = await _serve(world, sid)
+        try:
+            await _until(lambda: world.procs)
+            return world.procs[0].argv
+        finally:
+            await world.sessions.close_all()
+            await client.close()
+
+    argv = asyncio.run(scenario())
+    assert "-an" in argv and "0:a:0?" not in argv
+
+
+def test_поток_зрителю_идёт_с_правкой_sps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SPS с `nal_ref_idc = 2` go2rtc выбрасывает (`ts_sps.py`): зритель получает его с `nal_ref_idc = 3`."""
+    world = _World(tmp_path, monkeypatch)
+    pes = b"\x00\x00\x01\xe0\x00\x00\x80\x80\x05\x21\x00\x01\x00\x01" + b"\x00\x00\x00\x01\x47\x4d\x00\x29"
+    packet = bytes([0x47, 0x41, 0x00, 0x10]) + pes.ljust(184, b"\xff")
+
+    async def scenario() -> bytes:
+        sid, _stream, _start = await world.sessions.open("onvif-aa", BASE + 25)
+        client, response = await _serve(world, sid)
+        try:
+            await _until(lambda: world.procs)
+            world.procs[0].stdout.feed_data(packet[:100])
+            world.procs[0].stdout.feed_data(packet[100:])
+            return await response.content.readexactly(188)
+        finally:
+            await world.sessions.close_all()
+            await client.close()
+
+    got = asyncio.run(scenario())
+    assert got == packet.replace(b"\x00\x00\x00\x01\x47", b"\x00\x00\x00\x01\x67")
+
+
+def test_ffmpeg_без_потока_называет_причину_в_журнале(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    world = _World(tmp_path, monkeypatch)
+    monkeypatch.setattr(rs, "RETRY_S", 0.3)
+
+    async def scenario() -> None:
+        sid, _stream, _start = await world.sessions.open("onvif-aa", BASE + 25)
+        client, _response = await _serve(world, sid)
+        try:
+            await _until(lambda: world.procs)
+            world.procs[0].stderr.feed_data(b"Error opening input: Invalid data found\n")
+            world.procs[0].kill()
+            await asyncio.sleep(0.1)
+        finally:
+            await world.sessions.close_all()
+            await client.close()
+
+    asyncio.run(scenario())
+    assert any("Invalid data found" in record.getMessage() for record in caplog.records)
 
 
 def test_до_первого_байта_смещение_ноль_а_перемотка_продолжает_время(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -15,6 +15,9 @@ WebRTC-потребитель, и серия перемоток копила и�
 ⚠ Время на выходе ПРОДОЛЖАЕТСЯ через каждый перезапуск (`-output_ts_offset` = секунды с первого отданного
 байта): с метками заново от нуля поток вставал на 8–14 с после каждой перемотки (проба 2026-10-26).
 ⚠ Звук — всегда Opus: A-law в MPEG-TS не ложится, а AAC go2rtc отдаёт WebRTC как есть, и тот его не берёт.
+⚠ Дорожка звука объявлена, а пакетов в ней нет (камеры EYEPLUS с динамиком и микрофоном): ffmpeg ждал бы звук
+до первого байта ~30 с (замер на объекте 2026-10-27) — такая запись играется без звука (`has_audio`).
+⚠ SPS в потоке правится под go2rtc (`ts_sps.py`): с `nal_ref_idc = 2` он его выбрасывает, и запись не видна.
 ⚠ Через пустоты сессия идёт сама, следующим участком: время под иглой бандл считает по разметке.
 """
 
@@ -24,6 +27,7 @@ import asyncio
 import shutil
 import tempfile
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -36,6 +40,7 @@ from . import host_load
 from .const import LOGGER
 from .go2rtc_embed import API_PORT
 from .recorder_index import Segment, SegmentIndex
+from .ts_sps import SpsFix
 
 if TYPE_CHECKING:
     from .recorder import Recorder
@@ -65,6 +70,9 @@ def clock() -> float:
 
 Spawn = Callable[..., Awaitable[Any]]
 Keyframe = Callable[[Any, Path, float], Awaitable[float]]
+AudioProbe = Callable[[Any, Path], Awaitable[bool]]
+# Сколько строк ошибок ffmpeg сессии попадает в журнал, когда он не отдал ни байта.
+ERROR_TAIL = 3
 
 
 def playlist_from(index: SegmentIndex, at_s: float, started: bool = False) -> tuple[list[Segment], float] | None:
@@ -84,11 +92,12 @@ def playlist_from(index: SegmentIndex, at_s: float, started: bool = False) -> tu
     return run, max(start - first[0], 0.0)
 
 
-def session_command(binary: str, playlist: Path, offset_s: float) -> list[str]:
+def session_command(binary: str, playlist: Path, offset_s: float, audio: bool = True) -> list[str]:
+    sound = ["-map", "0:a:0?", *AUDIO] if audio else ["-an"]
     return [
         binary, "-hide_banner", "-loglevel", "error", "-nostdin",
         "-re", "-f", "concat", "-safe", "0", "-i", str(playlist),
-        "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", *AUDIO,
+        "-map", "0:v:0", "-c:v", "copy", *sound,
         "-f", "mpegts", "-output_ts_offset", f"{offset_s:.3f}", "-muxdelay", "0", "-muxpreload", "0", "pipe:1",
     ]
 
@@ -97,6 +106,22 @@ async def _default_keyframe(recorder: Any, path: Path, offset: float) -> float:
     from .recorder_api import keyframe_before  # noqa: PLC0415 — служба импортирует запись, не наоборот
 
     return await keyframe_before(recorder, path, offset)
+
+
+async def _drain(proc: Any, errors: deque[str]) -> None:
+    """Ошибки ffmpeg сессии — в хвост для журнала; канал читается всегда, иначе ffmpeg встал бы на записи в него."""
+    stream = getattr(proc, "stderr", None)
+    if stream is None:
+        return
+    while line := await stream.readline():
+        if text := line.decode(errors="replace").strip():
+            errors.append(text)
+
+
+async def _default_audio(recorder: Any, path: Path) -> bool:
+    from .recorder_api import has_audio  # noqa: PLC0415 — служба импортирует запись, не наоборот
+
+    return await has_audio(recorder, path)
 
 
 @dataclass
@@ -123,6 +148,8 @@ class PlaybackSession:
     closed: bool = False
     # Сколько списков собрано: у каждого свой файл (`_plan`).
     lists: int = 0
+    # Есть ли в записи камеры звук — решается первым списком сессии; None — ещё не смотрели.
+    audio: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -135,10 +162,14 @@ class _Planned:
 
 
 class PlaybackSessions:
-    def __init__(self, recorder: Recorder, port: Callable[[], int], spawn: Spawn | None = None, keyframe: Keyframe | None = None) -> None:
+    def __init__(
+        self, recorder: Recorder, port: Callable[[], int], spawn: Spawn | None = None, keyframe: Keyframe | None = None,
+        audio: AudioProbe | None = None,
+    ) -> None:
         self.rec, self.port = recorder, port
         self.spawn: Spawn = spawn or asyncio.create_subprocess_exec
         self.keyframe: Keyframe = keyframe or _default_keyframe
+        self.audio: AudioProbe = audio or _default_audio
         self.sessions: dict[str, PlaybackSession] = {}
         self._sweeper: asyncio.Future[None] | None = None
 
@@ -274,6 +305,8 @@ class PlaybackSessions:
         if found is None:
             return None
         run, inpoint = found
+        if session.audio is None:
+            session.audio = await self.audio(self.rec, run[0][2])
         if inpoint > 0:
             inpoint = await self.keyframe(self.rec, run[0][2], inpoint)
         lines = ["ffconcat version 1.0"]
@@ -321,15 +354,22 @@ class PlaybackSessions:
             offset = clock() - session.first_byte_at if session.first_byte_at is not None else 0.0
             binary = await self.rec.env.run(shutil.which, "ffmpeg") or "ffmpeg"
             proc = await self.spawn(
-                *session_command(binary, session.playlist, offset),
-                stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                *session_command(binary, session.playlist, offset, session.audio is not False),
+                stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             session.proc, session.gen_started = proc, clock()
             host_load.track(f"play:{session.camera}:{session.id}", getattr(proc, "pid", None))
+            errors: deque[str] = deque(maxlen=ERROR_TAIL)
+            drain = asyncio.ensure_future(_drain(proc, errors))
             sent = await self._copy(session, proc, gen)
             await self._stop_proc(session, proc)
+            await asyncio.wait({drain}, timeout=1.0)
+            drain.cancel()
             if gen != session.gen or session.closed or session.paused or session.reader is None:
                 return
+            if not sent:
+                # ⚠ Без этой строки отказ немой: сессия молча повторяет, а у жильца крутилка (EYEPLUS 2026-10-27).
+                LOGGER.warning("Просмотр %s: ffmpeg сессии не отдал потока: %s", session.camera, " | ".join(errors) or "без сообщений")
             failures = 0 if sent else failures + 1
             position = self._position(session)
             length = sum(piece[1] for piece in session.run) - session.inpoint
@@ -347,14 +387,18 @@ class PlaybackSessions:
 
     async def _copy(self, session: PlaybackSession, proc: Any, gen: int) -> bool:
         sent = False
+        fix = SpsFix()
         while chunk := await proc.stdout.read(CHUNK):
             reader = session.reader
             if reader is None or gen != session.gen:
                 return sent
+            data = fix.feed(chunk)
+            if not data:
+                continue
             if session.first_byte_at is None:
                 session.first_byte_at = clock()
             try:
-                await reader.write(chunk)
+                await reader.write(data)
             except (ConnectionError, RuntimeError):
                 return sent
             sent = True

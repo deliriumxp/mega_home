@@ -522,6 +522,34 @@ def test_ключевой_кадр_до_метки(tmp_path: Path) -> None:
     assert asyncio.run(_keyframe_before(_Rec(), tmp_path / "нет.mkv", 6.3)) == 6.3
 
 
+def test_звук_в_куске_по_его_пакетам(tmp_path: Path) -> None:
+    """Сессия без звука, если пакетов звука в записи нет (`has_audio`): иначе ffmpeg ждал бы звук ~30 с."""
+    from mega_home.core.recorder_api import has_audio
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not shutil.which("ffprobe"):
+        pytest.skip("нужны ffmpeg и ffprobe")
+    import subprocess
+
+    video = ["-f", "lavfi", "-i", "testsrc=size=160x90:rate=10"]
+    sound, mute = tmp_path / "sound.mkv", tmp_path / "mute.mkv"
+    subprocess.run([ffmpeg, "-v", "error", "-y", *video, "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "2",
+                    "-c:v", "libx264", "-c:a", "pcm_alaw", str(sound)], check=True)
+    subprocess.run([ffmpeg, "-v", "error", "-y", *video, "-t", "2", "-c:v", "libx264", str(mute)], check=True)
+
+    class _Env:
+        async def run(self, func, *args):
+            return func(*args)
+
+    class _Rec:
+        env = _Env()
+
+    assert asyncio.run(has_audio(_Rec(), sound)) is True
+    assert asyncio.run(has_audio(_Rec(), mute)) is False
+    # Не прочитали — звук есть: так играли и раньше.
+    assert asyncio.run(has_audio(_Rec(), tmp_path / "нет.mkv")) is True
+
+
 def test_ключевой_кадр_ищется_по_пакетам_без_декода(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Перемотка ждёт ответ: `frame=` заставлял ffprobe декодировать до 12 с видео — 2,5 с на кусок 720p
     (живой прогон сессии 2026-10-26), флаг ключевого кадра есть у пакета без декода."""
