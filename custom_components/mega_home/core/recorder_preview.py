@@ -81,7 +81,15 @@ def command(binary: str, nice: str, stream: str, cache: Path, tune: PreviewTune 
         *([nice, "-n", "10"] if nice else []), binary, "-hide_banner", "-loglevel", "error", "-nostdin",
         "-rtsp_transport", "tcp", "-use_wallclock_as_timestamps", "1", "-skip_frame", "nokey",
         "-i", f"rtsp://127.0.0.1:{RTSP_PORT}/{stream}", "-copyts", "-map", "0:v:0", "-an",
-        "-vf", f"scale=-2:{tune.height},format=yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+        "-vf", f"scale=-2:{tune.height},format=yuv420p", *preview_output_args(tune, cache),
+    ]
+
+
+def preview_output_args(tune: PreviewTune, cache: Path) -> list[str]:
+    """Кодировщик и куски превью — общие у своего процесса превью и у выхода читателя конвейера
+    (`video_reader.py`); вход и фильтр масштаба у них свои."""
+    return [
+        "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
         "-crf", str(tune.crf), "-g", str(tune.gop), "-bf", "0", "-fps_mode", "passthrough",
         "-f", "segment", "-segment_time", str(PREVIEW_S), "-segment_atclocktime", "1", "-reset_timestamps", "1",
         "-strftime", "1", "-segment_format", "mp4",
