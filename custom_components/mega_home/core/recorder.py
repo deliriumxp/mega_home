@@ -45,6 +45,8 @@ from .recorder_preview import PreviewTune, PreviewWriter, sweep_legacy, tune_of
 from .recorder_sink import MAX_MOTION_S, RAM_DIR, SEGMENT_LIST, SEGMENT_S, RecordSink  # noqa: F401
 # Раздел конфига и годность хранилища — `recorder_spec.py`; здесь под прежними именами для службы и спек.
 from .recorder_spec import CameraSpec, camera_specs, storage_problem  # noqa: F401
+from .video_pipeline import CameraPipeline
+from .video_spec import VideoSection, video_section
 
 SERVICE = "recorder"
 SCAN_S = 2.0
@@ -159,9 +161,19 @@ class _Camera(RecordSink):
 class Recorder:
     """Раздел `recorder` конфига → камеры, уборка и служба на петле (`recorder_api.py`)."""
 
-    def __init__(self, env: Host, subscribe: Callable[[Callable[[dict[str, Any]], None]], Callable[[], None]]) -> None:
+    def __init__(
+        self,
+        env: Host,
+        subscribe: Callable[[Callable[[dict[str, Any]], None]], Callable[[], None]],
+        publish: Callable[..., None] | None = None,
+    ) -> None:
         self.env = env
         self._subscribe = subscribe
+        # Концентратор событий (`device_events.EventHub.publish`): кадры своей детекции конвейера камеры.
+        self.publish: Callable[..., None] = publish or (lambda *_args, **_kwargs: None)
+        # Раздел `video`: камера одним описанием, конвейер на камеру (`video_pipeline.py`).
+        self.pipelines: dict[str, CameraPipeline] = {}
+        self._pipe_unsubscribe: Callable[[], None] | None = None
         self._unsubscribe: Callable[[], None] | None = None
         self._key: str | None = None
         self._lock = asyncio.Lock()
@@ -186,19 +198,63 @@ class Recorder:
 
     def sinks(self) -> list[RecordSink]:
         """Запись всех камер — делят память кэша (`RecordSink.guard_once`) и уборку."""
-        return list(self.cameras.values())
+        return [*self.cameras.values(), *(p.record for p in self.pipelines.values() if p.record is not None)]
+
+    def sink(self, camera: str) -> RecordSink | None:
+        """Запись камеры для службы (`recorder_api.py`) — какого бы раздела она ни была."""
+        pipeline = self.pipelines.get(camera)
+        return self.cameras.get(camera) or (pipeline.record if pipeline is not None else None)
+
+    def pending_activity(self, camera: str, start: float, stop: float) -> list[tuple[int, float]]:
+        """Ещё не записанные корзины силы движения камеры (служба `/activity`)."""
+        pipeline = self.pipelines.get(camera)
+        if pipeline is not None:
+            return pipeline.activity.pending(start, stop)
+        sink = self.cameras.get(camera)
+        return activity.pending(sink.spec.access, start, stop) if sink is not None else []
 
     def apply(self, config: dict[str, Any] | None) -> None:
         # ⚠ Служба на петле — всегда, а не только при записи: папку хранилища выбирают ДО записи.
         # Не поднялась (порт, ошибка) — новая попытка на следующем конфиге.
         if self._api is None and (self._api_task is None or self._api_task.done()):
             self._api_task = self.env.spawn(self._start_api(), "mega_home: служба записи")
+        video = (config or {}).get("video")
         section = (config or {}).get("recorder") if isinstance((config or {}).get("recorder"), dict) else None
-        key = json.dumps(section, sort_keys=True)
+        key = json.dumps({"video": video} if isinstance(video, dict) else section, sort_keys=True)
         if key == self._key:
             return
         self._key = key
-        self.env.spawn(self._reconfigure(section), "mega_home: запись камер")
+        self.env.spawn(self.reconfigure(config), "mega_home: запись камер")
+
+    async def reconfigure(self, config: dict[str, Any] | None) -> None:
+        """Раздел `video` (конвейер камеры) главнее прежнего `recorder`: менеджер шлёт один из двух по
+        версии дома, а оба разом значили бы два хозяина у одной камеры."""
+        video = video_section(config)
+        if video is None:
+            section = (config or {}).get("recorder")
+            await self._reconfigure(section if isinstance(section, dict) else None)
+            return
+        async with self._lock:
+            await self._stop_all()
+            self._specs = []
+            await self._storage_from(video.storage, video.mount, video.local, video.limit, video.preview)
+            cache = await self.env.run(self._ram_cache, sum(1 for c in video.cameras if c.record and c.record.mode == "motion"))
+            self.pipelines = {
+                camera.id: CameraPipeline(
+                    self, camera, cache if cache is not None and camera.record and camera.record.mode == "motion" else self.storage / ".cache"
+                )
+                for camera in video.cameras
+            }
+            if self.pipelines:
+                self._supervisor = self.env.spawn(self._supervise(), "mega_home: запись камер, сторож")
+
+    async def _storage_from(self, path: Path, mount: dict[str, Any] | None, local: bool, limit: int, preview: PreviewTune) -> None:
+        self.storage = path
+        if self.mount is not None and mount != self.mount:
+            # Хранилище сменили: прежний диск или сетевая папка больше не нужны дому.
+            await self.env.run(storage.unmount, storage.MOUNT_POINT)
+        self.mount, self.local, self.limit, self.preview = mount, local, limit, preview
+        self.why = ""
 
     async def _start_api(self) -> None:
         from .recorder_api import start_api  # noqa: PLC0415
@@ -221,17 +277,15 @@ class Recorder:
     async def _reconfigure(self, section: dict[str, Any] | None) -> None:
         async with self._lock:
             await self._stop_all()
+            self.pipelines = {}
             self._specs = camera_specs(section)
-            self.storage = Path(str((section or {}).get("storage") or ""))
-            mount = (section or {}).get("mount") if isinstance((section or {}).get("mount"), dict) else None
-            if self.mount is not None and mount != self.mount:
-                # Хранилище сменили: прежний диск или сетевая папка больше не нужны дому.
-                await self.env.run(storage.unmount, storage.MOUNT_POINT)
-            self.mount = mount
-            self.local = (section or {}).get("local") is True
-            self.limit = int(float((section or {}).get("limitGb") or 0) * 1024**3)
-            self.preview = tune_of((section or {}).get("preview"))
-            self.why = ""
+            await self._storage_from(
+                Path(str((section or {}).get("storage") or "")),
+                (section or {}).get("mount") if isinstance((section or {}).get("mount"), dict) else None,
+                (section or {}).get("local") is True,
+                int(float((section or {}).get("limitGb") or 0) * 1024**3),
+                tune_of((section or {}).get("preview")),
+            )
             if self._specs:
                 self._supervisor = self.env.spawn(self._supervise(), "mega_home: запись камер, сторож")
 
@@ -279,11 +333,14 @@ class Recorder:
                 if problem != self.why:
                     LOGGER.warning("Запись камер: %s", problem)
                 self.why = problem
-                # Писать некуда — камеры стоят; начатое в кэше не переносим на флеш.
+                # Писать некуда — камеры стоят; начатое в кэше не переносим на флеш. Детекция и кадр камер
+                # конвейера от хранилища не зависят — идут без записи.
                 await self._stop_cameras(collect=False)
+                await self._run_pipelines(record_on=False)
                 return
             self.why = ""
-            if not self.cameras:
+            await self._run_pipelines(record_on=True)
+            if not self.cameras and self._specs:
                 await self._start_cameras()
             for camera in self.cameras.values():
                 if camera.task is None or camera.task.done():
@@ -297,6 +354,36 @@ class Recorder:
             rows = activity.take(camera.spec.access, time.time())
             if rows:
                 await self.env.run(camera.store_activity, rows)
+        for pipeline in list(self.pipelines.values()):
+            rows = pipeline.activity.take(time.time())
+            if rows and pipeline.record is not None and pipeline.record_on:
+                await self.env.run(pipeline.record.store_activity, rows)
+
+    async def _run_pipelines(self, record_on: bool) -> None:
+        """Конвейеры камер — с записью или без: смена хранилища перезапускает их с другим набором выходов."""
+        if self.pipelines and self._pipe_unsubscribe is None:
+            # Движение от самой камеры (подписка PullPoint) приходит событием — запись ловит его словарём.
+            self._pipe_unsubscribe = self._subscribe(self._on_event)
+        for pipeline in self.pipelines.values():
+            alive = pipeline.task is not None and not pipeline.task.done()
+            if alive and pipeline.record_on == record_on:
+                continue
+            if alive:
+                await self._stop_pipeline(pipeline, collect=False)
+            pipeline.record_on = record_on
+            pipeline.task = self.env.spawn(pipeline.run(record_on), f"mega_home: конвейер {pipeline.plan.id}")
+
+    async def _stop_pipeline(self, pipeline: CameraPipeline, collect: bool) -> None:
+        task, pipeline.task = pipeline.task, None
+        if isinstance(task, asyncio.Future):
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if collect and pipeline.record_on and pipeline.record is not None and pipeline.preview is not None:
+            try:
+                await pipeline.record.collect(final=True)
+                await self.env.run(pipeline.preview.collect, True)
+            except Exception as err:  # noqa: BLE001
+                LOGGER.warning("Запись %s: начатое не сохранилось: %s", pipeline.plan.id, err)
 
     async def _start_cameras(self) -> None:
         ram = await self.env.run(self._ram_cache, sum(1 for s in self._specs if s.motion_mode))
@@ -342,6 +429,11 @@ class Recorder:
             if isinstance(supervisor, asyncio.Future):
                 await asyncio.gather(supervisor, return_exceptions=True)
         await self._stop_cameras(collect=True)
+        if self._pipe_unsubscribe is not None:
+            self._pipe_unsubscribe()
+            self._pipe_unsubscribe = None
+        for pipeline in self.pipelines.values():
+            await self._stop_pipeline(pipeline, collect=True)
 
     def _ram_cache(self, motion_cameras: int) -> Path | None:
         """Кэш камер «по движению» в памяти, если её хватает; нет — их кэш на диске хранилища.
@@ -359,8 +451,8 @@ class Recorder:
         return path
 
     def _on_event(self, frame: dict[str, Any]) -> None:
-        for camera in self.cameras.values():
-            camera.on_event(frame)
+        for sink in self.sinks():
+            sink.on_event(frame)
 
     async def probe(self, path: Path) -> float:
         """Длительность куска по ffprobe — только у куска, который ffmpeg не закрыл в список
@@ -383,10 +475,13 @@ class Recorder:
     def state(self) -> dict[str, Any]:
         return {
             "enabled": self._key not in (None, "null"),
-            "storage": str(self.storage) if self._specs else None,
+            "storage": str(self.storage) if self._specs or self.pipelines else None,
             "mount": {"type": self.mount.get("type"), "source": self.mount.get("source")} if self.mount else None,
             "limitGb": round(self.limit / 1024**3, 1) if self.limit else None,
             "cache": sorted({str(c.cache.parent) for c in self.cameras.values()}) or None,
             "why": self.why,
-            "cameras": {cid: camera.state() for cid, camera in self.cameras.items()},
+            "cameras": {
+                **{cid: camera.state() for cid, camera in self.cameras.items()},
+                **{cid: pipeline.state() for cid, pipeline in self.pipelines.items()},
+            },
         }

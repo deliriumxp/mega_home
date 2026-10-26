@@ -35,7 +35,7 @@ import os
 import shutil
 import time
 from collections import deque
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple
 from urllib.parse import quote
 
 import aiohttp
@@ -241,25 +241,20 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
         async with aiohttp.ClientSession() as session, session.put(url) as answer:
             if answer.status >= 400:
                 raise RuntimeError(f"go2rtc не принял поток ({answer.status})")
-    detector = Detector(
-        np,
-        threshold=_number(spec, "threshold", 30, 5, 120),
-        area=int(_number(spec, "area", 6, 1, 256)),
-        lightning=_number(spec, "lightning", 0.8, 0.1, 1.0),
-        alpha=_number(spec, "alpha", 0.01, 0.001, 0.5),
-        mask=spec.get("mask"),
-        min_size=_number(spec, "minSize", 0.0, 0.0, 100.0),
-    )
     fps = _number(spec, "fps", 5, 1, 10)
-    need = int(_number(spec, "frames", 2, 1, 50))
-    off_s = _number(spec, "offDelay", 30, 1, 600)
     ffmpeg, nice = await loop.run_in_executor(None, lambda: (shutil.which("ffmpeg"), shutil.which("nice")))
     if not ffmpeg:
         raise RuntimeError("в системе нет ffmpeg")
-    # Движение публикуется, если описание не сказало иначе: у камеры, чьё движение приходит от неё
-    # самой, детекция дома нужна только ради людей (`motionEvents: false`), и строк движения дважды нет.
-    publish = spec.get("motionEvents") is not False
     watch, model, tune = await _person_setup(loop, np, spec)
+    # Нагрузка (`host_load`): ffmpeg детекции, счёт кадра и сети «человек» — одна строка камеры.
+    load_key = f"motion:{descriptor.id}"
+    run = MotionLoop(
+        np, spec,
+        emit=lambda event, data, file: ctx.emit(descriptor, source, spec, event, data, file=file),
+        on_share=lambda at, share: activity.note(descriptor.id, at, share),
+        load_key=load_key,
+        person=(watch, model, tune) if watch is not None else None,
+    )
     ffmpeg_args = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-rtsp_transport", "tcp",
         "-threads", "1", "-skip_loop_filter", "all", "-flags2", "+fast",
@@ -268,7 +263,7 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
     small = f"fps={fps:g},scale={WIDTH}:{HEIGHT}:flags=area,format=gray,gblur=sigma=1:steps=1"
     pipe_out = -1
     # Крупный кадр — каждый `ratio`-й маленький: оба режет `fps` от одного начала (`_person_pairs`).
-    ratio = max(round(fps * watch.every), 1) if watch is not None else 1
+    ratio = run.ratio
     if watch is None:
         ffmpeg_args += ["-vf", small, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
     else:
@@ -288,82 +283,27 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
         stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         **({"pass_fds": (pipe_out,)} if watch is not None else {}),
     )
-    big: deque[tuple[int, Any]] = deque(maxlen=4)
-    boxes: deque[tuple[int, Any]] = deque(maxlen=4 * ratio)
-    index = -1
     frames_task: asyncio.Future[None] | None = None
     if watch is not None:
         os.close(pipe_out)
-        frames_task = asyncio.ensure_future(_person_frames(loop, np, pipe_in, big))
+        frames_task = asyncio.ensure_future(_person_frames(loop, np, pipe_in, run.big))
     tail: deque[str] = deque(maxlen=6)
     drain = asyncio.ensure_future(_drain(proc, tail))
-    # Нагрузка (`host_load`): ffmpeg детекции, счёт кадра и сети «человек» — одна строка камеры.
     # `nice` исполняет ffmpeg на своём pid.
-    load_key = f"motion:{descriptor.id}"
     host_load.track(load_key, proc.pid)
-    moving, peak, last_motion = 0, 0.0, 0.0
-    active = False
     try:
         assert proc.stdout is not None
         while True:
-            wait = IDLE_S if detector.previous is not None else FIRST_FRAME_S
+            wait = IDLE_S if run.detector.previous is not None else FIRST_FRAME_S
             try:
                 raw = await asyncio.wait_for(proc.stdout.readexactly(FRAME), wait)
             except asyncio.IncompleteReadError as err:
                 raise RuntimeError(f"ffmpeg закончил поток: {' | '.join(tail) or 'без слов'}") from err
             except asyncio.TimeoutError as err:
                 raise ConnectionError(f"нет кадров дольше {wait:g} с") from err
-            # Счёт идёт в процессе дома, а не в ffmpeg. Время ПОТОКА, а не процесса (`process_time`):
-            # тот считал бы и работу других потоков HA, шедшую в эти доли миллисекунды.
-            began = time.thread_time()
-            share = detector.detect(raw)
-            host_load.spent(load_key, time.thread_time() - began)
-            index += 1
-            if watch is not None:
-                # Повтор кадра — тоже кадр потока: номер растёт, рамка — прежняя.
-                boxes.append((index, detector.box if share != 0.0 else None))
-            if share is None:
-                continue
-            now = loop.time()
-            moving = moving + 1 if share else 0
-            if share:
-                last_motion, peak = now, max(peak, share)
-            if not active and moving >= need:
-                active = True
-                if publish:
-                    ctx.emit(descriptor, source, spec, "motion", {"state": "start", "share": round(share, 4)})
-            elif active and now - last_motion >= off_s:
-                active = False
-                if publish:
-                    ctx.emit(descriptor, source, spec, "motion", {"state": "stop", "share": round(peak, 4)})
-                peak = 0.0
-                if watch is not None and watch.end():
-                    ctx.emit(descriptor, source, spec, "person", {"person": "stop"})
-            if active and share:
-                # Сила движения для ленты архива (`activity.py`) — только внутри окна, как полоса движения.
-                activity.note(descriptor.id, time.time(), share)
-            for frame, box in _person_pairs(big, boxes, ratio, index) if watch is not None else ():
-                if not (active and box and watch.due(now)):
-                    continue
-                value, spent = await loop.run_in_executor(None, _person_score, np, model, frame, box, tune.margin)
-                # Счёт сети — в строке камеры, как счёт кадра; пишется в цикле событий (`host_load.spent`).
-                host_load.spent(load_key, spent)
-                if watch.seen(value, now):
-                    # Снимок события — крупный участок ТОГО кадра, где сеть увидела человека (заказчик
-                    # 2026-10-24): снимок камеры правилом вложения пришёл бы секундами позже.
-                    picture = await loop.run_in_executor(None, _person_shot, frame, box, tune)
-                    # ⚠ Своё имя события и свой ключ данных (`person`, а не `state`): запись по движению
-                    # (`recorder.py`) и лента ловят движение подстрокой `"state":"start"`.
-                    ctx.emit(
-                        descriptor, source, spec, "person", {"person": "start", "score": round(value, 3)},
-                        file=("image/jpeg", picture) if picture else None,
-                    )
+            await run.frame(raw)
     finally:
-        if active and publish:
-            # Источник встал посреди движения: окно записи и метка ленты не висят открытыми.
-            ctx.emit(descriptor, source, spec, "motion", {"state": "stop", "share": round(peak, 4)})
-        if watch is not None and watch.end():
-            ctx.emit(descriptor, source, spec, "person", {"person": "stop"})
+        run.close()
         if frames_task is not None:
             frames_task.cancel()
         drain.cancel()
@@ -371,6 +311,109 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
         if proc.returncode is None:
             proc.kill()
             await proc.wait()
+
+
+class MotionLoop:
+    """Кадры детекции одной камеры → «началось/кончилось», сила движения, люди.
+
+    Один разбор у двух хозяев: источник `motion` слушателя (раздел `recorder`, `motion()` выше) и читатель
+    конвейера камеры (`video_pipeline.py`, раздел `video`). Конвейер получает смены движения ВЫЗОВОМ
+    (`on_motion`) — запись по движению своей камеры больше не ловит их подстрокой в событии.
+    """
+
+    def __init__(
+        self,
+        np: Any,
+        spec: dict[str, Any],
+        *,
+        emit: Callable[[str, dict[str, Any], tuple[str, bytes] | None], None],
+        on_motion: Callable[[bool, float], None] | None = None,
+        on_share: Callable[[float, float], None] | None = None,
+        load_key: str = "",
+        person: tuple[Any, Any, PersonTune] | None = None,
+    ) -> None:
+        self.np, self.emit, self.on_motion, self.on_share, self.load_key = np, emit, on_motion, on_share, load_key
+        self.detector = Detector(
+            np,
+            threshold=_number(spec, "threshold", 30, 5, 120),
+            area=int(_number(spec, "area", 6, 1, 256)),
+            lightning=_number(spec, "lightning", 0.8, 0.1, 1.0),
+            alpha=_number(spec, "alpha", 0.01, 0.001, 0.5),
+            mask=spec.get("mask"),
+            min_size=_number(spec, "minSize", 0.0, 0.0, 100.0),
+        )
+        fps = _number(spec, "fps", 5, 1, 10)
+        self.need = int(_number(spec, "frames", 2, 1, 50))
+        self.off_s = _number(spec, "offDelay", 30, 1, 600)
+        # Движение публикуется, если описание не сказало иначе: у камеры, чьё движение приходит от неё
+        # самой, детекция дома нужна только ради людей (`motionEvents: false`), и строк движения дважды нет.
+        self.publish = spec.get("motionEvents") is not False
+        self.watch, self.model, self.tune = person if person is not None else (None, None, PersonTune())
+        self.ratio = max(round(fps * self.watch.every), 1) if self.watch is not None else 1
+        self.big: deque[tuple[int, Any]] = deque(maxlen=4)
+        self.boxes: deque[tuple[int, Any]] = deque(maxlen=4 * self.ratio)
+        self.index = -1
+        self.moving, self.peak, self.last_motion, self.active = 0, 0.0, 0.0, False
+
+    async def frame(self, raw: bytes) -> None:
+        loop = asyncio.get_running_loop()
+        # Счёт идёт в процессе дома, а не в ffmpeg. Время ПОТОКА, а не процесса (`process_time`):
+        # тот считал бы и работу других потоков HA, шедшую в эти доли миллисекунды.
+        began = time.thread_time()
+        share = self.detector.detect(raw)
+        host_load.spent(self.load_key, time.thread_time() - began)
+        self.index += 1
+        if self.watch is not None:
+            # Повтор кадра — тоже кадр потока: номер растёт, рамка — прежняя.
+            self.boxes.append((self.index, self.detector.box if share != 0.0 else None))
+        if share is None:
+            return
+        now = loop.time()
+        self.moving = self.moving + 1 if share else 0
+        if share:
+            self.last_motion, self.peak = now, max(self.peak, share)
+        if not self.active and self.moving >= self.need:
+            self.active = True
+            self._changed(True, {"state": "start", "share": round(share, 4)})
+        elif self.active and now - self.last_motion >= self.off_s:
+            self._stop()
+        if self.active and share and self.on_share is not None:
+            # Сила движения для ленты архива (`activity.py`) — только внутри окна, как полоса движения.
+            self.on_share(time.time(), share)
+        watch = self.watch
+        for frame, box in _person_pairs(self.big, self.boxes, self.ratio, self.index) if watch is not None else ():
+            if not (self.active and box and watch.due(now)):
+                continue
+            value, spent = await loop.run_in_executor(None, _person_score, self.np, self.model, frame, box, self.tune.margin)
+            # Счёт сети — в строке камеры, как счёт кадра; пишется в цикле событий (`host_load.spent`).
+            host_load.spent(self.load_key, spent)
+            if watch.seen(value, now):
+                # Снимок события — крупный участок ТОГО кадра, где сеть увидела человека (заказчик
+                # 2026-10-24): снимок камеры правилом вложения пришёл бы секундами позже.
+                picture = await loop.run_in_executor(None, _person_shot, frame, box, self.tune)
+                # ⚠ Своё имя события и свой ключ данных (`person`, а не `state`): запись по движению
+                # раздела `recorder` и лента ловят движение подстрокой `"state":"start"`.
+                self.emit("person", {"person": "start", "score": round(value, 3)}, ("image/jpeg", picture) if picture else None)
+
+    def close(self) -> None:
+        """Источник встал: окно записи и метка ленты не висят открытыми посреди движения."""
+        if self.active:
+            self._stop()
+        elif self.watch is not None and self.watch.end():
+            self.emit("person", {"person": "stop"}, None)
+
+    def _stop(self) -> None:
+        self.active = False
+        self._changed(False, {"state": "stop", "share": round(self.peak, 4)})
+        self.peak = 0.0
+        if self.watch is not None and self.watch.end():
+            self.emit("person", {"person": "stop"}, None)
+
+    def _changed(self, on: bool, data: dict[str, Any]) -> None:
+        if self.publish:
+            self.emit("motion", data, None)
+        if self.on_motion is not None:
+            self.on_motion(on, time.time())
 
 
 class PersonTune(NamedTuple):

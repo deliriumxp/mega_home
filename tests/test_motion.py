@@ -228,3 +228,35 @@ def test_источник_встал_посреди_движения_окно_з
 def test_без_потока_источник_не_запускается() -> None:
     with pytest.raises(ValueError, match="не задан поток"):
         asyncio.run(mo.motion(_Ctx(), DeviceDescriptor(id="cam", host="192.168.1.9"), "motion", {}))
+
+
+def test_петля_детекции_зовёт_запись_напрямую() -> None:
+    """Конвейер камеры (`video_pipeline.py`) получает смены движения вызовом, а не подстрокой события."""
+    changes: list[bool] = []
+    shares: list[float] = []
+    emitted: list[tuple[str, str]] = []
+
+    async def scenario() -> None:
+        loop = mo.MotionLoop(
+            np, {"offDelay": 1},
+            emit=lambda event, data, _file: emitted.append((event, data["state"])),
+            on_motion=lambda on, _at: changes.append(on),
+            on_share=lambda _at, share: shares.append(share),
+            load_key="cam:x:sub",
+        )
+        for _ in range(60):
+            await loop.frame(_frame())
+        for i in range(15):
+            await loop.frame(_frame(spot_x=10 + i * 3))
+        for _ in range(30):
+            await loop.frame(_frame())
+            await asyncio.sleep(0.05)
+        loop.close()
+
+    host_load._inside.clear()  # noqa: SLF001
+    asyncio.run(scenario())
+    assert changes == [True, False]
+    assert emitted == [("motion", "start"), ("motion", "stop")]
+    assert shares and all(0 < share <= 1 for share in shares)
+    assert host_load._inside["cam:x:sub"] > 0  # noqa: SLF001
+    host_load._inside.clear()  # noqa: SLF001

@@ -261,11 +261,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     if coordinator.data:
         sip_bridge.apply(coordinator.data)
 
-    # Запись камер (`core/recorder.py`): раздел `recorder` конфига объекта. Движение берёт
-    # из того же концентратора событий, что лента жильца.
+    # Запись камер (`core/recorder.py`): раздел `video` (конвейер камеры) или прежний `recorder`
+    # конфига объекта. Движение берёт из того же концентратора событий, что лента жильца, туда же
+    # кладёт кадры своей детекции.
     from .core.recorder import Recorder
 
-    coordinator.recorder = Recorder(coordinator.env, coordinator.events.subscribe)
+    coordinator.recorder = Recorder(coordinator.env, coordinator.events.subscribe, coordinator.events.publish)
     if coordinator.data:
         coordinator.recorder.apply(coordinator.data)
 

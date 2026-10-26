@@ -34,6 +34,7 @@ from .recorder_preview import whole_fragments
 if TYPE_CHECKING:
     from .recorder import Recorder
     from .recorder_index import SegmentIndex
+    from .recorder_sink import RecordSink
 
 # Куски с зазором меньше этого — один участок шкалы (стык кусков ffmpeg — доли секунды).
 JOIN_GAP_S = 1.5
@@ -88,9 +89,15 @@ def _installer_only(what: str, value: str) -> str | None:
 def _camera(request: web.Request) -> str:
     recorder: Recorder = request.app[_RECORDER]
     camera = request.query.get("camera", "")
-    if camera not in recorder.cameras:
+    if recorder.sink(camera) is None:
         raise web.HTTPNotFound(text='{"error": "такой камеры в записи нет"}', content_type="application/json")
     return camera
+
+
+def _sink(recorder: Recorder, camera: str) -> RecordSink:
+    sink = recorder.sink(camera)
+    assert sink is not None  # `_camera` уже ответил 404 на чужую камеру
+    return sink
 
 
 async def _index(request: web.Request) -> tuple[str, SegmentIndex]:
@@ -98,7 +105,7 @@ async def _index(request: web.Request) -> tuple[str, SegmentIndex]:
     До первого прохода записи (служба поднята раньше камер) индекс читается здесь, в исполнителе."""
     recorder: Recorder = request.app[_RECORDER]
     camera = _camera(request)
-    index = recorder.cameras[camera].index
+    index = _sink(recorder, camera).index
     if not index.loaded:
         await recorder.env.run(index.ensure, bool(recorder.limit))
     return camera, index
@@ -327,7 +334,7 @@ async def _frame(request: web.Request) -> web.Response:
 
 async def _preview_index(request: web.Request) -> Any:
     recorder: Recorder = request.app[_RECORDER]
-    camera = recorder.cameras[_camera(request)]
+    camera = _sink(recorder, _camera(request))
     if not camera.previews.loaded:
         await recorder.env.run(camera.previews.load)
     return camera
@@ -352,13 +359,14 @@ async def _activity(request: web.Request) -> web.Response:
     """Сила движения в окне `from`..`to` (секунды): `[[начало корзины мс, доля], …]` по `step` секунд —
     записанные ряды суток и ещё не записанные корзины детектора (`activity.py`)."""
     recorder: Recorder = request.app[_RECORDER]
-    camera = recorder.cameras[_camera(request)]
+    cid = _camera(request)
+    camera = _sink(recorder, cid)
     start = _number(request, "from")
     # Лента спрашивает по суткам; окно шире недели — не её вопрос, и обход дней им не раздуть.
     stop = min(_number(request, "to"), start + 7 * 86400)
     days = sorted({day_of(start), day_of(stop)} | {day_of(at) for at in range(int(start), int(stop), 86400)})
     rows = dict(await recorder.env.run(lambda: [row for day in days for row in activity.read(camera.index.root / day, start, stop)]))
-    rows.update(activity.pending(camera.spec.access, start, stop))
+    rows.update(recorder.pending_activity(cid, start, stop))
     return web.json_response({"step": activity.STEP_S, "activity": [[b * 1000, round(v, 4)] for b, v in sorted(rows.items())]})
 
 
