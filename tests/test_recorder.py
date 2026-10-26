@@ -14,6 +14,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -693,3 +694,99 @@ def test_сброс_кэша_держит_предел_и_не_трогает_д
     assert cache.shed(tmp_path, 10) == 1
     assert len(list(tmp_path.glob("*.mkv"))) == 2
     assert cache.shed(tmp_path / "нет", 10) == 0
+
+
+def test_служба_открывает_двигает_и_закрывает_сессию(tmp_path: Path) -> None:
+    """Контракт с бандлом: `POST /sessions`, `/seek`, `/pause`, `DELETE`; чужая сессия — 404 словами."""
+    from mega_home.core import recorder_session as rs
+
+    base = rec.epoch_of("20261023T120000")
+    assert base is not None
+    for offset in (0, 10, 20):
+        _segment(tmp_path, "onvif-aa", base + offset)
+
+    class _Go2rtc:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def _answer(self, url: str) -> Any:
+            self.calls.append(url)
+
+            class _A:
+                status = 200
+
+                async def __aenter__(self) -> Any:
+                    return self
+
+                async def __aexit__(self, *_args: object) -> None:
+                    return None
+
+            return _A()
+
+        put = delete = _answer
+
+    recorder = rec.Recorder(FakeHost(tmp_path, _Go2rtc()), lambda _listener: (lambda: None))
+    recorder.storage = tmp_path
+    recorder.cameras = {"onvif-aa": _camera(tmp_path)}
+
+    async def keyframe(_rec: Any, _path: Any, offset: float) -> float:
+        return offset
+
+    async def spawn(*_argv: str, **_kwargs: Any) -> Any:
+        raise AssertionError("без зрителя ffmpeg не запускается")
+
+    recorder.sessions = rs.PlaybackSessions(recorder, lambda: 1, spawn=spawn, keyframe=keyframe)
+
+    async def scenario() -> tuple[dict, dict, int, int, dict, int, int]:
+        runner = await start_api(recorder)
+        try:
+            async with TestClient(TestServer(runner.app)) as client:
+                opened = await (await client.post(f"/sessions?camera=onvif-aa&at={int((base + 5) * 1000)}")).json()
+                moved = await (await client.post(f"/sessions/{opened['id']}/seek?at={int((base + 15) * 1000)}")).json()
+                paused = (await client.post(f"/sessions/{opened['id']}/pause")).status
+                closed = (await client.delete(f"/sessions/{opened['id']}")).status
+                gone = await (await client.post(f"/sessions/{opened['id']}/seek?at=1")).json()
+                gone_status = (await client.post(f"/sessions/{opened['id']}/seek?at=1")).status
+                empty = (await client.post("/sessions?camera=onvif-aa&at=1000")).status
+                return opened, moved, paused, closed, gone, gone_status, empty
+        finally:
+            await runner.cleanup()
+            services.unregister(rec.SERVICE)
+
+    opened, moved, paused, closed, gone, gone_status, empty = asyncio.run(scenario())
+    assert opened["stream"] == f"play_{opened['id']}" and opened["startMs"] == int((base + 5) * 1000)
+    assert moved == {"startMs": int((base + 15) * 1000)}
+    assert (paused, closed, gone_status, empty) == (200, 200, 404, 404)
+    assert gone == {"error": "сессии нет"}
+
+
+def test_поток_сессии_закрыт_для_телефона() -> None:
+    from mega_home.core import recorder_api
+
+    assert recorder_api._installer_only("path", "/sessions/abc.ts") is not None  # noqa: SLF001
+    assert recorder_api._installer_only("path", "/sessions/abc/seek?at=1") is None  # noqa: SLF001
+    assert recorder_api._installer_only("path", "/latest?camera=x") is None  # noqa: SLF001
+
+
+def test_последний_кадр_камеры(tmp_path: Path) -> None:
+    """Плитка, кадр события и маска — последний кадр конвейера из памяти; кадра нет — 404."""
+    recorder = rec.Recorder(FakeHost(tmp_path), lambda _listener: (lambda: None))
+    asyncio.run(recorder.reconfigure({"video": {"storage": str(tmp_path), "cameras": [
+        {"id": "onvif-aa", "streams": {"main": {"name": "a", "source": "rtsp://x"}}, "detect": {"stream": "main"}},
+    ]}}))
+
+    async def scenario() -> tuple[int, int, bytes, str]:
+        runner = await start_api(recorder)
+        try:
+            async with TestClient(TestServer(runner.app)) as client:
+                before = (await client.get("/latest?camera=onvif-aa")).status
+                recorder.pipelines["onvif-aa"].frame.feed(b"\xff\xd8jpeg\xff\xd9")
+                answer = await client.get("/latest?camera=onvif-aa")
+                return before, answer.status, await answer.read(), answer.headers.get("Cache-Control", "")
+        finally:
+            await runner.cleanup()
+            services.unregister(rec.SERVICE)
+
+    before, status, body, cache = asyncio.run(scenario())
+    assert (before, status, body) == (404, 200, b"\xff\xd8jpeg\xff\xd9")
+    assert cache == "private, max-age=2"

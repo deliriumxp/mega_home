@@ -29,6 +29,7 @@ from aiohttp import web
 from . import activity, services, storage
 from .go2rtc_embed import PLAYLIST_INPUT
 from .recorder import SERVICE, day_of
+from .recorder_play_api import add_routes
 from .recorder_preview import whole_fragments
 
 if TYPE_CHECKING:
@@ -69,6 +70,8 @@ async def start_api(recorder: Recorder) -> web.AppRunner:
     app.router.add_post("/folders", _make_folder)
     app.router.add_post("/mount", _preview_mount)
     app.router.add_delete("/mount", _preview_unmount)
+    # Просмотр сессией и последний кадр камеры (дом 0.6.0+): `recorder_play_api.py`.
+    add_routes(app, recorder)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", 0).start()
@@ -81,8 +84,12 @@ def _installer_only(what: str, value: str) -> str | None:
     """Диски, папки и подключение хранилища — только менеджеру (инсталлятору): телефон с ключом
     устройства не монтирует сетевые папки ядром дома и не создаёт папки на его дисках. Путь сюда
     приходит уже приведённым (`connect.service_path`)."""
-    if what == "path" and value.split("?", 1)[0].rstrip("/") in ("/disks", "/folders", "/mount"):
+    path = value.split("?", 1)[0].rstrip("/") if what == "path" else ""
+    if path in ("/disks", "/folders", "/mount"):
         return "хранилище записи настраивает инсталлятор через менеджер"
+    # Поток сессии читает свой go2rtc на петле; телефону он идёт WebRTC, а не дверью.
+    if path.startswith("/sessions/") and path.endswith(".ts"):
+        return "поток просмотра читает go2rtc дома"
     return None
 
 

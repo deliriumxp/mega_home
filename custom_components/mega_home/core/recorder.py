@@ -45,6 +45,7 @@ from .recorder_preview import PreviewTune, PreviewWriter, sweep_legacy, tune_of
 from .recorder_sink import MAX_MOTION_S, RAM_DIR, SEGMENT_LIST, SEGMENT_S, RecordSink  # noqa: F401
 # Раздел конфига и годность хранилища — `recorder_spec.py`; здесь под прежними именами для службы и спек.
 from .recorder_spec import CameraSpec, camera_specs, storage_problem  # noqa: F401
+from .recorder_session import PlaybackSessions
 from .video_pipeline import CameraPipeline
 from .video_spec import VideoSection, video_section
 
@@ -174,6 +175,8 @@ class Recorder:
         # Раздел `video`: камера одним описанием, конвейер на камеру (`video_pipeline.py`).
         self.pipelines: dict[str, CameraPipeline] = {}
         self._pipe_unsubscribe: Callable[[], None] | None = None
+        # Просмотр записи сессией (`recorder_session.py`): поток отдаёт эта же служба на петле.
+        self.sessions = PlaybackSessions(self, lambda: services.resolve(SERVICE) or 0)
         self._unsubscribe: Callable[[], None] | None = None
         self._key: str | None = None
         self._lock = asyncio.Lock()
@@ -263,6 +266,8 @@ class Recorder:
 
     async def async_stop(self) -> None:
         self._key = None
+        # Сессии просмотра — раньше записи: их ffmpeg читает куски, которые уборка и остановка трогают.
+        await self.sessions.close_all()
         await self._reconfigure(None)
         task, self._api_task = self._api_task, None
         if isinstance(task, asyncio.Future) and not task.done():
