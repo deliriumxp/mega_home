@@ -108,7 +108,7 @@ class _Camera:
             try:
                 if not self.index.loaded:
                     await self.rec.env.run(self.index.ensure, bool(self.rec.limit))
-                await self._register()
+                await self.register()
                 await self._record()
             except asyncio.CancelledError:
                 raise
@@ -123,7 +123,7 @@ class _Camera:
                 self.why = f"кусок не сохранился: {err}"
             await asyncio.sleep(RESTART_S)
 
-    async def _register(self) -> None:
+    async def register(self) -> None:
         url = (
             f"http://127.0.0.1:{API_PORT}/api/streams?name={quote(self.spec.stream, safe='')}"
             f"&src={quote(self.spec.source, safe='')}"

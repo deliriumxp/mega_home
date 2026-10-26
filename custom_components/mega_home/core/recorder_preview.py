@@ -178,6 +178,10 @@ class PreviewWriter:
                     await env.run(self.camera.previews.load)
                 # Оставшееся от прошлого процесса (остановка HA без уборки) — в хранилище до нового списка.
                 await env.run(self.collect, True)
+                # ⚠ Свой поток заводим ДО ffmpeg: иначе превью стартует раньше записи и получает
+                # от go2rtc 404 «stream not found» (объект 2026-10-26, сразу после перезапуска HA).
+                # PUT идемпотентен, а после перезапуска go2rtc он же возвращает поток на место.
+                await self.camera.register()
                 await self._write()
             except asyncio.CancelledError:
                 raise
