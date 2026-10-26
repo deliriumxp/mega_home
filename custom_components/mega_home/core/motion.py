@@ -63,9 +63,18 @@ class Detector:
     """Доля изменившейся площади кадра; 0 — движения нет (или детектор калибруется)."""
 
     def __init__(
-        self, np: Any, threshold: float = 30, area: int = 6, lightning: float = 0.8, alpha: float = 0.01, mask: Any = None
+        self,
+        np: Any,
+        threshold: float = 30,
+        area: int = 6,
+        lightning: float = 0.8,
+        alpha: float = 0.01,
+        mask: Any = None,
+        min_size: float = 0.0,
     ) -> None:
         self.np, self.threshold, self.area, self.lightning, self.alpha = np, threshold, area, lightning, alpha
+        # Минимальная площадь бокса движения в процентах кадра: далёкий человек не считается.
+        self.min_size = min(max(min_size, 0.0), 100.0)
         # Маска — многоугольники в долях кадра, как у Frigate (блик, мигающий фонарь, ветки): там
         # кадр обнуляется, и ни фон, ни живость изменений не видят.
         self.masked = masked_area(np, mask)
@@ -118,9 +127,8 @@ class Detector:
             self.lively.append(self._windows(np.abs(frame - self.previous[0]) > self.threshold))
         self.previous = (frame, pixels)
         live = found & (sum(self.lively) >= LIVELY_NEED) if len(self.lively) == LIVELY_OF else None
-        alive = live is not None and np.count_nonzero(live)
-        rows, cols = np.nonzero(live) if alive else ((), ())
-        self.box = (int(cols.min()) * CELL, int(rows.min()) * CELL, int(cols.max()) * CELL + 2 * CELL, int(rows.max()) * CELL + 2 * CELL) if alive else None
+        self.box = _accepted_box(np, live, dilated, self.min_size) if live is not None else None
+        alive = self.box is not None
         if share < 0.05 and spots <= 4:
             self.calibrating = False
         if share > self.lightning:
@@ -134,6 +142,50 @@ class Detector:
         if self.calibrating:
             self.box = None
         return 0.0 if self.calibrating or not alive else float(share)
+
+
+def _accepted_box(np: Any, windows: Any, changed: Any, min_size: float) -> tuple[int, int, int, int] | None:
+    """Бокс принятых компонент движения (пиксели кадра) или None.
+
+    Соседние окна 16×16 сливаются в компоненты; компонент, у которого площадь ИЗМЕНИВШИХСЯ
+    пикселей меньше `min_size` процентов кадра, отбрасывается (далёкий человек, мелкий блик).
+    ⚠ Не площадь бокса: у идущего пятна бокс раздувается хвостом и порог переставал бы ловить
+    далёкого человека.
+    """
+    found = windows
+    rows, cols = found.shape
+    seen = np.zeros_like(found, dtype=bool)
+    accepted: list[tuple[int, int, int, int]] = []
+    for row in range(rows):
+        for col in range(cols):
+            if not found[row, col] or seen[row, col]:
+                continue
+            seen[row, col] = True
+            stack = [(row, col)]
+            top = bottom = row
+            left = right = col
+            while stack:
+                r, c = stack.pop()
+                top, bottom = min(top, r), max(bottom, r)
+                left, right = min(left, c), max(right, c)
+                for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                    if 0 <= nr < rows and 0 <= nc < cols and found[nr, nc] and not seen[nr, nc]:
+                        seen[nr, nc] = True
+                        stack.append((nr, nc))
+            # Окно (r, c) — это 16×16 пикселей, начиная с (c, r)·CELL (склейка 3×3).
+            x0, y0 = left * CELL, top * CELL
+            x1, y1 = (right + 2) * CELL, (bottom + 2) * CELL
+            area = int(np.count_nonzero(changed[y0:y1, x0:x1])) * 100.0 / (WIDTH * HEIGHT)
+            if area >= min_size:
+                accepted.append((x0, y0, x1, y1))
+    if not accepted:
+        return None
+    return (
+        min(box[0] for box in accepted),
+        min(box[1] for box in accepted),
+        max(box[2] for box in accepted),
+        max(box[3] for box in accepted),
+    )
 
 
 def masked_area(np: Any, polygons: Any) -> Any:
@@ -196,6 +248,7 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
         lightning=_number(spec, "lightning", 0.8, 0.1, 1.0),
         alpha=_number(spec, "alpha", 0.01, 0.001, 0.5),
         mask=spec.get("mask"),
+        min_size=_number(spec, "minSize", 0.0, 0.0, 100.0),
     )
     fps = _number(spec, "fps", 5, 1, 10)
     need = int(_number(spec, "frames", 2, 1, 50))
