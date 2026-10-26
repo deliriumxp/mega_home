@@ -521,6 +521,36 @@ def test_ключевой_кадр_до_метки(tmp_path: Path) -> None:
     assert asyncio.run(_keyframe_before(_Rec(), tmp_path / "нет.mkv", 6.3)) == 6.3
 
 
+def test_ключевой_кадр_ищется_по_пакетам_без_декода(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Перемотка ждёт ответ: `frame=` заставлял ffprobe декодировать до 12 с видео — 2,5 с на кусок 720p
+    (живой прогон сессии 2026-10-26), флаг ключевого кадра есть у пакета без декода."""
+    from mega_home.core import recorder_api
+
+    seen: list[tuple] = []
+
+    class _Proc:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b'{"packets": [{"pts_time": "2.0", "flags": "K__"}, {"pts_time": "2.1", "flags": "___"}], "format": {"start_time": "0.0"}}', b""
+
+    async def fake_exec(*argv, **_kwargs):  # noqa: ANN002, ANN003
+        seen.append(argv)
+        return _Proc()
+
+    class _Env:
+        async def run(self, func, *args):  # noqa: ANN001, ANN201
+            return "/usr/bin/ffprobe" if func is shutil.which else func(*args)
+
+    class _Rec:
+        env = _Env()
+
+    monkeypatch.setattr(recorder_api.asyncio, "create_subprocess_exec", fake_exec)
+    assert asyncio.run(recorder_api.keyframe_before(_Rec(), tmp_path / "c.mkv", 2.5)) == pytest.approx(2.0)
+    entries = seen[0][seen[0].index("-show_entries") + 1]
+    assert entries.startswith("packet=") and "frame=" not in entries
+
+
 def test_сутки_из_одного_превью_уходят_по_сроку(tmp_path: Path) -> None:
     """Превью пишется всегда, и у суток без движения кусков нет: индекс кусков их не знает, а уборка
     по сроку обязана снести и их."""

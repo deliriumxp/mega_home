@@ -148,6 +148,8 @@ async def _keyframe_before(recorder: Recorder, path: Any, offset: float) -> floa
     или ffprobe нет — сам `offset`: список играется с ближайшего ключевого кадра и так.
 
     ⚠ Ошибка тут — не отказ списка: время старта станет приблизительным, как было раньше.
+    ⚠ По ПАКЕТАМ (флаг `K`), а не по кадрам: `frame=` заставлял ffprobe декодировать до 12 с видео —
+    2,5 с на кусок 720p, и столько ждала каждая перемотка (живой прогон сессии 2026-10-26).
     """
     binary = await recorder.env.run(shutil.which, "ffprobe")
     if not binary:
@@ -156,7 +158,7 @@ async def _keyframe_before(recorder: Recorder, path: Any, offset: float) -> floa
     async with _PROBES:
         proc = await asyncio.create_subprocess_exec(
             binary, "-v", "error", "-select_streams", "v:0", "-read_intervals", f"{low:.3f}%{offset + 0.5:.3f}",
-            "-show_entries", "frame=pts_time,key_frame:format=start_time", "-of", "json", str(path),
+            "-show_entries", "packet=pts_time,flags:format=start_time", "-of", "json", str(path),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
         try:
@@ -168,11 +170,15 @@ async def _keyframe_before(recorder: Recorder, path: Any, offset: float) -> floa
             return offset
     try:
         start = float((answer.get("format") or {}).get("start_time") or 0.0)
-        keys = [float(f["pts_time"]) - start for f in answer.get("frames", []) if f.get("key_frame") == 1 and "pts_time" in f]
+        keys = [float(p["pts_time"]) - start for p in answer.get("packets", []) if "K" in str(p.get("flags", "")) and "pts_time" in p]
     except (TypeError, ValueError):
         return offset
     before = [k for k in keys if k <= offset + 0.05]
     return max(max(before), 0.0) if before else offset
+
+
+# Им же встают сессии просмотра (`recorder_session.py`).
+keyframe_before = _keyframe_before
 
 
 async def _playlist(request: web.Request) -> web.Response:
