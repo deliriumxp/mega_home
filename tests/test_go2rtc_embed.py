@@ -216,6 +216,7 @@ def test_смерть_во_время_работы_снимает_службу_�
     assert "(2)" in embed.state()["why"] and "WRN something" in embed.state()["why"]
     assert env.spawned == [
         "mega_home go2rtc: сторож продюсеров",
+        "mega_home go2rtc: сторож API",
         "mega_home go2rtc: перезапуск после падения",
     ]
 
@@ -277,3 +278,54 @@ def test_занятый_порт_повторяет_старт_а_не_сдаё�
 
     asyncio.run(scenario())
     assert sleeps == [embed.RETRY_EVERY]
+
+
+def test_повторы_старта_не_кончаются(monkeypatch):
+    """Ревью 2026-10-27: после 15 неудач (5 минут) повторы кончались — видео не было до перезапуска HA. Теперь они
+    идут всегда: сначала часто, потом раз в `RETRY_SLOW`; исключение попытки повторы не обрывает."""
+    calls = [0]
+
+    async def start(_env):
+        calls[0] += 1
+        if calls[0] == 3:
+            raise OSError("конфиг не записался")
+        return calls[0] > embed.RETRY_ATTEMPTS + 2
+
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr(embed, "async_start", start)
+    monkeypatch.setattr(embed.asyncio, "sleep", fake_sleep)
+    assert asyncio.run(embed._retry_start(FakeHost())) is True
+    assert sleeps[0] == embed.RETRY_EVERY and sleeps[-1] == embed.RETRY_SLOW
+
+
+def test_зависший_api_перезапускает_go2rtc(monkeypatch):
+    """Ревью 2026-10-27: сторож следил только за смертью процесса — go2rtc, повисший по API, никто не перезапускал."""
+    proc = _Proc()
+    _fake_launch(monkeypatch, proc)
+
+    async def api(_env):
+        return False  # процесс жив, а API молчит
+
+    monkeypatch.setattr(embed, "_api_alive", api)
+    monkeypatch.setattr(embed, "_start_drain", lambda: None)
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(_seconds: float) -> None:
+        await real_sleep(0)
+
+    async def scenario() -> FakeHost:
+        env = FakeHost()
+        assert await embed.async_start(env) is True
+        monkeypatch.setattr(embed.asyncio, "sleep", fake_sleep)
+        await embed._watch(env)
+        return env
+
+    env = asyncio.run(scenario())
+    assert embed.is_running() is False and "API" in embed.state()["why"]
+    assert env.spawned[-1] == "mega_home go2rtc: повтор старта"

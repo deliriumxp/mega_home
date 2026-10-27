@@ -97,6 +97,11 @@ CONFIG_PREFIX = "mega_home_go2rtc_"
 # помеха длилась минуту (TIME_WAIT прежнего запуска), а отказ жил до ребута.
 RETRY_EVERY = 20.0
 RETRY_ATTEMPTS = 15
+# После частых попыток — реже, но всегда.
+RETRY_SLOW = 300.0
+# Сторож API живого процесса: проба раз в `WATCH_EVERY`, столько неответов подряд — перезапуск.
+WATCH_EVERY = 30.0
+WATCH_FAILS = 3
 # Сколько ждём выхода сироты после SIGTERM и затем после SIGKILL.
 ORPHAN_STOP_S = 5.0
 
@@ -105,6 +110,7 @@ _proc: asyncio.subprocess.Process | None = None
 _drain: asyncio.Task[None] | None = None
 _retry: asyncio.Task[None] | None = None
 _guard: asyncio.Task[None] | None = None
+_watcher: asyncio.Task[None] | None = None
 _tmp: str | None = None
 _ready = False
 _log: deque[str] = deque(maxlen=LOG_TAIL)
@@ -112,7 +118,7 @@ _log: deque[str] = deque(maxlen=LOG_TAIL)
 
 async def async_start(env: Host) -> bool:
     """Поднять свой go2rtc. False — не поднят, причина в `state()["why"]`."""
-    global _env, _proc, _tmp, _ready, _why, _guard
+    global _env, _proc, _tmp, _ready, _why, _guard, _watcher
 
     if is_running():
         return True
@@ -176,6 +182,7 @@ async def async_start(env: Host) -> bool:
     services.register("go2rtc", API_PORT)
     LOGGER.info("mega_home go2rtc готов: %s, медиа :%s", URL, WEBRTC_PORT)
     _guard = env.spawn(go2rtc_guard.run(URL, _proc.pid), "mega_home go2rtc: сторож продюсеров")
+    _watcher = env.spawn(_watch(env), "mega_home go2rtc: сторож API")
     return True
 
 
@@ -193,23 +200,53 @@ async def _retry_start(env: Host, attempts: int = RETRY_ATTEMPTS) -> bool:
 
     ⚠ Неудачный `async_start` снова зовёт `_schedule_retry`, тот видит живую
     задачу (эту) и второй цикл не заводит — повторы не размножаются.
+    ⚠ Повторы НЕ кончаются: первые `attempts` — часто, дальше раз в `RETRY_SLOW`. Раньше после 15 неудач видео не было
+    до перезапуска HA, а исключение попытки обрывало цикл (ревью 2026-10-27).
     """
-    for _ in range(attempts):
-        await asyncio.sleep(RETRY_EVERY)
-        if is_running() or await async_start(env):
-            return True
-    LOGGER.warning("go2rtc так и не поднялся за %d попыток: %s", attempts, _why)
-    return False
+    global _why
+
+    tries = 0
+    while True:
+        await asyncio.sleep(RETRY_EVERY if tries < attempts else RETRY_SLOW)
+        try:
+            if is_running() or await async_start(env):
+                return True
+        except Exception as err:  # noqa: BLE001 — повтор не умирает от одной попытки
+            _why = f"go2rtc не запустился: {err}"
+        tries += 1
+        if tries == attempts:
+            LOGGER.warning("go2rtc не поднялся за %d попыток: %s — повторяю раз в %.0f с", attempts, _why, RETRY_SLOW)
 
 
-async def async_stop() -> None:
-    """Снять процесс и убрать за собой. Зовётся при выгрузке и остановке HA."""
-    global _proc, _tmp, _drain, _ready, _retry, _guard
+async def _watch(env: Host) -> None:
+    """Сторож API живого go2rtc: процесс жив, а API молчит `WATCH_FAILS` проб подряд — перезапуск. ⚠ Раньше следилась
+    только смерть процесса, и повисший go2rtc держал без видео до перезапуска HA (ревью 2026-10-27)."""
+    global _ready, _why
+
+    fails = 0
+    while _ready:
+        await asyncio.sleep(WATCH_EVERY)
+        fails = 0 if await _api_alive(env) else fails + 1
+        if fails >= WATCH_FAILS:
+            _why = f"go2rtc не отвечает по API {WATCH_FAILS} раз подряд — перезапуск"
+            LOGGER.warning("%s", _why)
+            await async_stop(watcher=True)
+            _schedule_retry(env)
+            return
+
+
+async def async_stop(watcher: bool = False) -> None:
+    """Снять процесс и убрать за собой. Зовётся при выгрузке и остановке HA. `watcher` — зовёт сам сторож API:
+    снимать себя он не должен."""
+    global _proc, _tmp, _drain, _ready, _retry, _guard, _watcher
 
     _ready = False
     guard, _guard = _guard, None
     if guard is not None and not guard.done():
         guard.cancel()
+    watching, _watcher = _watcher, None
+    if watching is not None and not watcher and not watching.done():
+        watching.cancel()
     services.unregister("go2rtc")
     host_load.untrack("go2rtc")
     drain, _drain = _drain, None
