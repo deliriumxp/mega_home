@@ -80,6 +80,22 @@ def test_конвейер_регистрирует_все_потоки_каме�
     assert session.puts == [("onvif_aa", "rtsp://u:p@10.0.0.5/main"), ("onvif_aa_sub", "rtsp://u:p@10.0.0.5/sub")]
 
 
+def test_запуск_читателя_заводит_потоки_в_go2rtc_заново(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """.102, ночь на 2026-10-27: поток `_sub` пропал из go2rtc, а конвейер заводил потоки только на старте — читатель
+    до утра перезапускал ffmpeg на 404 «DESCRIBE failed», камера стояла без детекции и превью."""
+    from mega_home.core import video_pipeline
+    from mega_home.core.video_reader import reader_plan
+
+    session = _Session()
+    recorder, _published = _recorder(tmp_path, session)
+    pipeline = CameraPipeline(recorder, _plan(DETECT_ONLY), tmp_path / ".cache")
+    spec = reader_plan(pipeline.plan, pipeline.cache, False)[0]
+    monkeypatch.setattr(video_pipeline.shutil, "which", lambda _name: None)
+    with pytest.raises(RuntimeError, match="нет ffmpeg"):
+        asyncio.run(pipeline._spawn(spec))  # noqa: SLF001
+    assert ("onvif_aa_sub", "rtsp://u:p@10.0.0.5/sub") in session.puts
+
+
 def test_своя_детекция_открывает_окно_записи_без_концентратора(tmp_path: Path) -> None:
     recorder, published = _recorder(tmp_path)
     pipeline = CameraPipeline(recorder, _plan(CAMERA), tmp_path / ".cache")

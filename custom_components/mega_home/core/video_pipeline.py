@@ -118,6 +118,9 @@ class CameraPipeline:
 
     async def _spawn(self, spec: ReaderSpec) -> asyncio.subprocess.Process:
         self._retire(spec.key)
+        # ⚠ Потоки — в go2rtc перед КАЖДЫМ запуском, не только на старте: пропал поток (снят, go2rtc перезапущен) —
+        # читатель иначе крутил 404 «DESCRIBE failed» до перезапуска конвейера (.102, ночь на 2026-10-27).
+        await self.register()
         loop = asyncio.get_running_loop()
         binary, nice = await self.rec.env.run(lambda: (shutil.which("ffmpeg"), shutil.which("nice")))
         if not binary:
