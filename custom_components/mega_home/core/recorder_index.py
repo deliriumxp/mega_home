@@ -264,12 +264,12 @@ def clean(storage: Path, cameras: list[Any], now: float, limit: int = 0) -> None
         used = sum(camera.index.size() for camera in cameras) if limit else 0
         if shutil.disk_usage(storage).free >= floor and (not limit or used <= limit):
             break
-        oldest = min(
-            (((camera.index.day_names() or ["~"])[0], camera) for camera in cameras), key=lambda item: item[0], default=None
-        )
-        if oldest is None or oldest[0] == "~":
+        # ⚠ По началу самого старого КУСКА, не по имени дня: при равенстве дней `min` брал первую камеру, и она теряла
+        # сутки целиком, пока у второй лежали куски того же дня старше (.102 2026-10-27).
+        heads = [(pieces[0][0], at, camera) for at, camera in enumerate(cameras) if (pieces := camera.index.oldest(1))]
+        if not heads:
             break
-        camera = oldest[1]
+        camera = min(heads, key=lambda item: item[:2])[2]
         for begin, _length, path in camera.index.oldest(60):
             size = path.stat().st_size if path.is_file() else 0
             path.unlink(missing_ok=True)

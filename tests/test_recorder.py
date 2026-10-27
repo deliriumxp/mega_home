@@ -392,6 +392,23 @@ def test_лимит_локального_диска_убирает_старое(
     assert [p.exists() for p in pieces] == [False, True, True]
 
 
+def test_лимит_убирает_самые_старые_куски_а_не_сутки_первой_камеры(tmp_path: Path) -> None:
+    """.102 2026-10-27: камера выбиралась по имени самого старого дня, при равенстве — первая в списке, и она теряла
+    все сутки, пока у второй лежали куски того же дня старше (у «Домофона» архив начинался ровно с 00:00 UTC)."""
+    now = rec.epoch_of("20261026T200000")
+    assert now is not None
+    first, second = _camera(tmp_path), _camera(tmp_path, id="onvif-bb")
+    late = [_segment(tmp_path, "onvif-aa", now - 10 * 3600 + 10 * i) for i in range(61)]
+    early = [_segment(tmp_path, "onvif-bb", now - 18 * 3600 + 10 * i) for i in range(61)]
+    for piece in late + early:
+        piece.write_bytes(b"x" * 100)
+    for camera in (first, second):
+        camera.index.load(sizes=True)
+    rec.clean(tmp_path, [first, second], now, limit=122 * 100 - 100)
+    assert all(p.exists() for p in late)
+    assert [p.exists() for p in early] == [False] * 60 + [True]
+
+
 def test_служба_отдаёт_дни_участки_и_список(tmp_path: Path) -> None:
     base = rec.epoch_of("20261023T120000")
     assert base is not None
