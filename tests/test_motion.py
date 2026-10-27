@@ -101,21 +101,14 @@ def test_маска_закрывает_мигающий_блик() -> None:
     assert mo.masked_area(np, [[[0, 0], [1, 0]]]) is None  # не многоугольник — маски нет
 
 
-def test_минимальный_размер_отсекает_далёкое_пятно() -> None:
-    """MinSize — площадь бокса в процентах кадра: малое пятно не сработка, крупное — сработка."""
-    def spot(spot_x: int, size: int) -> bytes:
-        frame = np.frombuffer(_frame(), np.uint8).reshape(mo.HEIGHT, mo.WIDTH).copy()
-        frame[45 : 45 + size, spot_x : spot_x + size] = 5
-        return frame.tobytes()
-
-    small = mo.Detector(np, min_size=2.0)
-    big = mo.Detector(np, min_size=2.0)
-    for detector in (small, big):
-        _run(detector, [_frame() for _ in range(60)])
-    # 12×12: изменившихся пикселей ~1,2 % кадра — ниже порога 2 %.
-    assert not any(_run(small, [spot(10 + i * 4, 12) for i in range(30)]))
-    # 40×40 даёт больше 2 % — проходит.
-    assert any(_run(big, [spot(10 + i * 4, 40) for i in range(30)]))
+def test_порога_размера_у_движения_нет() -> None:
+    """Как у Frigate: размер — у рамки человека (`person.minSize`), а не у движения. Описание с прежним `minSize`
+    движение не глушит: идущий человек менял 1,6–5,3 % кадра и при пороге 10–15 % не виделся вовсе (.90.250)."""
+    loop = mo.MotionLoop(np, {"minSize": 15}, emit=lambda *_a: None)
+    _run(loop.detector, [_frame() for _ in range(60)])
+    shares = _run(loop.detector, [_frame(spot_x=10 + i * 4) for i in range(30)])
+    assert all(s for s in shares[3:])
+    assert loop.detector.box is not None and mo.box_share(loop.detector.box) < 15
 
 
 def test_малое_пятно_шумом_не_считается() -> None:

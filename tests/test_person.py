@@ -182,6 +182,20 @@ def test_без_человека_события_нет(monkeypatch) -> None:
     assert not [e for e in events if e["kind"] == "person"]
 
 
+def test_рамка_меньше_min_size_сети_не_идёт_а_движение_остаётся(monkeypatch) -> None:
+    """`person.minSize` — площадь рамки в % кадра (как `min_area` объекта у Frigate): пятно 12×12 — малая рамка,
+    человека нет, но окно движения и его событие на месте."""
+    spec = {"stream": "cam_sub", "offDelay": 1, "person": {"every": 1, "threshold": 0.5, "frames": 2, "minSize": 50}}
+    events, _command = _person_run(monkeypatch, spec, [0.9, 0.9, 0.9, 0.9])
+    assert not [e for e in events if e["kind"] == "person"]
+    assert ("motion", "start") in [(e["kind"], e.get("state")) for e in events]
+
+
+def test_площадь_рамки_в_процентах_кадра() -> None:
+    assert mo.box_share((0, 0, mo.WIDTH, mo.HEIGHT)) == 100.0
+    assert mo.box_share((0, 0, mo.WIDTH // 2, mo.HEIGHT // 2)) == 25.0
+
+
 def test_только_люди_движение_не_публикуется(monkeypatch) -> None:
     """Движение камеры приходит от неё самой: детекция дома — ради людей, строк движения дважды нет."""
     spec = {"stream": "cam_sub", "offDelay": 1, "motionEvents": False, "person": {"every": 1, "frames": 1}}
