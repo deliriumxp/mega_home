@@ -27,7 +27,6 @@ import asyncio
 import shutil
 import tempfile
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -71,8 +70,9 @@ def clock() -> float:
 Spawn = Callable[..., Awaitable[Any]]
 Keyframe = Callable[[Any, Path, float], Awaitable[float]]
 AudioProbe = Callable[[Any, Path], Awaitable[bool]]
-# Сколько строк ошибок ffmpeg сессии попадает в журнал, когда он не отдал ни байта.
-ERROR_TAIL = 3
+# Сколько строк ошибок ffmpeg сессии попадает в журнал, когда он не отдал ни байта. ⚠ ПЕРВЫХ: причина —
+# первая строка («Impossible to open '<кусок>'»), дальше её следствия; хвост терял её (объект 2026-10-27).
+ERROR_HEAD = 3
 
 
 def playlist_from(index: SegmentIndex, at_s: float, started: bool = False) -> tuple[list[Segment], float] | None:
@@ -108,13 +108,13 @@ async def _default_keyframe(recorder: Any, path: Path, offset: float) -> float:
     return await keyframe_before(recorder, path, offset)
 
 
-async def _drain(proc: Any, errors: deque[str]) -> None:
-    """Ошибки ffmpeg сессии — в хвост для журнала; канал читается всегда, иначе ffmpeg встал бы на записи в него."""
+async def _drain(proc: Any, errors: list[str]) -> None:
+    """Первые ошибки ffmpeg сессии — для журнала; канал читается до конца, иначе ffmpeg встал бы на записи в него."""
     stream = getattr(proc, "stderr", None)
     if stream is None:
         return
     while line := await stream.readline():
-        if text := line.decode(errors="replace").strip():
+        if len(errors) < ERROR_HEAD and (text := line.decode(errors="replace").strip()):
             errors.append(text)
 
 
@@ -359,7 +359,7 @@ class PlaybackSessions:
             )
             session.proc, session.gen_started = proc, clock()
             host_load.track(f"play:{session.camera}:{session.id}", getattr(proc, "pid", None))
-            errors: deque[str] = deque(maxlen=ERROR_TAIL)
+            errors: list[str] = []
             drain = asyncio.ensure_future(_drain(proc, errors))
             sent = await self._copy(session, proc, gen)
             await self._stop_proc(session, proc)

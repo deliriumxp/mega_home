@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from . import host_load
 from .const import LOGGER
 from .go2rtc_embed import RTSP_PORT
-from .recorder_index import day_of, epoch_of
+from .recorder_index import day_of, epoch_of, length_ms
 
 if TYPE_CHECKING:
     from .recorder_sink import RecordSink
@@ -100,7 +100,7 @@ def preview_output_args(tune: PreviewTune, cache: Path) -> list[str]:
 
 
 def piece_name(begin: float, length: float) -> str:
-    return f"{time.strftime('%H%M%S', time.gmtime(begin))}-{int(length * 1000)}.mp4"
+    return f"{time.strftime('%H%M%S', time.gmtime(begin))}-{length_ms(length)}.mp4"
 
 
 def whole_fragments(data: bytes) -> bytes:

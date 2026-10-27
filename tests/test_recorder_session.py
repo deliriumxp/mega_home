@@ -217,7 +217,13 @@ def test_ffmpeg_без_потока_называет_причину_в_журн�
         client, _response = await _serve(world, sid)
         try:
             await _until(lambda: world.procs)
-            world.procs[0].stderr.feed_data(b"Error opening input: Invalid data found\n")
+            # Вывод объекта 2026-10-27: причина — ПЕРВАЯ строка, остальные — её следствия.
+            world.procs[0].stderr.feed_data(
+                b"[concat @ 0x1] Impossible to open '/media/nvr/cam/033037-8026.mkv'\n"
+                b"[in#0 @ 0x2] Error opening input: No such file or directory\n"
+                b"Error opening input file /tmp/mega_home_play/x-1.ffconcat.\n"
+                b"Error opening input files: No such file or directory\n"
+            )
             world.procs[0].kill()
             await asyncio.sleep(0.1)
         finally:
@@ -225,7 +231,7 @@ def test_ffmpeg_без_потока_называет_причину_в_журн�
             await client.close()
 
     asyncio.run(scenario())
-    assert any("Invalid data found" in record.getMessage() for record in caplog.records)
+    assert any("Impossible to open '/media/nvr/cam/033037-8026.mkv'" in record.getMessage() for record in caplog.records)
 
 
 def test_до_первого_байта_смещение_ноль_а_перемотка_продолжает_время(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -261,6 +261,20 @@ def test_индекс_в_памяти_ведёт_запись_а_не_переч
     assert [n for _b, n, _p in index.between(midnight, midnight + 20)] == [4.0]
 
 
+def test_путь_куска_из_индекса_совпадает_с_файлом_после_загрузки(tmp_path: Path) -> None:
+    """Объект 2026-10-27: длина в имени шла через дробь и `int` — `8027 / 1000 * 1000` = 8026,99…, и после
+    перезапуска HA индекс вёл к `…-8026.mkv` вместо `…-8027.mkv`: сессия крутила отказ ffmpeg без конца."""
+    base = rec.epoch_of("20261027T033037")
+    assert base is not None
+    lengths = [8027, 8029, 10_033, 9_999, 10_001]
+    files = [_segment(tmp_path, "onvif-aa", base + 20 * n, length) for n, length in enumerate(lengths)]
+    index = SegmentIndex(tmp_path / "onvif-aa")
+    index.load()
+    assert [p for _b, _n, p in index.between(base, base + 200)] == files
+    # Запись кладёт кусок под тем же именем, что потом вернёт загрузка индекса.
+    assert index.add(base + 200, 8.027) == tmp_path / "onvif-aa" / "2026-10-27" / "033357-8027.mkv"
+
+
 def test_загрузка_индекса_одна_и_не_затирает_добавленное(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Ревью 2026-10-24: индекс грузят запись камеры, служба и уборка, каждая в своём потоке; вторая
     загрузка присваиванием затирала куски, добавленные записью после ЕЁ обхода. Обход один, `add` ждёт его."""

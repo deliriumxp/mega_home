@@ -52,6 +52,12 @@ def day_of(epoch: float) -> str:
     return time.strftime("%Y-%m-%d", time.gmtime(epoch))
 
 
+def length_ms(length: float) -> int:
+    """Длина в имени куска (записи и превью) — мс ОКРУГЛЕНИЕМ: путь выводится из длины, а `int` дроби
+    (`8027 / 1000 * 1000` = 8026,99…) после перезапуска HA вёл мимо файла (объект 2026-10-27)."""
+    return round(length * 1000)
+
+
 def segment_name(begin: float, length_ms: int) -> str:
     return f"{time.strftime('%H%M%S', time.gmtime(begin))}-{length_ms}.mkv"
 
@@ -105,7 +111,7 @@ class SegmentIndex:
             day = _Day()
             for begin, length, path in scan_day(folder):
                 day.begins.append(begin)
-                day.lengths.append(int(length * 1000))
+                day.lengths.append(length_ms(length))
                 if sizes:
                     day.size += path.stat().st_size
             if sizes and len(day.begins):
@@ -128,17 +134,17 @@ class SegmentIndex:
 
     def add(self, begin: float, length: float, size: int = 0) -> Path:
         """Новый кусок; тот же момент повторно — замена (перезапуск в ту же секунду)."""
-        name, length_ms = day_of(begin), int(length * 1000)
+        name, ms = day_of(begin), length_ms(length)
         with self._loading, self._lock:
             day = self._days.setdefault(name, _Day())
             at = bisect_left(day.begins, begin)
             if at < len(day.begins) and day.begins[at] == begin:
-                day.lengths[at] = length_ms
+                day.lengths[at] = ms
             else:
                 day.begins.insert(at, begin)
-                day.lengths.insert(at, length_ms)
+                day.lengths.insert(at, ms)
             day.size += size
-        return self._path(name, begin, length_ms)
+        return self._path(name, begin, ms)
 
     def account(self, begin: float, size: int) -> None:
         """Кусок превью-видео (`recorder_preview.py`) — в объём его дня."""

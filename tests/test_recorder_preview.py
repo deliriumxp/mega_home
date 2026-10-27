@@ -23,7 +23,7 @@ from mega_home.core import services, storage
 from mega_home.core.go2rtc_embed import RTSP_PORT
 from mega_home.core.recorder_api import start_api
 from mega_home.core.recorder_preview import (
-    PREVIEW_LIST, SWEPT, PreviewTune, command, sweep_legacy, tune_of, whole_fragments,
+    PREVIEW_LIST, SWEPT, PreviewIndex, PreviewTune, command, sweep_legacy, tune_of, whole_fragments,
 )
 
 SECTION = {"storage": "/media/video", "cameras": [{"id": "cam", "stream": "cam_main", "source": "rtsp://u:p@10.0.0.5/main"}]}
@@ -172,6 +172,19 @@ def test_служба_отдаёт_список_и_куски(tmp_path: Path) ->
     assert closed == (200, "private, max-age=86400", b"closed")
     assert going == ("no-store", head + _box(b"moof") + _box(b"mdat", b"v"))
     assert missing == 404
+
+
+def test_путь_превью_после_загрузки_совпадает_с_файлом(tmp_path: Path) -> None:
+    """Как у кусков записи: `int(8.027 * 1000)` = 8026 — после перезапуска HA путь вёл мимо файла."""
+    begin = rec.epoch_of("20261027T033037")
+    assert begin is not None
+    day = tmp_path / "cam" / "2026-10-27" / "preview"
+    day.mkdir(parents=True)
+    piece = day / "033037-8027.mp4"
+    piece.write_bytes(b"x")
+    index = PreviewIndex(tmp_path / "cam")
+    index.load()
+    assert index.path(begin) == piece
 
 
 def test_прежние_кадры_и_спрайты_убираются_один_раз(tmp_path: Path) -> None:

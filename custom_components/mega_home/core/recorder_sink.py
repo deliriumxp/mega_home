@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 from . import activity
 from .const import LOGGER
 from .recorder_cache import cap_bytes, memory_available, shed
-from .recorder_index import MAX_SEGMENT_S, SegmentIndex, day_of, epoch_of, segment_name
+from .recorder_index import MAX_SEGMENT_S, SegmentIndex, day_of, epoch_of, length_ms, segment_name
 from .recorder_preview import PreviewIndex
 from .recorder_spec import CameraSpec
 
@@ -206,7 +206,7 @@ class RecordSink:
         if problem:
             raise OSError(problem)
         size = path.stat().st_size
-        target = self.index.root / day_of(start) / segment_name(start, int(length * 1000))
+        target = self.index.root / day_of(start) / segment_name(start, length_ms(length))
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(path), str(target))
         # В индекс — после переноса: сорвавшийся перенос не оставляет в нём куска, которого нет.
