@@ -190,6 +190,28 @@ def test_уже_смонтированная_папка_с_косой_черто
     assert libc.calls == []
 
 
+def test_живая_точка_не_требует_dns_каждую_минуту(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ревью 2026-10-27: сторож раз в минуту резолвил имя NAS (у USB — читал суперблоки всех дисков) ДО проверки «уже
+    смонтировано»: перезагрузили роутер — DNS не ответил — «проблема» — запись всех камер снята."""
+    point = tmp_path / "point"
+    libc = _FakeLibc(0)
+    monkeypatch.setattr(storage, "_libc", lambda: libc)
+    monkeypatch.setattr(storage, "mounted", lambda: {str(point): ("//10.0.0.2/demo", "cifs")})
+    lookups: list[str] = []
+
+    def resolve(host: str) -> str:
+        lookups.append(host)
+        if len(lookups) > 1:
+            raise OSError("DNS не ответил")
+        return "10.0.0.2"
+
+    monkeypatch.setattr(storage.socket, "gethostbyname", resolve)
+    spec = {"type": "cifs", "source": "//nas.local/demo"}
+    assert storage.mount(spec, point) == ""
+    assert storage.mount(spec, point) == ""  # DNS лежит, а точка та же и жива
+    assert lookups == ["nas.local"] and libc.calls == []
+
+
 def test_служба_отдаёт_папки_и_подключает_для_выбора(roots: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     recorder = rec.Recorder(FakeHost(roots), lambda _listener: (lambda: None))
     mounts: list[tuple[dict, Path]] = []

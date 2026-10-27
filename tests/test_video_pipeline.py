@@ -227,6 +227,52 @@ def test_раздел_video_главнее_recorder(tmp_path: Path) -> None:
     assert set(recorder.pipelines) == {"onvif-aa"} and recorder.cameras == {}
 
 
+def test_правка_одной_камеры_не_трогает_остальные(tmp_path: Path) -> None:
+    """Ревью 2026-10-27: любая правка раздела `video` (маска одной камеры) перезапускала все камеры — каждая теряла
+    предзапись и детектор заново калибровался. Хранилище то же — пересоздаётся только изменившаяся камера."""
+    recorder, _published = _recorder(tmp_path)
+    video = {"storage": str(tmp_path), "cameras": [CAMERA, DETECT_ONLY]}
+    asyncio.run(recorder.reconfigure({"video": video}))
+    first = dict(recorder.pipelines)
+    changed = {**DETECT_ONLY, "detect": {"stream": "sub", "minSize": 10}}
+    asyncio.run(recorder.reconfigure({"video": {**video, "cameras": [CAMERA, changed]}}))
+    assert recorder.pipelines["onvif-aa"] is first["onvif-aa"]
+    assert recorder.pipelines["onvif-bb"] is not first["onvif-bb"]
+    # Сменилось хранилище — новые все.
+    asyncio.run(recorder.reconfigure({"video": {**video, "storage": str(tmp_path / "other"), "cameras": [CAMERA, changed]}}))
+    assert recorder.pipelines["onvif-aa"] is not first["onvif-aa"]
+
+
+def test_разовый_сбой_хранилища_не_снимает_запись_а_возврат_перечитывает_индекс(tmp_path: Path) -> None:
+    """Ревью 2026-10-27: одна неудачная проба хранилища (DNS, мигание сети) снимала запись всех камер, начатое в кэше
+    бросалось. А индекс, прочитанный при отсутствующем диске (питание вернулось раньше NAS), оставался пустым навсегда —
+    «архив стёрт». Теперь запись снимается после `STORAGE_FAILS` неудач подряд, возврат хранилища перечитывает индексы."""
+    import tempfile
+
+    storage_dir = Path(tempfile.mkdtemp(prefix="pipe-"))
+    recorder, _published = _recorder(storage_dir)
+    recorder.local, recorder.limit = True, 1024**3
+    asyncio.run(recorder.reconfigure({"video": {"storage": str(storage_dir), "local": True, "limitGb": 1, "cameras": [CAMERA]}}))
+    answers = iter([""] + ["NAS не ответил"] * rec.STORAGE_FAILS + [""])
+    recorder._storage_check = lambda: next(answers)  # type: ignore[method-assign]  # noqa: SLF001
+    pipeline = recorder.pipelines["onvif-aa"]
+    asyncio.run(recorder._check())  # noqa: SLF001
+    assert pipeline.record_on
+    for _ in range(rec.STORAGE_FAILS - 1):
+        asyncio.run(recorder._check())  # noqa: SLF001
+        assert pipeline.record_on and not recorder.why
+    asyncio.run(recorder._check())  # noqa: SLF001
+    assert not pipeline.record_on and recorder.why == "NAS не ответил"
+    assert pipeline.record is not None
+    pipeline.record.index.loaded = True  # прочитан, пока диска не было, — пустым
+    piece = storage_dir / "onvif-aa" / "2026-10-23" / "120000-10000.mkv"
+    piece.parent.mkdir(parents=True)
+    piece.write_bytes(b"x")
+    asyncio.run(recorder._check())  # noqa: SLF001
+    assert pipeline.record_on
+    assert [p for _b, _n, p in pipeline.record.index.between(0, 2e9)] == [piece]
+
+
 def test_детекция_без_записи_идёт_без_хранилища(tmp_path: Path) -> None:
     recorder, _published = _recorder(tmp_path)
     missing = tmp_path / "нет-диска"

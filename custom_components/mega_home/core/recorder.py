@@ -54,6 +54,8 @@ SERVICE = "recorder"
 SCAN_S = 2.0
 RESTART_S = 10.0
 CLEAN_EVERY_S = 60.0
+# Столько неудачных проб хранилища подряд (раз в `CLEAN_EVERY_S`) снимают идущую запись.
+STORAGE_FAILS = 3
 # Проба хранилища (монтирование, каталог) не держит сторож дольше: пропавший NAS отвечает отказом
 # только через повторы ядра.
 STORAGE_CHECK_S = 90.0
@@ -195,6 +197,11 @@ class Recorder:
         self._api_task: asyncio.Task[None] | None = None
         self._specs: list[CameraSpec] = []
         self._supervisor: asyncio.Task[None] | None = None
+        # Хранилище раздела `video` (путь, монтирование, лимит, превью): то же — камеры пересоздаются по одной.
+        self._where: tuple[Any, ...] | None = None
+        # Неудачных проб хранилища подряд; было ли оно недоступно (до первой удачной — неизвестно, то есть да).
+        self._storage_fails = 0
+        self._storage_down = True
         # Уборка кадров и спрайтов прежних версий (`recorder_preview.sweep_legacy`) — раз на запуск камер.
         self._sweep: asyncio.Task[None] | None = None
         # Идущая проба хранилища (монтирование и каталог): вторая поверх висящей не заводится.
@@ -242,17 +249,31 @@ class Recorder:
             await self._reconfigure(section if isinstance(section, dict) else None)
             return
         async with self._lock:
-            await self._stop_all()
-            self._specs = []
-            await self._storage_from(video.storage, video.mount, video.local, video.limit, video.preview)
+            where = (video.storage, json.dumps(video.mount, sort_keys=True), video.local, video.limit, video.preview)
+            # ⚠ Хранилище то же — пересоздаются только изменившиеся камеры: правка маски одной камеры перезапускала все,
+            # каждая теряла предзапись, детектор калибровался заново (ревью 2026-10-27).
+            partial = not self._specs and self.pipelines and where == self._where and self._supervisor is not None
+            if not partial:
+                await self._stop_all()
+                self._specs = []
+                await self._storage_from(video.storage, video.mount, video.local, video.limit, video.preview)
+                self._where, old = where, {}
+            else:
+                old = self.pipelines
             cache = await self.env.run(self._ram_cache, sum(1 for c in video.cameras if c.record and c.record.mode == "motion"))
-            self.pipelines = {
-                camera.id: CameraPipeline(
-                    self, camera, cache if cache is not None and camera.record and camera.record.mode == "motion" else self.storage / ".cache"
-                )
-                for camera in video.cameras
-            }
-            if self.pipelines:
+            fresh: dict[str, CameraPipeline] = {}
+            for camera in video.cameras:
+                root = cache if cache is not None and camera.record and camera.record.mode == "motion" else self.storage / ".cache"
+                kept = old.get(camera.id)
+                fresh[camera.id] = kept if kept is not None and kept.plan == camera and kept.cache == root / camera.id else CameraPipeline(self, camera, root)
+            for cid, pipeline in old.items():
+                if fresh.get(cid) is not pipeline:
+                    await self._stop_pipeline(pipeline, collect=True)
+            self.pipelines = fresh
+            if partial:
+                # Новые камеры — сразу, а не через минуту до прохода сторожа; хранилище уже проверено им.
+                await self._run_pipelines(record_on=not self.why)
+            elif self.pipelines:
                 self._supervisor = self.env.spawn(self._supervise(), "mega_home: запись камер, сторож")
 
     async def _storage_from(self, path: Path, mount: dict[str, Any] | None, local: bool, limit: int, preview: PreviewTune) -> None:
@@ -339,14 +360,31 @@ class Recorder:
             except Exception as err:  # noqa: BLE001 — отказ ФС (stat по мёртвой точке) — это причина, не падение
                 problem = f"хранилище не отвечает: {err}"
             if problem:
+                self._storage_fails += 1
+                writing = any(p.record_on for p in self.pipelines.values()) or bool(self.cameras)
+                # ⚠ Идущую запись снимает только `STORAGE_FAILS` неудач подряд: одна проба (DNS, мигание сети) снимала
+                # запись всех камер и бросала начатое в кэше (ревью 2026-10-27). Куски тем временем ждут в кэше.
+                if writing and self._storage_fails < STORAGE_FAILS:
+                    if self._storage_fails == 1:
+                        LOGGER.warning("Запись камер: %s — проверю ещё раз, прежде чем остановить запись", problem)
+                    return
                 if problem != self.why:
                     LOGGER.warning("Запись камер: %s", problem)
                 self.why = problem
+                self._storage_down = True
                 # Писать некуда — камеры стоят; начатое в кэше не переносим на флеш. Детекция и кадр камер
                 # конвейера от хранилища не зависят — идут без записи.
                 await self._stop_cameras(collect=False)
                 await self._run_pipelines(record_on=False)
                 return
+            self._storage_fails = 0
+            if self._storage_down:
+                # ⚠ Хранилище вернулось (или впервые годно): индексы, прочитанные без него, — пустые, их перечитать.
+                # Иначе после пропадания питания (контроллер раньше NAS) архив «стёрт» до перезапуска HA (ревью 2026-10-27).
+                for sink in self.sinks():
+                    sink.index.loaded = False
+                    sink.previews.loaded = False
+                self._storage_down = False
             self.why = ""
             await self._run_pipelines(record_on=True)
             if not self.cameras and self._specs:

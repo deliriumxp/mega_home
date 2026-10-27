@@ -21,6 +21,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import errno
+import json
 import os
 import re
 import shutil
@@ -42,6 +43,9 @@ _CONTAINER_FS = {"overlay", "tmpfs", "ramfs", "rootfs", "aufs", "squashfs", "dev
 # Без исполнения, устройств и времени доступа: видео, а не система.
 _FLAGS = 2 | 4 | 8 | 1024  # MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME
 _SKIP = ("loop", "ram", "zram", "mtdblock", "sr", "fd", "nbd", "dm-")
+# Точка → (настройка, источник в /proc/mounts), которые смонтировал этот дом: та же настройка на той же точке —
+# без повторного разбора (DNS, суперблоки).
+_ACTIVE: dict[str, tuple[str, str]] = {}
 _ERRORS = {
     # Замер 2026-10-23, привилегированный LXC Proxmox: tmpfs монтируется, cifs и nfs — EPERM, пока
     # в конфиге контейнера нет `features: mount=cifs;nfs` (AppArmor Proxmox).
@@ -209,15 +213,22 @@ def mount(spec: dict[str, Any], target: Path = MOUNT_POINT) -> str:
     """Смонтировать `spec` (`type`: `cifs`/`nfs`/`usb`, `source`, `user`, `pass`, `options`) в
     `target`; уже смонтировано то же — ничего не делать. Пусто — смонтировано, иначе причина."""
     kind, source = str(spec.get("type") or ""), str(spec.get("source") or "").strip()
+    key = json.dumps(spec, sort_keys=True, default=str)
+    current = mounted().get(str(target))
+    # ⚠ Та же настройка уже смонтирована этим домом — ни DNS, ни чтения суперблоков: сторож зовёт `mount` раз в
+    # минуту, и сбой DNS (перезагрузили роутер) делал «проблему» из живого NAS — запись всех камер снималась
+    # (ревью 2026-10-27). Жива ли точка, проверяет `storage_problem`.
+    if current is not None and _ACTIVE.get(str(target)) == (key, current[0]):
+        return ""
     try:
         device, fstype, data = _plan(kind, source, spec)
     except (ValueError, OSError) as err:
         return str(err)
-    current = mounted().get(str(target))
     # ⚠ Без хвостовой «/»: ядро показывает источник в /proc/mounts без неё, а настройка менеджера
     # может её содержать — с ложным несовпадением сторож записи (раз в минуту) отмонтировал бы
     # рабочий NAS посреди записи.
     if current is not None and current[0].rstrip("/") == device.rstrip("/"):
+        _ACTIVE[str(target)] = (key, current[0])
         return ""
     if current is not None:
         unmount(target)
@@ -226,11 +237,15 @@ def mount(spec: dict[str, Any], target: Path = MOUNT_POINT) -> str:
     if libc.mount(device.encode(), str(target).encode(), fstype.encode(), _FLAGS, data.encode()) != 0:
         code = ctypes.get_errno()
         return f"не смонтировалось ({source}): {_ERRORS.get(code, os.strerror(code))}"
+    after = mounted().get(str(target))
+    if after is not None:
+        _ACTIVE[str(target)] = (key, after[0])
     return ""
 
 
 def unmount(target: Path = MOUNT_POINT) -> None:
     """Отмонтировать лениво (MNT_DETACH): открытый ffmpeg не держит отмену записи."""
+    _ACTIVE.pop(str(target), None)
     if str(target) in mounted():
         _libc().umount2(str(target).encode(), 2)
 
