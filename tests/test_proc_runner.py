@@ -149,3 +149,46 @@ def test_отмена_снимает_процесс_и_учёт_нагрузки
     assert tracked is not None
     assert code is not None
     assert still is False
+
+
+def test_источник_отказал_до_срока_пауза_его_а_не_удвоение(monkeypatch) -> None:
+    """`Refused` — камера сама сказала «не сейчас»: повтор через её срок, а не через 10–120 с (каждая попытка
+    входа продлевала бы блокировку)."""
+    from mega_home.core.proc_runner import Refused
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) >= 2:
+            raise asyncio.CancelledError
+
+    async def spawn():
+        raise Refused("камера заблокировала вход", 1800)
+
+    async def tick() -> float:
+        return 0.0
+
+    runner = ProcessRunner(FakeHost(), "cam", stall_s=60)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    try:
+        asyncio.run(runner.run(spawn, tick))
+    except asyncio.CancelledError:
+        pass
+    assert sleeps == [1800, 1800] and runner.why == "камера заблокировала вход"
+
+
+def test_нет_видео_в_потоке_причина_словами() -> None:
+    started: list[asyncio.subprocess.Process] = []
+    runner = ProcessRunner(FakeHost(), "rec", stall_s=60)
+    code = "import sys; sys.stderr.write('[segment @ 0x1] dimensions not set\\n'); sys.exit(234)"
+
+    async def once() -> None:
+        await runner._once(await _spawn(code, started)(), _tick_now)  # noqa: SLF001
+
+    asyncio.run(once())
+    assert runner.why.startswith("в потоке нет видео")
+
+
+async def _tick_now() -> float:
+    return time.monotonic()

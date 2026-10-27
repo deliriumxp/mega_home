@@ -22,7 +22,7 @@ import shutil
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import aiohttp
 
@@ -31,7 +31,7 @@ from .activity import ActivityBuckets
 from .const import LOGGER
 from .go2rtc_embed import API_PORT
 from .latest_frame import LatestFrame, pump
-from .proc_runner import ProcessRunner
+from .proc_runner import ProcessRunner, Refused
 from .recorder_preview import PreviewSink
 from .recorder_sink import RAM_DIR, RecordSink
 from .video_reader import ReaderFds, ReaderSpec, reader_command, reader_plan
@@ -52,6 +52,9 @@ PREPARE_RETRY_S = 10.0
 PREPARE_RETRY_MAX_S = 120.0
 # ⚠ Свой срок на API go2rtc: умолчание сессии HA — 300 с, и зависший go2rtc держал бы запуск камеры минутами.
 GO2RTC_TIMEOUT = aiohttp.ClientTimeout(total=10)
+# Камера заблокировала вход по RTSP (защита от подбора): следующий вход — не раньше. Блокировку продлевает каждая
+# попытка входа, а наш перезапуск раз в 2 мин держал её сутки (камера .90.147 объекта .90.250, 2026-10-27).
+LOCKED_RETRY_S = 1800
 
 
 class CameraPipeline:
@@ -181,6 +184,12 @@ class CameraPipeline:
 
     async def _spawn(self, spec: ReaderSpec) -> asyncio.subprocess.Process:
         self._retire(spec.key)
+        runner = self.runners.get(spec.key)
+        if runner is not None and runner.why:
+            # Прошлый запуск отказал — сперва спросить камеру, пускает ли она вообще (`rtsp_locked`).
+            source = next((s.source for s in self.plan.streams.values() if s.name == spec.stream), "")
+            if await rtsp_locked(source):
+                raise Refused(f"камера заблокировала вход по RTSP (защита от подбора пароля) — повтор через {LOCKED_RETRY_S // 60:g} мин", LOCKED_RETRY_S)
         await self._settle(spec)
         await self._restore()
         loop = asyncio.get_running_loop()
@@ -295,6 +304,28 @@ class CameraPipeline:
         out: dict[str, Any] = self.record.state() if self.record is not None else {"mode": None}
         why = "; ".join([self.why] * bool(self.why) + [f"{key}: {runner.why}" for key, runner in self.runners.items() if runner.why])
         return {**out, "readers": why, "frameAt": round(shot[1], 3) if shot else None, "recording": self.record_on}
+
+
+async def rtsp_locked(source: str) -> bool:
+    """Камера отвечает «заблокировано» на `OPTIONS` — запрос БЕЗ учётки, входом он не считается и блокировку не
+    продлевает (RFC 2326 §10.1: `OPTIONS` не требует авторизации). Ответ камеры .90.147: `RTSP/1.0 400 Server is
+    locked` и на `OPTIONS`, и на `DESCRIBE`. Не RTSP, нет ответа, другой ответ — не блокировка: решает обычный повтор."""
+    url = urlsplit(source)
+    if url.scheme != "rtsp" or not url.hostname:
+        return False
+    target = f"rtsp://{url.hostname}:{url.port or 554}{url.path or '/'}"
+    writer = None
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(url.hostname, url.port or 554), 5)
+        writer.write(f"OPTIONS {target} RTSP/1.0\r\nCSeq: 1\r\n\r\n".encode())
+        await writer.drain()
+        status = await asyncio.wait_for(reader.readline(), 5)
+    except (OSError, asyncio.TimeoutError, ValueError):
+        return False
+    finally:
+        if writer is not None:
+            writer.close()
+    return status.startswith(b"RTSP/") and b"locked" in status.lower()
 
 
 async def _pipe_reader(loop: Any, fd: int) -> tuple[asyncio.StreamReader, Any]:
