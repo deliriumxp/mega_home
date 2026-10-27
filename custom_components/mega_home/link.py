@@ -70,6 +70,8 @@ class ManagerLink:
         self._watch: Any = None
         # Качалка кадров `event` в сокет; живёт ровно одно подключение (`_attach_events`).
         self._event_pump: asyncio.Task[None] | None = None
+        # Тип установки HA не меняется за жизнь процесса — спрашиваем один раз.
+        self._installation_type: str | None = None
 
     @property
     def connected(self) -> bool:
@@ -193,6 +195,10 @@ class ManagerLink:
             # ⚠ Общим энкодером: в ответе `states` бывают даты атрибутов, и голый
             # `json.dumps` на них падал — ответ не уходил вовсе (`ops_base.dumps`).
             await socket.send_json(reply, dumps=dumps)
+            if reply["ok"] and frame.get("op") == "host-unit":
+                # Служба хоста переключена — hello заново, как после смены бандла:
+                # карточка объекта читает состояние из него, второго пути нет.
+                await socket.send_json(await self._hello())
         except Exception as err:  # noqa: BLE001 - the link reconnects on its own
             LOGGER.debug("Could not send the answer: %s", err)
 
@@ -316,7 +322,29 @@ class ManagerLink:
             # браузеру, а не то, что мы намеревались скачать.
             "app_version": bundle.version if bundle else None,
             "app_error": bundle.last_error if bundle else None,
+            # Ядро, тип установки и Bluetooth хоста: уязвим ли дом к падению MGMT,
+            # решает менеджер своей таблицей (`host_system.py`). Нет поля — дом
+            # старый, менеджер молчит.
+            "host": await self._host(),
         }
+
+    async def _host(self) -> dict[str, Any] | None:
+        """Факты о хосте для hello; любая ошибка — `None`, канал важнее подсказки."""
+        from .host_system import facts
+
+        try:
+            if self._installation_type is None:
+                # Тип установки знает только HA: «Home Assistant OS», «Home Assistant
+                # Supervised», «Home Assistant Container», «Home Assistant Core»
+                # (`helpers/system_info.py` ядра — страницы документации нет).
+                from homeassistant.helpers.system_info import async_get_system_info
+
+                info = await async_get_system_info(self._hass)
+                self._installation_type = str(info.get("installation_type") or "")
+            return await facts(self._coordinator.env.run, self._installation_type or None)
+        except Exception as err:  # noqa: BLE001 - канал важнее подсказки
+            LOGGER.debug("Host facts are unavailable: %s", err)
+            return None
 
     async def _handle(self, payload: dict[str, Any], socket: Any = None) -> None:
         kind = payload.get("t")
