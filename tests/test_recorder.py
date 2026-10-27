@@ -868,16 +868,23 @@ def test_служба_открывает_двигает_и_закрывает_с
                 gone = await (await client.post(f"/sessions/{opened['id']}/seek?at=1")).json()
                 gone_status = (await client.post(f"/sessions/{opened['id']}/seek?at=1")).status
                 empty = (await client.post("/sessions?camera=onvif-aa&at=1000")).status
-                return opened, moved, paused, closed, gone, gone_status, empty
+                # Все места камеры заняты смотрящими — 429 с причиной, а не вытеснение чужого просмотра.
+                for _ in range(3):
+                    opened_more = await (await client.post(f"/sessions?camera=onvif-aa&at={int((base + 5) * 1000)}")).json()
+                    recorder.sessions.sessions[opened_more["id"]].reader = object()  # type: ignore[assignment]
+                busy = await client.post(f"/sessions?camera=onvif-aa&at={int((base + 5) * 1000)}")
+                return opened, moved, paused, closed, gone, gone_status, empty, (busy.status, await busy.json())
         finally:
+            await recorder.sessions.close_all()
             await runner.cleanup()
             services.unregister(rec.SERVICE)
 
-    opened, moved, paused, closed, gone, gone_status, empty = asyncio.run(scenario())
+    opened, moved, paused, closed, gone, gone_status, empty, busy = asyncio.run(scenario())
     assert opened["stream"] == f"play_{opened['id']}" and opened["startMs"] == int((base + 5) * 1000)
     assert moved == {"startMs": int((base + 15) * 1000)}
     assert (paused, closed, gone_status, empty) == (200, 200, 404, 404)
     assert gone == {"error": "сессии нет"}
+    assert busy[0] == 429 and "уже смотрят" in busy[1]["error"]
 
 
 def test_поток_сессии_закрыт_для_телефона() -> None:
@@ -900,13 +907,20 @@ def test_последний_кадр_камеры(tmp_path: Path) -> None:
         try:
             async with TestClient(TestServer(runner.app)) as client:
                 before = (await client.get("/latest?camera=onvif-aa")).status
-                recorder.pipelines["onvif-aa"].frame.feed(b"\xff\xd8jpeg\xff\xd9")
+                frame = recorder.pipelines["onvif-aa"].frame
+                frame.feed(b"\xff\xd8jpeg\xff\xd9")
                 answer = await client.get("/latest?camera=onvif-aa")
-                return before, answer.status, await answer.read(), answer.headers.get("Cache-Control", "")
+                result = (before, answer.status, await answer.read(), answer.headers.get("Cache-Control", ""))
+                # Ревью 2026-10-27: читатель мёртв — кадр часовой давности отдавался как живой (плитка «живая», кадр к
+                # звонку — старый). Старше срока — 404, тот, кто просит, берёт другой путь.
+                frame._last = (frame._last[0], time.time() - 3600)  # noqa: SLF001
+                stale = (await client.get("/latest?camera=onvif-aa")).status
+                return (*result, stale)
         finally:
             await runner.cleanup()
             services.unregister(rec.SERVICE)
 
-    before, status, body, cache = asyncio.run(scenario())
+    before, status, body, cache, stale = asyncio.run(scenario())
     assert (before, status, body) == (404, 200, b"\xff\xd8jpeg\xff\xd9")
     assert cache == "private, max-age=2"
+    assert stale == 404

@@ -44,9 +44,15 @@ from .ts_sps import SpsFix
 if TYPE_CHECKING:
     from .recorder import Recorder
 
-# Сессий на дом и на камеру: сверх — снимается самая давняя по последней команде.
+# Сессий на дом и на камеру: сверх — снимается самая давняя БРОШЕННАЯ; смотрятся все — отказ (`SessionsBusy`).
 MAX_SESSIONS = 8
 MAX_PER_CAMERA = 3
+# Столько раз подряд ffmpeg отдал байты и оборвался на том же месте — кусок битый, пропустить.
+STUCK_TRIES = 2
+
+
+class SessionsBusy(Exception):
+    """Новую сессию не открыть: все места заняты смотрящими."""
 # Сессия, к которой зритель так и не пришёл (переговоры не начались), и сессия, чей зритель ушёл.
 IDLE_S = 30.0
 GRACE_S = 10.0
@@ -180,10 +186,10 @@ class PlaybackSessions:
         """Новая сессия на метке; ответ — id, имя потока go2rtc и где встанет первый кадр (ключевой)."""
         session = PlaybackSession(id=uuid4().hex[:12], camera=camera, stream="", playlist=Path(), touched=clock())
         session.stream = f"play_{session.id}"
+        await self._evict(camera)
         start = await self._prepare(session, at_s, started=False)
         if start is None:
             raise LookupError("записи у этого момента нет")
-        await self._evict(camera)
         self.sessions[session.id] = session
         await self._go2rtc("PUT", f"name={quote(session.stream, safe='')}&src={quote(self._source(session), safe='')}")
         if self._sweeper is None or self._sweeper.done():
@@ -354,6 +360,7 @@ class PlaybackSessions:
     async def _feed(self, session: PlaybackSession, gen: int) -> None:
         """Подавать, пока сессия жива: конец списка — следующий с конца прежнего, у живого края — ждать."""
         failures = 0
+        stuck, stuck_at = 0, None
         while not session.closed and session.reader is not None and not session.paused and gen == session.gen:
             offset = clock() - session.first_byte_at if session.first_byte_at is not None else 0.0
             binary = await self.rec.env.run(shutil.which, "ffmpeg") or "ffmpeg"
@@ -389,6 +396,19 @@ class PlaybackSessions:
                 # единого байта второй раз подряд — не крутить его без паузы.
                 if failures >= 2:
                     await asyncio.sleep(RETRY_S)
+                if sent:
+                    # Не продвинулось ВПЕРЁД (откат к ключевому кадру — тоже на месте).
+                    stuck = stuck + 1 if stuck_at is not None and position < stuck_at + 1.0 else 1
+                    stuck_at = position if stuck == 1 else stuck_at
+                    if stuck >= STUCK_TRIES:
+                        # ⚠ Байты пошли, а место не сдвинулось — битый кусок: с того же ключевого кадра жилец видел одни
+                        # и те же секунды по кругу (ревью 2026-10-27). Кусок — пропустить, причину — в журнал.
+                        stuck, stuck_at = 0, None
+                        begin = next((b for b, n in session.run if b <= position < b + n), position)
+                        LOGGER.warning("Просмотр %s: обрыв на одном месте (%.0f) дважды — кусок пропущен", session.camera, position)
+                        if gen == session.gen and await self._prepare(session, begin, started=True) is None:
+                            await asyncio.sleep(RETRY_S)
+                        continue
                 if gen == session.gen and await self._prepare(session, position if sent else session.at_s, started=False) is None:
                     await asyncio.sleep(RETRY_S)
                 continue
@@ -456,12 +476,16 @@ class PlaybackSessions:
                 LOGGER.warning("Просмотр %s: ffmpeg сессии не снялся", session.id)
 
     async def _evict(self, camera: str) -> None:
-        own = sorted((s for s in self.sessions.values() if s.camera == camera), key=lambda s: s.touched)
-        while len(own) >= MAX_PER_CAMERA:
-            await self.close(own.pop(0).id)
-        every = sorted(self.sessions.values(), key=lambda s: s.touched)
-        while len(every) >= MAX_SESSIONS:
-            await self.close(every.pop(0).id)
+        """Место под новую сессию — за счёт БРОШЕННЫХ (без читателя), самых давних первыми. ⚠ Смотрящую не снимать:
+        тот зритель вставал, его перемотка вытесняла следующего — каскад (ревью 2026-10-27). Все смотрятся — отказ."""
+        for limit, pool in ((MAX_PER_CAMERA, [s for s in self.sessions.values() if s.camera == camera]), (MAX_SESSIONS, list(self.sessions.values()))):
+            idle = sorted((s for s in pool if s.reader is None), key=lambda s: s.touched)
+            while len(pool) >= limit:
+                if not idle:
+                    raise SessionsBusy(f"запись этой камеры уже смотрят {len(pool)}" if limit == MAX_PER_CAMERA else "дом уже показывает предельное число записей")
+                victim = idle.pop(0)
+                pool.remove(victim)
+                await self.close(victim.id)
 
     async def _go2rtc(self, method: str, query: str) -> None:
         url = f"http://127.0.0.1:{API_PORT}/api/streams?{query}"

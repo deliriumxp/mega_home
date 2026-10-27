@@ -409,6 +409,57 @@ def test_предел_сессий_снимает_самую_старую_той
     assert ids[0] not in world.sessions.sessions and all(sid in world.sessions.sessions for sid in ids[1:])
 
 
+def test_смотрящую_сессию_не_вытесняет_новое_открытие(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ревью 2026-10-27: четвёртое открытие той же камеры снимало сессию, которую СМОТРЯТ (самая давняя перемотка), —
+    тот зритель вставал, его перемотка вытесняла следующего: каскад. Вытесняется только брошенная; все смотрятся —
+    новое открытие получает отказ."""
+    world = _World(tmp_path, monkeypatch)
+
+    async def scenario() -> tuple[str, list[str]]:
+        ids = []
+        for n in range(rs.MAX_PER_CAMERA):
+            world.clock[0] += 1
+            ids.append((await world.sessions.open("onvif-aa", BASE + 25 + n))[0])
+        for sid in ids[:-1]:
+            world.sessions.sessions[sid].reader = object()  # type: ignore[assignment]
+        fourth = (await world.sessions.open("onvif-aa", BASE + 40))[0]
+        world.sessions.sessions[fourth].reader = object()  # type: ignore[assignment]
+        with pytest.raises(rs.SessionsBusy):
+            await world.sessions.open("onvif-aa", BASE + 45)
+        return fourth, ids
+
+    fourth, ids = asyncio.run(scenario())
+    assert set(world.sessions.sessions) == {*ids[:-1], fourth}
+
+
+def test_обрыв_на_одном_месте_дважды_пропускает_кусок(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ревью 2026-10-27: ошибка чтения посреди куска — ffmpeg отдал байты и упал, место не сдвинулось, перепланирование
+    с того же ключевого кадра — жилец видел одни и те же секунды по кругу, журнал молчал. Дважды на том же месте — кусок
+    пропускается, причина в журнале."""
+    world = _World(tmp_path, monkeypatch)
+
+    async def scenario() -> list[str]:
+        sid, _stream, _start = await world.sessions.open("onvif-aa", BASE + 25)
+        client, response = await _serve(world, sid)
+        try:
+            for n in range(rs.STUCK_TRIES):
+                await _until(lambda: len(world.procs) > n)
+                world.procs[n].stdout.feed_data(b"A" * 188)
+                await response.content.readexactly(188)
+                world.procs[n].kill()  # байты пошли, и ffmpeg упал на битом месте
+            await _until(lambda: len(world.procs) > rs.STUCK_TRIES)
+            return Path(_value(world.procs[rs.STUCK_TRIES].argv, "-i")).read_text().splitlines()
+        finally:
+            await world.sessions.close_all()
+            await client.close()
+
+    listed = asyncio.run(scenario())
+    index = world.recorder.cameras["onvif-aa"].index
+    after = index.first_after(BASE + 20, BASE + 100, started=True)  # кусок после битого [20, 30)
+    assert after is not None and after[0] == BASE + 30
+    assert listed[1] == f"file '{after[2]}'" and "inpoint" not in listed[2]
+
+
 def test_конец_списка_у_живого_края_ждёт_новых_кусков(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     world = _World(tmp_path, monkeypatch)
     monkeypatch.setattr(rs, "RETRY_S", 0.05)

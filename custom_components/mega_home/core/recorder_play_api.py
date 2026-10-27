@@ -1,7 +1,8 @@
 """Маршруты службы `recorder` для просмотра записи сессией и последнего кадра камеры (дом 0.6.0+).
 
 Контракт с бандлом (`home-playback.ts` менеджера) и менеджером (кадр маски, кадр события):
-  * `POST /sessions?camera&at=<мс UTC>` → `{"id", "stream", "startMs"}` | 404 — записи у метки нет;
+  * `POST /sessions?camera&at=<мс UTC>` → `{"id", "stream", "startMs"}` | 404 — записи у метки нет | 429 — все
+    места камеры (дома) заняты смотрящими (дом 0.6.5+; раньше вытеснялась смотрящая);
   * `POST /sessions/{id}/seek?at=<мс>` → `{"startMs"}` | 404 `{"error": "сессии нет"}` — бандл откроет новую |
     416 — записи у метки нет (сессия играет прежнее место);
   * `POST /sessions/{id}/pause` → `{"ok": true}`; `DELETE /sessions/{id}` → `{"ok": true}`;
@@ -15,7 +16,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import time
+
 from aiohttp import web
+
+from .recorder_session import SessionsBusy
+
+# Кадр конвейера обновляется раз в 2 с: старше этого — читатель стоит.
+LATEST_STALE_S = 30.0
 
 if TYPE_CHECKING:
     from .recorder import Recorder
@@ -33,6 +41,9 @@ def add_routes(app: web.Application, recorder: Recorder) -> None:
             sid, stream, start = await recorder.sessions.open(camera, at)
         except LookupError as err:
             return web.json_response({"error": str(err)}, status=404)
+        except SessionsBusy as err:
+            # Все места заняты смотрящими: отказ новому, а не вытеснение чужого просмотра (ревью 2026-10-27).
+            return web.json_response({"error": str(err)}, status=429)
         return web.json_response({"id": sid, "stream": stream, "startMs": int(start * 1000)})
 
     async def seek(request: web.Request) -> web.Response:
@@ -64,6 +75,10 @@ def add_routes(app: web.Application, recorder: Recorder) -> None:
         shot = pipeline.latest() if pipeline is not None else None
         if shot is None:
             return web.json_response({"error": "кадра камеры нет"}, status=404)
+        if time.time() - shot[1] > LATEST_STALE_S:
+            # ⚠ Читатель стоит — кадр давний: отдать его как живой значило показать плитку «живой» и старый кадр к
+            # звонку (ревью 2026-10-27). 404 — просящий берёт другой путь (кадр go2rtc).
+            return web.json_response({"error": "кадр камеры устарел — поток не идёт"}, status=404)
         # Кадр обновляется раз в 2 с (`video_reader.LATEST_FPS`): держать дольше — показывать старое.
         return web.Response(body=shot[0], content_type="image/jpeg", headers={"Cache-Control": "private, max-age=2"})
 
