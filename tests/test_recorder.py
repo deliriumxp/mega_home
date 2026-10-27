@@ -409,6 +409,31 @@ def test_лимит_убирает_самые_старые_куски_а_не_с
     assert [p.exists() for p in early] == [False] * 60 + [True]
 
 
+def test_служба_отдаёт_состояние_камер_с_часами_дома_только_менеджеру(tmp_path: Path) -> None:
+    """.102, ночь на 2026-10-27: читатель камеры 8 ч крутил отказ, а менеджер молчал — состояние камер жило только в
+    диагностике HA. `/state` — то же состояние записи с часами дома (по ним менеджер судит о свежести кадра)."""
+    from mega_home.core.recorder_api import _installer_only
+
+    recorder = rec.Recorder(FakeHost(tmp_path), lambda _listener: (lambda: None))
+    recorder.storage = tmp_path
+    recorder.cameras = {"onvif-aa": _camera(tmp_path)}
+
+    async def scenario() -> dict:
+        runner = await start_api(recorder)
+        try:
+            async with TestClient(TestServer(runner.app)) as client:
+                return await (await client.get("/state")).json()
+        finally:
+            await runner.cleanup()
+            services.unregister(rec.SERVICE)
+
+    before = time.time()
+    state = asyncio.run(scenario())
+    assert before <= state["now"] <= time.time()
+    assert "onvif-aa" in state["cameras"]
+    assert _installer_only("path", "/state") is not None
+
+
 def test_служба_отдаёт_дни_участки_и_список(tmp_path: Path) -> None:
     base = rec.epoch_of("20261023T120000")
     assert base is not None

@@ -65,6 +65,7 @@ async def start_api(recorder: Recorder) -> web.AppRunner:
     app.router.add_get("/previews", _previews)
     app.router.add_get("/preview", _preview)
     app.router.add_get("/overview", _overview)
+    app.router.add_get("/state", _state)
     app.router.add_get("/activity", _activity)
     app.router.add_get("/disks", _disks)
     app.router.add_get("/folders", _folders)
@@ -88,6 +89,8 @@ def _installer_only(what: str, value: str) -> str | None:
     path = value.split("?", 1)[0].rstrip("/") if what == "path" else ""
     if path in ("/disks", "/folders", "/mount"):
         return "хранилище записи настраивает инсталлятор через менеджер"
+    if path == "/state":
+        return "состояние записи смотрит инсталлятор через менеджер"
     # Поток сессии читает свой go2rtc на петле; телефону он идёт WebRTC, а не дверью.
     if path.startswith("/sessions/") and path.endswith(".ts"):
         return "поток просмотра читает go2rtc дома"
@@ -402,6 +405,13 @@ async def _overview(request: web.Request) -> web.Response:
         raise web.HTTPNotFound(text='{"error": "обзора нет"}', content_type="application/json")
     cache = "no-store" if day_of(start) == day_of(time.time()) else "private, max-age=86400"
     return web.Response(body=data, content_type="video/mp4", headers={"Cache-Control": cache})
+
+
+async def _state(request: web.Request) -> web.Response:
+    """Состояние записи и камер (как в диагностике HA) с часами дома `now`: менеджер судит о простое камеры —
+    отказ читателя, давний кадр — по ним, а не по своим часам (дом 0.6.4+)."""
+    recorder: Recorder = request.app[_RECORDER]
+    return web.json_response({"now": time.time(), **recorder.state()})
 
 
 async def _activity(request: web.Request) -> web.Response:
