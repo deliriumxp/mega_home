@@ -70,11 +70,12 @@ class Detector:
         lightning: float = 0.8,
         alpha: float = 0.01,
         mask: Any = None,
-        min_size: float = 0.0,
     ) -> None:
         self.np, self.threshold, self.area, self.lightning, self.alpha = np, threshold, area, lightning, alpha
-        # Минимальная площадь бокса движения в процентах кадра: далёкий человек не считается.
-        self.min_size = min(max(min_size, 0.0), 100.0)
+        # ⚠ Порога размера у движения нет, как у Frigate: его `contour_area` — шум в 10 точек (здесь — `area`
+        # окна), а размер объекта (`min_area`) проверяется у рамки ОБЪЕКТА. Порог по изменившимся точкам
+        # (0.5.38–0.6.5) отсекал людей целиком: у идущего человека меняется 1,6–5,3 % кадра при пороге
+        # 10–15 % (записи объекта .90.250, 2026-10-26/27). Размер человека — `PersonTune.min_size`.
         # Маска — многоугольники в долях кадра, как у Frigate (блик, мигающий фонарь, ветки): там
         # кадр обнуляется, и ни фон, ни живость изменений не видят.
         self.masked = masked_area(np, mask)
@@ -127,7 +128,7 @@ class Detector:
             self.lively.append(self._windows(np.abs(frame - self.previous[0]) > self.threshold))
         self.previous = (frame, pixels)
         live = found & (sum(self.lively) >= LIVELY_NEED) if len(self.lively) == LIVELY_OF else None
-        self.box = _accepted_box(np, live, dilated, self.min_size) if live is not None else None
+        self.box = _live_box(np, live) if live is not None else None
         alive = self.box is not None
         if share < 0.05 and spots <= 4:
             self.calibrating = False
@@ -144,48 +145,17 @@ class Detector:
         return 0.0 if self.calibrating or not alive else float(share)
 
 
-def _accepted_box(np: Any, windows: Any, changed: Any, min_size: float) -> tuple[int, int, int, int] | None:
-    """Бокс принятых компонент движения (пиксели кадра) или None.
-
-    Соседние окна 16×16 сливаются в компоненты; компонент, у которого площадь ИЗМЕНИВШИХСЯ
-    пикселей меньше `min_size` процентов кадра, отбрасывается (далёкий человек, мелкий блик).
-    ⚠ Не площадь бокса: у идущего пятна бокс раздувается хвостом и порог переставал бы ловить
-    далёкого человека.
-    """
-    found = windows
-    rows, cols = found.shape
-    seen = np.zeros_like(found, dtype=bool)
-    accepted: list[tuple[int, int, int, int]] = []
-    for row in range(rows):
-        for col in range(cols):
-            if not found[row, col] or seen[row, col]:
-                continue
-            seen[row, col] = True
-            stack = [(row, col)]
-            top = bottom = row
-            left = right = col
-            while stack:
-                r, c = stack.pop()
-                top, bottom = min(top, r), max(bottom, r)
-                left, right = min(left, c), max(right, c)
-                for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
-                    if 0 <= nr < rows and 0 <= nc < cols and found[nr, nc] and not seen[nr, nc]:
-                        seen[nr, nc] = True
-                        stack.append((nr, nc))
-            # Окно (r, c) — это 16×16 пикселей, начиная с (c, r)·CELL (склейка 3×3).
-            x0, y0 = left * CELL, top * CELL
-            x1, y1 = (right + 2) * CELL, (bottom + 2) * CELL
-            area = int(np.count_nonzero(changed[y0:y1, x0:x1])) * 100.0 / (WIDTH * HEIGHT)
-            if area >= min_size:
-                accepted.append((x0, y0, x1, y1))
-    if not accepted:
+def _live_box(np: Any, windows: Any) -> tuple[int, int, int, int] | None:
+    """Рамка живых окон (пиксели кадра) или None. Окно (r, c) — 16×16 пикселей от (c, r)·CELL (склейка 2×2 ячеек)."""
+    rows, cols = np.nonzero(windows)
+    if not len(rows):
         return None
-    return (
-        min(box[0] for box in accepted),
-        min(box[1] for box in accepted),
-        max(box[2] for box in accepted),
-        max(box[3] for box in accepted),
-    )
+    return int(cols.min()) * CELL, int(rows.min()) * CELL, (int(cols.max()) + 2) * CELL, (int(rows.max()) + 2) * CELL
+
+
+def box_share(box: tuple[int, int, int, int]) -> float:
+    """Площадь рамки в процентах кадра — мера `person.minSize`, как `min_area` объекта у Frigate."""
+    return (box[2] - box[0]) * (box[3] - box[1]) * 100.0 / (WIDTH * HEIGHT)
 
 
 def masked_area(np: Any, polygons: Any) -> Any:
@@ -340,7 +310,6 @@ class MotionLoop:
             lightning=_number(spec, "lightning", 0.8, 0.1, 1.0),
             alpha=_number(spec, "alpha", 0.01, 0.001, 0.5),
             mask=spec.get("mask"),
-            min_size=_number(spec, "minSize", 0.0, 0.0, 100.0),
         )
         fps = _number(spec, "fps", 5, 1, 10)
         self.need = int(_number(spec, "frames", 2, 1, 50))
@@ -364,8 +333,10 @@ class MotionLoop:
         host_load.spent(self.load_key, time.thread_time() - began)
         self.index += 1
         if self.watch is not None:
-            # Повтор кадра — тоже кадр потока: номер растёт, рамка — прежняя.
-            self.boxes.append((self.index, self.detector.box if share != 0.0 else None))
+            # Повтор кадра — тоже кадр потока: номер растёт, рамка — прежняя. Рамка меньше `minSize` сети не идёт
+            # (далёкий человек, кошка): окно движения и запись она не трогает.
+            box = self.detector.box if share != 0.0 else None
+            self.boxes.append((self.index, box if box is not None and box_share(box) >= self.tune.min_size else None))
         if share is None:
             return
         now = loop.time()
@@ -417,11 +388,12 @@ class MotionLoop:
 
 
 class PersonTune(NamedTuple):
-    """Кадр выреза и снимок события — из раздела `person` описания."""
+    """Кадр выреза, снимок события и наименьшая рамка человека (`minSize`, % кадра) — из раздела `person` описания."""
 
     width: int = PERSON_WIDTH
     margin: float = person.MARGIN
     shot: int = SHOT_WIDTH
+    min_size: float = 0.0
 
 
 async def _person_setup(loop: asyncio.AbstractEventLoop, np: Any, spec: dict[str, Any]) -> tuple[Any, Any, PersonTune]:
@@ -445,6 +417,7 @@ async def _person_setup(loop: asyncio.AbstractEventLoop, np: Any, spec: dict[str
         width=int(_number(options, "width", PERSON_WIDTH, 320, 1920)) // 2 * 2,
         margin=_number(options, "margin", person.MARGIN, 0.0, 1.0),
         shot=int(_number(options, "shot", SHOT_WIDTH, 160, 1280)),
+        min_size=_number(options, "minSize", 0.0, 0.0, 100.0),
     )
     return watch, model, tune
 
