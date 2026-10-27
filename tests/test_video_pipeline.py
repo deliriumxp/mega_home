@@ -319,3 +319,30 @@ def test_служба_отвечает_по_камере_конвейера(tmp_
     days, segments, level, foreign = asyncio.run(scenario())
     assert (days, segments, foreign) == (200, 200, 404)
     assert level["activity"] == [[1000000, 0.4]]
+
+
+def test_блокировку_камеры_узнаём_запросом_без_учётки() -> None:
+    """`OPTIONS` без учётки: «Server is locked» — блокировка; обычный ответ, не RTSP, нет ответа — нет."""
+    from mega_home.core.video_pipeline import rtsp_locked
+
+    seen: list[bytes] = []
+
+    async def scenario(answer: bytes) -> bool:
+        async def handle(reader, writer):  # noqa: ANN001
+            seen.append(await reader.readuntil(b"\r\n\r\n"))
+            writer.write(answer)
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            return await rtsp_locked(f"rtsp://admin:secret@127.0.0.1:{port}/stream1")
+        finally:
+            server.close()
+
+    assert asyncio.run(scenario(b"RTSP/1.0 400 Server is locked\r\nCSeq: 1\r\n\r\n")) is True
+    assert asyncio.run(scenario(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n")) is False
+    # Учётка в запрос не уходит — это не попытка входа.
+    assert all(b"secret" not in s and b"Authorization" not in s for s in seen)
+    assert asyncio.run(rtsp_locked("ffmpeg:x")) is False

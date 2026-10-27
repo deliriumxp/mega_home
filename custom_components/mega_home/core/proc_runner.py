@@ -28,6 +28,15 @@ HEALTHY_S = 60.0
 _ADDRESS = re.compile(r"0x[0-9a-f]+")
 
 
+class Refused(Exception):
+    """Запуск бессмыслен до срока: источник сам сказал «не сейчас» (камера заблокировала вход). Пауза — его, а не
+    удвоение: каждая попытка входа продлевала бы блокировку."""
+
+    def __init__(self, why: str, retry_s: float) -> None:
+        super().__init__(why)
+        self.retry_s = retry_s
+
+
 class ProcessRunner:
     """⚠ Отказ подряд растягивает паузу вдвое до `max_restart_s`: камера или панель с малым числом RTSP-сессий
     (вызывная панель, .90.250 2026-10-27) получала новое подключение каждые ~15 с, и журнал — строку на каждый перезапуск."""
@@ -52,10 +61,13 @@ class ProcessRunner:
         pause = self.restart_s
         while True:
             self._progressed = 0.0
+            wait: float | None = None
             try:
                 await self._once(await spawn(), tick)
             except asyncio.CancelledError:
                 raise
+            except Refused as err:
+                self.why, wait = str(err), err.retry_s
             except Exception as err:  # noqa: BLE001 — один отказ не роняет камеру насовсем
                 self.why = str(err)
             if _ADDRESS.sub("0x", self.why) != _ADDRESS.sub("0x", self._reported):
@@ -64,7 +76,7 @@ class ProcessRunner:
             # ⚠ «Здоров» — по ПРОГРЕССУ, не по времени жизни: снятый по «встал» живёт дольше порога всегда, и пауза
             # сбрасывалась — камера без данных получала новое подключение каждую минуту (ревью 2026-10-27).
             pause = self.restart_s if self._progressed >= HEALTHY_S else min(pause * 2, self.max_restart_s)
-            await asyncio.sleep(pause)
+            await asyncio.sleep(wait if wait is not None else pause)
 
     async def _once(self, proc: asyncio.subprocess.Process, tick: Callable[[], Awaitable[float]]) -> None:
         self._tail.clear()
@@ -85,7 +97,11 @@ class ProcessRunner:
                     return
                 self.why = self._reported = ""
             await asyncio.wait_for(drain, 1)
-            self.why = f"ffmpeg завершился ({proc.returncode}): {' | '.join(self._tail) or 'без слов'}"
+            tail = " | ".join(self._tail) or "без слов"
+            # Копия без размера кадра — в потоке не пришло ни одного кадра видео (вызывная панель .90.250 2026-10-28: основной
+            # поток без пакетов, дополнительный живой). Инсталлятору — что делать, а не текст ffmpeg.
+            hint = "в потоке нет видео — камера не отдаёт кадры (перезагрузите её или запишите другой поток): " if "dimensions not set" in tail else ""
+            self.why = f"{hint}ffmpeg завершился ({proc.returncode}): {tail}"
         finally:
             await self._stop(proc)
             drain.cancel()
