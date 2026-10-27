@@ -168,7 +168,7 @@ def test_служба_отдаёт_список_и_куски(tmp_path: Path) ->
 
     listing, closed, going, missing = asyncio.run(scenario())
     ms = int(begin * 1000)
-    assert listing == {"previews": [[ms, ms + 600_000]], "live": [ms + 600_000, ms + 700_000]}
+    assert listing == {"previews": [[ms, ms + 600_000]], "live": [ms + 600_000, ms + 700_000], "overview": []}
     assert closed == (200, "private, max-age=86400", b"closed")
     assert going == ("no-store", head + _box(b"moof") + _box(b"mdat", b"v"))
     assert missing == 404
@@ -185,6 +185,49 @@ def test_путь_превью_после_загрузки_совпадает_с
     index = PreviewIndex(tmp_path / "cam")
     index.load()
     assert index.path(begin) == piece
+
+
+def test_служба_отдаёт_обзор_суток(tmp_path: Path) -> None:
+    """Обзор суток (`recorder_overview.py`) — в списке `/previews` и файлом `/overview`: прошлые сутки — в кэше
+    браузера, идущие растут каждые 10 минут — `no-store`."""
+    from mega_home.core import recorder_overview as ov
+
+    root = Path(tempfile.mkdtemp(prefix="pv-"))
+    camera = _camera(root)
+    recorder = camera.rec
+    recorder.cameras = {"cam": camera}
+    begin = rec.epoch_of("20261020T000000")
+    assert begin is not None
+    folder = root / "cam" / "2026-10-20" / "preview"
+    folder.mkdir(parents=True)
+    (folder / ov.OVERVIEW_FILE).write_bytes(b"overview")
+    recorder.overviews._days[("cam", "2026-10-20")] = ov._Day(done={4, 9}, built=(4, 9))  # noqa: SLF001
+    today = rec.day_of(time.time())
+    (root / "cam" / today / "preview").mkdir(parents=True)
+    (root / "cam" / today / "preview" / ov.OVERVIEW_FILE).write_bytes(b"today")
+    recorder.overviews._days[("cam", today)] = ov._Day(done={0}, built=(0, 0))  # noqa: SLF001
+
+    async def scenario() -> tuple:
+        runner = await start_api(recorder)
+        try:
+            async with TestClient(TestServer(runner.app)) as client:
+                listing = await (await client.get(f"/previews?camera=cam&from={begin}&to={begin + 86400}")).json()
+                first = int((begin + 4 * ov.STEP_S) * 1000)
+                closed = await client.get(f"/overview?camera=cam&start={first}")
+                going = await client.get(f"/overview?camera=cam&start={int(time.time() * 1000)}")
+                missing = (await client.get(f"/overview?camera=cam&start={int((begin - 86400) * 1000)}")).status
+                return listing, (closed.status, closed.headers["Cache-Control"], await closed.read()), (
+                    going.headers["Cache-Control"], await going.read()), missing
+        finally:
+            await runner.cleanup()
+            services.unregister(rec.SERVICE)
+
+    listing, closed, going, missing = asyncio.run(scenario())
+    first, stop = int((begin + 4 * ov.STEP_S) * 1000), int((begin + 10 * ov.STEP_S) * 1000)
+    assert listing["overview"] == [[first, stop, ov.STEP_S, False]]
+    assert closed == (200, "private, max-age=86400", b"overview")
+    assert going == ("no-store", b"today")
+    assert missing == 404
 
 
 def test_прежние_кадры_и_спрайты_убираются_один_раз(tmp_path: Path) -> None:

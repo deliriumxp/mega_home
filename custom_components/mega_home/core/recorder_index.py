@@ -115,8 +115,9 @@ class SegmentIndex:
                 if sizes:
                     day.size += path.stat().st_size
             if sizes and len(day.begins):
-                # Превью-видео дня (`recorder_preview.py`) — тоже объём: лимит считает всё, что лежит.
-                day.size += sum(item.stat().st_size for item in (folder / "preview").glob("*.mp4"))
+                # Превью-видео дня (`recorder_preview.py`) и его обзор с кадрами (`recorder_overview.py`) — тоже
+                # объём: лимит считает всё, что лежит.
+                day.size += sum(item.stat().st_size for item in (folder / "preview").rglob("*") if item.is_file())
             if len(day.begins):
                 days[folder.name] = day
         with self._lock:

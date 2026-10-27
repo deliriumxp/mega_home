@@ -41,6 +41,7 @@ from .go2rtc_embed import API_PORT, RTSP_PORT
 from .host import Host
 from .recorder_cache import RAM_PER_CAMERA, cap_bytes, memory_available, ram_fits, shed  # noqa: F401
 from .recorder_index import clean, day_of, epoch_of  # noqa: F401
+from .recorder_overview import Overviews
 from .recorder_preview import PreviewTune, PreviewWriter, sweep_legacy, tune_of
 from .recorder_sink import MAX_MOTION_S, RAM_DIR, SEGMENT_LIST, SEGMENT_S, RecordSink  # noqa: F401
 # Раздел конфига и годность хранилища — `recorder_spec.py`; здесь под прежними именами для службы и спек.
@@ -198,6 +199,9 @@ class Recorder:
         self._sweep: asyncio.Task[None] | None = None
         # Идущая проба хранилища (монтирование и каталог): вторая поверх висящей не заводится.
         self._checking: asyncio.Future[str] | None = None
+        # Обзор суток превью (`recorder_overview.py`): проход сторожа — фоном, не под замком записи, один за раз.
+        self.overviews = Overviews(self.env)
+        self._overview: asyncio.Future[None] | None = None
 
     def sinks(self) -> list[RecordSink]:
         """Запись всех камер — делят память кэша (`RecordSink.guard_once`) и уборку."""
@@ -353,6 +357,8 @@ class Recorder:
                 if camera.preview_task is None or camera.preview_task.done():
                     camera.preview_task = self.env.spawn(camera.preview.run(), f"mega_home: превью {camera.spec.id}")
         await self.env.run(clean, self.storage, self.sinks(), time.time(), self.limit)
+        if self._overview is None or self._overview.done():
+            self._overview = asyncio.ensure_future(self._overview_pass())
         # Сила движения (`activity.py`): корзины забираются в цикле событий — их пишет детектор, — а
         # дописываются в ряд суток в исполнителе.
         for camera in list(self.cameras.values()):
@@ -427,12 +433,20 @@ class Recorder:
                 LOGGER.warning("Запись %s: начатое не сохранилось: %s", camera.spec.id, err)
         self.cameras = {}
 
+    async def _overview_pass(self) -> None:
+        try:
+            await self.overviews.step(self.sinks())
+        except Exception as err:  # noqa: BLE001 — обзор превью не роняет запись
+            LOGGER.warning("Обзор превью: проход не прошёл: %s", err)
+
     async def _stop_all(self) -> None:
         supervisor, self._supervisor = self._supervisor, None
-        if supervisor is not None:
-            supervisor.cancel()
-            if isinstance(supervisor, asyncio.Future):
-                await asyncio.gather(supervisor, return_exceptions=True)
+        for task in (supervisor, self._overview):
+            if task is not None:
+                task.cancel()
+                if isinstance(task, asyncio.Future):
+                    await asyncio.gather(task, return_exceptions=True)
+        self._overview = None
         await self._stop_cameras(collect=True)
         if self._pipe_unsubscribe is not None:
             self._pipe_unsubscribe()

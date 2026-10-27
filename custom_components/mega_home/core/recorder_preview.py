@@ -164,6 +164,9 @@ class PreviewIndex:
     def drop_day(self, name: str) -> None:
         self._days.pop(name, None)
 
+    def day_names(self) -> list[str]:
+        return sorted(self._days)
+
 
 class PreviewSink:
     """Куски превью из кэша камеры — в хранилище, в индекс и в объём дня. Без процесса: куски пишет либо

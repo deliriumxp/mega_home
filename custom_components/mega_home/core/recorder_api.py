@@ -64,6 +64,7 @@ async def start_api(recorder: Recorder) -> web.AppRunner:
     app.router.add_get("/frame", _frame)
     app.router.add_get("/previews", _previews)
     app.router.add_get("/preview", _preview)
+    app.router.add_get("/overview", _overview)
     app.router.add_get("/activity", _activity)
     app.router.add_get("/disks", _disks)
     app.router.add_get("/folders", _folders)
@@ -386,7 +387,21 @@ async def _previews(request: web.Request) -> web.Response:
         stamp = await camera.rec.env.run(lambda: current[1].stat().st_mtime)
         if stamp > start and current[0] < stop:
             live = [int(current[0] * 1000), int(stamp * 1000)]
-    return web.json_response({"previews": pieces, "live": live})
+    # Обзор суток (дом 0.6.3+, `recorder_overview.py`): `[первый кадр мс, конец мс, шаг с, идёт ли]`.
+    overview = camera.rec.overviews.listed(camera, start, stop)
+    return web.json_response({"previews": pieces, "live": live, "overview": overview})
+
+
+async def _overview(request: web.Request) -> web.Response:
+    """Обзор суток превью с первым кадром `start` (мс) — mp4 целиком; идущие сутки растут — `no-store`."""
+    camera = await _preview_index(request)
+    start = _number(request, "start") / 1000
+    path = camera.rec.overviews.path(camera, start)
+    data = await camera.rec.env.run(_read, path) if path else b""
+    if not data:
+        raise web.HTTPNotFound(text='{"error": "обзора нет"}', content_type="application/json")
+    cache = "no-store" if day_of(start) == day_of(time.time()) else "private, max-age=86400"
+    return web.Response(body=data, content_type="video/mp4", headers={"Cache-Control": cache})
 
 
 async def _activity(request: web.Request) -> web.Response:
