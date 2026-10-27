@@ -85,11 +85,13 @@ def ram_fits(cameras: int, shm_free: int) -> bool:
     return available is None or available >= need + RAM_HEADROOM
 
 
-def shed(cache: Path, cap: int) -> int:
+def shed(cache: Path, cap: int, busy: str | None = None) -> int:
     """Кэш камеры сверх предела: удалить самые старые куски, пока он больше `cap`; сколько удалено.
 
     Два самых новых не трогаются: идущий пишется, а закрытый только что ждёт переноса. Только удаление
     в памяти — сеть и хранилище не задействованы, поэтому сброс не зависит от переносчика.
+    ⚠ `busy` — кусок, который сейчас переносится: на медленном хранилище это и есть самый старый, и его удаление
+    роняло перенос (ревью 2026-10-27).
     """
     try:
         entries = sorted((e for e in os.scandir(cache) if e.name.endswith(".mkv")), key=lambda e: e.name)
@@ -105,6 +107,8 @@ def shed(cache: Path, cap: int) -> int:
     for path, size in sized[:-2]:
         if total <= cap:
             break
+        if busy is not None and os.path.basename(path) == busy:
+            continue
         try:
             os.unlink(path)
         except OSError:

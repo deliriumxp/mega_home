@@ -310,6 +310,39 @@ def test_загрузка_индекса_одна_и_не_затирает_до�
     assert [b for b, _n, _p in index.between(base, base + 20)] == [base, base + 10]
 
 
+def test_отказ_переноса_не_роняет_разбор_и_кусок_ждёт_в_кэше(tmp_path: Path) -> None:
+    """Ревью 2026-10-27: исключение переноса (нет места, EIO, мигание NAS) проходило через разбор в цикл процесса и
+    снимало ffmpeg записи — с ним терялся идущий кусок. Теперь отказ — причина в состоянии, кусок ждёт в кэше."""
+    folder = Path(tempfile.mkdtemp(prefix="rec-"))
+    camera = _camera(folder, motion_mode=False)
+    camera.rec.local, camera.rec.limit = True, 1024**3
+    camera.cache.mkdir(parents=True)
+    piece = camera.cache / "20261023T120000.mkv"
+    piece.write_bytes(b"x")
+    (camera.cache / rec.SEGMENT_LIST).write_text(f"{piece},0.000000,10.000000\n")
+
+    def broken(*_args: object) -> None:
+        raise OSError(5, "Input/output error")
+
+    camera._save = broken  # type: ignore[method-assign]  # noqa: SLF001
+    asyncio.run(camera.collect())
+    assert piece.exists() and camera.saved == 0
+    assert "не сохранился" in camera.why and "Input/output error" in camera.why
+
+
+def test_сброс_кэша_не_трогает_переносимый_кусок(tmp_path: Path) -> None:
+    """Сброс кэша в памяти удалял самый старый кусок — тот самый, что переносился на медленное хранилище."""
+    from mega_home.core.recorder_cache import shed
+
+    pieces = []
+    for n in range(5):
+        piece = tmp_path / f"20261023T1200{n}0.mkv"
+        piece.write_bytes(b"x" * 100)
+        pieces.append(piece)
+    assert shed(tmp_path, 150, busy=pieces[0].name) == 2
+    assert [p.exists() for p in pieces] == [True, False, False, True, True]
+
+
 def test_готовность_и_длительность_куска_по_списку_ffmpeg(tmp_path: Path) -> None:
     """ffmpeg сам пишет список готовых кусков (`-segment_list`, CSV): кусок берётся, когда он
     в списке, длительность — оттуда, ffprobe на каждый кусок не зовётся."""

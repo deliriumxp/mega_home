@@ -64,6 +64,8 @@ class RecordSink:
         self.shed = 0
         self._shed_warned = 0.0
         self._saving: asyncio.Future[None] | None = None
+        # Кусок, который сейчас переносится: сброс кэша в памяти его не трогает.
+        self.busy: str | None = None
         self._last_ready = 0.0
         # Окна движения: [начало, конец или None, последнее «есть движение»] — часы дома.
         self.windows: list[list[float | None]] = []
@@ -85,7 +87,7 @@ class RecordSink:
         cameras = sum(1 for sink in self.rec.sinks() if sink.in_ram) or 1
         horizon = self.spec.pre_s + 2 * SEGMENT_S
         cap = cap_bytes(self.rate, horizon, cameras, await self.rec.env.run(memory_available))
-        removed = await self.rec.env.run(shed, self.cache, cap)
+        removed = await self.rec.env.run(shed, self.cache, cap, self.busy)
         if removed:
             self.shed += removed
             if time.monotonic() - self._shed_warned > SHED_WARN_S:
@@ -187,18 +189,32 @@ class RecordSink:
         """
         if self._saving is not None and not self._saving.done():
             return False
+        self.busy = path.name
         self._saving = asyncio.ensure_future(self.rec.env.run(self._save, path, start, length))
         # Результат опоздавшего переноса никто не ждёт: прочесть, чтобы цикл не жаловался.
-        self._saving.add_done_callback(lambda done: done.cancelled() or done.exception())
+        self._saving.add_done_callback(self._saved)
         try:
             await asyncio.wait_for(asyncio.shield(self._saving), SAVE_TIMEOUT_S)
         except asyncio.TimeoutError:
             self.why = "хранилище не отвечает: куски ждут в кэше"
             LOGGER.warning("Запись %s: перенос куска %s длится дольше %g с", self.spec.id, path.name, SAVE_TIMEOUT_S)
             return False
-        if self.why.startswith("хранилище не отвечает"):
+        except Exception as err:  # noqa: BLE001
+            # ⚠ Отказ переноса (нет места, EIO, мигание NAS) — причина в состоянии, кусок ждёт в кэше: исключение,
+            # ушедшее в цикл процесса, снимало ffmpeg записи вместе с идущим куском (ревью 2026-10-27).
+            why = f"кусок {path.name} не сохранился: {err}"
+            if why != self.why:
+                LOGGER.warning("Запись %s: %s", self.spec.id, why)
+            self.why = why
+            return False
+        if self.why.startswith(("хранилище не отвечает", "кусок ")):
             self.why = ""
         return True
+
+    def _saved(self, done: asyncio.Future[None]) -> None:
+        self.busy = None
+        if not done.cancelled():
+            done.exception()
 
     def _save(self, path: Path, start: float, length: float) -> None:
         # ⚠ Перед КАЖДЫМ куском: отвалившийся диск оставляет пустой каталог на флеше контроллера.

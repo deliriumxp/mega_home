@@ -1,15 +1,15 @@
-"""Читатель потока конвейера камеры: ОДИН ffmpeg на поток go2rtc, который дом читает, со всеми выходами.
+"""Читатели камеры конвейера: запись — своим ffmpeg (только копия), декодер — один на камеру со всеми выходами.
 
-Зачем. До 0.6.0 запись, превью и детекция одной камеры были тремя процессами: дважды читали основной
-поток и декодировали его ключевые кадры под превью, хотя детекция той же камеры уже декодировала
-дополнительный. Здесь правило одно: что нужно от потока — то выходы его читателя
+Зачем. До 0.6.0 превью и детекция одной камеры были отдельными процессами и дважды декодировали её потоки.
+Правило: всё, что требует декода (детекция, превью, последний кадр), — выходы ОДНОГО декодера
 (`docs/superpowers/specs/2026-10-26-video-engine-rewrite-design.md` менеджера, «Конвейер камеры»).
+⚠ А запись — НЕ его выход (решение заказчика 2026-10-27, ревью надёжности): в общем ffmpeg копия вставала, когда
+детекция не успевала читать трубу кадров, и отказ любого выхода снимал запись. Подключение к камере не
+прибавляется — оба процесса читают свой go2rtc.
 
-⚠ Превью и последний кадр — с того декодера, который уже есть: поток детекции, если детекция есть,
-иначе только ключевые кадры потока записи (`-skip_frame nokey` — опция декодера: копия на соседнем
-выходе получает все пакеты, проба 2026-10-26 — 250 пакетов из 250 при 5 декодированных кадрах).
-⚠ `-use_wallclock_as_timestamps` здесь НЕ ставится: вход общий с копией записи, и метки кусков стали бы
-временем прихода пакетов. Начало куска превью — из имени (`strftime`), как и у кусков записи.
+⚠ Превью и последний кадр — с декодера детекции, если она есть, иначе только ключевые кадры потока записи
+(`-skip_frame nokey`).
+⚠ `-use_wallclock_as_timestamps` НЕ ставится: начало куска — из имени (`strftime`), у записи и у превью.
 """
 
 from __future__ import annotations
@@ -62,35 +62,41 @@ def _bounded(value: object, default: float, low: float, high: float) -> float:
         return default
 
 
-def reader_plan(camera: CameraPlan, cache: Path, record_on: bool) -> list[ReaderSpec]:
-    """Читатели камеры — не больше одного на поток. `record_on=False` — хранилище не годно: без записи и
-    превью (детекция и последний кадр от хранилища не зависят)."""
+def reader_plan(camera: CameraPlan, cache: Path, record_on: bool, preview_root: Path | None = None) -> list[ReaderSpec]:
+    """Читатели камеры: запись — СВОИМ процессом (`record`, только копия), декодер — один на камеру (детекция,
+    превью, последний кадр). `record_on=False` — хранилище не годно: без записи и превью (детекция и последний кадр
+    от хранилища не зависят). `preview_root` — куда декодер пишет куски превью (локально, не на хранилище).
+
+    ⚠ Запись отдельно (решение заказчика 2026-10-27, ревью надёжности): в общем ffmpeg запись вставала, когда детекция
+    не успевала читать трубу кадров, а отказ любого выхода снимал все. Подключение к камере не прибавляется — поток
+    раздаёт go2rtc; копия не декодирует, процессора почти не берёт."""
     record = camera.record.stream if camera.record and record_on else None
     detect = camera.detect.stream if camera.detect else None
     decoder = detect or record
     out: list[ReaderSpec] = []
-    for key in ("main", "sub"):
-        if key not in (record, detect):
-            continue
-        params = camera.detect.params if camera.detect and key == detect else None
-        person = params.get("person") if params else None
-        fps = _bounded(params.get("fps", 5), 5.0, 1.0, 10.0) if params is not None else None
-        every = _bounded(person.get("every", 1.0), 1.0, 0.2, 10.0) if isinstance(person, dict) else 1.0
-        out.append(
-            ReaderSpec(
-                key=key,
-                stream=camera.streams[key].name,
-                record_dir=cache if key == record else None,
-                detect_fps=fps,
-                person_width=int(_bounded(person.get("width", PERSON_WIDTH), PERSON_WIDTH, 320, 1920)) // 2 * 2
-                if isinstance(person, dict)
-                else None,
-                person_ratio=max(round((fps or 1.0) * every), 1),
-                preview_dir=cache / PREVIEW_DIR if key == decoder and record else None,
-                latest=key == decoder,
-                keyframes_only=key == decoder and params is None,
-            )
+    if record is not None:
+        out.append(ReaderSpec("record", camera.streams[record].name, cache, None, None, 1, None, False, False))
+    if decoder is None:
+        return out
+    params = camera.detect.params if camera.detect and decoder == detect else None
+    person = params.get("person") if params else None
+    fps = _bounded(params.get("fps", 5), 5.0, 1.0, 10.0) if params is not None else None
+    every = _bounded(person.get("every", 1.0), 1.0, 0.2, 10.0) if isinstance(person, dict) else 1.0
+    out.append(
+        ReaderSpec(
+            key=decoder,
+            stream=camera.streams[decoder].name,
+            record_dir=None,
+            detect_fps=fps,
+            person_width=int(_bounded(person.get("width", PERSON_WIDTH), PERSON_WIDTH, 320, 1920)) // 2 * 2
+            if isinstance(person, dict)
+            else None,
+            person_ratio=max(round((fps or 1.0) * every), 1),
+            preview_dir=(preview_root or cache) / PREVIEW_DIR if record else None,
+            latest=True,
+            keyframes_only=params is None,
         )
+    )
     return out
 
 

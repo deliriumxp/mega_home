@@ -13,6 +13,7 @@ from mega_home.core.recorder_preview import PreviewTune
 from mega_home.core.video_reader import ReaderFds, reader_command, reader_plan
 
 CACHE = Path("/dev/shm/mega_home_rec/onvif-aa")
+PREVIEW_ROOT = Path("/dev/shm/mega_home_preview/onvif-aa")
 MAIN = {"name": "onvif_aa", "source": "rtsp://x/main"}
 SUB = {"name": "onvif_aa_sub", "source": "rtsp://x/sub"}
 RECORD = {"stream": "main", "mode": "motion"}
@@ -36,28 +37,35 @@ def _value(argv: list[str], flag: str) -> str:
 
 
 def test_запись_основного_и_детекция_дополнительного_два_читателя() -> None:
-    main, sub = reader_plan(CAM_MAIN_SUB, CACHE, record_on=True)
-    assert (main.key, main.stream, main.record_dir, main.preview_dir, main.latest, main.detect_fps) == (
-        "main", "onvif_aa", CACHE, None, False, None,
+    record, sub = reader_plan(CAM_MAIN_SUB, CACHE, record_on=True, preview_root=PREVIEW_ROOT)
+    assert (record.key, record.stream, record.record_dir, record.preview_dir, record.latest, record.detect_fps) == (
+        "record", "onvif_aa", CACHE, None, False, None,
     )
     assert (sub.key, sub.stream, sub.detect_fps, sub.preview_dir, sub.latest, sub.record_dir) == (
-        "sub", "onvif_aa_sub", 5.0, CACHE / "preview", True, None,
+        "sub", "onvif_aa_sub", 5.0, PREVIEW_ROOT / "preview", True, None,
     )
-    argv = reader_command("ffmpeg", "", main, PreviewTune(), ReaderFds(None, None))
+    argv = reader_command("ffmpeg", "", record, PreviewTune(), ReaderFds(None, None))
     assert "-filter_complex" not in argv and "-skip_frame" not in argv
 
 
-def test_без_дополнительного_один_читатель_на_всё() -> None:
-    (only,) = reader_plan(CAM_MAIN_ONLY, CACHE, record_on=True)
-    assert only.record_dir == CACHE and only.detect_fps == 5.0 and only.preview_dir == CACHE / "preview"
-    assert only.latest and not only.keyframes_only
+# Решение заказчика 2026-10-27 (ревью надёжности): запись — ВСЕГДА своим процессом, только копия. Общий ffmpeg
+# с декодером останавливал запись, когда детекция («человек») не успевала читать трубу кадров, а отказ любого выхода
+# снимал все. К камере подключение не прибавляется — поток раздаёт go2rtc.
+def test_запись_всегда_своим_процессом_даже_на_том_же_потоке() -> None:
+    record, main = reader_plan(CAM_MAIN_ONLY, CACHE, record_on=True, preview_root=PREVIEW_ROOT)
+    assert (record.key, record.record_dir, record.detect_fps, record.preview_dir, record.latest) == ("record", CACHE, None, None, False)
+    assert (main.key, main.record_dir, main.detect_fps, main.preview_dir, main.latest) == ("main", None, 5.0, PREVIEW_ROOT / "preview", True)
+    argv = reader_command("ffmpeg", "", record, PreviewTune(), ReaderFds(None, None))
+    assert "-filter_complex" not in argv and "-skip_frame" not in argv and _value(argv, "-c") == "copy"
 
 
 def test_запись_без_детекции_превью_и_кадр_из_ключевых() -> None:
-    (only,) = reader_plan(CAM_RECORD_ONLY, CACHE, record_on=True)
-    assert only.keyframes_only and only.latest and only.preview_dir == CACHE / "preview"
-    argv = reader_command("ffmpeg", "", only, PreviewTune(), ReaderFds(None, 9))
+    record, main = reader_plan(CAM_RECORD_ONLY, CACHE, record_on=True, preview_root=PREVIEW_ROOT)
+    assert record.key == "record" and record.record_dir == CACHE and not record.latest
+    assert main.keyframes_only and main.latest and main.record_dir is None and main.preview_dir == PREVIEW_ROOT / "preview"
+    argv = reader_command("ffmpeg", "", main, PreviewTune(), ReaderFds(None, 9))
     assert argv.index("-skip_frame") < argv.index("-i") and _value(argv, "-skip_frame") == "nokey"
+    assert "-segment_list" in argv and _value(argv, "-segment_list") == str(PREVIEW_ROOT / "preview.csv")
 
 
 def test_детекция_без_записи_без_превью() -> None:

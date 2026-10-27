@@ -101,6 +101,43 @@ def test_закрытые_куски_по_списку_ffmpeg_уходят_в_х
     assert "102000-277000.mp4" in {p.name for p in day.iterdir()} and not live.exists()
 
 
+def test_новый_список_после_перезапуска_читается_с_начала() -> None:
+    """Ревью 2026-10-27 (проверено пробой): смещение в списке превью не сбрасывалось, и после первого перезапуска
+    читателя новый, более короткий список не читался — часы без превью и без обзора суток."""
+    root = Path(tempfile.mkdtemp(prefix="pv-"))
+    camera = _camera(root)
+    listed = camera.cache / PREVIEW_LIST
+    first, second = rec.epoch_of("20261024T100000"), rec.epoch_of("20261024T101000")
+    assert first is not None and second is not None
+    (camera.preview.cache / "20261024T100000.mp4").write_bytes(b"m")
+    listed.write_text(f"20261024T100000.mp4,{first:.6f},{first + 600:.6f}\n" + "x" * 200 + "\n")
+    camera.preview.collect(False)
+    # Новый ffmpeg начал список заново — он короче прежнего: читается с начала, даже без явного сброса.
+    (camera.preview.cache / "20261024T101000.mp4").write_bytes(b"m")
+    listed.write_text(f"20261024T101000.mp4,{second:.6f},{second + 600:.6f}\n")
+    camera.preview.collect(False)
+    assert [p[0] for p in camera.previews.between(first, first + 3600)] == [first, second]
+
+
+def test_отказ_переноса_превью_не_роняет_разбор() -> None:
+    """Отказ переноса куска превью (нет места, мигание NAS) вылетал из разбора и снимал декодер камеры с детекцией."""
+    root = Path(tempfile.mkdtemp(prefix="pv-"))
+    camera = _camera(root)
+    first = rec.epoch_of("20261024T100000")
+    assert first is not None
+    piece = camera.preview.cache / "20261024T100000.mp4"
+    piece.write_bytes(b"m")
+    (camera.cache / PREVIEW_LIST).write_text(f"20261024T100000.mp4,{first:.6f},{first + 600:.6f}\n")
+    camera.rec.problem = lambda: ""  # type: ignore[method-assign]
+
+    def broken(*_args: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    camera.preview._store = broken  # type: ignore[method-assign]  # noqa: SLF001
+    camera.preview.collect(False)
+    assert piece.exists() and "No space left" in camera.preview.why
+
+
 def test_список_без_часов_стены_длина_по_меткам_потока() -> None:
     """Выход превью у читателя конвейера идёт без `-use_wallclock_as_timestamps` (вход общий с копией
     записи): список называет метки потока, начало куска — в имени, длина — конец минус начало."""

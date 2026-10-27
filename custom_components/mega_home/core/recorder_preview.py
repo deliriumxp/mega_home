@@ -172,10 +172,15 @@ class PreviewSink:
     """Куски превью из кэша камеры — в хранилище, в индекс и в объём дня. Без процесса: куски пишет либо
     свой процесс превью (`PreviewWriter`, раздел `recorder`), либо выход читателя конвейера (`video_reader.py`)."""
 
-    def __init__(self, camera: RecordSink) -> None:
+    def __init__(self, camera: RecordSink, root: Path | None = None) -> None:
+        """`root` — где пишет ffmpeg превью (куски в `root/preview/`, список рядом); по умолчанию кэш записи камеры."""
         self.camera = camera
-        self.cache = camera.cache / PREVIEW_DIR
+        self.cache = (root or camera.cache) / PREVIEW_DIR
         self.why = ""
+        self._offset = 0
+
+    def restart_list(self) -> None:
+        """Новый ffmpeg начинает список заново."""
         self._offset = 0
 
     def current(self) -> tuple[float, Path] | None:
@@ -190,6 +195,10 @@ class PreviewSink:
         listed = self.cache.parent / PREVIEW_LIST
         lines: list[str] = []
         try:
+            # ⚠ Новый ffmpeg пишет список заново: он короче прочитанного — читать с начала (ревью 2026-10-27: без этого
+            # после первого перезапуска читателя превью не попадало в индекс).
+            if listed.stat().st_size < self._offset:
+                self._offset = 0
             with listed.open("rb") as handle:
                 handle.seek(self._offset)
                 chunk = handle.read()
@@ -218,7 +227,14 @@ class PreviewSink:
             if path not in listed_paths and begin is not None and stop > begin:
                 done.append((path, begin, stop - begin))
         for path, begin, length in done:
-            self._store(path, begin, length)
+            try:
+                self._store(path, begin, length)
+            except OSError as err:
+                # Кусок ждёт в кэше следующего разбора; исключение снимало бы декодер камеры вместе с детекцией.
+                self.why = f"кусок превью {path.name} не сохранился: {err}"
+                return
+            if self.why.startswith("кусок превью"):
+                self.why = ""
 
     def _store(self, path: Path, begin: float, length: float) -> None:
         camera = self.camera
