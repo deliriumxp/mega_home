@@ -91,11 +91,11 @@ class _World:
         self.recorder.cameras = {"onvif-aa": rec._Camera(self.recorder, rec.camera_specs(SECTION)[0], tmp_path / ".cache")}  # noqa: SLF001
         index = self.recorder.cameras["onvif-aa"].index
         index.loaded = True
-        for n in range(30):
-            index.add(BASE + n * 10, 10.0)
-        if gaps:
-            for n in range(30):
-                index.add(BASE + 3600 + n * 10, 10.0)
+        for begin in [BASE + n * 10 for n in range(30)] + ([BASE + 3600 + n * 10 for n in range(30)] if gaps else []):
+            # Файлы кусков — на диске: пропавший кусок сессия узнаёт по диску.
+            path = index.add(begin, 10.0)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
         self.procs: list[_Proc] = []
         self.clock = [100.0]
         monkeypatch.setattr(rs, "clock", lambda: self.clock[0])
@@ -232,6 +232,73 @@ def test_ffmpeg_без_потока_называет_причину_в_журн�
 
     asyncio.run(scenario())
     assert any("Impossible to open '/media/nvr/cam/033037-8026.mkv'" in record.getMessage() for record in caplog.records)
+
+
+def _after_failure(world: _World) -> list[str]:
+    """Сессия с метки BASE+25 (кусок BASE+20 первым), первый ffmpeg падает без байта — список второго."""
+
+    async def scenario() -> list[str]:
+        sid, _stream, _start = await world.sessions.open("onvif-aa", BASE + 25)
+        client, _response = await _serve(world, sid)
+        try:
+            await _until(lambda: world.procs)
+            world.procs[0].kill()
+            await _until(lambda: len(world.procs) > 1)
+            return [line for line in Path(_value(world.procs[1].argv, "-i")).read_text().splitlines() if line.startswith("file")]
+        finally:
+            await world.sessions.close_all()
+            await client.close()
+
+    return asyncio.run(scenario())
+
+
+def test_пропавший_с_диска_кусок_пропускается_и_уходит_из_индекса(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Иначе сессия повторяет отказ ffmpeg на том же куске без конца — у жильца крутилка."""
+    world = _World(tmp_path, monkeypatch)
+    index = world.recorder.cameras["onvif-aa"].index
+    gone, after = index.first_after(BASE + 25, BASE + 100), index.first_after(BASE + 35, BASE + 100)
+    assert gone is not None and after is not None and gone[0] == BASE + 20
+    gone[2].unlink()
+    files = _after_failure(world)
+    assert files[0] == f"file '{after[2]}'"
+    assert [b for b, _n, _p in index.between(BASE + 15, BASE + 35)] == [BASE + 10, BASE + 30]
+
+
+def test_пропала_папка_дня_уходит_день_целиком(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Сутки, удалённые руками: пропуск по куску стоил бы отказа ffmpeg на каждый из 8 640 кусков."""
+    import shutil
+
+    world = _World(tmp_path, monkeypatch)
+    index = world.recorder.cameras["onvif-aa"].index
+    first = index.first_after(BASE + 25, BASE + 100)
+    assert first is not None
+    shutil.rmtree(first[2].parent)
+
+    async def scenario() -> None:
+        sid, _stream, _start = await world.sessions.open("onvif-aa", BASE + 25)
+        client, _response = await _serve(world, sid)
+        try:
+            await _until(lambda: world.procs)
+            world.procs[0].kill()
+            await _until(lambda: not index.days())
+        finally:
+            await world.sessions.close_all()
+            await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_отвалилось_хранилище_индекс_не_трогается(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Нет каталога камеры — не смонтирован диск: куски не пропали, сессия ждёт их, как прежде."""
+    import shutil
+
+    world = _World(tmp_path, monkeypatch)
+    index = world.recorder.cameras["onvif-aa"].index
+    first = index.first_after(BASE + 25, BASE + 100)
+    assert first is not None
+    shutil.rmtree(index.root)
+    assert _after_failure(world)[0] == f"file '{first[2]}'"
+    assert len(index.between(BASE, BASE + 300)) == 30
 
 
 def test_до_первого_байта_смещение_ноль_а_перемотка_продолжает_время(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

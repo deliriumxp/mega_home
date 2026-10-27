@@ -150,6 +150,8 @@ class PlaybackSession:
     lists: int = 0
     # Есть ли в записи камеры звук — решается первым списком сессии; None — ещё не смотрели.
     audio: bool | None = None
+    # Первый кусок идущего списка: пропал с диска — его надо забыть (`_forget_gone`).
+    head: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +161,7 @@ class _Planned:
     last_begin: float
     run: list[tuple[float, float]]
     inpoint: float
+    head: Path
 
 
 class PlaybackSessions:
@@ -322,11 +325,12 @@ class PlaybackSessions:
             target.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         await self.rec.env.run(write)
-        return _Planned(target, run[0][0] + inpoint, run[-1][0], [(begin, length) for begin, length, _path in run], inpoint)
+        return _Planned(target, run[0][0] + inpoint, run[-1][0], [(begin, length) for begin, length, _path in run], inpoint, run[0][2])
 
     async def _commit(self, session: PlaybackSession, planned: _Planned) -> float:
         old, session.playlist = session.playlist, planned.playlist
         session.at_s, session.last_begin, session.run, session.inpoint = planned.at_s, planned.last_begin, planned.run, planned.inpoint
+        session.head = planned.head
         if old != planned.playlist:
             await self.rec.env.run(lambda: old.unlink(missing_ok=True) if old.name else None)
         return session.at_s
@@ -370,6 +374,13 @@ class PlaybackSessions:
             if not sent:
                 # ⚠ Без этой строки отказ немой: сессия молча повторяет, а у жильца крутилка (EYEPLUS 2026-10-27).
                 LOGGER.warning("Просмотр %s: ffmpeg сессии не отдал потока: %s", session.camera, " | ".join(errors) or "без сообщений")
+            if not sent and await self._forget_gone(session):
+                # Кусок пропал — с той же метки уже следующий; ждать нечего. Обрыв посреди списка на пропавшем
+                # куске приходит сюда же: перепланирование ставит его первым.
+                failures = 0
+                if gen == session.gen and await self._prepare(session, session.at_s, started=False) is None:
+                    await asyncio.sleep(RETRY_S)
+                continue
             failures = 0 if sent else failures + 1
             position = self._position(session)
             length = sum(piece[1] for piece in session.run) - session.inpoint
@@ -384,6 +395,31 @@ class PlaybackSessions:
             # Доиграли список: дальше — куски после последнего; новых нет — живой край, ждать дописанных.
             while gen == session.gen and not session.closed and await self._prepare(session, session.last_begin, started=True) is None:
                 await asyncio.sleep(RETRY_S)
+
+    async def _forget_gone(self, session: PlaybackSession) -> bool:
+        """Первого куска списка нет на диске — забыть его (день без папки — целиком); иначе отказ ffmpeg без
+        конца. Нет каталога камеры — не смонтировано хранилище: куски не пропали, индекс не трогаем."""
+        sink, head = self.rec.sink(session.camera), session.head
+        if sink is None or head is None or not session.run:
+            return False
+        index, begin = sink.index, session.run[0][0]
+
+        def check() -> bool:
+            try:
+                if head.exists() or not index.root.is_dir():
+                    return False
+                if head.parent.is_dir():
+                    index.forget(begin)
+                else:
+                    index.drop_day(head.parent.name)
+            except OSError:
+                return False
+            return True
+
+        gone = await self.rec.env.run(check)
+        if gone:
+            LOGGER.warning("Просмотр %s: куска %s нет на диске — пропущен", session.camera, head)
+        return gone
 
     async def _copy(self, session: PlaybackSession, proc: Any, gen: int) -> bool:
         sent = False
