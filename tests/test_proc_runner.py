@@ -47,6 +47,37 @@ def test_упавший_процесс_перезапускается_и_при�
     assert "3" in why and "boom" in why
 
 
+def test_отказ_подряд_растягивает_паузу_и_журнал_не_засыпает(tmp_path: Path, caplog) -> None:  # noqa: ANN001
+    """.90.250 2026-10-27: основной поток панели Akuvox перестал отдавать видео, читатель записи падал каждые ~15 с —
+    каждый раз новая RTSP-сессия к панели с малым числом сессий и новая строка журнала (адреса `0x…` в тексте
+    ffmpeg разные): 158 строк за полчаса. Подряд идущие отказы растягивают паузу до предела, одна причина — одна строка."""
+
+    async def scenario() -> tuple[list[float], int]:
+        runner = ProcessRunner(FakeHost(tmp_path), "cam:x:main", stall_s=30, restart_s=0.05, scan_s=0.05, max_restart_s=0.4)
+        started: list[asyncio.subprocess.Process] = []
+        stamps: list[float] = []
+        spawn = _spawn("import sys, random; sys.stderr.write(f'[segment @ 0x{random.getrandbits(40):x}] dimensions not set\\n'); sys.exit(234)", started)
+
+        async def counted() -> asyncio.subprocess.Process:
+            stamps.append(time.monotonic())
+            return await spawn()
+
+        async def tick() -> float:
+            return time.monotonic()
+
+        task = asyncio.ensure_future(runner.run(counted, tick))
+        await asyncio.sleep(2.0)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return [b - a for a, b in zip(stamps, stamps[1:])], len(started)
+
+    gaps, _count = asyncio.run(scenario())
+    assert gaps[0] < 0.3 and max(gaps) >= 0.35  # пауза росла
+    assert max(gaps) < 0.8  # и упёрлась в предел
+    warned = [r for r in caplog.records if "dimensions not set" in r.getMessage()]
+    assert len(warned) == 1
+
+
 def test_вставший_процесс_снимается_по_сроку(tmp_path: Path) -> None:
     async def scenario() -> tuple[int | None, str]:
         runner = ProcessRunner(FakeHost(tmp_path), "cam:x:main", stall_s=0.2, restart_s=10, scan_s=0.05)

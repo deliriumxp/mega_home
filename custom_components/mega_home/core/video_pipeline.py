@@ -85,6 +85,21 @@ class CameraPipeline:
                 if answer.status >= 400:
                     raise RuntimeError(f"go2rtc не принял поток {stream.name} ({answer.status})")
 
+    async def _restore(self) -> None:
+        """Перед запуском читателя — завести в go2rtc потоки камеры, которых там НЕТ (сняты, go2rtc перезапущен).
+        ⚠ Живые не трогать: повторный PUT подменяет объект потока, идущий читатель остаётся на прежнем, а новый
+        потребитель открывает к камере ещё одно подключение — вызывная панель с малым числом RTSP-сессий перестала
+        отдавать основной поток (.90.250 2026-10-27)."""
+        async with self.rec.env.session().get(f"http://127.0.0.1:{API_PORT}/api/streams") as answer:
+            live = await answer.json(content_type=None) if answer.status < 400 else {}
+        for stream in self.plan.streams.values():
+            if stream.name in (live or {}):
+                continue
+            url = f"http://127.0.0.1:{API_PORT}/api/streams?name={quote(stream.name, safe='')}&src={quote(stream.source, safe='')}"
+            async with self.rec.env.session().put(url) as answer:
+                if answer.status >= 400:
+                    raise RuntimeError(f"go2rtc не принял поток {stream.name} ({answer.status})")
+
     async def run(self, record_on: bool) -> None:
         """Держать камеру, пока задачу не снимут. Хозяин — сторож записи (`Recorder._check`)."""
         self.record_on = record_on
@@ -118,9 +133,7 @@ class CameraPipeline:
 
     async def _spawn(self, spec: ReaderSpec) -> asyncio.subprocess.Process:
         self._retire(spec.key)
-        # ⚠ Потоки — в go2rtc перед КАЖДЫМ запуском, не только на старте: пропал поток (снят, go2rtc перезапущен) —
-        # читатель иначе крутил 404 «DESCRIBE failed» до перезапуска конвейера (.102, ночь на 2026-10-27).
-        await self.register()
+        await self._restore()
         loop = asyncio.get_running_loop()
         binary, nice = await self.rec.env.run(lambda: (shutil.which("ffmpeg"), shutil.which("nice")))
         if not binary:

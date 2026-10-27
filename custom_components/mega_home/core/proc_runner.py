@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections import deque
 from typing import Awaitable, Callable
@@ -21,10 +22,21 @@ from .const import LOGGER
 from .host import Host
 
 
+# Процесс прожил столько с прогрессом — отказ после этого не «подряд», пауза снова короткая.
+HEALTHY_S = 60.0
+# Адреса структур в тексте ffmpeg (`[segment @ 0x7cdf…]`) меняются от запуска к запуску — причина та же.
+_ADDRESS = re.compile(r"0x[0-9a-f]+")
+
+
 class ProcessRunner:
-    def __init__(self, env: Host, key: str, *, stall_s: float, restart_s: float = 10.0, scan_s: float = 2.0) -> None:
+    """⚠ Отказ подряд растягивает паузу вдвое до `max_restart_s`: камера или панель с малым числом RTSP-сессий
+    (вызывная панель, .90.250 2026-10-27) получала новое подключение каждые ~15 с, и журнал — строку на каждый перезапуск."""
+
+    def __init__(
+        self, env: Host, key: str, *, stall_s: float, restart_s: float = 10.0, scan_s: float = 2.0, max_restart_s: float = 120.0,
+    ) -> None:
         self.env, self.key = env, key
-        self.stall_s, self.restart_s, self.scan_s = stall_s, restart_s, scan_s
+        self.stall_s, self.restart_s, self.scan_s, self.max_restart_s = stall_s, restart_s, scan_s, max_restart_s
         self.why = ""
         self._reported = ""
         self._tail: deque[str] = deque(maxlen=8)
@@ -35,17 +47,20 @@ class ProcessRunner:
         tick: Callable[[], Awaitable[float]],
     ) -> None:
         """Вечно: процесс → его жизнь → причина конца → пауза → снова. Отмена снимает процесс."""
+        pause = self.restart_s
         while True:
+            started = time.monotonic()
             try:
                 await self._once(await spawn(), tick)
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001 — один отказ не роняет камеру насовсем
                 self.why = str(err)
-            if self.why != self._reported:
+            if _ADDRESS.sub("0x", self.why) != _ADDRESS.sub("0x", self._reported):
                 self._reported = self.why
                 LOGGER.warning("%s: %s", self.key, self.why)
-            await asyncio.sleep(self.restart_s)
+            pause = self.restart_s if time.monotonic() - started >= HEALTHY_S else min(pause * 2, self.max_restart_s)
+            await asyncio.sleep(pause)
 
     async def _once(self, proc: asyncio.subprocess.Process, tick: Callable[[], Awaitable[float]]) -> None:
         self._tail.clear()
