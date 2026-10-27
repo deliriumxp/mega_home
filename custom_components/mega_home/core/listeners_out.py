@@ -417,7 +417,7 @@ async def mqtt(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[s
 
     topics = [str(t) for t in spec.get("topics") or [] if str(t)]
 
-    def on_message(topic: str, data: bytes) -> None:
+    def on_message(topic: str, data: bytes, retained: bool) -> None:
         ctx.emit(descriptor, source, spec, "message", {"topic": topic, **body_of(data)})
 
     client = MqttClient(

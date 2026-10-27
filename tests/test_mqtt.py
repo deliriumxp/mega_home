@@ -46,7 +46,7 @@ def test_подписка_принимает_сообщение_и_подтве�
         server, port = await _broker(client)
         async with server:
             client_ = mqtt.MqttClient(
-                "127.0.0.1", port, "user", "pass", on_message=lambda t, d: got.append((t, d))
+                "127.0.0.1", port, "user", "pass", on_message=lambda t, d, r: got.append((t, d))
             )
             await client_.connect()
             await client_.subscribe(["door/#"])

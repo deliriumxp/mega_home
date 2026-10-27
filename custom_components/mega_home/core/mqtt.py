@@ -1,11 +1,11 @@
-"""Минимальный клиент MQTT 3.1.1 — для подписок слушателей (`listeners_out.mqtt`).
+"""Минимальный клиент MQTT 3.1.1 — подписки слушателей (`listeners_out.mqtt`) и
+вид `connect` `mqtt` (`exchange`).
 
 ⚠ Свой клиент, а не зависимость: HACS ставит только каталог интеграции, `pip`
 на объекте требует интернета, а объекты бывают офлайн
 (`docs/home-gateway.md` в менеджере). Поэтому здесь ровно то, что нужно
-подписке: CONNECT, SUBSCRIBE, приём PUBLISH (с PUBACK на QoS 1), PING,
-DISCONNECT. Своей публикации нет: её вызывающих не стало вместе с
-`mqtt_calls.py`, а мёртвый код протокола — это код, который никто не проверяет.
+подписке и одиночному обмену: CONNECT, SUBSCRIBE, PUBLISH в обе стороны (с PUBACK
+на QoS 1), PING, DISCONNECT.
 
 Формат пакетов — стандарт OASIS «MQTT Version 3.1.1» (2014), разделы 2 и 3:
 фиксированный заголовок (тип и флаги в старшем байте, остаток длины — число
@@ -15,11 +15,23 @@ DISCONNECT. Своей публикации нет: её вызывающих н
 from __future__ import annotations
 
 import asyncio
+import ssl
 import struct
-from typing import Callable
+from secrets import token_hex
+from typing import Any, Callable
 
-from .connect import tls_context
+from .connect import (
+    MAX_READ,
+    MAX_SEND,
+    _body_answer,
+    _decode_b64,
+    _timeout,
+    resolve_address,
+    socket_target,
+    tls_context,
+)
 from .const import LOGGER
+from .ops_base import OpError
 
 CONNECT, CONNACK, PUBLISH, PUBACK = 0x10, 0x20, 0x30, 0x40
 SUBSCRIBE, SUBACK, PINGREQ, PINGRESP, DISCONNECT = 0x82, 0x90, 0xC0, 0xD0, 0xE0
@@ -75,6 +87,23 @@ def subscribe_packet(topics: list[str], packet_id: int) -> bytes:
     return packet(SUBSCRIBE, body)
 
 
+def publish_packet(topic: str, data: bytes, qos: int, retain: bool, packet_id: int) -> bytes:
+    # 3.3.1: флаги — QoS битами 1–2 и RETAIN битом 0; номер пакета только при QoS > 0 (3.3.2.2).
+    body = _string(topic) + (struct.pack(">H", packet_id) if qos else b"") + data
+    return packet(PUBLISH | (qos << 1) | (1 if retain else 0), body)
+
+
+def matches(pattern: str, topic: str) -> bool:
+    """Тема под фильтром подписки: `+` — одно звено, `#` — остаток (4.7.1)."""
+    want, got = pattern.split("/"), topic.split("/")
+    for index, part in enumerate(want):
+        if part == "#":
+            return True
+        if index >= len(got) or part not in ("+", got[index]):
+            return False
+    return len(want) == len(got)
+
+
 async def read_packet(reader: asyncio.StreamReader) -> tuple[int, bytes]:
     head = await reader.readexactly(1)
     size, shift = 0, 0
@@ -112,11 +141,15 @@ class MqttClient:
         password: str = "",
         tls: bool = False,
         client_id: str = "mega_home",
-        on_message: Callable[[str, bytes], None] | None = None,
+        on_message: Callable[[str, bytes, bool], None] | None = None,
+        context: ssl.SSLContext | None = None,
+        server_hostname: str | None = None,
     ) -> None:
         self._host, self._port, self._tls = host, port, tls
         self._username, self._password, self._client_id = username, password, client_id
         self._on_message = on_message
+        # Готовый TLS и имя для SNI — у брокера по имени хоста (`connect.socket_target`).
+        self._context, self._server_hostname = context, server_hostname
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._next_id = 0
@@ -127,10 +160,13 @@ class MqttClient:
     async def connect(self, timeout: float = 10.0) -> None:
         # ⚠ Брокер в LAN объекта — самоподписанный сертификат, доверие по адресу
         # из конфига (то же решение и тот же контекст, что у `connect.py`).
-        context = tls_context() if self._tls else None
+        context = self._context or (tls_context() if self._tls else None)
         try:
             self._reader, self._writer = await asyncio.wait_for(
-                asyncio.open_connection(self._host, self._port, ssl=context), timeout
+                asyncio.open_connection(
+                    self._host, self._port, ssl=context, server_hostname=self._server_hostname if context else None
+                ),
+                timeout,
             )
             self._writer.write(connect_packet(self._client_id, self._username, self._password, KEEPALIVE))
             await self._writer.drain()
@@ -152,20 +188,30 @@ class MqttClient:
     async def subscribe(self, topics: list[str]) -> None:
         if not topics:
             return
+        granted = await self._acked(lambda packet_id: subscribe_packet(topics, packet_id), "подписку")
+        if b"\x80" in granted:
+            raise MqttError("брокер отказал в подписке")
+
+    async def publish(self, topic: str, data: bytes, qos: int = 0, retain: bool = False) -> None:
+        if not qos:
+            await self._send(publish_packet(topic, data, 0, retain, 0))
+            return
+        await self._acked(lambda packet_id: publish_packet(topic, data, qos, retain, packet_id), "публикацию")
+
+    async def _acked(self, build: Callable[[int], bytes], what: str) -> bytes:
+        """Пакет с номером и ожидание его подтверждения (SUBACK, PUBACK)."""
         packet_id = self._next_id = self._next_id % 65535 + 1
         waiter: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
         self._acks[packet_id] = waiter
         try:
-            await self._send(subscribe_packet(topics, packet_id))
-            granted = await asyncio.wait_for(waiter, 10)
+            await self._send(build(packet_id))
+            return await asyncio.wait_for(waiter, 10)
         except asyncio.TimeoutError as err:
-            raise MqttError("брокер не подтвердил подписку") from err
+            raise MqttError(f"брокер не подтвердил {what}") from err
         finally:
             # ⚠ Ожидание снимается на ЛЮБОМ исходе: не дождавшееся брокера
             # оставалось в `_acks` до закрытия подключения.
             self._acks.pop(packet_id, None)
-        if b"\x80" in granted:
-            raise MqttError("брокер отказал в подписке")
 
     async def close(self) -> None:
         for task in self._tasks:
@@ -208,8 +254,8 @@ class MqttClient:
                     if qos == 1:
                         await self._send(packet(PUBACK, struct.pack(">H", packet_id)))
                     if self._on_message is not None:
-                        self._on_message(topic, data)
-                elif kind == SUBACK and len(body) >= 2:
+                        self._on_message(topic, data, bool(head & 0x01))
+                elif kind in (SUBACK, PUBACK) and len(body) >= 2:
                     (packet_id,) = struct.unpack_from(">H", body)
                     future = self._acks.pop(packet_id, None)
                     if future is not None and not future.done():
@@ -241,3 +287,105 @@ class MqttClient:
                     return
         except (asyncio.CancelledError, MqttError):
             pass
+
+
+# Потолок сообщений одного обмена: снимок контроллера — тысячи сохранённых тем,
+# объём сверху держит общий `MAX_READ` вызова.
+MAX_MESSAGES = 20000
+
+
+async def exchange(payload: dict[str, Any]) -> dict[str, Any]:
+    """Вид `connect` `mqtt`: подключиться, подписаться, опубликовать, собрать, отключиться.
+
+    Подписка подтверждается брокером (SUBACK) ДО публикации — иначе ответ на
+    запрос RPC мог бы прийти раньше подписки на него. Сбор кончается первым из:
+    сообщение под фильтром `until`, набралось `count`, тишина `quiet` секунд с
+    последнего сообщения, истёк `deadline`. ⚠ `quiet` — не таймер вокруг чужой
+    системы: сигнала «сохранённые сообщения кончились» в MQTT 3.1.1 нет, снимок
+    брокера иначе не закончить. Смысла тем дом не знает.
+    """
+    host, port = resolve_address(payload)
+    timeout = _timeout(payload)
+    auth = payload.get("auth") if isinstance(payload.get("auth"), dict) else {}
+    topics = [str(t) for t in payload.get("subscribe") or [] if str(t)] if isinstance(payload.get("subscribe") or [], list) else None
+    if topics is None:
+        raise OpError("subscribe — список фильтров")
+    outgoing = [_outgoing(item) for item in (payload.get("publish") if isinstance(payload.get("publish"), list) else [])]
+    collect = payload.get("collect") if isinstance(payload.get("collect"), dict) else {}
+    until = str(collect.get("until") or "")
+    count = _count(collect.get("count"))
+    quiet = _timeout({"timeout": collect.get("quiet")}, 0) if collect.get("quiet") is not None else 0
+    deadline = _timeout({"timeout": collect.get("deadline")}, timeout) if collect.get("deadline") is not None else timeout
+    address, context, sni = await socket_target(host, port, payload.get("tls") is True)
+    got: list[dict[str, Any]] = []
+    state = {"size": 0, "done": False}
+    arrived = asyncio.Event()
+
+    def on_message(topic: str, data: bytes, retained: bool) -> None:
+        if state["done"]:
+            return
+        state["size"] += len(topic) + len(data)
+        if len(got) >= MAX_MESSAGES or state["size"] > MAX_READ:
+            state["done"] = True
+        else:
+            got.append({"topic": topic, **_body_answer(data), "retained": retained})
+            state["done"] = bool(until and matches(until, topic)) or bool(count and len(got) >= count)
+        arrived.set()
+
+    client = MqttClient(
+        address, port, str(auth.get("user") or ""), str(auth.get("pass") or ""),
+        client_id=f"mega_home-connect-{token_hex(4)}", on_message=on_message, context=context, server_hostname=sni,
+    )
+    try:
+        await client.connect(timeout)
+        await client.subscribe(topics)
+        for topic, data, qos, retain in outgoing:
+            await client.publish(topic, data, qos, retain)
+        if topics:
+            await _collect(client, arrived, state, quiet, deadline)
+    except MqttError as err:
+        raise OpError(f"Брокер: {err}", 502) from err
+    finally:
+        await client.close()
+    return {"messages": got, "truncated": len(got) >= MAX_MESSAGES or state["size"] > MAX_READ}
+
+
+async def _collect(client: MqttClient, arrived: asyncio.Event, state: dict[str, Any], quiet: float, deadline: float) -> None:
+    loop = asyncio.get_running_loop()
+    end = loop.time() + deadline
+    while not state["done"] and not client.closed.is_set():
+        left = end - loop.time()
+        if left <= 0:
+            return
+        arrived.clear()
+        waiters = [asyncio.ensure_future(arrived.wait()), asyncio.ensure_future(client.closed.wait())]
+        finished, pending = await asyncio.wait(waiters, timeout=min(left, quiet) if quiet else left, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        if not finished:
+            return
+
+
+def _outgoing(item: Any) -> tuple[str, bytes, int, bool]:
+    if not isinstance(item, dict):
+        raise OpError("publish[] — объекты {topic, payload}")
+    topic = str(item.get("topic") or "")
+    if not topic or "+" in topic or "#" in topic:
+        raise OpError("publish[].topic — тема без подстановочных знаков")
+    if item.get("payloadBase64"):
+        data = _decode_b64(item["payloadBase64"], "publish[].payloadBase64")
+    else:
+        data = str(item.get("payload") or "").encode("utf-8")
+        if len(data) > MAX_SEND:
+            raise OpError(f"publish[].payload: больше {MAX_SEND} байт")
+    qos = item.get("qos", 0)
+    if qos not in (0, 1):
+        raise OpError("publish[].qos — 0 или 1")
+    return topic, data, qos, item.get("retain") is True
+
+
+def _count(value: Any) -> int:
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError) as err:
+        raise OpError("collect.count — число") from err
