@@ -40,6 +40,8 @@ class ProcessRunner:
         self.why = ""
         self._reported = ""
         self._tail: deque[str] = deque(maxlen=8)
+        # Сколько секунд шёл прогресс у текущего процесса (по `tick`).
+        self._progressed = 0.0
 
     async def run(
         self,
@@ -49,7 +51,7 @@ class ProcessRunner:
         """Вечно: процесс → его жизнь → причина конца → пауза → снова. Отмена снимает процесс."""
         pause = self.restart_s
         while True:
-            started = time.monotonic()
+            self._progressed = 0.0
             try:
                 await self._once(await spawn(), tick)
             except asyncio.CancelledError:
@@ -59,7 +61,9 @@ class ProcessRunner:
             if _ADDRESS.sub("0x", self.why) != _ADDRESS.sub("0x", self._reported):
                 self._reported = self.why
                 LOGGER.warning("%s: %s", self.key, self.why)
-            pause = self.restart_s if time.monotonic() - started >= HEALTHY_S else min(pause * 2, self.max_restart_s)
+            # ⚠ «Здоров» — по ПРОГРЕССУ, не по времени жизни: снятый по «встал» живёт дольше порога всегда, и пауза
+            # сбрасывалась — камера без данных получала новое подключение каждую минуту (ревью 2026-10-27).
+            pause = self.restart_s if self._progressed >= HEALTHY_S else min(pause * 2, self.max_restart_s)
             await asyncio.sleep(pause)
 
     async def _once(self, proc: asyncio.subprocess.Process, tick: Callable[[], Awaitable[float]]) -> None:
@@ -75,6 +79,7 @@ class ProcessRunner:
                 except asyncio.TimeoutError:
                     pass
                 last = max(await tick(), started)
+                self._progressed = max(self._progressed, last - started)
                 if time.monotonic() - last > self.stall_s:
                     self.why = f"нет данных дольше {self.stall_s:g} с — поток встал"
                     return
@@ -102,4 +107,9 @@ class ProcessRunner:
             await asyncio.wait_for(proc.wait(), 5)
         except asyncio.TimeoutError:
             proc.kill()
-            await proc.wait()
+            try:
+                # ⚠ Со сроком: ffmpeg в состоянии D (умирающий USB-диск, зависший NAS) не выходит и по SIGKILL — ждать
+                # его без срока значило заморозить камеру и остановку HA (ревью 2026-10-27).
+                await asyncio.wait_for(proc.wait(), 5)
+            except asyncio.TimeoutError:
+                LOGGER.warning("Процесс %s не снялся и по SIGKILL — брошен", proc.pid)

@@ -24,13 +24,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
+import aiohttp
+
 from . import motion
 from .activity import ActivityBuckets
+from .const import LOGGER
 from .go2rtc_embed import API_PORT
 from .latest_frame import LatestFrame, pump
 from .proc_runner import ProcessRunner
 from .recorder_preview import PreviewSink
-from .recorder_sink import RecordSink
+from .recorder_sink import RAM_DIR, RecordSink
 from .video_reader import ReaderFds, ReaderSpec, reader_command, reader_plan
 from .video_spec import CameraPlan, record_spec
 
@@ -42,14 +45,26 @@ if TYPE_CHECKING:
 STALL_S = 60.0
 # Источник событий своей детекции — тот же, что у слушателя (`listeners.py`, тип `motion`).
 SOURCE = "motion"
+# Куски превью декодера — в памяти (`/dev/shm`), если она есть.
+PREVIEW_RAM = RAM_DIR / "mega_home_preview"
+# Подготовка камеры не удалась — повтор с паузой, растущей до предела.
+PREPARE_RETRY_S = 10.0
+PREPARE_RETRY_MAX_S = 120.0
+# ⚠ Свой срок на API go2rtc: умолчание сессии HA — 300 с, и зависший go2rtc держал бы запуск камеры минутами.
+GO2RTC_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 
 class CameraPipeline:
     def __init__(self, recorder: Recorder, plan: CameraPlan, cache_root: Path) -> None:
         self.rec, self.plan = recorder, plan
         self.cache = cache_root / plan.id
+        # Превью пишет декодер — в память, не в кэш записи: у постоянной записи тот лежит на хранилище, и мигание
+        # NAS снимало бы декодер вместе с детекцией (ревью 2026-10-27).
+        self.preview_root = PREVIEW_RAM / plan.id if PREVIEW_RAM.parent.is_dir() else self.cache
         self.record: RecordSink | None = RecordSink(recorder, record_spec(plan), cache_root) if plan.record else None
-        self.preview: PreviewSink | None = PreviewSink(self.record) if self.record is not None else None
+        self.preview: PreviewSink | None = PreviewSink(self.record, self.preview_root) if self.record is not None else None
+        # Почему камера не запущена (подготовка: go2rtc, индекс); пусто — запущена.
+        self.why = ""
         if self.record is not None:
             self.record.preview = self.preview
         self.activity = ActivityBuckets()
@@ -76,49 +91,60 @@ class CameraPipeline:
         # `local` — запись по движению и лента внутри дома видят событие без менеджера.
         self.rec.publish(self.plan.id, SOURCE, event, data, local=True, file=file)
 
-    async def register(self) -> None:
-        """Все потоки камеры — в свой go2rtc. ⚠ Повторная регистрация того же источника идущие потоки не
-        рвёт (go2rtc 1.9.14), а после перезапуска go2rtc возвращает их на место."""
-        for stream in self.plan.streams.values():
-            url = f"http://127.0.0.1:{API_PORT}/api/streams?name={quote(stream.name, safe='')}&src={quote(stream.source, safe='')}"
-            async with self.rec.env.session().put(url) as answer:
-                if answer.status >= 400:
-                    raise RuntimeError(f"go2rtc не принял поток {stream.name} ({answer.status})")
-
     async def _restore(self) -> None:
-        """Перед запуском читателя — завести в go2rtc потоки камеры, которых там НЕТ (сняты, go2rtc перезапущен).
+        """Завести в go2rtc потоки камеры, которых там НЕТ (сняты, go2rtc перезапущен) или чей источник сменился.
         ⚠ Живые не трогать: повторный PUT подменяет объект потока, идущий читатель остаётся на прежнем, а новый
         потребитель открывает к камере ещё одно подключение — вызывная панель с малым числом RTSP-сессий перестала
         отдавать основной поток (.90.250 2026-10-27)."""
-        async with self.rec.env.session().get(f"http://127.0.0.1:{API_PORT}/api/streams") as answer:
-            live = await answer.json(content_type=None) if answer.status < 400 else {}
+        async with self.rec.env.session().get(f"http://127.0.0.1:{API_PORT}/api/streams", timeout=GO2RTC_TIMEOUT) as answer:
+            live = (await answer.json(content_type=None) if answer.status < 400 else None) or {}
         for stream in self.plan.streams.values():
-            if stream.name in (live or {}):
+            producers = (live.get(stream.name) or {}).get("producers") or []
+            if any(isinstance(p, dict) and p.get("url") == stream.source for p in producers):
                 continue
             url = f"http://127.0.0.1:{API_PORT}/api/streams?name={quote(stream.name, safe='')}&src={quote(stream.source, safe='')}"
-            async with self.rec.env.session().put(url) as answer:
+            async with self.rec.env.session().put(url, timeout=GO2RTC_TIMEOUT) as answer:
                 if answer.status >= 400:
                     raise RuntimeError(f"go2rtc не принял поток {stream.name} ({answer.status})")
 
     async def run(self, record_on: bool) -> None:
-        """Держать камеру, пока задачу не снимут. Хозяин — сторож записи (`Recorder._check`)."""
+        """Держать камеру, пока задачу не снимут. Хозяин — сторож записи (`Recorder._check`).
+        ⚠ Не бросает: отказ подготовки (go2rtc ещё не поднят, индекс не читается) — причина в состоянии и повтор
+        с паузой; задача, упавшая исключением, молчала до прохода сторожа (ревью 2026-10-27)."""
         self.record_on = record_on
-        env, record = self.rec.env, self.record if record_on else None
-        await env.run(lambda: (self.cache / "preview").mkdir(parents=True, exist_ok=True))
-        if record is not None:
-            if not record.index.loaded:
-                await env.run(record.index.ensure, bool(self.rec.limit))
-            if not record.previews.loaded:
-                await env.run(record.previews.load)
+        record = self.record if record_on else None
+        pause = PREPARE_RETRY_S
+        while True:
+            try:
+                await self._prepare(record)
+                self.why = ""
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001
+                why = f"камера не запущена: {err}"
+                if why != self.why:
+                    LOGGER.warning("Камера %s: %s", self.plan.id, why)
+                self.why = why
+                await asyncio.sleep(pause)
+                pause = min(pause * 2, PREPARE_RETRY_MAX_S)
         guard = asyncio.ensure_future(self._guard(record)) if record is not None and record.in_ram else None
         try:
-            await self.register()
-            await asyncio.gather(*(self._reader(spec) for spec in reader_plan(self.plan, self.cache, record_on)))
+            await asyncio.gather(*(self._reader(spec) for spec in reader_plan(self.plan, self.cache, record_on, self.preview_root)))
         finally:
             if guard is not None:
                 guard.cancel()
             for key in list(self._loops) + list(self._consumers):
                 self._retire(key)
+
+    async def _prepare(self, record: RecordSink | None) -> None:
+        env = self.rec.env
+        if record is not None:
+            if not record.index.loaded:
+                await env.run(record.index.ensure, bool(self.rec.limit))
+            if not record.previews.loaded:
+                await env.run(record.previews.load)
+        await self._restore()
 
     async def _guard(self, record: RecordSink) -> None:
         """Предел кэша в памяти — своим циклом: разбор кусков ждёт хранилище, а память ждать не может."""
@@ -127,12 +153,35 @@ class CameraPipeline:
             await record.guard_once()
 
     async def _reader(self, spec: ReaderSpec) -> None:
-        runner = ProcessRunner(self.rec.env, f"cam:{self.plan.id}:{spec.key}", stall_s=STALL_S)
+        # Ключ записи — `record:<камера>`: так её процесс подписан в нагрузке контроллера у менеджера.
+        key = f"record:{self.plan.id}" if spec.record_dir is not None else f"cam:{self.plan.id}:{spec.key}"
+        runner = ProcessRunner(self.rec.env, key, stall_s=STALL_S)
         self.runners[spec.key] = runner
         await runner.run(lambda: self._spawn(spec), lambda: self._tick(spec))
 
+    async def _settle(self, spec: ReaderSpec) -> None:
+        """Перед новым ffmpeg — разобрать всё, что оставил прежний (и прошлый запуск HA): иначе новый список
+        затирал прежний, и последний кусок перед перезапуском — момент, когда камера отвалилась, — не попадал в архив
+        (ревью 2026-10-27). Отказ хранилища здесь не мешает запуску: куски ждут в кэше, причина — в состоянии."""
+        env = self.rec.env
+        if spec.record_dir is not None and self.record is not None:
+            await env.run(lambda: spec.record_dir.mkdir(parents=True, exist_ok=True))
+            try:
+                await self.record.collect(final=True)
+            except Exception as err:  # noqa: BLE001
+                self.record.why = f"начатое не разобрано: {err}"
+            self.record.restart_list()
+        if spec.preview_dir is not None and self.preview is not None:
+            await env.run(lambda: spec.preview_dir.mkdir(parents=True, exist_ok=True))
+            try:
+                await env.run(self.preview.collect, True)
+            except Exception as err:  # noqa: BLE001
+                self.preview.why = f"начатое превью не разобрано: {err}"
+            self.preview.restart_list()
+
     async def _spawn(self, spec: ReaderSpec) -> asyncio.subprocess.Process:
         self._retire(spec.key)
+        await self._settle(spec)
         await self._restore()
         loop = asyncio.get_running_loop()
         binary, nice = await self.rec.env.run(lambda: (shutil.which("ffmpeg"), shutil.which("nice")))
@@ -140,10 +189,10 @@ class CameraPipeline:
             raise RuntimeError("в системе нет ffmpeg")
         person_r, person_w = os.pipe() if spec.person_width is not None else (None, None)
         latest_r, latest_w = os.pipe() if spec.latest else (None, None)
-        if spec.record_dir is not None and self.record is not None:
-            self.record.restart_list()
         argv = reader_command(binary, nice or "", spec, self.rec.preview, ReaderFds(person_w, latest_w))
         writers = tuple(fd for fd in (person_w, latest_w) if fd is not None)
+        readers = [fd for fd in (person_r, latest_r) if fd is not None]
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -156,14 +205,31 @@ class CameraPipeline:
         finally:
             for fd in writers:
                 os.close(fd)
+            if proc is None:
+                for fd in readers:
+                    os.close(fd)
         self._progress[spec.key] = time.monotonic()
         consumers: list[Any] = []
-        if spec.detect_fps is not None:
-            consumers += await self._detection(spec, proc, loop, person_r)
-        if latest_r is not None:
-            reader, transport = await _pipe_reader(loop, latest_r)
-            consumers += [transport, asyncio.ensure_future(pump(reader, self.frame, lambda: self._mark(spec.key)))]
         self._consumers[spec.key] = consumers
+        try:
+            if spec.detect_fps is not None:
+                consumers += await self._detection(spec, proc, loop, person_r)
+                person_r = None
+            if latest_r is not None:
+                reader, transport = await _pipe_reader(loop, latest_r)
+                latest_r = None
+                consumers += [transport, asyncio.ensure_future(pump(reader, self.frame, lambda: self._mark(spec.key)))]
+        except BaseException:
+            # ⚠ Процесс уже запущен: без этого он оставался сиротой — держал потребителя go2rtc, а с ним подключение
+            # к камере, до перезапуска HA (ревью 2026-10-27).
+            self._retire(spec.key)
+            for fd in (person_r, latest_r):
+                if fd is not None:
+                    os.close(fd)
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+            raise
         return proc
 
     async def _detection(self, spec: ReaderSpec, proc: asyncio.subprocess.Process, loop: Any, person_r: int | None) -> list[Any]:
@@ -202,13 +268,20 @@ class CameraPipeline:
         self._progress[key] = time.monotonic()
 
     async def _tick(self, spec: ReaderSpec) -> float:
-        """Разобрать готовое и сказать, когда читатель в последний раз дал что-то."""
-        last = self._progress.get(spec.key, 0.0)
+        """Разобрать готовое и сказать, когда читатель в последний раз дал что-то: запись — по готовому куску,
+        декодер — по кадру детекции или JPEG. ⚠ Отказ разбора — причина в состоянии, не исключение: оно снимало ffmpeg."""
         if spec.record_dir is not None and self.record is not None:
-            last = max(last, await self.record.collect())
+            try:
+                return await self.record.collect()
+            except Exception as err:  # noqa: BLE001
+                self.record.why = f"куски не разобраны: {err}"
+                return 0.0
         if spec.preview_dir is not None and self.preview is not None:
-            await self.rec.env.run(self.preview.collect, False)
-        return last
+            try:
+                await self.rec.env.run(self.preview.collect, False)
+            except Exception as err:  # noqa: BLE001
+                self.preview.why = f"превью не разобрано: {err}"
+        return self._progress.get(spec.key, 0.0)
 
     def _retire(self, key: str) -> None:
         run = self._loops.pop(key, None)
@@ -220,7 +293,7 @@ class CameraPipeline:
     def state(self) -> dict[str, Any]:
         shot = self.frame.jpeg()
         out: dict[str, Any] = self.record.state() if self.record is not None else {"mode": None}
-        why = "; ".join(f"{key}: {runner.why}" for key, runner in self.runners.items() if runner.why)
+        why = "; ".join([self.why] * bool(self.why) + [f"{key}: {runner.why}" for key, runner in self.runners.items() if runner.why])
         return {**out, "readers": why, "frameAt": round(shot[1], 3) if shot else None, "recording": self.record_on}
 
 

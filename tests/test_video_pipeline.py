@@ -58,12 +58,12 @@ class _Session:
         self.puts: list[tuple[str, str]] = []
         self.live = live or {}
 
-    def put(self, url: str) -> _Answer:
+    def put(self, url: str, **_kwargs: object) -> _Answer:
         query = parse_qs(urlparse(url).query)
         self.puts.append((query["name"][0], query["src"][0]))
         return _Answer()
 
-    def get(self, _url: str) -> _Listing:
+    def get(self, _url: str, **_kwargs: object) -> _Listing:
         return _Listing(self.live)
 
 
@@ -84,12 +84,104 @@ def _plan(raw: dict) -> video_spec.CameraPlan:
     return section.cameras[0]
 
 
-def test_конвейер_регистрирует_все_потоки_камеры(tmp_path: Path) -> None:
-    session = _Session()
+def test_конвейер_заводит_пропавшие_и_сменившие_источник_потоки(tmp_path: Path) -> None:
+    """Ревью 2026-10-27: старт конвейера заводил ВСЕ потоки повторным PUT — go2rtc подменял объект потока, и к панели
+    с малым числом RTSP-сессий шло лишнее подключение. Заводится только пропавший или сменивший источник."""
+    session = _Session(live={"onvif_aa": {"producers": [{"url": "rtsp://u:p@10.0.0.5/old"}]}, "onvif_aa_sub": {"producers": [{"url": "rtsp://u:p@10.0.0.5/sub"}]}})
     recorder, _published = _recorder(tmp_path, session)
     pipeline = CameraPipeline(recorder, _plan(CAMERA), tmp_path / ".cache")
-    asyncio.run(pipeline.register())
-    assert session.puts == [("onvif_aa", "rtsp://u:p@10.0.0.5/main"), ("onvif_aa_sub", "rtsp://u:p@10.0.0.5/sub")]
+    asyncio.run(pipeline._restore())  # noqa: SLF001
+    assert session.puts == [("onvif_aa", "rtsp://u:p@10.0.0.5/main")]
+    fresh = _Session()
+    recorder, _published = _recorder(tmp_path, fresh)
+    asyncio.run(CameraPipeline(recorder, _plan(CAMERA), tmp_path / ".cache")._restore())  # noqa: SLF001
+    assert fresh.puts == [("onvif_aa", "rtsp://u:p@10.0.0.5/main"), ("onvif_aa_sub", "rtsp://u:p@10.0.0.5/sub")]
+
+
+def test_запуск_записи_сначала_разбирает_куски_прежнего_ffmpeg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ревью 2026-10-27: последний кусок перед перезапуском читателя (камера отвалилась — момент происшествия) не попадал
+    в архив — новый ffmpeg переписывал список, кусок оставался сиротой в кэше."""
+    from mega_home.core import video_pipeline
+    from mega_home.core.video_reader import reader_plan
+
+    import tempfile
+
+    storage = Path(tempfile.mkdtemp(prefix="pipe-"))  # путь хранилища — латиницей (`storage_problem`)
+    recorder, _published = _recorder(storage, _Session())
+    recorder.local, recorder.limit = True, 1024**3
+    continuous = {**CAMERA, "record": {"stream": "main", "mode": "continuous"}}
+    pipeline = CameraPipeline(recorder, _plan(continuous), storage / ".cache")
+    assert pipeline.record is not None
+    cache = pipeline.record.cache
+    cache.mkdir(parents=True)
+    piece = cache / "20261023T120000.mkv"
+    piece.write_bytes(b"x")
+    (cache / "segments.csv").write_text(f"{piece},0.000000,10.000000\n")
+    pipeline.record.index.loaded = True
+    spec = reader_plan(pipeline.plan, pipeline.record.cache, True)[0]
+    assert spec.key == "record"
+    monkeypatch.setattr(video_pipeline.shutil, "which", lambda _name: None)
+    with pytest.raises(RuntimeError, match="нет ffmpeg"):
+        asyncio.run(pipeline._spawn(spec))  # noqa: SLF001
+    assert not piece.exists() and pipeline.record.saved == 1
+
+
+def test_сбой_после_запуска_ffmpeg_не_оставляет_сироту(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ревью 2026-10-27: исключение после старта ffmpeg (настройка детекции, трубы) оставляло процесс — он держал
+    потребителя go2rtc, а с ним подключение к камере, до перезапуска HA."""
+    import sys
+
+    from mega_home.core import video_pipeline
+    from mega_home.core.video_reader import reader_plan
+
+    recorder, _published = _recorder(tmp_path, _Session())
+    pipeline = CameraPipeline(recorder, _plan(DETECT_ONLY), tmp_path / ".cache")
+    spec = reader_plan(pipeline.plan, pipeline.cache, False)[0]
+    started: list = []
+    real = asyncio.create_subprocess_exec
+
+    async def spawn(*_argv: str, **kwargs: object) -> asyncio.subprocess.Process:
+        proc = await real(sys.executable, "-c", "import time; time.sleep(30)", stdin=asyncio.subprocess.DEVNULL,
+                          stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, pass_fds=kwargs.get("pass_fds", ()))
+        started.append(proc)
+        return proc
+
+    async def broken(*_args: object) -> list:
+        raise RuntimeError("сеть «человек» не загрузилась")
+
+    monkeypatch.setattr(video_pipeline.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(pipeline, "_detection", broken)
+
+    async def scenario() -> int | None:
+        with pytest.raises(RuntimeError, match="человек"):
+            await pipeline._spawn(spec)  # noqa: SLF001
+        return started[0].returncode
+
+    assert asyncio.run(scenario()) is not None
+
+
+def test_задача_конвейера_не_падает_на_отказе_go2rtc(tmp_path: Path) -> None:
+    """Ревью 2026-10-27: исключение из `run()` (go2rtc ещё не поднят, неверная ссылка) убивало задачу камеры молча —
+    в состоянии пусто. Теперь причина в состоянии, задача повторяет сама."""
+
+    class _Refusing(_Session):
+        def put(self, url: str, **_kwargs: object) -> _Answer:
+            answer = super().put(url, **_kwargs)
+            answer.status = 500
+            return answer
+
+    recorder, _published = _recorder(tmp_path, _Refusing())
+    pipeline = CameraPipeline(recorder, _plan(DETECT_ONLY), tmp_path / ".cache")
+
+    async def scenario() -> None:
+        task = asyncio.ensure_future(pipeline.run(False))
+        await asyncio.sleep(0.2)
+        assert not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert "go2rtc не принял поток" in pipeline.state()["readers"]
 
 
 def test_запуск_читателя_заводит_только_пропавшие_потоки(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -78,6 +78,37 @@ def test_отказ_подряд_растягивает_паузу_и_журна
     assert len(warned) == 1
 
 
+def test_пауза_сбрасывается_по_прогрессу_а_не_по_времени_жизни(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    """Ревью 2026-10-27: «здоров» считался по времени жизни, а процесс, снятый по «встал», всегда живёт дольше порога —
+    пауза сбрасывалась, и камера без данных получала новое подключение каждую минуту. Здоров — только с прогрессом."""
+    from mega_home.core import proc_runner
+
+    monkeypatch.setattr(proc_runner, "HEALTHY_S", 0.1)
+
+    async def scenario() -> list[float]:
+        runner = ProcessRunner(FakeHost(tmp_path), "cam:x:main", stall_s=0.15, restart_s=0.05, scan_s=0.03, max_restart_s=0.4)
+        started: list[asyncio.subprocess.Process] = []
+        stamps: list[float] = []
+        spawn = _spawn("import time; time.sleep(30)", started)
+
+        async def counted() -> asyncio.subprocess.Process:
+            stamps.append(time.monotonic())
+            return await spawn()
+
+        async def tick() -> float:
+            return 0.0  # данных нет
+
+        task = asyncio.ensure_future(runner.run(counted, tick))
+        await asyncio.sleep(2.0)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return [b - a for a, b in zip(stamps, stamps[1:])]
+
+    gaps = asyncio.run(scenario())
+    # Жизнь ~0,15 с + пауза: пауза растёт 0,1 → 0,2 → 0,4, а не стоит на 0,05.
+    assert gaps[-1] - gaps[0] >= 0.2
+
+
 def test_вставший_процесс_снимается_по_сроку(tmp_path: Path) -> None:
     async def scenario() -> tuple[int | None, str]:
         runner = ProcessRunner(FakeHost(tmp_path), "cam:x:main", stall_s=0.2, restart_s=10, scan_s=0.05)
