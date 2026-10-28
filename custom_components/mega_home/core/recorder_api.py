@@ -54,6 +54,11 @@ _PROBES = asyncio.Semaphore(2)
 # Сколько до метки смотрим назад в поисках ключевого кадра: больше типичного GOP камеры.
 KEYFRAME_LOOKBACK_S = 12.0
 KEYFRAME_TIMEOUT_S = 5
+# Ответ, который не изменится никогда (закрытый кусок превью, прошедшие сутки, кадр прошлого): телефон кладёт
+# такие в свой кэш прошлого и больше не спрашивает (`sw.js` бандла). Пропадёт с уборкой — 404 у живого вопроса.
+IMMUTABLE = "private, max-age=31536000, immutable"
+# Кадр записи старше этого — прошлое: куски у метки уже легли.
+SETTLED_S = 120.0
 
 
 async def start_api(recorder: Recorder) -> web.AppRunner:
@@ -369,8 +374,10 @@ async def _frame(request: web.Request) -> web.Response:
             image = b""
     if not image:
         raise web.HTTPNotFound(text='{"error": "кадр не извлёкся"}', content_type="application/json")
-    # Запись под меткой не меняется — кадр можно держать в кэше браузера.
-    return web.Response(body=image, content_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+    # Запись под прошедшей меткой не меняется — кадр навсегда (телефон держит его в своём кэше прошлого, `sw.js`).
+    # У живого края — коротко: «ближайший кадр после метки» ещё может стать ближе, когда допишется кусок.
+    cache = IMMUTABLE if at < time.time() - SETTLED_S else "private, max-age=60"
+    return web.Response(body=image, content_type="image/jpeg", headers={"Cache-Control": cache})
 
 
 async def _preview_index(request: web.Request) -> Any:
@@ -406,7 +413,7 @@ async def _overview(request: web.Request) -> web.Response:
     data = await camera.rec.env.run(_read, path) if path else b""
     if not data:
         raise web.HTTPNotFound(text='{"error": "обзора нет"}', content_type="application/json")
-    cache = "no-store" if day_of(start) == day_of(time.time()) else "private, max-age=86400"
+    cache = "no-store" if day_of(start) == day_of(time.time()) else IMMUTABLE
     return web.Response(body=data, content_type="video/mp4", headers={"Cache-Control": cache})
 
 
@@ -433,8 +440,8 @@ async def _activity(request: web.Request) -> web.Response:
 
 
 async def _preview(request: web.Request) -> web.Response:
-    """Кусок превью-видео с началом `start` (мс) — mp4 целиком. Закрытый не меняется — сутки в кэше
-    браузера; идущий — до последнего целого фрагмента (`whole_fragments`) и `no-store`."""
+    """Кусок превью-видео с началом `start` (мс) — mp4 целиком. Закрытый не меняется — навсегда (`IMMUTABLE`);
+    идущий — до последнего целого фрагмента (`whole_fragments`) и `no-store`."""
     camera = await _preview_index(request)
     start = _number(request, "start") / 1000
     path = camera.previews.path(start)
@@ -444,7 +451,7 @@ async def _preview(request: web.Request) -> web.Response:
         cache = "no-store"
     else:
         data = await camera.rec.env.run(_read, path) if path else b""
-        cache = "private, max-age=86400"
+        cache = IMMUTABLE
     if not data:
         raise web.HTTPNotFound(text='{"error": "превью нет"}', content_type="application/json")
     return web.Response(body=data, content_type="video/mp4", headers={"Cache-Control": cache})

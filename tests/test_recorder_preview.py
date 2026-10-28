@@ -206,7 +206,7 @@ def test_служба_отдаёт_список_и_куски(tmp_path: Path) ->
     listing, closed, going, missing = asyncio.run(scenario())
     ms = int(begin * 1000)
     assert listing == {"previews": [[ms, ms + 600_000]], "live": [ms + 600_000, ms + 700_000], "overview": []}
-    assert closed == (200, "private, max-age=86400", b"closed")
+    assert closed == (200, "private, max-age=31536000, immutable", b"closed")
     assert going == ("no-store", head + _box(b"moof") + _box(b"mdat", b"v"))
     assert missing == 404
 
@@ -262,7 +262,7 @@ def test_служба_отдаёт_обзор_суток(tmp_path: Path) -> None
     listing, closed, going, missing = asyncio.run(scenario())
     first, stop = int((begin + 4 * ov.STEP_S) * 1000), int((begin + 10 * ov.STEP_S) * 1000)
     assert listing["overview"] == [[first, stop, ov.STEP_S, False]]
-    assert closed == (200, "private, max-age=86400", b"overview")
+    assert closed == (200, "private, max-age=31536000, immutable", b"overview")
     assert going == ("no-store", b"today")
     assert missing == 404
 

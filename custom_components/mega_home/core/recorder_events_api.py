@@ -1,7 +1,7 @@
 """Маршруты службы `recorder` для событий камеры — меток на записи (`recorder_events.py`, дом 0.6.9+).
 
 Контракт с бандлом и менеджером:
-  * `GET /events?camera&from&to` (секунды UTC; окно не шире недели) → `{"events": [{"id", "start", "stop",
+  * `GET /events?camera&from&to[&limit]` (секунды UTC; окно не шире недели, строк ≤ 500) → `{"events": [{"id", "start", "stop",
     "labels", "frame"}]}`, новые первыми; `start`/`stop` — мс UTC, `stop` — `null`, пока окно идёт;
   * `GET /event-frame?camera&id` → `image/jpeg` кадра метки | 404. Кадр метки не меняется никогда:
     `immutable` — телефон держит его в своём кэше, пока запись дня жива.
@@ -19,8 +19,9 @@ from . import recorder_events
 if TYPE_CHECKING:
     from .recorder import Recorder
 
-# Окно ответа не шире недели: обход дней им не раздуть.
+# Окно ответа не шире недели: обход дней им не раздуть. Строк — не больше страницы ленты с запасом.
 MAX_WINDOW_S = 7 * 86400
+MAX_ROWS = 500
 
 
 def add_routes(app: web.Application, recorder: Recorder) -> None:
@@ -31,11 +32,13 @@ def add_routes(app: web.Application, recorder: Recorder) -> None:
         try:
             start = float(request.query["from"])
             stop = min(float(request.query["to"]), start + MAX_WINDOW_S)
+            limit = min(max(int(request.query.get("limit") or MAX_ROWS), 1), MAX_ROWS)
         except (KeyError, ValueError):
             return web.json_response({"error": "нет чисел from и to"}, status=400)
         rows = await recorder.env.run(recorder_events.read, sink.index.root, start, stop)
         # Метки, ещё не легшие на диск (кусок окна в кэше), — не отдаём: события без записи нет.
-        return web.json_response({"events": rows}, headers={"Cache-Control": "no-store"})
+        # `limit` — самые новые: лента листает назад, ставя `to` на начало последней строки.
+        return web.json_response({"events": rows[:limit]}, headers={"Cache-Control": "no-store"})
 
     async def frame(request: web.Request) -> web.Response:
         sink = recorder.sink(request.query.get("camera", ""))
