@@ -28,6 +28,29 @@ HEALTHY_S = 60.0
 _ADDRESS = re.compile(r"0x[0-9a-f]+")
 
 
+class ExitWatch:
+    """Ожидание выхода процесса — ОДНОЙ задачей на его жизнь, с опросом по сроку.
+
+    ⚠ Не `wait_for(shield(proc.wait()), …)` в цикле: по сроку отменяется только `shield`, а внутренняя задача
+    `proc.wait()` висит, пока процесс жив. Читатель камеры живёт часами, цикл ходит раз в 2 с — объект .90.250
+    (2026-10-28) копил 11 тысяч задач `Process.wait` (по 145 в минуту на 5 ffmpeg), HA упёрся в память контейнера
+    и встал. Замок — `tests/test_proc_runner.py`.
+    """
+
+    def __init__(self, proc: asyncio.subprocess.Process) -> None:
+        self._task: asyncio.Future[int] = asyncio.ensure_future(proc.wait())
+
+    async def within(self, seconds: float) -> bool:
+        """Процесс вышел за `seconds`."""
+        done, _pending = await asyncio.wait({self._task}, timeout=seconds)
+        return bool(done)
+
+    def close(self) -> None:
+        """Хозяин ушёл раньше выхода процесса: задача ожидания снимается вместе с ним."""
+        if not self._task.done():
+            self._task.cancel()
+
+
 class Refused(Exception):
     """Запуск бессмыслен до срока: источник сам сказал «не сейчас» (камера заблокировала вход). Пауза — его, а не
     удвоение: каждая попытка входа продлевала бы блокировку."""
@@ -82,14 +105,12 @@ class ProcessRunner:
         self._tail.clear()
         host_load.track(self.key, proc.pid)
         drain = asyncio.ensure_future(self._drain(proc))
+        exited = ExitWatch(proc)
         started = time.monotonic()
         try:
             while True:
-                try:
-                    await asyncio.wait_for(asyncio.shield(proc.wait()), self.scan_s)
+                if await exited.within(self.scan_s):
                     break
-                except asyncio.TimeoutError:
-                    pass
                 last = max(await tick(), started)
                 self._progressed = max(self._progressed, last - started)
                 if time.monotonic() - last > self.stall_s:
@@ -103,6 +124,7 @@ class ProcessRunner:
             hint = "в потоке нет видео — камера не отдаёт кадры (перезагрузите её или запишите другой поток): " if "dimensions not set" in tail else ""
             self.why = f"{hint}ffmpeg завершился ({proc.returncode}): {tail}"
         finally:
+            exited.close()
             await self._stop(proc)
             drain.cancel()
             host_load.untrack(self.key, proc.pid)

@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from . import host_load
+from .proc_runner import ExitWatch
 from .const import LOGGER
 from .go2rtc_embed import RTSP_PORT
 from .recorder_index import day_of, epoch_of, length_ms
@@ -307,17 +308,17 @@ class PreviewWriter(PreviewSink):
         self._started = time.time()
         self._tail.clear()
         drain = asyncio.ensure_future(self._drain(proc))
+        exited = ExitWatch(proc)
         try:
             while True:
-                try:
-                    await asyncio.wait_for(asyncio.shield(proc.wait()), SCAN_S)
+                if await exited.within(SCAN_S):
                     break
-                except asyncio.TimeoutError:
-                    await env.run(self.collect, False)
+                await env.run(self.collect, False)
                 if await env.run(self._stalled):
                     raise RuntimeError(f"кусок превью не растёт дольше {STALL_S:g} с — поток встал")
                 self.why = self._reported = ""
         finally:
+            exited.close()
             if proc.returncode is None:
                 proc.terminate()
                 try:
