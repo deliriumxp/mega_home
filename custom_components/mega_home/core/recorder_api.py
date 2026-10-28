@@ -29,6 +29,7 @@ from aiohttp import web
 from . import activity, services, storage
 from .go2rtc_embed import PLAYLIST_INPUT
 from .recorder import SERVICE, day_of
+from .recorder_events_api import add_routes as add_event_routes
 from .recorder_play_api import add_routes
 from .recorder_preview import whole_fragments
 
@@ -74,6 +75,8 @@ async def start_api(recorder: Recorder) -> web.AppRunner:
     app.router.add_delete("/mount", _preview_unmount)
     # Просмотр сессией и последний кадр камеры (дом 0.6.0+): `recorder_play_api.py`.
     add_routes(app, recorder)
+    # События камеры — метки на записи (дом 0.6.9+): `recorder_events_api.py`.
+    add_event_routes(app, recorder)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", 0).start()

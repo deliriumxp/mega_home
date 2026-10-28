@@ -70,6 +70,8 @@ class CameraPipeline:
         self.why = ""
         if self.record is not None:
             self.record.preview = self.preview
+            # Кадр метки события — последний кадр камеры в памяти, без ffmpeg на событие.
+            self.record.snapshot = lambda: (self.latest() or (None, 0.0))[0]
         self.activity = ActivityBuckets()
         self.frame = LatestFrame()
         # Пишет ли конвейер сейчас (хранилище годно); детекция и кадр идут и без него.
@@ -93,6 +95,9 @@ class CameraPipeline:
     def emit(self, event: str, data: dict[str, Any], file: tuple[str, bytes] | None) -> None:
         # `local` — запись по движению и лента внутри дома видят событие без менеджера.
         self.rec.publish(self.plan.id, SOURCE, event, data, local=True, file=file)
+        # Человек в окне движения — ярлык метки события, её кадр — снимок участка с человеком.
+        if event == "person" and data.get("person") == "start" and self.record is not None:
+            self.record.events.label("person", file[1] if file else None)
 
     async def _restore(self) -> None:
         """Завести в go2rtc потоки камеры, которых там НЕТ (сняты, go2rtc перезапущен) или чей источник сменился.

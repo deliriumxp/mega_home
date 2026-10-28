@@ -18,11 +18,13 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from . import activity
 from .const import LOGGER
+from . import recorder_events
 from .recorder_cache import cap_bytes, memory_available, shed
+from .recorder_events import EventMarks
 from .recorder_index import MAX_SEGMENT_S, SegmentIndex, day_of, epoch_of, length_ms, segment_name
 from .recorder_preview import PreviewIndex
 from .recorder_spec import CameraSpec
@@ -69,6 +71,9 @@ class RecordSink:
         self._last_ready = 0.0
         # Окна движения: [начало, конец или None, последнее «есть движение»] — часы дома.
         self.windows: list[list[float | None]] = []
+        # События камеры — метки на записи (`recorder_events.py`); кадр метки — последний кадр конвейера камеры.
+        self.events = EventMarks(self.index.root)
+        self.snapshot: Callable[[], bytes | None] = lambda: None
         # Превью-видео камеры (`recorder_preview.py`): индекс — у хранилища, куски кладёт хозяин превью.
         self.previews = PreviewIndex(recorder.storage / spec.id)
         self.preview: PreviewSink | None = None
@@ -124,6 +129,9 @@ class RecordSink:
     async def collect(self, final: bool = False) -> float:
         """Разобрать готовое; ответ — монотонное время последнего готового куска (прогресс читателя)."""
         await self._collect(final)
+        items = self.events.take()
+        if items and not self.rec.problem():
+            await self.rec.env.run(recorder_events.write, items)
         return self._last_ready
 
     async def _collect(self, final: bool = False) -> None:
@@ -166,6 +174,7 @@ class RecordSink:
             if not self.spec.motion_mode or self.wanted(start, start + length, now):
                 if not await self._save_bounded(path, start, length):
                     return  # хранилище не отвечает: остальные ждут в кэше, пределом их держит `guard_once`
+                self.events.recorded(start, start + length, self.spec.pre_s, self.spec.post_s)
             elif start + length + self.spec.pre_s < now - SEGMENT_S or final:
                 self.dropped += 1
                 await self.rec.env.run(path.unlink, True)
@@ -273,19 +282,24 @@ class RecordSink:
         if on:
             if open_ is None:
                 self.windows.append([at, None, at])
+                self.events.open(at, self.snapshot())
             else:
                 open_[2] = at
         elif open_ is not None:
             open_[1] = at
+            self.events.close(at)
         else:
             # «Кончилось» без открытого окна — движение уложилось между опросами: окно-точка,
             # запас до и после сохранит его куски.
             self.windows.append([at, at, at])
+            self.events.open(at, self.snapshot())
+            self.events.close(at)
 
     def _expire(self, now: float) -> None:
         for window in self.windows:
             if window[1] is None and now - float(window[2] or now) > MAX_MOTION_S:
                 window[1] = window[2]
+                self.events.close(float(window[2] or now))
         keep = now - self.spec.post_s - 3600
         self.windows = [w for w in self.windows if w[1] is None or float(w[1]) > keep]
 
