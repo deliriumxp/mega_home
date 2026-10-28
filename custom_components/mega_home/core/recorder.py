@@ -36,6 +36,7 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 from . import activity, host_load, services, storage
+from .proc_runner import ExitWatch
 from .const import LOGGER
 from .go2rtc_embed import API_PORT, RTSP_PORT
 from .host import Host
@@ -126,17 +127,17 @@ class _Camera(RecordSink):
         guard = asyncio.ensure_future(self._guard()) if self.in_ram else None
         self.why = ""
         host_load.track(f"record:{self.spec.id}", proc.pid)
+        exited = ExitWatch(proc)
         try:
             while True:
-                try:
-                    await asyncio.wait_for(asyncio.shield(proc.wait()), SCAN_S)
+                if await exited.within(SCAN_S):
                     break
-                except asyncio.TimeoutError:
-                    await self._collect()
+                await self._collect()
                 if time.monotonic() - self._last_ready > STALL_S:
                     proc.terminate()
                     raise RuntimeError(f"готовых кусков нет дольше {STALL_S:g} с — поток встал")
         finally:
+            exited.close()
             if proc.returncode is None:
                 proc.terminate()
                 try:

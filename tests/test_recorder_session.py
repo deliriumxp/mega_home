@@ -611,3 +611,16 @@ def test_пока_собирается_новое_место_прежнее_иг
     during, count = asyncio.run(scenario())
     assert during is None  # прежний ffmpeg жив, пока ищется новое место
     assert count == 2
+
+
+def test_метка_далеко_после_последней_записи_записи_нет(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Объект .90.250 (2026-10-28): камера перестала писать, сессия на событие через сутки вставала на вчерашний
+    последний кусок, и жилец смотрел вчерашнее. Назад годится только кусок у самой метки (живой край)."""
+    world = _World(tmp_path, monkeypatch)
+    index = world.recorder.cameras["onvif-aa"].index
+    end = BASE + 300  # 30 кусков по 10 с
+    assert rs.playlist_from(index, end + 2 * 3600) is None
+    with pytest.raises(LookupError):
+        asyncio.run(world.sessions.open("onvif-aa", end + 2 * 3600))
+    near = rs.playlist_from(index, end + 60)  # идущий кусок ещё не в индексе
+    assert near is not None and near[0][0][0] == BASE + 290

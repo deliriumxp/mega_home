@@ -192,3 +192,39 @@ def test_нет_видео_в_потоке_причина_словами() -> No
 
 async def _tick_now() -> float:
     return time.monotonic()
+
+
+def _waiters() -> int:
+    """Висящие задачи ожидания выхода процесса (`Process.wait`)."""
+    return sum(1 for t in asyncio.all_tasks() if "Process.wait" in repr(t.get_coro()))
+
+
+def test_долгий_процесс_не_копит_задачи_ожидания(tmp_path: Path) -> None:
+    """Объект .90.250 (2026-10-28): цикл раз в 2 с заводил новую `proc.wait()` под `shield`, и за ночь висело
+    11 тысяч задач — HA упёрся в память контейнера. Живой процесс — одна задача ожидания на всю его жизнь."""
+
+    async def scenario() -> tuple[int, int]:
+        runner = ProcessRunner(FakeHost(tmp_path), "cam:x:main", stall_s=30, restart_s=5, scan_s=0.01)
+        started: list[asyncio.subprocess.Process] = []
+
+        async def tick() -> float:
+            return time.monotonic()
+
+        task = asyncio.ensure_future(runner.run(_spawn("import time; time.sleep(30)", started), tick))
+        await asyncio.sleep(0.6)  # десятки проходов цикла
+        alive = _waiters()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0.05)
+        return alive, _waiters()
+
+    alive, after = asyncio.run(scenario())
+    assert alive <= 1
+    assert after == 0
+
+
+def test_замок_нет_shield_вокруг_proc_wait() -> None:
+    """Приём, который течёт, — запрещён во всём коде дома: ожидание выхода процесса только через `ExitWatch`."""
+    root = Path(__file__).resolve().parents[1] / "custom_components" / "mega_home"
+    bad = [str(p.relative_to(root)) for p in root.rglob("*.py") if "asyncio.shield(proc.wait())" in p.read_text(encoding="utf-8")]
+    assert bad == []
