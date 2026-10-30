@@ -10,7 +10,7 @@ and it must survive a browser data wipe on the resident's own phone.
 ⚠ The file name is a HASH of the tile id, never the id itself — same reasoning
 as `photos.py`: no value from the wire can ever escape the directory.
 
-⚠ Only what the current config knows as a CAMERA TILE can be written: the view
+⚠ Only what the current config knows as a TILE can be written: the view
 checks that before calling `save` (`crop_key_known`). Without it anyone on the
 local network could fill the object's disk with an unbounded number of files
 (the HTTP surface has no authentication yet — see the module docstring in
@@ -82,21 +82,21 @@ class CropStore:
 # приём, что у `photo_key_known`/`photo_keys`.
 
 
+# ⚠ Ключ — ЛЮБАЯ плитка состава, как у фона (`photo_key_known`): у какой плитки есть кадр, решает
+# приложение, а не дом. Прежде дом пускал только домен `camera` — и вызывная панель с терминалом
+# Face ID (домен `intercom`, тот же проигрыватель с тем же участком) получали «Камера не найдена»,
+# а уборка стёрла бы их участок (заказчик 2026-10-30). Список доменов в доме — знание, которого у
+# шлюза быть не должно: следующая плитка с кадром снова потребовала бы релиза.
+
+
 def crop_keys(config: dict[str, Any]) -> list[str]:
-    """Id плиток, у которых МОЖЕТ быть свой кадр: камеры состава."""
-    return [
-        tile["id"]
-        for tile in config.get("tiles", [])
-        if tile.get("id") and tile.get("domain") == "camera"
-    ]
+    """Id плиток, у которых МОЖЕТ быть свой кадр: плитки состава."""
+    return [tile["id"] for tile in config.get("tiles", []) if tile.get("id")]
 
 
 def crop_key_known(config: dict[str, Any], tile_id: str) -> bool:
-    """Можно ли писать кадр под этим id: он обязан быть КАМЕРОЙ состава."""
-    return any(
-        tile.get("id") == tile_id and tile.get("domain") == "camera"
-        for tile in config.get("tiles", [])
-    )
+    """Можно ли писать кадр под этим id: он обязан быть плиткой состава."""
+    return bool(tile_id) and tile_id in crop_keys(config)
 
 
 def crop_value_valid(payload: Any) -> bool:

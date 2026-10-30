@@ -218,11 +218,11 @@ CROP_CONFIG = {
 }
 
 
-def test_кадр_можно_завести_только_у_камеры() -> None:
-    assert _crop_keys(CROP_CONFIG) == ["camera.entrance"]
+def test_кадр_можно_завести_только_у_плитки_состава() -> None:
+    # Домен дом не толкует (у какой плитки есть кадр, решает приложение) — диск стережёт состав.
+    assert _crop_keys(CROP_CONFIG) == ["camera.entrance", "light.kitchen_main"]
     assert _crop_key_known(CROP_CONFIG, "camera.entrance")
-    # Не камера, чужой id и id без записи в составе — не ключ.
-    assert not _crop_key_known(CROP_CONFIG, "light.kitchen_main")
+    # Чужой id и id без записи в составе — не ключ.
     assert not _crop_key_known(CROP_CONFIG, "camera.unknown")
 
 

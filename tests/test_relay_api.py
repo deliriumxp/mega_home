@@ -262,14 +262,11 @@ def test_кадр_камеры_снаружи_тоже_ложится_в_дом(
     assert json_of(call(coordinator, "GET", "api/crops"))["crops"] == {}
 
 
-def test_чужая_плитка_и_не_камера_и_кривое_тело_отвергаются(coordinator):
+def test_чужая_плитка_и_кривое_тело_отвергаются(coordinator):
+    # Ключ — плитка состава, домен дом не толкует (`crops.py`): кадр двери пишется так же, как камеры.
     crop = {"x": 0.5, "y": 0.4, "w": 0.3}
     with pytest.raises(ops.OpError) as err:
         call(coordinator, "POST", "api/crop/неизвестная", json.dumps(crop).encode())
-    assert err.value.status == HTTPStatus.NOT_FOUND
-
-    with pytest.raises(ops.OpError) as err:
-        call(coordinator, "POST", "api/crop/t1", json.dumps(crop).encode())  # свет, не камера
     assert err.value.status == HTTPStatus.NOT_FOUND
 
     with pytest.raises(ops.OpError) as err:
