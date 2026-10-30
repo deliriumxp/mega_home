@@ -481,11 +481,12 @@ def test_правило_уведомления_снаружи_ложится_в_
     assert json_of(call(coordinator, "DELETE", "api/alert/t-temp"))["accepted"] is True
 
 
-def test_правило_только_датчику_и_в_нашей_форме(coordinator):
+def test_правило_только_плитке_состава_и_в_нашей_форме(coordinator):
+    # Домен дом не толкует (`alerts.alert_keys`, замок `test_core_domain_blind.py`): чужая плитка — нет.
     _with_alerts(coordinator)
     rule = {"op": "gt", "value": 25, "holdSec": 0, "cooldownSec": 900, "enabled": True}
     with pytest.raises(ops.OpError) as err:
-        call(coordinator, "POST", "api/alert/t1", json.dumps(rule).encode())  # свет, не датчик
+        call(coordinator, "POST", "api/alert/чужая", json.dumps(rule).encode())
     assert err.value.status == HTTPStatus.NOT_FOUND
 
     with pytest.raises(ops.OpError) as err:

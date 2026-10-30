@@ -36,7 +36,6 @@ from .host import Host, PeriodicSave
 from .source import EntityState, StateSource
 
 STORE_KEY = "mega_home_alerts"
-DOMAINS = frozenset({"sensor", "binary_sensor"})
 OPS = frozenset({"on", "off", "eq", "gt", "lt"})
 FIELDS = frozenset({"op", "value", "holdSec", "cooldownSec", "enabled"})
 # Поля, задающие САМ вход в условие; пауза и включённость его не меняют (`save`).
@@ -64,11 +63,17 @@ Later = Callable[[float, Callable[[], None]], Callable[[], None]]
 
 
 def alert_keys(config: dict[str, Any] | None) -> list[str]:
-    """Id плиток, у которых МОЖЕТ быть правило: датчики состава."""
+    """Id плиток, у которых МОЖЕТ быть правило: плитки состава с сущностью — её состояние и сличается.
+
+    ⚠ Не по домену: каким плиткам предлагать уведомление, решает приложение (`sensor-alerts.ts`), а
+    условие (`on/off/eq/gt/lt`) домена не знает. Прежний список `sensor`/`binary_sensor` в доме
+    означал релиз ради уведомления о любой другой плитке (заказчик 2026-10-30, замок
+    `test_core_domain_blind.py`).
+    """
     return [
         tile["id"]
         for tile in (config or {}).get("tiles", []) or []
-        if tile.get("id") and tile.get("domain") in DOMAINS
+        if tile.get("id") and tile.get("entityId")
     ]
 
 
@@ -239,10 +244,11 @@ class Alerts:
         if self._unsubscribe:
             self._unsubscribe()
             self._unsubscribe = None
+        keys = set(alert_keys(config))
         self._entity = {
             tile["id"]: tile["entityId"]
             for tile in (config or {}).get("tiles", []) or []
-            if tile.get("id") and tile.get("entityId") and tile.get("domain") in DOMAINS
+            if tile.get("id") in keys
         }
         self._tiles = {}
         for tile, rule in self._rules.items():
