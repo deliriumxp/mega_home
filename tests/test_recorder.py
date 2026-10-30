@@ -639,6 +639,34 @@ def test_звук_в_куске_по_его_пакетам(tmp_path: Path) -> No
     assert asyncio.run(has_audio(_Rec(), tmp_path / "нет.mkv")) is True
 
 
+def test_звук_с_застывшими_метками_не_годится_а_время_куска_от_видео(tmp_path: Path) -> None:
+    """EYEPLUS «Гостиная» (.90.250, 2026-10-30): метки звука застыли, видео куска на 40 000 с позже первого звука.
+    Такой звук — не звук (`has_audio`), а начало куска и ключевые кадры считаются от первого кадра видео."""
+    from mega_home.core.recorder_api import _keyframe_before, has_audio, video_start
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not shutil.which("ffprobe"):
+        pytest.skip("нужны ffmpeg и ffprobe")
+    import subprocess
+
+    skewed = tmp_path / "skewed.mkv"
+    subprocess.run([ffmpeg, "-v", "error", "-y", "-itsoffset", "1000", "-f", "lavfi", "-t", "4", "-i", "testsrc=size=160x90:rate=10",
+                    "-f", "lavfi", "-t", "4", "-i", "anullsrc=r=8000:cl=mono", "-map", "0:v", "-map", "1:a", "-c:v", "libx264",
+                    "-g", "20", "-c:a", "pcm_alaw", str(skewed)], check=True)
+
+    class _Env:
+        async def run(self, func, *args):
+            return func(*args)
+
+    class _Rec:
+        env = _Env()
+
+    assert asyncio.run(has_audio(_Rec(), skewed)) is False
+    assert asyncio.run(video_start(_Rec(), skewed)) == pytest.approx(1000.0, abs=0.1)
+    # Ключевые кадры — раз в 2 с от начала ВИДЕО: на 2,7 с — кадр 2 с, а не «не нашли».
+    assert asyncio.run(_keyframe_before(_Rec(), skewed, 2.7)) == pytest.approx(2.0, abs=0.05)
+
+
 def test_ключевой_кадр_ищется_по_пакетам_без_декода(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Перемотка ждёт ответ: `frame=` заставлял ffprobe декодировать до 12 с видео — 2,5 с на кусок 720p
     (живой прогон сессии 2026-10-26), флаг ключевого кадра есть у пакета без декода."""
