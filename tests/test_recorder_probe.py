@@ -46,6 +46,23 @@ def test_факты_дорожек_видно_звук_без_пакетов_и_
     assert video_track["first"] == pytest.approx(1000, abs=0.1) and audio_track["first"] == pytest.approx(0, abs=0.1)
 
 
+def test_ответ_пробы_совпадает_с_образцом_контракта(tmp_path: Path) -> None:
+    """Образец `contracts/recorder-probe.json` разбирает менеджер своей спекой: форма разбора дома обязана совпадать с ним
+    ключ в ключ — переименование поля в доме иначе молча давало бы «неизвестно» в мастере камеры."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not shutil.which("ffprobe"):
+        pytest.skip("нужны ffmpeg и ffprobe")
+    sample = tmp_path / "s.mkv"
+    subprocess.run([ffmpeg, "-v", "error", "-y", "-f", "lavfi", "-t", "2", "-i", "testsrc=size=160x90:rate=10",
+                    "-f", "lavfi", "-t", "2", "-i", "anullsrc=r=8000:cl=mono", "-c:v", "libx264", "-c:a", "pcm_alaw", str(sample)], check=True)
+    video, audio = _facts(sample)
+    audio.update(meanDb=None, peakDb=None)  # уровень добавляет `_keep` — в образце он есть
+    contract = json.loads((Path(__file__).parents[1] / "custom_components/mega_home/contracts/recorder-probe.json").read_text())
+    assert set(contract) - {"_"} == {"seconds", "id", "tracks"}
+    by_type = {track["type"]: set(track) for track in contract["tracks"]}
+    assert set(video) == by_type["video"] and set(audio) == by_type["audio"]
+
+
 def test_дорожка_без_пакетов_видна_нулём() -> None:
     answer = {"streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}, {"index": 1, "codec_type": "audio", "codec_name": "pcm_alaw"}],
               "packets": [{"stream_index": 0, "pts_time": "0.0"}, {"stream_index": 0, "pts_time": "0.1"}]}
