@@ -217,6 +217,25 @@ def test_видео_не_с_начала_файла_каждому_куску_с
     assert second[0].startswith("inpoint 40") and second[1] == "duration 10.000"
 
 
+def test_сдвинутый_кусок_один_в_списке_тоже_с_началом_видео(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """У живого края в списке один кусок: режим решает сдвиг, а не число кусков (ревью 2026-10-30)."""
+    world = _World(tmp_path, monkeypatch, audio=False, video_at=40000.0)
+
+    async def scenario() -> list[str]:
+        sid, _stream, _start = await world.sessions.open("onvif-aa", BASE + 295)
+        client, _response = await _serve(world, sid)
+        try:
+            await _until(lambda: world.procs)
+            return Path(_value(world.procs[0].argv, "-i")).read_text().splitlines()
+        finally:
+            await world.sessions.close_all()
+            await client.close()
+
+    lines = asyncio.run(scenario())
+    assert len([line for line in lines if line.startswith("file")]) == 1
+    assert lines[2].startswith("inpoint 40") and lines[3] == "duration 6.500"
+
+
 def test_поток_зрителю_идёт_с_правкой_sps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """SPS с `nal_ref_idc = 2` go2rtc выбрасывает (`ts_sps.py`): зритель получает его с `nal_ref_idc = 3`."""
     world = _World(tmp_path, monkeypatch)
