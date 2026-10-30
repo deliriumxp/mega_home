@@ -31,6 +31,7 @@ from .go2rtc_embed import PLAYLIST_INPUT
 from .recorder import SERVICE, day_of
 from .recorder_events_api import add_routes as add_event_routes
 from .recorder_play_api import add_routes
+from .recorder_probe import add_routes as add_probe_routes
 from .recorder_preview import whole_fragments
 
 if TYPE_CHECKING:
@@ -84,6 +85,8 @@ async def start_api(recorder: Recorder) -> web.AppRunner:
     add_routes(app, recorder)
     # События камеры — метки на записи (дом 0.6.9+): `recorder_events_api.py`.
     add_event_routes(app, recorder)
+    # Проба потока путём записи до заведения камеры (дом 0.6.13+): `recorder_probe.py`.
+    add_probe_routes(app, recorder)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", 0).start()
@@ -101,6 +104,8 @@ def _installer_only(what: str, value: str) -> str | None:
         return "хранилище записи настраивает инсталлятор через менеджер"
     if path == "/state":
         return "состояние записи смотрит инсталлятор через менеджер"
+    if path == "/probe" or path.startswith("/probe/"):
+        return "поток камеры проверяет инсталлятор через менеджер"
     # Поток сессии читает свой go2rtc на петле; телефону он идёт WebRTC, а не дверью.
     if path.startswith("/sessions/") and path.endswith(".ts"):
         return "поток просмотра читает go2rtc дома"

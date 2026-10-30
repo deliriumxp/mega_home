@@ -86,6 +86,23 @@ def test_вход_без_часов_стены() -> None:
             assert "-use_wallclock_as_timestamps" not in reader_command("ffmpeg", "", spec, PreviewTune(), ReaderFds(5, 9))
 
 
+def test_особенности_камеры_данными_потока() -> None:
+    """Звук и аргументы входа — данные менеджера (дом 0.6.13+): камера, чей звук объявлен без пакетов или с застывшими
+    метками, пишется без звука; аргументы входа встают перед `-i` у всех читателей потока, без релиза дома."""
+    tuned = {**MAIN, "input": ["-use_wallclock_as_timestamps", "1"], "audio": "drop"}
+    record, main = reader_plan(_camera({"main": tuned}, RECORD, {"stream": "main"}), CACHE, True)
+    for spec in (record, main):
+        argv = reader_command("ffmpeg", "", spec, PreviewTune(), ReaderFds(None, None))
+        assert argv[argv.index("-i") - 2 : argv.index("-i")] == ["-use_wallclock_as_timestamps", "1"]
+    argv = reader_command("ffmpeg", "", record, PreviewTune(), ReaderFds(None, None))
+    assert "0:a?" not in argv and "0:v" in argv
+    # Без данных — как прежде: звук пишется, вход свой.
+    plain = reader_command("ffmpeg", "", reader_plan(CAM_RECORD_ONLY, CACHE, True)[0], PreviewTune(), ReaderFds(None, None))
+    assert "0:a?" in plain
+    # Второго входа данными не завести.
+    assert _camera({"main": {**MAIN, "input": ["-i", "rtsp://evil"]}}, RECORD, None).streams["main"].input == ()
+
+
 def test_выход_записи_тот_же_что_у_прежнего_процесса() -> None:
     main, _sub = reader_plan(CAM_MAIN_SUB, CACHE, True)
     argv = reader_command("ffmpeg", "", main, PreviewTune(), ReaderFds(None, None))

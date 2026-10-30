@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .recorder_preview import PreviewTune, tune_of
+from .recorder_probe import input_args
 from .recorder_spec import CameraSpec
 
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -34,6 +35,11 @@ MAX_STREAMS = 4
 class StreamPlan:
     name: str
     source: str
+    # Особенности камеры — данными менеджера (дом 0.6.13+): аргументы входа ffmpeg читателей потока
+    # (`recorder_probe.input_args`) и писать ли звук. Звук камеры бывает объявлен без пакетов или с застывшими
+    # метками — инсталлятор видит это пробой (`recorder_probe.py`) и выключает его, без релиза дома.
+    input: tuple[str, ...] = ()
+    audio: bool = True
 
 
 @dataclass(frozen=True)
@@ -111,7 +117,9 @@ def _camera(raw: Any) -> CameraPlan | None:
         if not _KEY.match(str(key)) or key in _RESERVED:
             continue
         if isinstance(item, dict) and _NAME.match(str(item.get("name", ""))) and item.get("source"):
-            streams[str(key)] = StreamPlan(str(item["name"]), str(item["source"]))
+            streams[str(key)] = StreamPlan(
+                str(item["name"]), str(item["source"]), input_args(item.get("input")), item.get("audio") != "drop",
+            )
     if not streams:
         return None
     return CameraPlan(id=str(raw["id"]), streams=streams, record=_record(raw.get("record"), streams), detect=_detect(raw.get("detect"), streams))
