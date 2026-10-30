@@ -1,0 +1,9 @@
+{
+  "_": "Образец ответа POST /probe службы recorder (recorder_probe.py). Контракт с менеджером: тест дома сверяет с ним форму разбора, спека менеджера (camera-probe.contract.spec.ts) разбирает его своим кодом. Поле переименовано с одной стороны — падает другая.",
+  "seconds": 6.2,
+  "id": "0123456789abcdef0123456789abcdef",
+  "tracks": [
+    {"type": "video", "codec": "h264", "packets": 72, "first": 0.0, "last": 5.92, "width": 1920, "height": 1080, "fps": 12.5},
+    {"type": "audio", "codec": "pcm_alaw", "packets": 150, "first": 0.0, "last": 5.96, "rate": 8000, "channels": 1, "meanDb": -34.2, "peakDb": -9.1}
+  ]
+}

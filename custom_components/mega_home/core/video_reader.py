@@ -45,6 +45,9 @@ class ReaderSpec:
     preview_dir: Path | None
     latest: bool
     keyframes_only: bool
+    # Аргументы входа и звук записи — данными потока (`video_spec.StreamPlan`).
+    input: tuple[str, ...] = ()
+    audio: bool = True
 
 
 @dataclass(frozen=True)
@@ -75,7 +78,8 @@ def reader_plan(camera: CameraPlan, cache: Path, record_on: bool, preview_root: 
     decoder = detect or record
     out: list[ReaderSpec] = []
     if record is not None:
-        out.append(ReaderSpec("record", camera.streams[record].name, cache, None, None, 1, None, False, False))
+        plan = camera.streams[record]
+        out.append(ReaderSpec("record", plan.name, cache, None, None, 1, None, False, False, plan.input, plan.audio))
     if decoder is None:
         return out
     params = camera.detect.params if camera.detect and decoder == detect else None
@@ -95,6 +99,7 @@ def reader_plan(camera: CameraPlan, cache: Path, record_on: bool, preview_root: 
             preview_dir=(preview_root or cache) / PREVIEW_DIR if record else None,
             latest=True,
             keyframes_only=params is None,
+            input=camera.streams[decoder].input,
         )
     )
     return out
@@ -109,10 +114,10 @@ def reader_command(binary: str, nice: str, spec: ReaderSpec, tune: PreviewTune, 
         argv += ["-threads", "1", "-skip_loop_filter", "all", "-flags2", "+fast"]
     elif decode:
         argv += ["-skip_frame", "nokey"]
-    argv += ["-i", f"rtsp://127.0.0.1:{RTSP_PORT}/{spec.stream}"]
+    argv += [*spec.input, "-i", f"rtsp://127.0.0.1:{RTSP_PORT}/{spec.stream}"]
     if spec.record_dir is not None:
         argv += [
-            "-map", "0:v", "-map", "0:a?", "-c", "copy",
+            "-map", "0:v", *(["-map", "0:a?"] if spec.audio else []), "-c", "copy",
             "-f", "segment", "-segment_time", str(SEGMENT_S), "-segment_format", "matroska",
             "-reset_timestamps", "1", "-strftime", "1",
             "-segment_list", str(spec.record_dir / SEGMENT_LIST), "-segment_list_type", "csv",
