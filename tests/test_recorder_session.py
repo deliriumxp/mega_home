@@ -84,7 +84,9 @@ class _Proc:
 class _World:
     """Запись камеры (куски в индексе), подменённые ffmpeg, go2rtc и часы."""
 
-    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gaps: bool = False, audio: bool = True) -> None:
+    def __init__(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gaps: bool = False, audio: bool = True, video_at: float = 0.0,
+    ) -> None:
         self.go2rtc = _Go2rtc()
         self.recorder = rec.Recorder(FakeHost(tmp_path, self.go2rtc), lambda _listener: (lambda: None))
         self.recorder.storage = tmp_path
@@ -110,7 +112,13 @@ class _World:
         async def has_audio(_recorder: Any, _path: Any) -> bool:
             return audio
 
-        self.sessions = rs.PlaybackSessions(self.recorder, lambda: 4321, spawn=spawn, keyframe=keyframe, audio=has_audio)
+        async def start(_recorder: Any, path: Path) -> float:
+            # Видео куска «на часы позже» начала файла — у каждого куска своё (застывшие метки звука).
+            return video_at + (int(path.stem.split("-")[0]) % 1000 if video_at else 0)
+
+        self.sessions = rs.PlaybackSessions(
+            self.recorder, lambda: 4321, spawn=spawn, keyframe=keyframe, audio=has_audio, start=start,
+        )
 
 
 def _value(argv: list[str], flag: str) -> str:
@@ -182,6 +190,31 @@ def test_запись_с_пустым_звуком_играется_без_зв�
 
     argv = asyncio.run(scenario())
     assert "-an" in argv and "0:a:0?" not in argv
+
+
+def test_видео_не_с_начала_файла_каждому_куску_своё_начало_и_длина(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Застывшие метки звука (EYEPLUS «Гостиная» .90.250, 2026-10-30): видео куска на 40 000 с позже начала файла, а
+    длина файла — по последней метке. Без начала видео и длины по индексу у каждого куска запись вставала на часы."""
+    world = _World(tmp_path, monkeypatch, audio=False, video_at=40000.0)
+
+    async def scenario() -> list[str]:
+        sid, _stream, _start = await world.sessions.open("onvif-aa", BASE + 25)
+        client, _response = await _serve(world, sid)
+        try:
+            await _until(lambda: world.procs)
+            return Path(_value(world.procs[0].argv, "-i")).read_text().splitlines()
+        finally:
+            await world.sessions.close_all()
+            await client.close()
+
+    lines = asyncio.run(scenario())
+    files = [line for line in lines if line.startswith("file")]
+    assert len(files) == min(rs.OFFSET_PIECES, 28)
+    first, second = lines[2:4], lines[5:7]
+    start = 40000 + int(Path(files[0][6:-1]).stem.split("-")[0]) % 1000
+    # Первый — с ключевого кадра (23,5 из 20…30), дальше — с начала видео куска и на всю его длину.
+    assert first == [f"inpoint {start + 3.5:.3f}", "duration 6.500"]
+    assert second[0].startswith("inpoint 40") and second[1] == "duration 10.000"
 
 
 def test_поток_зрителю_идёт_с_правкой_sps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

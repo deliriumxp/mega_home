@@ -54,6 +54,8 @@ _PROBES = asyncio.Semaphore(2)
 # Сколько до метки смотрим назад в поисках ключевого кадра: больше типичного GOP камеры.
 KEYFRAME_LOOKBACK_S = 12.0
 KEYFRAME_TIMEOUT_S = 5
+# Насколько первый звук куска может разойтись с первым кадром видео: дальше — часы звука сломаны (`has_audio`).
+AV_SKEW_S = 5.0
 # Ответ, который не изменится никогда (закрытый кусок превью, прошедшие сутки, кадр прошлого): телефон кладёт
 # такие в свой кэш прошлого и больше не спрашивает (`sw.js` бандла). Пропадёт с уборкой — 404 у живого вопроса.
 IMMUTABLE = "private, max-age=31536000, immutable"
@@ -173,11 +175,14 @@ async def _keyframe_before(recorder: Recorder, path: Any, offset: float) -> floa
     binary = await recorder.env.run(shutil.which, "ffprobe")
     if not binary:
         return offset
+    # ⚠ Отсчёт — от первого кадра ВИДЕО, а не от начала файла: у камеры с застывшими метками звука файл начинается
+    # звуком, а видео стоит на десятки тысяч секунд дальше (`video_start`).
+    base = await video_start(recorder, path)
     low = max(offset - KEYFRAME_LOOKBACK_S, 0.0)
     async with _PROBES:
         proc = await asyncio.create_subprocess_exec(
-            binary, "-v", "error", "-select_streams", "v:0", "-read_intervals", f"{low:.3f}%{offset + 0.5:.3f}",
-            "-show_entries", "packet=pts_time,flags:format=start_time", "-of", "json", str(path),
+            binary, "-v", "error", "-select_streams", "v:0", "-read_intervals", f"{base + low:.3f}%{base + offset + 0.5:.3f}",
+            "-show_entries", "packet=pts_time,flags", "-of", "json", str(path),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
         try:
@@ -188,8 +193,7 @@ async def _keyframe_before(recorder: Recorder, path: Any, offset: float) -> floa
                 proc.kill()
             return offset
     try:
-        start = float((answer.get("format") or {}).get("start_time") or 0.0)
-        keys = [float(p["pts_time"]) - start for p in answer.get("packets", []) if "K" in str(p.get("flags", "")) and "pts_time" in p]
+        keys = [float(p["pts_time"]) - base for p in answer.get("packets", []) if "K" in str(p.get("flags", "")) and "pts_time" in p]
     except (TypeError, ValueError):
         return offset
     before = [k for k in keys if k <= offset + 0.05]
@@ -200,15 +204,14 @@ async def _keyframe_before(recorder: Recorder, path: Any, offset: float) -> floa
 keyframe_before = _keyframe_before
 
 
-async def has_audio(recorder: Recorder, path: Any) -> bool:
-    """Есть ли в куске хоть один пакет звука. ⚠ У камер с динамиком и микрофоном дорожка объявлена всегда, а
-    пакетов может не быть вовсе (EYEPLUS, 2026-10-27). Не узнали — звук есть: так играли и раньше."""
+async def _first_pts(recorder: Recorder, path: Any, stream: str) -> float | None:
+    """Метка первого пакета дорожки (`v:0`, `a:0`); пакетов нет — None. Не прочитали — исключение `OSError`."""
     binary = await recorder.env.run(shutil.which, "ffprobe")
     if not binary:
-        return True
+        raise OSError("нет ffprobe")
     async with _PROBES:
         proc = await asyncio.create_subprocess_exec(
-            binary, "-v", "error", "-select_streams", "a:0", "-read_intervals", "%+#1",
+            binary, "-v", "error", "-select_streams", stream, "-read_intervals", "%+#1",
             "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(path),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
@@ -217,8 +220,40 @@ async def has_audio(recorder: Recorder, path: Any) -> bool:
         except asyncio.TimeoutError:
             if proc.returncode is None:
                 proc.kill()
-            return True
-    return proc.returncode != 0 or bool(out.strip())
+            raise OSError("ffprobe не ответил") from None
+    if proc.returncode != 0:
+        raise OSError("ffprobe не прочитал кусок")
+    line = out.decode().strip().splitlines()
+    try:
+        return float(line[0]) if line else None
+    except ValueError:
+        return None
+
+
+async def video_start(recorder: Recorder, path: Any) -> float:
+    """Метка первого кадра видео в куске (секунды файла); не узнали — 0, начало файла, как раньше."""
+    try:
+        return await _first_pts(recorder, path, "v:0") or 0.0
+    except OSError:
+        return 0.0
+
+
+async def has_audio(recorder: Recorder, path: Any) -> bool:
+    """Годится ли звук куска для просмотра. Не узнали — годится: так играли и раньше.
+
+    ⚠ Не годится, если пакетов нет (EYEPLUS «Прихожая»: дорожка объявлена всегда, пакетов нет — ffmpeg ждал
+    их ~30 с, 2026-10-27) или его метки не идут вместе с видео (EYEPLUS «Гостиная», объект .90.250 2026-10-30:
+    метки звука застыли, и видео в куске стоит на 40 000 с позже первого звука — сессия с начала куска отдавала
+    один звук и ждала видео часами). Звука у таких камер нет и в живом потоке.
+    """
+    try:
+        audio = await _first_pts(recorder, path, "a:0")
+        if audio is None:
+            return False
+        video = await _first_pts(recorder, path, "v:0")
+    except OSError:
+        return True
+    return video is None or abs(audio - video) <= AV_SKEW_S
 
 
 async def _playlist(request: web.Request) -> web.Response:

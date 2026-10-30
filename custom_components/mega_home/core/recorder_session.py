@@ -16,7 +16,9 @@ WebRTC-потребитель, и серия перемоток копила и�
 байта): с метками заново от нуля поток вставал на 8–14 с после каждой перемотки (проба 2026-10-26).
 ⚠ Звук — всегда Opus: A-law в MPEG-TS не ложится, а AAC go2rtc отдаёт WebRTC как есть, и тот его не берёт.
 ⚠ Дорожка звука объявлена, а пакетов в ней нет (камеры EYEPLUS с динамиком и микрофоном): ffmpeg ждал бы звук
-до первого байта ~30 с (замер на объекте 2026-10-27) — такая запись играется без звука (`has_audio`).
+до первого байта ~30 с (замер на объекте 2026-10-27) — такая запись играется без звука (`has_audio`). Так же —
+звук с застывшими метками (EYEPLUS «Гостиная» .90.250, 2026-10-30): видео куска стоит на часы позже его начала, и
+список даёт каждому куску начало видео (`_plan`).
 ⚠ SPS в потоке правится под go2rtc (`ts_sps.py`): с `nal_ref_idc = 2` он его выбрасывает, и запись не видна.
 ⚠ Через пустоты сессия идёт сама, следующим участком: время под иглой бандл считает по разметке.
 """
@@ -78,6 +80,10 @@ def clock() -> float:
 Spawn = Callable[..., Awaitable[Any]]
 Keyframe = Callable[[Any, Path, float], Awaitable[float]]
 AudioProbe = Callable[[Any, Path], Awaitable[bool]]
+VideoStart = Callable[[Any, Path], Awaitable[float]]
+# Видео куска начинается дальше этого от начала файла — список с началом видео у каждого куска (`_plan`).
+OFFSET_S = 1.0
+OFFSET_PIECES = 30
 # Сколько строк ошибок ffmpeg сессии попадает в журнал, когда он не отдал ни байта. ⚠ ПЕРВЫХ: причина —
 # первая строка («Impossible to open '<кусок>'»), дальше её следствия; хвост терял её (объект 2026-10-27).
 ERROR_HEAD = 3
@@ -119,6 +125,12 @@ async def _default_keyframe(recorder: Any, path: Path, offset: float) -> float:
     from .recorder_api import keyframe_before  # noqa: PLC0415 — служба импортирует запись, не наоборот
 
     return await keyframe_before(recorder, path, offset)
+
+
+async def _default_start(recorder: Any, path: Path) -> float:
+    from .recorder_api import video_start  # noqa: PLC0415 — служба импортирует запись, не наоборот
+
+    return await video_start(recorder, path)
 
 
 async def _drain(proc: Any, errors: list[str]) -> None:
@@ -180,12 +192,13 @@ class _Planned:
 class PlaybackSessions:
     def __init__(
         self, recorder: Recorder, port: Callable[[], int], spawn: Spawn | None = None, keyframe: Keyframe | None = None,
-        audio: AudioProbe | None = None,
+        audio: AudioProbe | None = None, start: VideoStart | None = None,
     ) -> None:
         self.rec, self.port = recorder, port
         self.spawn: Spawn = spawn or asyncio.create_subprocess_exec
         self.keyframe: Keyframe = keyframe or _default_keyframe
         self.audio: AudioProbe = audio or _default_audio
+        self.start: VideoStart = start or _default_start
         self.sessions: dict[str, PlaybackSession] = {}
         self._sweeper: asyncio.Future[None] | None = None
 
@@ -325,11 +338,21 @@ class PlaybackSessions:
             session.audio = await self.audio(self.rec, run[0][2])
         if inpoint > 0:
             inpoint = await self.keyframe(self.rec, run[0][2], inpoint)
+        # ⚠ Видео куска не с начала файла (застывшие метки звука, `has_audio`): ffconcat отсчитывает кусок от начала
+        # файла и его длину — по последней метке, и запись вставала на часы. Тогда каждому куску — своё начало видео и
+        # длина по индексу; список короче, чтобы не ждать проб всех кусков: доиграли — следующий.
+        starts = [await self.start(self.rec, run[0][2])]
+        if starts[0] > OFFSET_S:
+            run = run[:OFFSET_PIECES]
+            starts += [await self.start(self.rec, path) for _begin, _length, path in run[1:]]
         lines = ["ffconcat version 1.0"]
-        for number, (_begin, _length, path) in enumerate(run):
+        for number, (_begin, length, path) in enumerate(run):
             lines.append(f"file '{path}'")
-            if number == 0 and inpoint > 0:
-                lines.append(f"inpoint {inpoint:.3f}")
+            skip = inpoint if number == 0 else 0.0
+            if len(starts) > 1:
+                lines += [f"inpoint {starts[number] + skip:.3f}", f"duration {length - skip:.3f}"]
+            elif skip > 0:
+                lines.append(f"inpoint {skip:.3f}")
         session.lists += 1
         target = PLAY_DIR / f"{session.id}-{session.lists}.ffconcat"
 
