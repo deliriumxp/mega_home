@@ -21,7 +21,13 @@ from .recorder_spec import CameraSpec
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # Имя потока go2rtc уходит в путь RTSP на петле (`rtsp://127.0.0.1:…/<имя>`).
 _NAME = _ID
-_KEYS = ("main", "sub")
+# Ключ потока описания камеры — ЛЮБОЕ имя (`main`, `sub`, `third`, `fisheye`…): какой поток писать и на каком
+# искать движение, говорят `record.stream` и `detect.stream`. Прежний перечень `main`/`sub` значил релиз ради
+# камеры с третьим потоком (ревью 2026-10-30). ⚠ `record` — имя читателя записи (`video_reader.py`), ключом
+# потока его не взять: читатель декодера назван ключом своего потока, и они бы совпали.
+_KEY = re.compile(r"^[a-z][a-z0-9_]{0,15}$")
+_RESERVED = ("record",)
+MAX_STREAMS = 4
 
 
 @dataclass(frozen=True)
@@ -100,11 +106,13 @@ def _camera(raw: Any) -> CameraPlan | None:
     if not isinstance(raw, dict) or not _ID.match(str(raw.get("id", ""))):
         return None
     streams: dict[str, StreamPlan] = {}
-    for key in _KEYS:
-        item = (raw.get("streams") or {}).get(key) if isinstance(raw.get("streams"), dict) else None
+    described = raw.get("streams") if isinstance(raw.get("streams"), dict) else {}
+    for key, item in list(described.items())[:MAX_STREAMS]:
+        if not _KEY.match(str(key)) or key in _RESERVED:
+            continue
         if isinstance(item, dict) and _NAME.match(str(item.get("name", ""))) and item.get("source"):
-            streams[key] = StreamPlan(str(item["name"]), str(item["source"]))
-    if "main" not in streams:
+            streams[str(key)] = StreamPlan(str(item["name"]), str(item["source"]))
+    if not streams:
         return None
     return CameraPlan(id=str(raw["id"]), streams=streams, record=_record(raw.get("record"), streams), detect=_detect(raw.get("detect"), streams))
 

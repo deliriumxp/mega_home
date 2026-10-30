@@ -214,11 +214,13 @@ def test_удаление() -> None:
     assert rig.host.stores[STORE_KEY].data["rules"] == {}
 
 
-def test_ключи_только_датчики_состава() -> None:
-    assert alert_keys(CONFIG) == ["t-temp", "t-leak"]
-    assert alert_key_known(CONFIG, "t-leak")
-    assert not alert_key_known(CONFIG, "t-light")
-    assert not alert_key_known(CONFIG, "нет")
+def test_ключи_любая_плитка_состава_с_сущностью() -> None:
+    # Домен дом не толкует: каким плиткам предлагать уведомление, решает приложение.
+    config = {"tiles": [*CONFIG["tiles"], {"id": "t-cam", "domain": "camera"}]}
+    assert alert_keys(config) == ["t-temp", "t-leak", "t-light"]
+    assert alert_key_known(config, "t-light")
+    assert not alert_key_known(config, "t-cam")  # без сущности сличать нечего
+    assert not alert_key_known(config, "нет")
 
 
 def test_форма_правила() -> None:

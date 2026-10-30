@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mega_home.core.crops import CropStore, crop_value_valid
+from mega_home.core.crops import CropStore, crop_key_known, crop_keys, crop_value_valid
 
 CROP = {"x": 0.5, "y": 0.4, "w": 0.3}
 
@@ -67,3 +67,12 @@ def test_невалидное_тело_отвергается() -> None:
     assert not crop_value_valid({"x": 0.5, "y": 0.5, "w": 0.3, "z": 1})  # лишнее поле
     assert not crop_value_valid({"x": 1.5, "y": 0.5, "w": 0.3})  # вне 0..1
     assert not crop_value_valid({"x": "0.5", "y": 0.5, "w": 0.3})  # не число
+
+
+def test_ключ_кадра_любая_плитка_состава_домены_дом_не_толкует() -> None:
+    """Панель и терминал Face ID (`intercom`) — как камера; чужой id — нет (заказчик 2026-10-30)."""
+    config = {"tiles": [{"id": "cam", "domain": "camera"}, {"id": "gate", "domain": "intercom"}]}
+    assert crop_keys(config) == ["cam", "gate"]
+    assert crop_key_known(config, "gate")
+    assert not crop_key_known(config, "stranger")
+    assert not crop_key_known(config, "")

@@ -36,6 +36,8 @@ class DeviceDescriptor:
     timeout: float = CALL_TIMEOUT
     auth: AuthSpec = field(default_factory=AuthSpec)
     events: list[dict[str, Any]] = field(default_factory=list)
+    # Опции TLS описания (`tlsFingerprint`, `tlsClient`, `tlsInsecure` — `connect_tls.py`), как у вызова.
+    tls_options: dict[str, Any] = field(default_factory=dict)
 
 def _seconds(value: Any, default: float) -> float:
     try:
@@ -75,6 +77,7 @@ def descriptor_of(block: Any) -> DeviceDescriptor | None:
         timeout=_seconds(block.get("timeout"), CALL_TIMEOUT),
         auth=_auth_of(block.get("auth")),
         events=[item for item in events if isinstance(item, dict)] if isinstance(events, list) else [],
+        tls_options={k: block[k] for k in ("tlsInsecure", "tlsFingerprint", "tlsClient") if k in block},
     )
 
 class DeviceRegistry:

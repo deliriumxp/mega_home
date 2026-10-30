@@ -27,7 +27,7 @@ from urllib.parse import quote, unquote
 import aiohttp
 from aiohttp.abc import AbstractResolver
 
-from . import digest, services, wsse
+from . import connect_tls, digest, services, wsse
 from . import reduce as reduce_mod
 from .ops_base import OpError
 
@@ -328,34 +328,39 @@ class _Pinned(AbstractResolver):
     async def close(self) -> None:
         return None
 
-async def connector_for(host: str, port: int, tls: bool) -> aiohttp.TCPConnector | None:
+async def connector_for(
+    host: str, port: int, tls: bool, payload: dict[str, Any] | None = None
+) -> aiohttp.TCPConnector | None:
     """Соединитель aiohttp для адресата `resolve_address`.
 
     ⚠ По имени сертификат ПРОВЕРЯЕТСЯ (`ssl` по умолчанию у aiohttp — проверенный контекст,
-    собранный при его импорте, без блокирующей загрузки в цикле): в интернете самоподписанных
-    устройств объекта нет, а без проверки ответ подменит любой узел по пути. Литеральный адрес
-    — устройство LAN, его сертификат проверять нечем (`tls_context`).
+    собранный при его импорте, без блокирующей загрузки в цикле): без проверки ответ подменит любой
+    узел по пути. Литеральный адрес — устройство LAN, его сертификат проверять нечем (`tls_context`).
+    Иное доверие, отпечаток и клиентский сертификат — полями описания (`connect_tls.py`).
     """
-    if is_name(host):
-        return aiohttp.TCPConnector(resolver=_Pinned(await pinned(host, port)))
-    return aiohttp.TCPConnector(ssl=False) if tls else None
+    named = is_name(host)
+    ssl_param = await connect_tls.aiohttp_ssl(named, connect_tls.options(payload)) if tls else None
+    if named:
+        return aiohttp.TCPConnector(resolver=_Pinned(await pinned(host, port)), **({"ssl": ssl_param} if tls else {}))
+    return aiohttp.TCPConnector(ssl=ssl_param) if tls else None
 
-async def socket_target(host: str, port: int, tls: bool, family: int = socket.AF_UNSPEC) -> tuple[str, ssl.SSLContext | None, str | None]:
-    """Адрес, TLS и имя для SNI голого сокета (`tcp`, `udp`, сессии): имя — проверенным адресом."""
-    if not is_name(host):
-        return host, tls_context() if tls else None, None
+async def socket_target(
+    host: str, port: int, tls: bool, family: int = socket.AF_UNSPEC, payload: dict[str, Any] | None = None
+) -> tuple[str, ssl.SSLContext | None, str | None]:
+    """Адрес, TLS и имя для SNI голого сокета (`tcp`, `udp`, сессии): имя — проверенным адресом.
+    После рукопожатия вызывающий сверяет отпечаток (`connect_tls.check_pin`)."""
+    named = is_name(host)
+    context = await connect_tls.context_for(named, connect_tls.options(payload)) if tls else None
+    if not named:
+        return host, context, None
     address = (await pinned(host, port, family))[0]["host"]
-    return address, await verified_tls() if tls else None, host if tls else None
+    return address, context, host if tls else None
 
-_VERIFIED: ssl.SSLContext | None = None
-
-async def verified_tls() -> ssl.SSLContext:
-    """TLS С проверкой сертификата — для сокетов по имени. Системные сертификаты грузятся
-    в исполнителе: в цикле событий это блокирующий вызов (`tls_context`)."""
-    global _VERIFIED
-    if _VERIFIED is None:
-        _VERIFIED = await asyncio.get_running_loop().run_in_executor(None, ssl.create_default_context)
-    return _VERIFIED
+def pin_socket(writer: Any, payload: dict[str, Any] | None) -> None:
+    """Отпечаток сертификата голого сокета (`tlsFingerprint`) — сразу после рукопожатия."""
+    opts = connect_tls.options(payload)
+    if opts.get("pin"):
+        connect_tls.check_pin(writer.get_extra_info("ssl_object"), opts)
 
 def prepare_http(payload: dict[str, Any]) -> dict[str, Any]:
     """Разобрать описание HTTP-вызова: адрес, заголовки, тело, учётка, срок.
@@ -402,11 +407,20 @@ def prepare_http(payload: dict[str, Any]) -> dict[str, Any]:
         "host": host,
         "port": port,
         "tls": tls,
+        # Опции TLS описания (`connect_tls.py`) — проверены здесь, до сети; соединитель их применит.
+        "tlsPayload": _tls_fields(payload),
     }
+
+_TLS_FIELDS = ("tlsInsecure", "tlsFingerprint", "tlsClient")
+
+def _tls_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    fields = {k: payload[k] for k in _TLS_FIELDS if k in payload}
+    connect_tls.options(fields)
+    return fields
 
 async def client_for(call: dict[str, Any]) -> aiohttp.ClientSession:
     """Сессия aiohttp под разобранный вызов (`prepare_http`): соединитель — `connector_for`."""
-    return aiohttp.ClientSession(connector=await connector_for(call["host"], call["port"], call["tls"]))
+    return aiohttp.ClientSession(connector=await connector_for(call["host"], call["port"], call["tls"], call.get("tlsPayload")))
 
 async def http_send(
     session: aiohttp.ClientSession, call: dict[str, Any], timeout: aiohttp.ClientTimeout
@@ -466,24 +480,6 @@ async def _http(payload: dict[str, Any], plan: reduce_mod.Plan | None = None) ->
         if reduced is not None:
             return {"status": int(status), "headers": headers, "reduced": reduced}
     return _http_answer(status, headers, raw)
-
-_TLS: ssl.SSLContext | None = None
-
-def tls_context() -> ssl.SSLContext:
-    """TLS БЕЗ проверки сертификата — один на весь дом (`connect`, сессии, MQTT, проба).
-
-    ⚠ Проверять нечем: сертификаты устройств объекта самоподписанные, а литеральные адреса
-    пускает только частная сеть (`resolve_address`; по имени — `verified_tls`). ⚠ `SSLContext(...)`, а не
-    `create_default_context()`: тот грузит системные сертификаты — блокирующий
-    вызов в цикле событий (Home Assistant ругается на `load_default_certs`), и
-    всё ради проверки, которую мы тут же выключаем.
-    """
-    global _TLS
-    if _TLS is None:
-        _TLS = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        _TLS.check_hostname = False
-        _TLS.verify_mode = ssl.CERT_NONE
-    return _TLS
 
 def _refuse_double_encoded(path: str) -> None:
     """Двойное %-кодирование пути — отказ (сохранённая проверка `gateway.py`)."""

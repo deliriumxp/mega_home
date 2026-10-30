@@ -19,12 +19,41 @@ from http import HTTPStatus
 
 import pytest
 
-from mega_home.core import probe
+from mega_home.core import connect_sockets, probe
 from mega_home.core.ops import OpError
+
+
+@pytest.fixture(autouse=True)
+def loopback_is_lan(monkeypatch):
+    """Сервер теста на петле изображает устройство LAN: `connect` петлю литералом не пускает
+    (только именем службы дома), а проба ходит им — так же сделано в тестах MQTT."""
+    real = connect_sockets.resolve_address
+
+    def resolve(payload):
+        if str(payload.get("host")) == "127.0.0.1":
+            return "127.0.0.1", int(payload["port"])
+        return real(payload)
+
+    monkeypatch.setattr(connect_sockets, "resolve_address", resolve)
 
 
 def run(coro):
     return asyncio.run(coro)
+
+
+def test_проба_идёт_через_connect_а_не_своим_транспортом():
+    # Своего клиента у пробы нет (долг `docs/plan-thin-gateway.md`): адресат и TLS — правила `connect`.
+    source = __import__("inspect").getsource(probe)
+    assert "open_connection" not in source and "session.request" not in source
+    answer = run(probe.run(None, {"probes": [{"kind": "tcp", "host": "8.8.8.8", "port": 53, "timeoutMs": 500}]}))
+    assert answer["results"][0]["ok"] is False
+    assert "вне локальной сети" in answer["results"][0]["error"]
+
+
+def test_insecure_пробы_это_tls_insecure_вызова():
+    request = probe.request_of({"kind": "http", "url": "https://nvr.example.com:8443/a?b=1", "insecure": True})
+    assert request["host"] == "nvr.example.com" and request["port"] == 8443 and request["path"] == "/a?b=1"
+    assert request["tls"] is True and request["tlsInsecure"] is True
 
 
 async def serve(handler, host: str = "127.0.0.1"):

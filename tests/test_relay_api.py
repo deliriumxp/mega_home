@@ -262,14 +262,11 @@ def test_кадр_камеры_снаружи_тоже_ложится_в_дом(
     assert json_of(call(coordinator, "GET", "api/crops"))["crops"] == {}
 
 
-def test_чужая_плитка_и_не_камера_и_кривое_тело_отвергаются(coordinator):
+def test_чужая_плитка_и_кривое_тело_отвергаются(coordinator):
+    # Ключ — плитка состава, домен дом не толкует (`crops.py`): кадр двери пишется так же, как камеры.
     crop = {"x": 0.5, "y": 0.4, "w": 0.3}
     with pytest.raises(ops.OpError) as err:
         call(coordinator, "POST", "api/crop/неизвестная", json.dumps(crop).encode())
-    assert err.value.status == HTTPStatus.NOT_FOUND
-
-    with pytest.raises(ops.OpError) as err:
-        call(coordinator, "POST", "api/crop/t1", json.dumps(crop).encode())  # свет, не камера
     assert err.value.status == HTTPStatus.NOT_FOUND
 
     with pytest.raises(ops.OpError) as err:
@@ -484,11 +481,12 @@ def test_правило_уведомления_снаружи_ложится_в_
     assert json_of(call(coordinator, "DELETE", "api/alert/t-temp"))["accepted"] is True
 
 
-def test_правило_только_датчику_и_в_нашей_форме(coordinator):
+def test_правило_только_плитке_состава_и_в_нашей_форме(coordinator):
+    # Домен дом не толкует (`alerts.alert_keys`, замок `test_core_domain_blind.py`): чужая плитка — нет.
     _with_alerts(coordinator)
     rule = {"op": "gt", "value": 25, "holdSec": 0, "cooldownSec": 900, "enabled": True}
     with pytest.raises(ops.OpError) as err:
-        call(coordinator, "POST", "api/alert/t1", json.dumps(rule).encode())  # свет, не датчик
+        call(coordinator, "POST", "api/alert/чужая", json.dumps(rule).encode())
     assert err.value.status == HTTPStatus.NOT_FOUND
 
     with pytest.raises(ops.OpError) as err:
@@ -496,7 +494,7 @@ def test_правило_только_датчику_и_в_нашей_форме(
     assert err.value.status == HTTPStatus.BAD_REQUEST
 
     with pytest.raises(ops.OpError) as err:
-        call(coordinator, "POST", "api/alert/t-temp", json.dumps({**rule, "pad": "x" * 2000}).encode())
+        call(coordinator, "POST", "api/alert/t-temp", json.dumps({**rule, "pad": "x" * 5000}).encode())
     assert err.value.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
 
 

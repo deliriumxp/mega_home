@@ -251,11 +251,11 @@ async def _crop(coordinator: Any, method: str, tile: str, body: bytes) -> Reply:
     """Участок кадра камеры, подправленный САМИМ ЖИЛЬЦОМ: записать, снять.
 
     Кадр из менеджера остаётся ЗАГОТОВКОЙ: снял жилец свою правку — вернулся он.
-    Ключ — только камера текущего состава, той же дисциплиной, что у `_photo`.
+    Ключ — только плитка текущего состава, той же дисциплиной, что у `_photo`.
     """
     if method == "POST":
         if not crop_key_known(coordinator.data, tile):
-            raise ops.OpError("Камера не найдена", HTTPStatus.NOT_FOUND)
+            raise ops.OpError("Плитка не найдена", HTTPStatus.NOT_FOUND)
         payload = _json_body(body)
         if not crop_value_valid(payload):
             raise ops.OpError("Некорректный участок кадра", HTTPStatus.BAD_REQUEST)

@@ -122,8 +122,8 @@ def test_сессия_к_устройству_с_tls_без_проверки_с�
     from mega_home.core import listeners_out as out
 
     async def scenario() -> tuple[bool, bool]:
-        tls = out._session(DeviceDescriptor(id="d", host="192.168.1.10", port=8080, tls=True, timeout=5.0, auth=AuthSpec(type="none", user="", password="p"), events=[]))
-        plain = out._session(DeviceDescriptor(id="d", host="192.168.1.10", port=80, tls=False, timeout=5.0, auth=AuthSpec(type="none", user="", password=""), events=[]))
+        tls = await out._session(DeviceDescriptor(id="d", host="192.168.1.10", port=8080, tls=True, timeout=5.0, auth=AuthSpec(type="none", user="", password="p"), events=[]))
+        plain = await out._session(DeviceDescriptor(id="d", host="192.168.1.10", port=80, tls=False, timeout=5.0, auth=AuthSpec(type="none", user="", password=""), events=[]))
         try:
             return tls.connector._ssl is False, plain.connector._ssl is not False  # noqa: SLF001
         finally:
@@ -182,7 +182,7 @@ def test_digest_подписывает_путь_вместе_со_строкой
 
     async def scenario() -> tuple[int, bytes]:
         async with TestServer(_digest_device()) as server:
-            async with lo._session(_digest_descriptor(server.port)) as session:
+            async with await lo._session(_digest_descriptor(server.port)) as session:
                 block = {"path": "/events", "params": {"pass": "{pass}"}}
                 status, _kind, body = await lo._request(
                     session, _digest_descriptor(server.port), block, lo.base_values(_digest_descriptor(server.port))
