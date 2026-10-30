@@ -141,3 +141,38 @@ def test_служба_отдаёт_события_и_кадр_навсегда(t
     assert (status, body) == (200, b"jpeg-now")
     assert "immutable" in cache
     assert (missing, foreign) == (404, 404)
+
+
+def test_служба_отбирает_события_по_ярлыку_до_предела_страницы(tmp_path: Path) -> None:
+    # ⚠ Объект .90.250, Шлагбаум: 124 человека за сутки тонули в ночном движении — последние 50 событий были одним
+    # движением, и лента не находила людей. Отбор по ярлыку — ДО `limit`: страница — это 50 людей, а не 50 строк.
+    camera = _camera(tmp_path)
+    _motion(camera, True, BASE)
+    camera.events.label("person", b"person-shot")
+    _motion(camera, False, BASE + 5)
+    for n in range(1, 4):
+        _motion(camera, True, BASE + 10 * n)
+        _motion(camera, False, BASE + 10 * n + 5)
+    camera.events.recorded(BASE, BASE + 60, camera.spec.pre_s, camera.spec.post_s)
+    _flush(camera)
+    recorder = camera.rec
+    (tmp_path / ".cache").mkdir(exist_ok=True)
+    recorder.cameras = {"onvif-aa": camera}
+
+    async def scenario() -> tuple[list, list, list]:
+        runner = await start_api(recorder)
+        try:
+            async with TestClient(TestServer(runner.app)) as client:
+                window = f"/events?camera=onvif-aa&from={BASE - 60}&to={BASE + 120}"
+                people = await (await client.get(f"{window}&labels=person&limit=1")).json()
+                plain = await (await client.get(f"{window}&limit=1")).json()
+                every = await (await client.get(window)).json()
+                return people["events"], plain["events"], every["events"]
+        finally:
+            await runner.cleanup()
+            services.unregister(rec.SERVICE)
+
+    people, plain, every = asyncio.run(scenario())
+    assert [row["labels"] for row in people] == [["person"]]
+    # Без ярлыка — как прежде: самое новое событие (движение), все строки.
+    assert plain[0]["labels"] == [] and len(every) == 4
