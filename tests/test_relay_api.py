@@ -494,7 +494,7 @@ def test_правило_только_плитке_состава_и_в_наше�
     assert err.value.status == HTTPStatus.BAD_REQUEST
 
     with pytest.raises(ops.OpError) as err:
-        call(coordinator, "POST", "api/alert/t-temp", json.dumps({**rule, "pad": "x" * 2000}).encode())
+        call(coordinator, "POST", "api/alert/t-temp", json.dumps({**rule, "pad": "x" * 5000}).encode())
     assert err.value.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
 
 

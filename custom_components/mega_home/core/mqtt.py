@@ -26,10 +26,11 @@ from .connect import (
     _body_answer,
     _decode_b64,
     _timeout,
+    pin_socket,
     resolve_address,
     socket_target,
-    tls_context,
 )
+from .connect_tls import tls_context
 from .const import LOGGER
 from .ops_base import OpError
 
@@ -144,7 +145,10 @@ class MqttClient:
         on_message: Callable[[str, bytes, bool], None] | None = None,
         context: ssl.SSLContext | None = None,
         server_hostname: str | None = None,
+        tls_payload: dict[str, Any] | None = None,
     ) -> None:
+        # Описание с опциями TLS (`connect_tls.py`): отпечаток сверяется после рукопожатия.
+        self._tls_payload = tls_payload
         self._host, self._port, self._tls = host, port, tls
         self._username, self._password, self._client_id = username, password, client_id
         self._on_message = on_message
@@ -168,6 +172,8 @@ class MqttClient:
                 ),
                 timeout,
             )
+            if context is not None:
+                pin_socket(self._writer, self._tls_payload)
             self._writer.write(connect_packet(self._client_id, self._username, self._password, KEEPALIVE))
             await self._writer.drain()
             kind, body = await asyncio.wait_for(read_packet(self._reader), timeout)
@@ -316,7 +322,7 @@ async def exchange(payload: dict[str, Any]) -> dict[str, Any]:
     count = _count(collect.get("count"))
     quiet = _timeout({"timeout": collect.get("quiet")}, 0) if collect.get("quiet") is not None else 0
     deadline = _timeout({"timeout": collect.get("deadline")}, timeout) if collect.get("deadline") is not None else timeout
-    address, context, sni = await socket_target(host, port, payload.get("tls") is True)
+    address, context, sni = await socket_target(host, port, payload.get("tls") is True, payload=payload)
     got: list[dict[str, Any]] = []
     state = {"size": 0, "done": False}
     arrived = asyncio.Event()
@@ -335,6 +341,7 @@ async def exchange(payload: dict[str, Any]) -> dict[str, Any]:
     client = MqttClient(
         address, port, str(auth.get("user") or ""), str(auth.get("pass") or ""),
         client_id=f"mega_home-connect-{token_hex(4)}", on_message=on_message, context=context, server_hostname=sni,
+        tls_payload=payload,
     )
     try:
         await client.connect(timeout)

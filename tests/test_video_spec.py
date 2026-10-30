@@ -55,6 +55,21 @@ def test_запись_и_детекция_на_несуществующем_по
     assert camera.record is None and camera.detect is None
 
 
+def test_поток_камеры_с_любым_именем_а_не_только_main_и_sub() -> None:
+    # Камера с третьим потоком (или без «main») — данными описания, без релиза дома (ревью 2026-10-30).
+    third = {
+        **CAMERA,
+        "streams": {"wide": {"name": "onvif_aa_wide", "source": "rtsp://x/3"}, "record": {"name": "x", "source": "rtsp://x"}},
+        "record": {**CAMERA["record"], "stream": "wide"},
+        "detect": {"stream": "wide"},
+    }
+    section = video_spec.video_section({"video": {**SECTION, "cameras": [third]}})
+    assert section is not None
+    camera = section.cameras[0]
+    assert list(camera.streams) == ["wide"]  # «record» — имя читателя записи, ключом потока не берётся
+    assert camera.record is not None and camera.record.stream == "wide"
+
+
 def test_имя_потока_только_из_латиницы_цифр_и_подчёркивания() -> None:
     bad = {**CAMERA, "streams": {"main": {"name": "a/b", "source": "rtsp://x"}}}
     section = video_spec.video_section({"video": {**SECTION, "cameras": [bad]}})

@@ -36,7 +36,7 @@ from urllib.parse import quote, urlencode, urlsplit
 import aiohttp
 
 from . import wsse
-from .connect import http_send
+from .connect import connector_for, http_send
 from .const import LOGGER
 from .devices import DeviceDescriptor
 from .templating import parsed, pick, render
@@ -99,15 +99,20 @@ def base_values(descriptor: DeviceDescriptor) -> dict[str, Any]:
         "pass": descriptor.auth.password,
     }
 
-def _session(descriptor: DeviceDescriptor) -> aiohttp.ClientSession:
-    """Сессия к устройству: `tls` — без проверки сертификата, как у `connect.py`.
+def tls_payload(descriptor: DeviceDescriptor) -> dict[str, Any]:
+    """Опции TLS устройства для соединителя `connect`: по умолчанию сертификат НЕ проверяется.
 
     ⚠ Без этого источник к устройству с самоподписанным сертификатом (регистратор
     видеонаблюдения, 8080/https) падал на первом же `setup` и молча перезапускался
-    — объект остался без ленты событий (живой объект 2026-09-20). Проверять
-    сертификат нечем: адресаты — только частные адреса объекта.
+    — объект остался без ленты событий (живой объект 2026-09-20). Устройство объекта и по имени
+    (`nvr.local`) — устройство LAN; отпечаток и клиентский сертификат — полями описания.
     """
-    connector = aiohttp.TCPConnector(ssl=False) if descriptor.tls else None
+    return {"tlsInsecure": True, **descriptor.tls_options}
+
+
+async def _session(descriptor: DeviceDescriptor) -> aiohttp.ClientSession:
+    """Сессия к устройству — соединителем `connect` (адрес по имени, опции TLS описания)."""
+    connector = await connector_for(descriptor.host, descriptor.port, descriptor.tls, tls_payload(descriptor))
     return aiohttp.ClientSession(connector=connector)
 
 
@@ -224,7 +229,7 @@ async def poll(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[s
     renew_block = spec.get("renew") if isinstance(spec.get("renew"), dict) else None
     teardown_block = spec.get("teardown") if isinstance(spec.get("teardown"), dict) else None
     opened = False
-    async with _session(descriptor) as session:
+    async with await _session(descriptor) as session:
         async def do_teardown() -> None:
             nonlocal opened
             if teardown_block is None or not opened:
@@ -335,7 +340,7 @@ async def stream(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict
 
     idle = seconds(spec.get("idle"), IDLE_S, 5.0)
     call = _call(descriptor, spec, base_values(descriptor))
-    async with _session(descriptor) as session:
+    async with await _session(descriptor) as session:
         async with await http_send(session, call, aiohttp.ClientTimeout(total=None)) as response:
             # ⚠ Отказ устройства — ОТКАЗ, а не поток: тело 401 уходило бы
             # «событиями», а источник тихо перезапускался бы по кругу.
@@ -381,7 +386,7 @@ async def ws(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[str
     # ключ в query или свой заголовок уже на рукопожатии.
     call = _call(descriptor, spec, values)
     idle = seconds(spec.get("idle"), IDLE_S, 5.0)
-    async with _session(descriptor) as session:
+    async with await _session(descriptor) as session:
         socket_ = await session.ws_connect(
             call["url"].replace("http", "ws", 1), headers=call["headers"], heartbeat=30
         )
@@ -420,14 +425,22 @@ async def mqtt(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[s
     def on_message(topic: str, data: bytes, retained: bool) -> None:
         ctx.emit(descriptor, source, spec, "message", {"topic": topic, **body_of(data)})
 
+    from .connect import socket_target
+
+    # Адрес и TLS — как у вызова `connect` (имя хоста, клиентский сертификат, отпечаток — `connect_tls.py`).
+    options = tls_payload(descriptor)
+    address, context, sni = await socket_target(descriptor.host, descriptor.port, descriptor.tls, payload=options)
     client = MqttClient(
-        descriptor.host,
+        address,
         descriptor.port,
         descriptor.auth.user,
         descriptor.auth.password,
         tls=descriptor.tls,
         client_id=f"mega_home-{descriptor.id}-sub-{token_hex(4)}",
         on_message=on_message,
+        context=context,
+        server_hostname=sni,
+        tls_payload=options,
     )
     await client.connect()
     try:

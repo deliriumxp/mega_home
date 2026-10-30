@@ -292,7 +292,7 @@ class Streams:
             if str(req.get("kind") or "tcp") in ("tcp", "udp"):
                 udp = req.get("kind") == "udp"
                 address, context, sni = await connect_mod.socket_target(
-                    host, port, not udp and req.get("tls") is True, socket.AF_INET if udp else socket.AF_UNSPEC
+                    host, port, not udp and req.get("tls") is True, socket.AF_INET if udp else socket.AF_UNSPEC, payload=req
                 )
         except OpError as err:
             await self._fail(stream_id, err.message)
@@ -317,6 +317,13 @@ class Streams:
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(address, port, ssl=context, server_hostname=sni), 10
                 )
+                if context is not None:
+                    try:
+                        connect_mod.pin_socket(writer, req)
+                    except OpError as err:
+                        writer.close()
+                        await self._fail(stream_id, err.message)
+                        return
                 stream = _Stream(stream_id, reader, writer, self, idle)
             else:
                 await self._fail(stream_id, f"вид «{kind}» connect не умеет")
@@ -579,7 +586,7 @@ class _WsStream(_SessionBase):
     async def _run(self) -> None:
         headers = self._req.get("headers") if isinstance(self._req.get("headers"), dict) else None
         try:
-            connector = await connect_mod.connector_for(self._host, self._port, self._req.get("tls") is True)
+            connector = await connect_mod.connector_for(self._host, self._port, self._req.get("tls") is True, self._req)
             self._session = aiohttp.ClientSession(connector=connector, trace_configs=connect_mod.no_redirects())
             # Срок — на РУКОПОЖАТИЕ: число в `timeout=` у aiohttp задавало лишь
             # срок закрытия (и устарело), а к мёртвому адресу ждали бы минуты.

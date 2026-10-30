@@ -6,33 +6,32 @@
 а интеграция стоит в той же локалке и достаёт те же устройства без него вовсе.
 
 ⚠ Здесь НЕТ ни одной проверки: ни «здоров ли директор», ни «что значит этот
-ответ». Только два примитива — HTTP-запрос и обмен строками по TCP/TLS. Смысл
-пробы (куда идти, что послать, как понять ответ) живёт В МЕНЕДЖЕРЕ и меняется
-его деплоем, а не релизом HACS с перезапуском Home Assistant на КАЖДОМ объекте
-(docs/plan-thin-integration.md, docs/monitoring-and-logs.md). Новая проверка
-мониторинга обязана быть новым ЗАДАНИЕМ, а не новым кодом здесь; если задание
-из этих двух примитивов не собирается — это разговор про примитив, а не про
-проверку.
+ответ». Смысл пробы (куда идти, что послать, как понять ответ) живёт В МЕНЕДЖЕРЕ
+и меняется его деплоем (docs/plan-thin-integration.md, docs/monitoring-and-logs.md).
+
+⚠ Своего транспорта у пробы НЕТ (ревью 2026-10-30, долг `docs/plan-thin-gateway.md`): задание
+переводится в вызов `connect` и исполняется им — один адресат, один TLS (`connect_tls.py`), одни
+пределы. Прежний свой HTTP/TCP-клиент ходил без проверки адреса и мимо опций TLS, и каждая ось,
+закрытая в `connect`, у пробы оставалась открытой. Форма задания и ответа — прежняя: её шлют
+мониторинг и сторож менеджера (`probe.types.ts`).
 
 ⚠ Кто зовёт: ТОЛЬКО менеджер, живым каналом (`link.py`), где объект уже опознан
-своим токеном. Локальной HTTP-двери у этой операции нет и быть не должно —
-контур дома без аутентификации, и там она стала бы открытым прокси в LAN
-объекта для любого, кто в его Wi-Fi.
+своим токеном, и сторож дома правилами того же менеджера (`agent.py`).
 """
 
 from __future__ import annotations
 
 import asyncio
-import re
+import base64
 import ssl
 import time
 from http import HTTPStatus
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
 
-from .connect import tls_context
-from .const import LOGGER
+from . import connect
 from .host import Host
 from .ops_base import OpError
 
@@ -59,162 +58,100 @@ async def run(env: Host, payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(probes, list) or not probes:
         raise OpError("Задание пробы пустое", HTTPStatus.BAD_REQUEST)
     if len(probes) > MAX_PROBES:
-        raise OpError(
-            f"Заданий в одном запросе больше {MAX_PROBES}", HTTPStatus.BAD_REQUEST
-        )
-    results = await asyncio.gather(*(_one(env, item) for item in probes))
+        raise OpError(f"Заданий в одном запросе больше {MAX_PROBES}", HTTPStatus.BAD_REQUEST)
+    results = await asyncio.gather(*(_one(item) for item in probes))
     return {"results": list(results)}
 
 
-async def _one(env: Host, item: Any) -> dict[str, Any]:
+def request_of(item: dict[str, Any]) -> dict[str, Any]:
+    """Задание пробы → вызов `connect`. `insecure` — «не проверять сертификат» и по имени хоста
+    (`tlsInsecure`): у контроллера Control4 `CN=<uuid>`, у регистратора самоподписанный, и доверенной
+    цепочки для них не существует; устройству по адресу сертификат не проверяется и так."""
+    kind = str(item.get("kind") or "")
+    timeout = _timeout(item)
+    tls_extra = {"tlsInsecure": True} if item.get("insecure") else {}
+    if kind == "http":
+        url = urlsplit(str(item.get("url") or ""))
+        if url.scheme not in ("http", "https") or not url.hostname:
+            raise OpError("адрес пробы должен быть http(s)")
+        body = item.get("body")
+        return {
+            "kind": "http",
+            "host": url.hostname,
+            "port": url.port or (443 if url.scheme == "https" else 80),
+            "tls": url.scheme == "https",
+            "method": str(item.get("method") or "GET").upper(),
+            "path": (url.path or "/") + (f"?{url.query}" if url.query else ""),
+            "headers": item.get("headers") if isinstance(item.get("headers"), dict) else {},
+            **({"body": body} if isinstance(body, str) else {}),
+            "timeout": timeout,
+            **tls_extra,
+        }
+    if kind == "tcp":
+        host, port = str(item.get("host") or ""), item.get("port")
+        if not host or not isinstance(port, int):
+            raise OpError("проба TCP без адреса или порта")
+        send = item.get("send")
+        marker = item.get("readUntil")
+        return {
+            "kind": "tcp",
+            "host": host,
+            "port": port,
+            "tls": item.get("tls") is True,
+            "sendBase64": base64.b64encode(send.encode("utf-8")).decode("ascii") if isinstance(send, str) and send else "",
+            "readUntil": {"deadline": timeout, **({"pattern": marker} if isinstance(marker, str) and marker else {})},
+            "timeout": timeout,
+            **tls_extra,
+        }
+    raise OpError(f"неизвестный вид пробы «{kind}»")
+
+
+async def _one(item: Any) -> dict[str, Any]:
     if not isinstance(item, dict):
         return _failed("задание не является объектом")
-    kind = str(item.get("kind") or "")
     started = time.monotonic()
     try:
-        if kind == "http":
-            return await _http(env, item, started)
-        if kind == "tcp":
-            return await _tcp(env, item, started)
-    except asyncio.TimeoutError:
-        return _failed(f"таймаут {_timeout(item) * 1000:.0f} мс", started)
-    except (aiohttp.ClientError, OSError, ssl.SSLError) as err:
-        # ⚠ Причина словами, а не класс исключения: её читает человек в карточке
-        # объекта, и «ConnectionRefusedError» ему не говорит ничего.
+        request = request_of(item)
+        answer = await connect.perform(request)
+    except OpError as err:
         return _failed(_describe(err), started)
-    except Exception as err:  # noqa: BLE001 — проба не имеет права ронять канал
-        LOGGER.exception("Проба сорвалась: %s", err)
+    except Exception:  # noqa: BLE001 — проба не имеет права ронять канал
         return _failed("проба сорвалась в доме", started)
-    return _failed(f"неизвестный вид пробы «{kind}»", started)
-
-
-async def _http(
-    env: Host, item: dict[str, Any], started: float
-) -> dict[str, Any]:
-    """Один HTTP(S)-запрос к устройству в LAN объекта.
-
-    ⚠ `insecure` (не проверять сертификат) — норма для этой сети, а не
-    небрежность: у контроллера Control4 `CN=<uuid>`, у регистратора
-    самоподписанный, и доверенной цепочки для них не существует в принципе.
-    Решает это менеджер заданием: он один знает, с кем говорит.
-    """
-    url = str(item.get("url") or "")
-    if not url.startswith(("http://", "https://")):
-        return _failed("адрес пробы должен быть http(s)", started)
-    body = item.get("body")
-    headers = item.get("headers") if isinstance(item.get("headers"), dict) else None
-    session = env.session()
-    async with session.request(
-        str(item.get("method") or "GET").upper(),
-        url,
-        headers=headers,
-        data=body.encode("utf-8") if isinstance(body, str) else None,
-        timeout=aiohttp.ClientTimeout(total=_timeout(item)),
-        ssl=False if item.get("insecure") else None,
-        # Редирект — это уже другой адрес, а проба спрашивает про ЭТОТ.
-        allow_redirects=False,
-    ) as answer:
-        raw = await answer.content.read(MAX_BODY_BYTES + 1)
-        text, truncated = _text(raw)
-        ok = 200 <= answer.status < 300
-        result = {
-            "ok": ok,
-            "ms": _ms(started),
-            "status": answer.status,
-            "body": text,
-        }
-        if truncated:
-            result["truncated"] = True
-        if not ok:
-            result["error"] = f"HTTP {answer.status}"
-        return result
-
-
-async def _tcp(env: Host, item: dict[str, Any], started: float) -> dict[str, Any]:
-    """Обмен строками по TCP, при надобности под TLS.
-
-    ⚠ Ради этого примитива он и заведён: канал `sysmand` контроллера Control4 —
-    TLS без авторизации, ОДНА команда на соединение, и закрывает соединение
-    только клиент (docs/control4-sysmand-integration.md). Поэтому здесь
-    обязательны признак конца ответа (`readUntil`) И жёсткий срок: без них
-    проба висит столько, сколько работает дом.
-    """
-    host = str(item.get("host") or "")
-    port = item.get("port")
-    if not host or not isinstance(port, int):
-        return _failed("проба TCP без адреса или порта", started)
-    timeout = _timeout(item)
-    context: ssl.SSLContext | None = None
-    if item.get("tls"):
-        # `insecure` — общий контекст дома без проверки (см. `_http`). С
-        # проверкой — системные сертификаты, и грузятся они в EXECUTOR: чтение с
-        # диска в цикле событий HA ругает в лог. ⚠ Прежний голый
-        # `SSLContext(PROTOCOL_TLS_CLIENT)` корней не грузил вовсе, и проверенная
-        # проба не проходила НИКОГДА.
-        context = tls_context() if item.get("insecure") else await env.run(ssl.create_default_context)
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(host, port, ssl=context), timeout
-    )
-    try:
-        send = item.get("send")
-        if isinstance(send, str) and send:
-            writer.write(send.encode("utf-8"))
-            await writer.drain()
-        text, hit = await _read_until(reader, item.get("readUntil"), timeout, started)
-    finally:
-        writer.close()
-        # ⚠ Закрытие дожидаемся, но не ценой ответа: у мёртвого сокета
-        # `wait_closed` умеет висеть, а результат пробы у нас уже есть.
-        try:
-            await asyncio.wait_for(writer.wait_closed(), 2)
-        except (asyncio.TimeoutError, OSError):
-            pass
-    result: dict[str, Any] = {"ok": hit, "ms": _ms(started), "body": text}
-    if not hit:
-        result["error"] = _tcp_error(text, item)
+    text, truncated = _text(answer)
+    if request["kind"] == "http":
+        status = int(answer.get("status") or 0)
+        result: dict[str, Any] = {"ok": 200 <= status < 300, "ms": _ms(started), "status": status, "body": text}
+        if not result["ok"]:
+            result["error"] = f"HTTP {status}"
+    else:
+        # Есть признак конца — ответ годен, когда он найден; нет — когда собеседник закрыл соединение
+        # сам (это и есть конец ответа у протокола без признака) или ответ упёрся в потолок.
+        pattern = "pattern" in request["readUntil"]
+        hit = bool(answer.get("matched")) if pattern else bool(text) and (bool(answer.get("closed")) or truncated)
+        result = {"ok": hit, "ms": _ms(started), "body": text}
+        if not hit:
+            result["error"] = (
+                "соединение закрыто без ответа" if not text else f"ответ не завершился признаком «{item.get('readUntil')}»"
+            )
+    if truncated:
+        result["truncated"] = True
     return result
 
 
-async def _read_until(
-    reader: asyncio.StreamReader,
-    marker: Any,
-    timeout: float,
-    started: float,
-) -> tuple[str, bool]:
-    """Читать до признака конца, до закрытия или до срока — что раньше.
-
-    Отдаём ДАЖЕ неполный текст: для пробы частичный вывод полезнее пустоты, и
-    именно по нему потом видно, на чём собеседник замолчал.
-    """
-    pattern = re.compile(str(marker)) if isinstance(marker, str) and marker else None
-    chunks: list[bytes] = []
-    size = 0
-    while True:
-        left = timeout - (time.monotonic() - started)
-        if left <= 0:
-            return _text(b"".join(chunks))[0], False
-        try:
-            chunk = await asyncio.wait_for(reader.read(65536), left)
-        except asyncio.TimeoutError:
-            return _text(b"".join(chunks))[0], False
-        if not chunk:
-            # Собеседник закрыл соединение сам: для протокола без признака
-            # конца это и есть конец ответа.
-            text = _text(b"".join(chunks))[0]
-            return text, pattern is None and bool(text)
-        chunks.append(chunk)
-        size += len(chunk)
-        text = _text(b"".join(chunks))[0]
-        if pattern is not None and pattern.search(text):
-            return text, True
-        if size > MAX_BODY_BYTES:
-            return text, pattern is None
-
-
-def _tcp_error(text: str, item: dict[str, Any]) -> str:
-    if not text:
-        return "соединение закрыто без ответа"
-    return f"ответ не завершился признаком «{item.get('readUntil')}»"
+def _describe(err: OpError) -> str:
+    """Причина словами для оператора — из первопричины, если она сетевая."""
+    cause = err.__cause__
+    if isinstance(cause, (asyncio.TimeoutError, aiohttp.ServerTimeoutError)):
+        return "таймаут"
+    if isinstance(cause, ConnectionRefusedError):
+        return "соединение отклонено (никто не слушает)"
+    if isinstance(cause, ssl.SSLError):
+        return f"ошибка TLS: {cause}"
+    if isinstance(cause, aiohttp.ClientConnectorError):
+        if isinstance(cause.os_error, ConnectionRefusedError):
+            return "соединение отклонено (никто не слушает)"
+        return f"не удалось соединиться: {cause.os_error}"
+    return err.message
 
 
 def _timeout(item: Any) -> float:
@@ -224,9 +161,9 @@ def _timeout(item: Any) -> float:
     return min(float(ms) / 1000.0, MAX_TIMEOUT_S)
 
 
-def _text(raw: bytes) -> tuple[str, bool]:
-    truncated = len(raw) > MAX_BODY_BYTES
-    return raw[:MAX_BODY_BYTES].decode("utf-8", "replace"), truncated
+def _text(answer: dict[str, Any]) -> tuple[str, bool]:
+    raw = base64.b64decode(answer["bodyBase64"]) if answer.get("bodyBase64") else str(answer.get("body") or "").encode("utf-8")
+    return raw[:MAX_BODY_BYTES].decode("utf-8", "replace"), len(raw) > MAX_BODY_BYTES
 
 
 def _ms(started: float) -> int:
@@ -234,22 +171,4 @@ def _ms(started: float) -> int:
 
 
 def _failed(error: str, started: float | None = None) -> dict[str, Any]:
-    return {
-        "ok": False,
-        "ms": _ms(started) if started is not None else 0,
-        "error": error,
-    }
-
-
-def _describe(err: Exception) -> str:
-    """Сетевая ошибка по-русски — её читает оператор, а не разработчик."""
-    if isinstance(err, ConnectionRefusedError):
-        return "соединение отклонено (никто не слушает)"
-    if isinstance(err, aiohttp.ServerTimeoutError):
-        return "таймаут"
-    if isinstance(err, ssl.SSLError):
-        return f"ошибка TLS: {err}"
-    if isinstance(err, aiohttp.ClientConnectorError):
-        return f"не удалось соединиться: {err.os_error}"
-    text = str(err) or err.__class__.__name__
-    return f"сетевая ошибка: {text}"
+    return {"ok": False, "ms": _ms(started) if started is not None else 0, "error": error}

@@ -26,23 +26,27 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
+from . import conditions, connect
 from .changes import NOT_A_STATE
+from .const import LOGGER
+from .ops_base import OpError
 from .host import Host, PeriodicSave
 from .source import EntityState, StateSource
 
 STORE_KEY = "mega_home_alerts"
-OPS = frozenset({"on", "off", "eq", "gt", "lt"})
-FIELDS = frozenset({"op", "value", "holdSec", "cooldownSec", "enabled"})
+FIELDS = frozenset({"op", "value", "holdSec", "cooldownSec", "enabled", "path", "do"})
 # Поля, задающие САМ вход в условие; пауза и включённость его не меняют (`save`).
-CONDITION = ("op", "value", "holdSec")
-# Тело правила с телефона — меньше килобайта: локальный контур без аутентификации, и диск
-# объекта не должен заполняться чем попало (тот же довод, что у фото, `photos.py`).
-MAX_RULE_BYTES = 1024
+CONDITION = ("op", "value", "holdSec", "path")
+# Тело правила с телефона — единицы килобайт: локальный контур без аутентификации, и диск
+# объекта не должен заполняться чем попало (тот же довод, что у фото, `photos.py`). 4 КБ, а не 1:
+# правило несёт и действия `do` — описания вызовов `connect`.
+MAX_RULE_BYTES = 4096
+# Действий на срабатывание: «закрыть кран и выключить насос», а не сценарий.
+MAX_DO = 4
 MAX_SEC = 86400
 MIN_COOLDOWN_SEC = 60
 # Сколько событие ждёт подтверждения менеджера (`device_events.publish`, `ttl`): звонку минута —
@@ -81,57 +85,46 @@ def alert_key_known(config: dict[str, Any] | None, tile_id: str) -> bool:
     return tile_id in alert_keys(config)
 
 
-def _number(value: Any) -> float | None:
-    """Конечное число или `None`. ⚠ `nan`/`inf` — не число: NaN-порог не срабатывает никогда, а
-    хранилище HA пишет его как `null`, и после перезапуска правило молча пропадало бы."""
-    if isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
-
-
 def rule_valid(payload: Any) -> dict[str, Any] | None:
-    """Правило в нашей форме или `None`. Число у «больше/меньше» приводится к числу."""
-    if not isinstance(payload, dict) or not set(payload) <= FIELDS or payload.get("op") not in OPS:
+    """Правило в нашей форме или `None`. Условие — общим языком (`conditions.py`): путь к полю
+    сущности (`state` — по умолчанию, `attributes.<имя>`), сравнение, значение.
+
+    ⚠ `path` и `do` попадают в правило, только если их задали: сохранённые правила прежней формы
+    обязаны остаться РАВНЫ своей проверке (`async_load`: `rule_valid(v) == v`), иначе отсеялись бы.
+    """
+    if not isinstance(payload, dict) or not set(payload) <= FIELDS:
         return None
-    op, value = payload["op"], payload.get("value")
+    path = payload.get("path", "state")
+    cond = conditions.valid({"path": path, "op": payload.get("op"), "value": payload.get("value")})
+    if cond is None or not path:
+        return None
     hold, cooldown, enabled = payload.get("holdSec", 0), payload.get("cooldownSec"), payload.get("enabled")
     if not isinstance(enabled, bool):
         return None
     for sec, low in ((hold, 0), (cooldown, MIN_COOLDOWN_SEC)):
         if not isinstance(sec, int) or isinstance(sec, bool) or not low <= sec <= MAX_SEC:
             return None
-    if op in ("gt", "lt"):
-        value = _number(value)
-        if value is None:
-            return None
-    elif op == "eq":
-        if isinstance(value, bool) or not isinstance(value, (str, int, float)) or value == "":
-            return None
-    else:
-        value = None
-    return {"op": op, "value": value, "holdSec": hold, "cooldownSec": cooldown, "enabled": enabled}
+    do = payload.get("do")
+    if do is not None and (not isinstance(do, list) or len(do) > MAX_DO or not all(isinstance(d, dict) for d in do)):
+        return None
+    rule = {"op": cond["op"], "value": cond.get("value"), "holdSec": hold, "cooldownSec": cooldown, "enabled": enabled}
+    if path != "state":
+        rule["path"] = path
+    if do:
+        rule["do"] = do
+    return rule
+
+
+def _tree(state: EntityState) -> dict[str, Any]:
+    return {"state": state.state, "attributes": state.attributes}
 
 
 def matches(rule: dict[str, Any], state: EntityState | None) -> bool | None:
     """В условии ли состояние; `None` — прибора не видно, оценка прежняя."""
     if state is None or state.state in NOT_A_STATE:
         return None
-    raw, op, value = state.state, rule["op"], rule.get("value")
-    if op == "on":
-        return raw == "on"
-    if op == "off":
-        return raw == "off"
-    actual = _number(raw)
-    if op == "eq":
-        wanted = _number(value)
-        return actual == wanted if actual is not None and wanted is not None else raw == str(value)
-    if actual is None:
-        return False
-    return actual > value if op == "gt" else actual < value
+    cond = {"path": rule.get("path", "state"), "op": rule["op"], **({"value": rule["value"]} if rule.get("value") is not None else {})}
+    return conditions.holds(_tree(state), cond)
 
 
 def _call_later(delay: float, fn: Callable[[], None]) -> Callable[[], None]:
@@ -148,8 +141,11 @@ class Alerts:
         publish: Publish,
         clock: Callable[[], float] = time.time,
         later: Later = _call_later,
+        act: Callable[[dict[str, Any]], Awaitable[Any]] | None = None,
     ) -> None:
         self._env = env
+        # Действие правила (`do`) — вызов `connect` той же дорогой, что у бандла: правило пишет телефон.
+        self._act = act or (lambda request: connect.perform(request, bundle=True))
         self._store = env.store(STORE_KEY)
         self._saver = PeriodicSave(self._store, self._snapshot)
         self._source, self._publish, self._clock, self._later = source, publish, clock, later
@@ -198,7 +194,7 @@ class Alerts:
         entity_id = self._entity.get(tile)
         current = self._source.get(entity_id) if entity_id else None
         last = self._seen.get(tile, {}).get("last")
-        same_condition = previous is not None and all(previous[k] == rule[k] for k in CONDITION)
+        same_condition = previous is not None and all(previous.get(k) == rule.get(k) for k in CONDITION)
         if tile in self._holds and same_condition and matches(rule, current) is True:
             self._seen[tile] = {"in": False, "last": last}
             await self.flush()
@@ -315,18 +311,33 @@ class Alerts:
             self._saver.touch()
             return
         unit = state.attributes.get("unit_of_measurement") if state else None
-        data = {"op": rule["op"], "value": rule["value"], "actual": state.state if state else None, "unit": unit}
+        path = rule.get("path", "state")
+        actual = conditions.value_at(_tree(state), path) if state else None
+        data = {"op": rule["op"], "value": rule["value"], "actual": actual if isinstance(actual, (str, int, float, bool)) else None, "unit": unit}
+        if path != "state":
+            data["path"] = path
         # ⚠ Не принят — вход НЕ учтён: иначе протечка, пойманная до концентратора событий, молча
         # пропадала бы, а правило ждало бы выхода из условия.
         if not self._publish(tile, data):
             return
         seen["in"], seen["last"] = True, now
+        # Действия правила (`do`: «протечка — закрыть кран») — вызовами `connect`, без менеджера и HA.
+        for request in rule.get("do") or []:
+            self._env.spawn(self._run(tile, request), "mega_home alert action")
         if last is None or now - last >= FLUSH_QUIET_S:
             # ⚠ Первое после затишья — на диск СРАЗУ, а не раз в период: пропадание питания в эти
             # минуты дало бы после загрузки повторный push по той же протечке.
             self._env.spawn(self.flush(), "mega_home alerts flush")
         else:
             self._saver.touch()
+
+    async def _run(self, tile: str, request: dict[str, Any]) -> None:
+        try:
+            await self._act(request)
+        except OpError as err:
+            LOGGER.warning("Действие правила %s не выполнено: %s", tile, err.message)
+        except Exception as err:  # noqa: BLE001 — действие одного правила не роняет остальные
+            LOGGER.warning("Действие правила %s сорвалось: %s", tile, err)
 
     def _cancel_hold(self, tile: str) -> None:
         cancel = self._holds.pop(tile, None)

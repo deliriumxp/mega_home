@@ -32,9 +32,11 @@ import time
 from datetime import timedelta
 from typing import Any
 
+from . import conditions, connect
 from .api import ManagerClient, ManagerError
 from .const import LOGGER
 from .host import Host, PeriodicSave
+from .ops_base import OpError
 from .probe import run as run_probe
 
 # Тик сторожа. Само правило говорит, как часто ему выполняться (`everySec`);
@@ -175,8 +177,7 @@ class AgentRunner:
             return
         state["ranAt"] = now
 
-        answer = await run_probe(self._env, {"probes": rule["probes"][:MAX_PROBES]})
-        results = answer.get("results", [])
+        results = await self._tasks(rule)
 
         # Пауза: устройство остановлено НАМЕРЕННО (обновление, ручное выключение),
         # и действовать по нему нельзя — перезагрузка посреди установки пакетов
@@ -238,16 +239,28 @@ class AgentRunner:
 
         state["actedAt"] = now
         state["actedToday"] = int(state.get("actedToday", 0)) + 1
-        answer = await run_probe(self._env, {"probes": action["probes"][:MAX_PROBES]})
+        done = await self._tasks(action)
         # ⚠ Отказ задания действия НЕ считаем провалом: контроллер, которому
         # послали `reboot`, уходит в перезагрузку прямо в этой сессии и ответить
         # уже не может. В отчёт кладём то, что видели, и решает человек.
         note = rule.get("note") or ""
-        detail = "; ".join(
-            str(r.get("error") or r.get("status") or "ok") for r in answer.get("results", [])
-        )
+        detail = "; ".join(str(r.get("error") or r.get("status") or "ok") for r in done)
         self._report(rule["id"], "acted", f"{note} → {detail}"[:400])
         LOGGER.warning("Сторож объекта выполнил действие правила «%s»: %s", rule["id"], detail)
+
+    async def _tasks(self, part: dict[str, Any]) -> list[dict[str, Any]]:
+        """Задания проверки или действия: пробы (`probes`, прежняя форма менеджера), затем вызовы
+        `connect` любого вида (`requests`: ws, mqtt, udp — то, чего проба не умеет). Результаты — одним
+        списком в этом порядке; отказ вызова — результат `{ok: false, error}`, а не исключение."""
+        results: list[dict[str, Any]] = []
+        if part.get("probes"):
+            results += (await run_probe(self._env, {"probes": part["probes"][:MAX_PROBES]})).get("results", [])
+        for request in (part.get("requests") or [])[:MAX_PROBES]:
+            try:
+                results.append({"ok": True, **await connect.perform(request)})
+            except OpError as err:
+                results.append({"ok": False, "error": err.message})
+        return results
 
     # --- отчёты ---
 
@@ -291,8 +304,7 @@ def _valid(rule: Any) -> bool:
             isinstance(rule, dict)
             and isinstance(rule.get("id"), str)
             and rule["id"]
-            and isinstance(rule.get("probes"), list)
-            and rule["probes"]
+            and _has_tasks(rule)
             and isinstance(rule.get("healthy"), list)
             and rule["healthy"]
             # Необязательное: правила менеджера старше этого поля его не несут.
@@ -300,8 +312,7 @@ def _valid(rule: Any) -> bool:
             and float(rule["everySec"]) > 0
             and float(rule["failForSec"]) >= 0
             and isinstance(rule.get("action"), dict)
-            and isinstance(rule["action"].get("probes"), list)
-            and rule["action"]["probes"]
+            and _has_tasks(rule["action"])
             and float(rule["action"]["cooldownSec"]) >= 0
             and int(rule["action"]["maxPerDay"]) > 0
         )
@@ -309,14 +320,24 @@ def _valid(rule: Any) -> bool:
         return False
 
 
+def _has_tasks(part: dict[str, Any]) -> bool:
+    """Есть что выполнить: непустые `probes` или `requests` (списки), остальное — не мусор."""
+    probes, requests = part.get("probes") or [], part.get("requests") or []
+    return isinstance(probes, list) and isinstance(requests, list) and bool(probes or requests)
+
+
 def _check(results: list[dict[str, Any]], check: dict[str, Any]) -> bool:
     """Одно условие «ответ такой, как ожидали».
 
-    ⚠ Язык беден намеренно (`agent.types.ts`): `ok`, код ответа, поле JSON,
-    подстрока. Богаче — значит толкование ответов переезжает сюда, а ему сюда
-    нельзя. Условие, которое здесь не выражается, — это разговор про поле
-    контракта, а не про код.
+    Две формы. Общая — язык условий дома (`conditions.py`): `{path, op, value}` по дереву
+    `{results: [...]}`, путь вида `results.0.body.director` (JSON тела раскрывается сам), любое
+    сравнение — больше, между, не равно. Прежняя (`agent.types.ts`): `probe` + `ok`/`status`/`json`/
+    `equals`/`contains` — её шлют правила менеджера, она остаётся как есть.
+    ⚠ Толкования здесь нет ни в одной: что значит поле, решает менеджер.
     """
+    if "op" in check:
+        cond = conditions.valid(check)
+        return cond is not None and conditions.holds({"results": results}, cond)
     index = check.get("probe", 0)
     if not isinstance(index, int) or index < 0 or index >= len(results):
         return False

@@ -89,7 +89,7 @@ def _descriptor(port: int, clock: dict | None = CLOCK) -> DeviceDescriptor:
 
 async def _pull(port: int, clock: dict | None = CLOCK) -> int:
     descriptor = _descriptor(port, clock)
-    async with lo._session(descriptor) as session:  # noqa: SLF001
+    async with await lo._session(descriptor) as session:  # noqa: SLF001
         status, _kind, _body = await lo._request(session, descriptor, {"method": "POST", "path": "/events", "body": REQUEST.decode()}, {})  # noqa: SLF001
         return status
 
