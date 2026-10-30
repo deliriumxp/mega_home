@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from . import activity
 from .const import LOGGER
-from . import recorder_events
+from . import recorder_damage, recorder_events
 from .recorder_cache import cap_bytes, memory_available, shed
 from .recorder_events import EventMarks
 from .recorder_index import MAX_SEGMENT_S, SegmentIndex, day_of, epoch_of, length_ms, segment_name
@@ -57,6 +57,8 @@ class RecordSink:
         self.last_saved = 0.0
         self.saved = 0
         self.dropped = 0
+        # Кусков, которые не читались и выброшены с отметкой (`recorder_damage.py`), с запуска дома.
+        self.damaged, self.damaged_at = 0, 0.0
         # Готовые куски по списку ffmpeg: имя → длительность; прочитанная часть списка — смещением.
         self._listed: dict[str, float] = {}
         self._list_offset = 0
@@ -172,6 +174,15 @@ class RecordSink:
             if self.in_ram:
                 self._measure(path, length)
             if not self.spec.motion_mode or self.wanted(start, start + length, now):
+                if not await self._readable(path):
+                    # Не читается — в архив не кладётся, на его месте отметка (`recorder_damage.py`).
+                    self._listed.pop(path.name, None)
+                    self.damaged, self.damaged_at = self.damaged + 1, time.time()
+                    LOGGER.warning("Запись %s: кусок %s не читается — отброшен, участок отмечен", self.spec.id, path.name)
+                    await self.rec.env.run(path.unlink, True)
+                    if not self.rec.problem():
+                        await self.rec.env.run(recorder_damage.append, self.index.root / day_of(start), start, start + length)
+                    continue
                 if not await self._save_bounded(path, start, length):
                     return  # хранилище не отвечает: остальные ждут в кэше, пределом их держит `guard_once`
                 self.events.recorded(start, start + length, self.spec.pre_s, self.spec.post_s)
@@ -181,6 +192,15 @@ class RecordSink:
             else:
                 continue
             self._listed.pop(path.name, None)
+
+    async def _readable(self, path: Path) -> bool:
+        """В куске есть хоть один пакет видео (`recorder_api._first_pts`, ~60 мс). Нет ffprobe — читается: так было."""
+        from .recorder_api import _first_pts  # noqa: PLC0415 — служба импортирует запись, не наоборот
+
+        try:
+            return await _first_pts(self.rec, path, "v:0") is not None
+        except OSError as err:
+            return str(err) == "нет ffprobe"
 
     def _measure(self, path: Path, length: float) -> None:
         """Поток камеры по её куску, байт/с: от него зависит, сколько памяти нужно кэшу."""
@@ -316,6 +336,8 @@ class RecordSink:
             "why": self.why,
             "saved": self.saved,
             "dropped": self.dropped,
+            "damaged": self.damaged,
+            "damagedAt": round(self.damaged_at, 3) or None,
             "lastSaved": round(self.last_saved, 3) or None,
             "motion": bool(self.windows and self.windows[-1][1] is None),
             "preview": self.preview.why if self.preview is not None else "",
