@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import tempfile
@@ -330,6 +331,31 @@ def test_отказ_переноса_не_роняет_разбор_и_кусо�
     assert "не сохранился" in camera.why and "Input/output error" in camera.why
 
 
+@pytest.mark.real_readable
+def test_нечитаемый_кусок_не_в_архив_а_отметкой(tmp_path: Path) -> None:
+    """Кусок без единого кадра видео в архив не кладётся: сессия на нём вставала бы. На его месте — отметка
+    «повреждено» в каталоге дня (лента жильца красит её красным), счётчик — в состоянии записи (дом 0.6.14+)."""
+    from mega_home.core import recorder_damage
+
+    if not shutil.which("ffprobe"):
+        pytest.skip("нужен ffprobe")
+    folder = Path(tempfile.mkdtemp(prefix="rec-"))
+    camera = _camera(folder, motion_mode=False)
+    camera.rec.local, camera.rec.limit = True, 1024**3
+    camera.cache.mkdir(parents=True)
+    piece = camera.cache / "20261023T120000.mkv"
+    piece.write_bytes(b"not a video")
+    (camera.cache / rec.SEGMENT_LIST).write_text(f"{piece},0.000000,10.000000\n")
+    camera.rec.problem = lambda: ""  # type: ignore[method-assign]
+    asyncio.run(camera.collect())
+    assert not piece.exists() and camera.saved == 0 and camera.damaged == 1 and camera.state()["damaged"] == 1
+    assert camera.state()["damagedAt"] is not None
+    start = rec.epoch_of("20261023T120000")
+    assert start is not None
+    day = camera.index.root / rec.day_of(start)
+    assert recorder_damage.read([day], start - 1, start + 20) == [[int(start * 1000), int((start + 10) * 1000)]]
+
+
 def test_сброс_кэша_не_трогает_переносимый_кусок(tmp_path: Path) -> None:
     """Сброс кэша в памяти удалял самый старый кусок — тот самый, что переносился на медленное хранилище."""
     from mega_home.core.recorder_cache import shed
@@ -505,6 +531,10 @@ def test_служба_отдаёт_дни_участки_и_список(tmp_pat
     ms = int(base * 1000)
     # Три куска подряд — один участок, кусок через 30 с пустоты — второй.
     assert segments["segments"][:2] == [[ms, ms + 30_000], [ms + 60_000, ms + 70_000]]
+    assert segments["damaged"] == []
+    # Форма ответа — ключ в ключ с образцом контракта: его разбирает лента бандла (`recorder-archive.ts`).
+    contract = json.loads((Path(__file__).parents[1] / "custom_components/mega_home/contracts/recorder-segments.json").read_text())
+    assert set(segments) == set(contract) - {"_"}
     assert play["startMs"] == ms + 15_000
     assert play["parts"][0] == [ms + 15_000, 5_000]
     # Список — только непрерывный участок; где запись продолжается — `nextMs`.

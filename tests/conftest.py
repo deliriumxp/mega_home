@@ -251,3 +251,24 @@ _module("homeassistant.util.dt", utcnow=_utcnow)
 _package = types.ModuleType("mega_home")
 _package.__path__ = [str(ROOT / "custom_components" / "mega_home")]
 sys.modules["mega_home"] = _package
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _segments_readable(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Куски записи в спеках — заглушки без видео: проверка «кусок читается» (`RecordSink._readable`, ffprobe) их
+    выбросила бы. Спеки, которые проверяют сам отброс, помечены `real_readable`."""
+    if request.node.get_closest_marker("real_readable"):
+        return
+    from mega_home.core.recorder_sink import RecordSink
+
+    async def readable(_self: object, _path: object) -> bool:
+        return True
+
+    monkeypatch.setattr(RecordSink, "_readable", readable)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "real_readable: настоящая проверка «кусок читается» (ffprobe), без подмены")

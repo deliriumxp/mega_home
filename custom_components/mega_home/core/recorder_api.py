@@ -26,7 +26,7 @@ from uuid import uuid4
 
 from aiohttp import web
 
-from . import activity, services, storage
+from . import activity, recorder_damage, services, storage
 from .go2rtc_embed import PLAYLIST_INPUT
 from .recorder import SERVICE, day_of
 from .recorder_events_api import add_routes as add_event_routes
@@ -166,7 +166,9 @@ async def _segments(request: web.Request) -> web.Response:
             merged[-1][1] = max(merged[-1][1], int((begin + length) * 1000))
         else:
             merged.append([int(begin * 1000), int((begin + length) * 1000)])
-    return web.json_response({"segments": merged})
+    # Повреждённые участки (дом 0.6.14+, `recorder_damage.py`): лента жильца красит их, просмотр туда не встаёт.
+    days = [index.root / day_of(at) for at in range(int(start), int(stop) + 86400, 86400)]
+    return web.json_response({"segments": merged, "damaged": await request.app[_RECORDER].env.run(recorder_damage.read, days, start, stop)})
 
 
 async def _keyframe_before(recorder: Recorder, path: Any, offset: float) -> float:
