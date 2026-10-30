@@ -83,7 +83,8 @@ AudioProbe = Callable[[Any, Path], Awaitable[bool]]
 VideoStart = Callable[[Any, Path], Awaitable[float]]
 # Видео куска начинается дальше этого от начала файла — список с началом видео у каждого куска (`_plan`).
 OFFSET_S = 1.0
-OFFSET_PIECES = 30
+# Кусков в таком списке: проба начала видео — ~60 мс на кусок (замер .90.250), и перемотка ждёт их все.
+OFFSET_PIECES = 8
 # Сколько строк ошибок ffmpeg сессии попадает в журнал, когда он не отдал ни байта. ⚠ ПЕРВЫХ: причина —
 # первая строка («Impossible to open '<кусок>'»), дальше её следствия; хвост терял её (объект 2026-10-27).
 ERROR_HEAD = 3
@@ -341,15 +342,17 @@ class PlaybackSessions:
         # ⚠ Видео куска не с начала файла (застывшие метки звука, `has_audio`): ffconcat отсчитывает кусок от начала
         # файла и его длину — по последней метке, и запись вставала на часы. Тогда каждому куску — своё начало видео и
         # длина по индексу; список короче, чтобы не ждать проб всех кусков: доиграли — следующий.
+        # ⚠ Режим решает СДВИГ первого куска, а не число кусков: у живого края в списке бывает один кусок.
         starts = [await self.start(self.rec, run[0][2])]
-        if starts[0] > OFFSET_S:
+        shifted = starts[0] > OFFSET_S
+        if shifted:
             run = run[:OFFSET_PIECES]
             starts += [await self.start(self.rec, path) for _begin, _length, path in run[1:]]
         lines = ["ffconcat version 1.0"]
         for number, (_begin, length, path) in enumerate(run):
             lines.append(f"file '{path}'")
             skip = inpoint if number == 0 else 0.0
-            if len(starts) > 1:
+            if shifted:
                 lines += [f"inpoint {starts[number] + skip:.3f}", f"duration {length - skip:.3f}"]
             elif skip > 0:
                 lines.append(f"inpoint {skip:.3f}")
