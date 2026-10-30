@@ -1,8 +1,11 @@
 """Маршруты службы `recorder` для событий камеры — меток на записи (`recorder_events.py`, дом 0.6.9+).
 
 Контракт с бандлом и менеджером:
-  * `GET /events?camera&from&to[&limit]` (секунды UTC; окно не шире недели, строк ≤ 500) → `{"events": [{"id", "start", "stop",
-    "labels", "frame"}]}`, новые первыми; `start`/`stop` — мс UTC, `stop` — `null`, пока окно идёт;
+  * `GET /events?camera&from&to[&limit][&labels]` (секунды UTC; окно не шире недели, строк ≤ 500) → `{"events": [{"id", "start",
+    "stop", "labels", "frame"}]}`, новые первыми; `start`/`stop` — мс UTC, `stop` — `null`, пока окно идёт. `labels` — ярлыки
+    через запятую (дом 0.6.15+): только события хотя бы с одним из них, отбор — до `limit`. ⚠ Иначе фильтр ленты по людям
+    видел только загруженную страницу: у Шлагбаума .90.250 последние 50 событий были ночным движением, а 124 человека за
+    сутки лежали глубже;
   * `GET /event-frame?camera&id` → `image/jpeg` кадра метки | 404. Кадр метки не меняется никогда:
     `immutable` — телефон держит его в своём кэше, пока запись дня жива.
 Событие есть, только пока есть запись под ним: метки уходят уборкой вместе с каталогом дня.
@@ -35,7 +38,8 @@ def add_routes(app: web.Application, recorder: Recorder) -> None:
             limit = min(max(int(request.query.get("limit") or MAX_ROWS), 1), MAX_ROWS)
         except (KeyError, ValueError):
             return web.json_response({"error": "нет чисел from и to"}, status=400)
-        rows = await recorder.env.run(recorder_events.read, sink.index.root, start, stop)
+        labels = set(filter(None, request.query.get("labels", "").split(",")))
+        rows = await recorder.env.run(recorder_events.read, sink.index.root, start, stop, labels)
         # Метки, ещё не легшие на диск (кусок окна в кэше), — не отдаём: события без записи нет.
         # `limit` — самые новые: лента листает назад, ставя `to` на начало последней строки.
         return web.json_response({"events": rows[:limit]}, headers={"Cache-Control": "no-store"})

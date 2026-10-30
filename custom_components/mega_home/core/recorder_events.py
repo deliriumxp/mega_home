@@ -113,8 +113,8 @@ def write(items: list[tuple[Path, dict[str, Any], bytes | None]]) -> None:
             out.write(json.dumps({**row, "frame": frame.is_file()}) + "\n")
 
 
-def read(root: Path, start: float, stop: float) -> list[dict[str, Any]]:
-    """Записанные метки с началом в `[start, stop)` (секунды), новые первыми."""
+def read(root: Path, start: float, stop: float, labels: set[str] | None = None) -> list[dict[str, Any]]:
+    """Записанные метки с началом в `[start, stop)` (секунды), новые первыми; `labels` — только с одним из ярлыков."""
     days = sorted({day_of(start), day_of(stop)} | {day_of(at) for at in range(int(start), int(stop), 86400)})
     rows: dict[str, dict[str, Any]] = {}
     for day in days:
@@ -127,7 +127,7 @@ def read(root: Path, start: float, stop: float) -> list[dict[str, Any]]:
                 row = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(row, dict) and start * 1000 <= int(row.get("start") or 0) < stop * 1000:
+            if isinstance(row, dict) and start * 1000 <= int(row.get("start") or 0) < stop * 1000 and (not labels or labels & set(row.get("labels") or [])):
                 rows[str(row.get("id"))] = row
     return sorted(rows.values(), key=lambda row: -int(row["start"]))
 
