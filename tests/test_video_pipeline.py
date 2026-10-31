@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -265,7 +266,10 @@ def test_разовый_сбой_хранилища_не_снимает_запи
     assert not pipeline.record_on and recorder.why == "NAS не ответил"
     assert pipeline.record is not None
     pipeline.record.index.loaded = True  # прочитан, пока диска не было, — пустым
-    piece = storage_dir / "onvif-aa" / "2026-10-23" / "120000-10000.mkv"
+    # День куска — сегодняшний (UTC, как `day_of`): зашитая дата через `retainDays` (7 суток) уходила
+    # под срок хранения, и тест падал сам собой.
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    piece = storage_dir / "onvif-aa" / today / "000000-10000.mkv"
     piece.parent.mkdir(parents=True)
     piece.write_bytes(b"x")
     asyncio.run(recorder._check())  # noqa: SLF001
