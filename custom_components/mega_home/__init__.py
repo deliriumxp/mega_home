@@ -36,7 +36,7 @@ from .core import go2rtc_embed, services
 from .core.agent import AgentRunner
 from .core.observe import Observer
 from .link import ManagerLink
-from .ha_update import async_self_update
+from .ha_update import async_self_update, async_watch_update_entity
 from .ha_api import NAME as HA_SERVICE, HaApi
 from .host_system import switch_unit
 from .core.sip_bridge import SipBridge
@@ -198,6 +198,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # Обновление по кнопке менеджера (`ha_update.py`): ядро зовёт его операцией
     # `self-update`; файлы качает тот же клиент менеджера, что и бандл.
     coordinator.self_update = partial(async_self_update, hass, coordinator.client)
+    entry.async_on_unload(async_watch_update_entity(hass))
     # Службы хоста по кнопке менеджера (операция `host-unit`): systemd по D-Bus,
     # без HA — `host_system.py`.
     coordinator.host_unit = switch_unit

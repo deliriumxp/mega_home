@@ -6,9 +6,13 @@ import asyncio
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import event as event_helper
 
 from fake_host import FakeSource
 from mega_home import ha_update
@@ -242,3 +246,130 @@ def test_ядро_зовёт_то_что_дал_адаптер() -> None:
     _Coordinator.self_update = None  # type: ignore[assignment]
     with pytest.raises(OpError, match="не умеет"):
         asyncio.run(ops.run(_Coordinator(), "self-update", None))
+
+
+# ── Ложное «обновление» у HACS и Marketplace после кнопки менеджера ──
+
+
+class _UpdateHass:
+    """Дом с сущностями обновления: службу `update.skip` запоминает, задачи исполняет."""
+
+    def __init__(self, *states: SimpleNamespace, refuse: bool = False) -> None:
+        self.skipped: list[str] = []
+        self.pending: list[Any] = []
+        self.states = SimpleNamespace(async_all=lambda domain: list(states))
+        self.services = SimpleNamespace(async_call=self._call)
+        self.refuse = refuse
+
+    async def _call(self, domain, service, data, blocking=False):  # noqa: ANN001, ANN202
+        assert (domain, service, blocking) == ("update", "skip", True)
+        if self.refuse:
+            raise HomeAssistantError("нельзя")
+        self.skipped.append(data["entity_id"])
+
+    def async_create_background_task(self, coro, name):  # noqa: ANN001, ANN201
+        self.pending.append(coro)
+
+    async def async_add_executor_job(self, func, *args):  # noqa: ANN001, ANN201
+        return func(*args)
+
+    def run(self) -> None:
+        async def _drain() -> None:
+            while self.pending:
+                await self.pending.pop(0)
+
+        asyncio.run(_drain())
+
+
+def _entity(latest: str = "v0.6.15", state: str = "on", **attrs: Any) -> SimpleNamespace:
+    # Настоящая строка стенда .102 на HACS: installed v0.5.11, latest v0.6.15, код новее.
+    return SimpleNamespace(
+        entity_id="update.mega_home_update",
+        state=state,
+        attributes={
+            "installed_version": "v0.5.11",
+            "latest_version": latest,
+            "release_url": f"https://github.com/deliriumxp/mega_home/releases/{latest}",
+            **attrs,
+        },
+    )
+
+
+def _disk(tmp_path: Path, version: str = "0.6.15") -> Path:
+    (tmp_path / "manifest.json").write_text(json.dumps({"version": version}))
+    return tmp_path
+
+
+def test_версия_уже_в_доме_не_предлагается(tmp_path: Path) -> None:
+    hass = _UpdateHass(_entity())
+    ha_update.async_watch_update_entity(hass, _disk(tmp_path))
+    hass.run()
+    assert hass.skipped == ["update.mega_home_update"]
+
+
+def test_релиз_новее_кода_в_доме_предлагается_как_обычно(tmp_path: Path) -> None:
+    hass = _UpdateHass(_entity("v0.6.16"))
+    ha_update.async_watch_update_entity(hass, _disk(tmp_path))
+    hass.run()
+    assert hass.skipped == []
+
+
+def test_релиз_старше_кода_с_менеджера_не_откатывает_дом(tmp_path: Path) -> None:
+    hass = _UpdateHass(_entity("v0.6.14"))
+    ha_update.async_watch_update_entity(hass, _disk(tmp_path))
+    hass.run()
+    assert hass.skipped == ["update.mega_home_update"]
+
+
+@pytest.mark.parametrize(
+    "entity",
+    [
+        _entity(state="off"),
+        _entity(in_progress=True),
+        # Хеш коммита с версией не сравнить.
+        _entity("a1b2c3d"),
+        SimpleNamespace(
+            entity_id="update.other",
+            state="on",
+            attributes={"latest_version": "1.0", "release_url": "https://github.com/x/other/releases/1.0"},
+        ),
+    ],
+)
+def test_чужое_и_несравнимое_не_трогаем(tmp_path: Path, entity: SimpleNamespace) -> None:
+    hass = _UpdateHass(entity)
+    ha_update.async_watch_update_entity(hass, _disk(tmp_path))
+    hass.run()
+    assert hass.skipped == []
+
+
+def test_сущность_появилась_после_старта_интеграции(tmp_path: Path) -> None:
+    added = event_helper.async_track_state_added_domain
+    added.calls.clear()
+    hass = _UpdateHass()
+    ha_update.async_watch_update_entity(hass, _disk(tmp_path))
+    domains, action = added.calls[-1]
+    assert domains == "update"
+    action(SimpleNamespace(data={"new_state": _entity()}))
+    hass.run()
+    assert hass.skipped == ["update.mega_home_update"]
+
+
+def test_новая_версия_у_наблюдаемой_сущности_сверяется_снова(tmp_path: Path) -> None:
+    changed = event_helper.async_track_state_change_event
+    changed.calls.clear()
+    hass = _UpdateHass(_entity("v0.6.14", state="off"))
+    ha_update.async_watch_update_entity(hass, _disk(tmp_path))
+    entity_ids, action = changed.calls[-1]
+    assert entity_ids == ["update.mega_home_update"]
+    action(SimpleNamespace(data={"new_state": _entity("v0.6.15")}))
+    hass.run()
+    assert hass.skipped == ["update.mega_home_update"]
+
+
+def test_отказ_службы_не_роняет_дом_и_пишется_в_лог(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    hass = _UpdateHass(_entity(), refuse=True)
+    ha_update.async_watch_update_entity(hass, _disk(tmp_path))
+    hass.run()
+    assert "Не удалось скрыть ложное обновление" in caplog.text
