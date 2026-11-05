@@ -34,10 +34,16 @@ import hashlib
 import shutil
 from http import HTTPStatus
 from json import loads
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Event, EventStateChangedData, HomeAssistant, State, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.event import (
+    async_track_state_added_domain,
+    async_track_state_change_event,
+)
 
 from .core.api import ManagerClient, ManagerError
 from .core.const import INTEGRATION_VERSION, LOGGER
@@ -204,15 +210,21 @@ def _differs(package_dir: Path, files: list[Any]) -> bool:
 
 def _older(candidate: str, than: str) -> bool:
     """`candidate` строго старше `than` по числовым частям; мусор — не старше."""
-    try:
-        a = [int(part) for part in candidate.split(".")]
-        b = [int(part) for part in than.split(".")]
-    except ValueError:
+    a, b = _numeric(candidate), _numeric(than)
+    if a is None or b is None:
         return False
     length = max(len(a), len(b))
     a += [0] * (length - len(a))
     b += [0] * (length - len(b))
     return a < b
+
+
+def _numeric(version: str) -> list[int] | None:
+    """Числовые части версии или тега релиза (`v0.6.15`); мусор (хеш коммита) — None."""
+    try:
+        return [int(part) for part in version.removeprefix("v").split(".")]
+    except ValueError:
+        return None
 
 
 def _manifest_version(package_dir: Path) -> str:
@@ -260,3 +272,84 @@ async def _restart_later(hass: HomeAssistant) -> None:
     await asyncio.sleep(RESTART_DELAY)
     LOGGER.warning("Перезапуск Home Assistant по команде менеджера")
     await hass.services.async_call("homeassistant", "restart", {})
+
+
+@callback
+def async_watch_update_entity(
+    hass: HomeAssistant, package_dir: Path = PACKAGE_DIR
+) -> Callable[[], None]:
+    """Не давать HA предлагать «обновление» на версию, которая в доме уже стоит.
+
+    HACS и Marketplace помнят установленную версию у себя и файлов не читают, поэтому
+    после кнопки менеджера их сущность навсегда говорит «установлена прежняя» и зовёт
+    обновиться. Хуже ложного баннера — откат: список релизов у них отстаёт, и нажатие
+    заменило бы новый код более старым релизом. Их хранилище закрыто, поэтому версию не
+    исправить, а скрыть предложение можно: это публичная служба `update.skip`. Ядро
+    сбрасывает пропуск, как только сменилась предлагаемая версия, поэтому релиз новее
+    кода в доме показывается как обычно.
+    """
+    stops: list[Callable[[], None]] = []
+    watched: set[str] = set()
+
+    @callback
+    def _check(state: State | None) -> None:
+        if state is None or state.state != "on" or state.attributes.get("in_progress"):
+            return
+        hass.async_create_background_task(
+            _skip_if_not_newer(hass, state, package_dir), "mega_home update entity"
+        )
+
+    @callback
+    def _on_change(event: Event[EventStateChangedData]) -> None:
+        _check(event.data["new_state"])
+
+    @callback
+    def _watch(state: State | None) -> None:
+        if state is None or state.entity_id in watched or not _offers_this_integration(state):
+            return
+        watched.add(state.entity_id)
+        stops.append(async_track_state_change_event(hass, [state.entity_id], _on_change))
+        _check(state)
+
+    @callback
+    def _on_added(event: Event[EventStateChangedData]) -> None:
+        _watch(event.data["new_state"])
+
+    # ⚠ Порядок старта интеграций не задан: сущность либо уже есть, либо появится позже.
+    stops.append(async_track_state_added_domain(hass, "update", _on_added))
+    for state in hass.states.async_all("update"):
+        _watch(state)
+
+    @callback
+    def _stop() -> None:
+        for stop in stops:
+            stop()
+
+    return _stop
+
+
+def _offers_this_integration(state: State) -> bool:
+    """Сущность обновления HACS или Marketplace, отвечающая за этот пакет.
+
+    Своего признака у неё нет. Картинка нужна потому, что у недоступной сущности нет
+    `release_url`, а у Marketplace без релизов он ведёт на сам репозиторий.
+    """
+    release = str(state.attributes.get("release_url") or "")
+    picture = str(state.attributes.get("entity_picture") or "")
+    return "/mega_home/releases" in release or "/mega_home/" in picture
+
+
+async def _skip_if_not_newer(hass: HomeAssistant, state: State, package_dir: Path) -> None:
+    latest = str(state.attributes.get("latest_version") or "")
+    on_disk = await hass.async_add_executor_job(_manifest_version, package_dir)
+    # Хеш коммита с версией не сравнить: честнее оставить предложение как есть.
+    if _numeric(latest) is None or _numeric(on_disk) is None or _older(on_disk, latest):
+        return
+    try:
+        await hass.services.async_call(
+            "update", "skip", {"entity_id": state.entity_id}, blocking=True
+        )
+    except HomeAssistantError as err:
+        LOGGER.warning("Не удалось скрыть ложное обновление %s до %s: %s", state.entity_id, latest, err)
+        return
+    LOGGER.info("Скрыто ложное обновление до %s: в доме уже %s", latest, on_disk)

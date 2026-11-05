@@ -232,8 +232,15 @@ def _track_time_interval(hass: object, action: object, interval: object) -> obje
 
 
 _track_time_interval.calls = []  # type: ignore[attr-defined]
+def _track_state_added_domain(hass: object, domains: object, action: object) -> object:
+    _track_state_added_domain.calls.append((domains, action))  # type: ignore[attr-defined]
+    return lambda: None
+
+
+_track_state_added_domain.calls = []  # type: ignore[attr-defined]
 _module(
     "homeassistant.helpers.event",
+    async_track_state_added_domain=_track_state_added_domain,
     async_track_state_change_event=_track_state_change_event,
     async_track_time_interval=_track_time_interval,
 )
