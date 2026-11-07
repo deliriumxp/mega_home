@@ -22,11 +22,11 @@ import shutil
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 import aiohttp
 
-from . import motion
+from . import go2rtc_streams, motion
 from .activity import ActivityBuckets
 from .const import LOGGER
 from .go2rtc_embed import API_PORT
@@ -101,19 +101,12 @@ class CameraPipeline:
 
     async def _restore(self) -> None:
         """Завести в go2rtc потоки камеры, которых там НЕТ (сняты, go2rtc перезапущен) или чей источник сменился.
-        ⚠ Живые не трогать: повторный PUT подменяет объект потока, идущий читатель остаётся на прежнем, а новый
-        потребитель открывает к камере ещё одно подключение — вызывная панель с малым числом RTSP-сессий перестала
-        отдавать основной поток (.90.250 2026-10-27)."""
-        async with self.rec.env.session().get(f"http://127.0.0.1:{API_PORT}/api/streams", timeout=GO2RTC_TIMEOUT) as answer:
-            live = (await answer.json(content_type=None) if answer.status < 400 else None) or {}
+        Живые не трогать — почему и как это узнаётся: `go2rtc_streams.py`."""
+        api, session = f"http://127.0.0.1:{API_PORT}", self.rec.env.session()
+        async with session.get(f"{api}/api/streams", timeout=GO2RTC_TIMEOUT) as answer:
+            listing = (await answer.json(content_type=None) if answer.status < 400 else None) or {}
         for stream in self.plan.streams.values():
-            producers = (live.get(stream.name) or {}).get("producers") or []
-            if any(isinstance(p, dict) and p.get("url") == stream.source for p in producers):
-                continue
-            url = f"http://127.0.0.1:{API_PORT}/api/streams?name={quote(stream.name, safe='')}&src={quote(stream.source, safe='')}"
-            async with self.rec.env.session().put(url, timeout=GO2RTC_TIMEOUT) as answer:
-                if answer.status >= 400:
-                    raise RuntimeError(f"go2rtc не принял поток {stream.name} ({answer.status})")
+            await go2rtc_streams.ensure(session, api, stream.name, stream.source, listing, GO2RTC_TIMEOUT)
 
     async def run(self, record_on: bool) -> None:
         """Держать камеру, пока задачу не снимут. Хозяин — сторож записи (`Recorder._check`).
