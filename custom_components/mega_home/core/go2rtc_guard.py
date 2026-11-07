@@ -34,6 +34,7 @@ from typing import Any
 import aiohttp
 
 from . import host_load
+from .go2rtc_streams import masked
 from .const import LOGGER
 
 # Как часто сверяемся и сколько ждём появления продюсера в `/api/streams`.
@@ -83,11 +84,14 @@ def registered_sources(streams: Any) -> set[str]:
 
 
 def orphans(children: list[Producer], sources: set[str], uptime: float, grace: float = GRACE_S) -> list[Producer]:
-    """Дети, чей вход не принадлежит ни одному живому потоку и которые старше `grace`."""
+    """Дети, чей вход не принадлежит ни одному живому потоку и которые старше `grace`.
+    ⚠ Вход сравнивается маской: go2rtc 1.9.15+ прячет учётку в адресах ответа (`go2rtc_streams.py`), и вход
+    `rtsp://u:p@…` иначе не нашёлся бы ни в одном потоке — живой продюсер сняли бы как сироту."""
+    hidden = {masked(source) for source in sources}
     return [
         child
         for child in children
-        if child.input and uptime - child.start >= grace and not any(child.input in source for source in sources)
+        if child.input and uptime - child.start >= grace and not any(masked(child.input) in source for source in hidden)
     ]
 
 

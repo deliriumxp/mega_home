@@ -36,11 +36,10 @@ import shutil
 import time
 from collections import deque
 from typing import Any, Callable, NamedTuple
-from urllib.parse import quote
 
 import aiohttp
 
-from . import activity, host_load, person
+from . import activity, go2rtc_streams, host_load, person
 from .const import LOGGER
 from .go2rtc_embed import API_PORT, RTSP_PORT
 
@@ -205,12 +204,10 @@ async def motion(ctx: Any, descriptor: Any, source: str, spec: dict[str, Any]) -
     loop = asyncio.get_running_loop()
     np = await loop.run_in_executor(None, importlib.import_module, "numpy")
     if spec.get("source"):
-        # Тот же источник под тем же именем, что у бандла (`<плитка>_sub`): повторная регистрация
-        # идущий поток не рвёт, а без неё go2rtc не знал бы потока, пока его никто не смотрит.
-        url = f"http://127.0.0.1:{API_PORT}/api/streams?name={quote(stream, safe='')}&src={quote(str(spec['source']), safe='')}"
-        async with aiohttp.ClientSession() as session, session.put(url) as answer:
-            if answer.status >= 400:
-                raise RuntimeError(f"go2rtc не принял поток ({answer.status})")
+        # Тот же источник под тем же именем, что у бандла (`<плитка>_sub`): без регистрации go2rtc не знал бы
+        # потока, пока его никто не смотрит; идущий — не перезаводить (`go2rtc_streams.py`).
+        async with aiohttp.ClientSession() as session:
+            await go2rtc_streams.ensure(session, f"http://127.0.0.1:{API_PORT}", stream, str(spec["source"]))
     fps = _number(spec, "fps", 5, 1, 10)
     ffmpeg, nice = await loop.run_in_executor(None, lambda: (shutil.which("ffmpeg"), shutil.which("nice")))
     if not ffmpeg:

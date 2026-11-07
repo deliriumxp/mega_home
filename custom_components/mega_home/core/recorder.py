@@ -33,9 +33,8 @@ import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote
 
-from . import activity, host_load, services, storage
+from . import activity, go2rtc_streams, host_load, services, storage
 from .proc_runner import ExitWatch
 from .const import LOGGER
 from .go2rtc_embed import API_PORT, RTSP_PORT
@@ -98,13 +97,8 @@ class _Camera(RecordSink):
             await asyncio.sleep(RESTART_S)
 
     async def register(self) -> None:
-        url = (
-            f"http://127.0.0.1:{API_PORT}/api/streams?name={quote(self.spec.stream, safe='')}"
-            f"&src={quote(self.spec.source, safe='')}"
-        )
-        async with self.rec.env.session().put(url) as answer:
-            if answer.status >= 400:
-                raise RuntimeError(f"go2rtc не принял поток ({answer.status})")
+        # Идущий поток не перезаводить: повтор подменил бы объект под читателем (`go2rtc_streams.py`).
+        await go2rtc_streams.ensure(self.rec.env.session(), f"http://127.0.0.1:{API_PORT}", self.spec.stream, self.spec.source)
 
     async def _record(self) -> None:
         binary = await self.rec.env.run(shutil.which, "ffmpeg")
