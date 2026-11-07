@@ -180,7 +180,8 @@ async def async_start(env: Host) -> bool:
         return False
     _why = ""
     services.register("go2rtc", API_PORT)
-    LOGGER.info("mega_home go2rtc готов: %s, медиа :%s", URL, WEBRTC_PORT)
+    # Версию go2rtc выбирает образ HA, не мы: смена вида ответа API приходит обновлением HA (`go2rtc_streams.py`).
+    LOGGER.info("mega_home go2rtc %s готов: %s, медиа :%s", await _version(env), URL, WEBRTC_PORT)
     _guard = env.spawn(go2rtc_guard.run(URL, _proc.pid), "mega_home go2rtc: сторож продюсеров")
     _watcher = env.spawn(_watch(env), "mega_home go2rtc: сторож API")
     return True
@@ -425,6 +426,16 @@ async def _await_api(env: Host) -> bool:
             pass
         await asyncio.sleep(0.2)
     return False
+
+
+async def _version(env: Host) -> str:
+    """Версия запущенного go2rtc из `GET /api`; не ответил — «?» (старт от этого не зависит)."""
+    try:
+        async with env.session().get(f"{URL}/api", timeout=_timeout(1)) as answer:
+            info = await answer.json(content_type=None) if answer.status < 400 else None
+    except Exception:  # noqa: BLE001 - только подпись в журнале
+        return "?"
+    return str(info.get("version") or "?") if isinstance(info, dict) else "?"
 
 
 async def _api_alive(env: Host) -> bool:

@@ -34,6 +34,7 @@ from typing import Any
 import aiohttp
 
 from . import host_load
+from . import go2rtc_streams
 from .go2rtc_streams import masked
 from .const import LOGGER
 
@@ -71,6 +72,9 @@ def registered_sources(streams: Any) -> set[str]:
     for name, stream in streams.items():
         if isinstance(name, str) and name:
             out.add(name)
+            # Источник, который заводили мы сами, — дословно: вид адреса в ответе go2rtc меняется от версии к версии.
+            if name in go2rtc_streams.registered:
+                out.add(go2rtc_streams.registered[name])
         if not isinstance(stream, dict):
             continue
         for producer in stream.get("producers") or []:
