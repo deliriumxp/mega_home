@@ -127,7 +127,9 @@ def spec_of(block: Any) -> DeviceSpec | None:
 
 def _number(value: Any, scale: float) -> Any:
     """Число с множителем; не число — как пришло (строка режима, флаг)."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or scale == 1.0:
+        # ⚠ Без множителя — как пришло: `2 * 1.0` дало бы `2.0`, и скорость «2» не нашлась бы в списке
+        # скоростей, а код состояния «4» — в таблице действий (сравнение идёт строкой).
         return value
     scaled = value * scale
     return round(scaled, 6) if isinstance(scaled, float) else scaled

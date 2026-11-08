@@ -73,6 +73,8 @@ def test_поля_по_путям_с_множителем() -> None:
     asyncio.run(device.refresh())
     assert device.available
     assert device.values == {"power": 1, "target": 18.0, "current": 17.3, "fan": 2, "missing": None}
+    # Целое без множителя остаётся целым: адаптер сравнивает строкой («2» в списке скоростей, «4» в действиях).
+    assert str(device.values["fan"]) == "2" and str(device.values["power"]) == "1"
     assert fake.calls[0] == {"host": "192.168.88.125", "port": 80, "kind": "http", "method": "GET", "path": "/json?state"}
     assert changes == [1]
     # Тот же ответ — не изменение: сущность не пишет одно состояние в историю каждые 10 с.

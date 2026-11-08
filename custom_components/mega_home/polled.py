@@ -12,11 +12,13 @@ from collections.abc import Callable
 from typing import Any
 
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import Entity
 
 from .core import connect
 from .core.const import DOMAIN
+from .core.ops_base import OpError
 from .core.polled_device import DeviceSpec, PolledDevice, spec_of
 
 UNIQUE_PREFIX = f"{DOMAIN}_polled_"
@@ -145,7 +147,12 @@ class PolledEntity(Entity):
         self.async_on_remove(self.polled.listen(self.spec.id, self.async_write_ha_state))
 
     async def write(self, name: str, value: Any) -> None:
+        # Отказ действия сущности — `HomeAssistantError` (правило качества HA `action-exceptions`):
+        # иначе HA пишет его в журнал как сбой интеграции, а жилец видит «неизвестную ошибку».
         device = self.device
         if device is None:
-            raise ValueError(f"прибора {self.spec.id} больше нет в составе")
-        await device.write(name, value)
+            raise HomeAssistantError(f"прибора {self.spec.name} больше нет в составе")
+        try:
+            await device.write(name, value)
+        except (ValueError, ConnectionError, LookupError, OpError) as err:
+            raise HomeAssistantError(f"{self.spec.name}: {err}") from err
