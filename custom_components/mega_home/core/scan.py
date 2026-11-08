@@ -74,6 +74,13 @@ NAME_TIMEOUT_S = 0.5
 NAME_CONCURRENCY = 32
 # UDP-порт для «толчка» ARP. Закрытый и никому не нужный.
 ARP_TOUCH_PORT = 9
+# Порты задания: какие порты проверить у каждого живого хоста и с каких снять страницу, — присылает менеджер
+# из своего реестра опознавателей (`device-signatures.ts`): новый вендор с новым портом — деплой менеджера, а
+# не релиз дома и не второй проход по сети. Потолок — чтобы задание не стало перебором портов.
+MAX_SCAN_PORTS = 64
+# Текст страницы без тегов — начало: признак для опознавания там, где `<title>` пуст и заполняется скриптом
+# (контроллер вентиляции ATLAS: `<title id=title></title>`, имя — в заставке страницы).
+TEXT_CHARS = 160
 
 
 _RUNNING = asyncio.Lock()
@@ -93,9 +100,19 @@ async def run(env: Host, payload: dict[str, Any]) -> dict[str, Any]:
 
 async def _run(env: Host, payload: dict[str, Any]) -> dict[str, Any]:
     network = _target_network(payload.get("subnet") if payload else None)
+    ports = _ports_of(payload.get("ports") if payload else None)
     started = time.monotonic()
     ips = [str(ip) for ip in network.hosts()][:MAX_HOSTS]
     LOGGER.info("Обход сети %s (%d адресов) по заказу менеджера", network, len(ips))
+    # Время этапов — в ответ: где уходят секунды, видно по каждому обходу, а не догадкой.
+    phases: dict[str, int] = {}
+    mark = time.monotonic()
+
+    def lap(name: str) -> None:
+        nonlocal mark
+        now = time.monotonic()
+        phases[name] = int((now - mark) * 1000)
+        mark = now
 
     # Толчок ARP и TCP-обход идут ВМЕСТЕ: пока ядро ждёт ответов на ARP,
     # TCP-обход уже отрабатывает, и отдельная пауза на ARP не тратится дважды.
@@ -104,6 +121,7 @@ async def _run(env: Host, payload: dict[str, Any]) -> dict[str, Any]:
         _tcp_sweep(ips),
         _arp_after(env),
     )
+    lap("sweep")
 
     hosts: list[dict[str, Any]] = []
     for ip in ips:
@@ -113,21 +131,41 @@ async def _run(env: Host, payload: dict[str, Any]) -> dict[str, Any]:
     # ⚠ Показываем ВСЕ найденные устройства, а не только те, у кого открыт
     # веб-порт: их мониторинг появится позже, и терять их уже здесь нельзя.
     hosts.sort(key=lambda host: ipaddress.ip_address(host["ip"]))
-    await _scan_ports(hosts)
-    await _fingerprint(env, hosts)
+    await _scan_ports(hosts, [port for port, _http in ports])
+    lap("ports")
+    await _fingerprint(env, hosts, {port for port, http in ports if http})
+    lap("pages")
     await _names(hosts)
+    lap("names")
 
     LOGGER.info(
-        "Обход сети %s закончен: %d устройств за %d мс",
+        "Обход сети %s закончен: %d устройств за %d мс (%s)",
         network,
         len(hosts),
         int((time.monotonic() - started) * 1000),
+        ", ".join(f"{name} {ms}" for name, ms in phases.items()),
     )
     return {
         "subnet": str(network),
         "ms": int((time.monotonic() - started) * 1000),
+        "phases": phases,
         "hosts": hosts,
     }
+
+
+def _ports_of(value: Any) -> list[tuple[int, bool]]:
+    """Порты задания `[{port, http}]`; нет или мусор — прежний список веб-портов (все со страницей)."""
+    out: list[tuple[int, bool]] = []
+    for item in value if isinstance(value, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            port = int(item.get("port"))
+        except (TypeError, ValueError):
+            continue
+        if 0 < port < 65536 and all(port != seen for seen, _ in out):
+            out.append((port, item.get("http") is True))
+    return out[:MAX_SCAN_PORTS] or [(port, True) for port in WEB_PORTS]
 
 
 def _target_network(value: Any) -> ipaddress.IPv4Network:
@@ -262,7 +300,7 @@ async def _is_open(ip: str, port: int, refused: bool = False) -> bool:
         return False
 
 
-async def _scan_ports(hosts: list[dict[str, Any]]) -> None:
+async def _scan_ports(hosts: list[dict[str, Any]], ports: list[int]) -> None:
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
     async def one(host: dict[str, Any]) -> None:
@@ -270,35 +308,43 @@ async def _scan_ports(hosts: list[dict[str, Any]]) -> None:
             async with semaphore:
                 return await _is_open(host["ip"], port)
 
-        opened = await asyncio.gather(*(check(port) for port in WEB_PORTS))
+        opened = await asyncio.gather(*(check(port) for port in ports))
         host["ports"] = [
             {"port": port, "tls": port in TLS_PORTS}
-            for port, is_open in zip(WEB_PORTS, opened)
+            for port, is_open in zip(ports, opened)
             if is_open
         ]
 
     await asyncio.gather(*(one(host) for host in hosts))
 
 
-async def _fingerprint(env: Host, hosts: list[dict[str, Any]]) -> None:
-    """Снять `Server` и `<title>` с открытых веб-портов: по ним видно, что это."""
+async def _fingerprint(env: Host, hosts: list[dict[str, Any]], http_ports: set[int]) -> None:
+    """Снять `Server`, `<title>` и начало текста с открытых веб-портов: по ним видно, что это."""
     session = env.session()
     semaphore = asyncio.Semaphore(FINGERPRINT_CONCURRENCY)
 
     async def one(host: dict[str, Any], port: dict[str, Any]) -> None:
         async with semaphore:
-            # ⚠ Схему не угадываем по номеру порта: на 80 сплошь и рядом HTTPS,
-            # а на 8080 — HTTP. Пробуем ожидаемую и, если не ответила, вторую.
-            order = (True, False) if port["tls"] else (False, True)
-            for tls in order:
-                info = await _fetch(session, host["ip"], port["port"], tls)
+            # ⚠ Схему не угадываем по номеру порта: на 80 сплошь и рядом HTTPS, а на 8080 — HTTP. Обе — РАЗОМ, а не
+            # по очереди: очередь стоила второго срока на каждом порту, где ожидаемая схема молчит (замер офиса
+            # 2026-11-08: снятие страниц — 6 с из 11). Ответили обе — берём ожидаемую.
+            expected = port["tls"]
+            first, second = await asyncio.gather(
+                _fetch(session, host["ip"], port["port"], expected),
+                _fetch(session, host["ip"], port["port"], not expected),
+            )
+            if first is None and second is None:
+                # ⚠ Камеры EYEPLUS рвут каждый второй запрос подряд (стенд `.90.201`, 2026-10-23): вторая схема
+                # разом могла сорвать ожидаемую. Повтор ожидаемой — один, и только там, где не ответила ни одна.
+                first = await _fetch(session, host["ip"], port["port"], expected)
+            for tls, info in ((expected, first), (not expected, second)):
                 if info is not None:
                     port["tls"] = tls
                     port.update(info)
                     return
 
     await asyncio.gather(
-        *(one(host, port) for host in hosts for port in host["ports"])
+        *(one(host, port) for host in hosts for port in host["ports"] if port["port"] in http_ports)
     )
 
 
@@ -320,14 +366,25 @@ async def _fetch(
             raw = await answer.content.read(MAX_FINGERPRINT_BYTES)
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError):
         return None
+    page = raw.decode("utf-8", "replace")
     return {
         "status": status,
         "server": server,
-        "title": _title(raw.decode("utf-8", "replace")),
+        "title": _title(page),
+        "text": _text(page),
     }
 
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_HIDDEN_RE = re.compile(r"<(script|style|head)\b.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
+_TAG_RE = re.compile(r"<[^>]*>")
+
+
+def _text(page: str) -> str:
+    """Видимый текст страницы — начало, без тегов, скриптов и стилей; смысл ему даёт менеджер."""
+    text = _TAG_RE.sub(" ", _HIDDEN_RE.sub(" ", page))
+    # Управляющие символы (поток нулей вместо страницы) — тоже пробел: `\s` их не берёт.
+    return re.sub(r"[\s\x00-\x1f\x7f]+", " ", text).strip()[:TEXT_CHARS]
 
 
 def _title(text: str) -> str:

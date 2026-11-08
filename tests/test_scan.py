@@ -91,5 +91,57 @@ def test_run_reports_host_with_web_port_and_title(monkeypatch):
         assert host["ports"] == [
             {"port": port, "tls": False, "status": 200, "server": "Test", "title": "Hello"}
         ]
+        assert set(result["phases"]) == {"sweep", "ports", "pages", "names"}
 
     run(scenario())
+
+
+def test_порты_задания_и_прежний_список_по_умолчанию():
+    assert scan._ports_of([{"port": 554}, {"port": 80, "http": True}, {"port": 80}, {"port": 0}, "мусор"]) == [
+        (554, False),
+        (80, True),
+    ]
+    assert scan._ports_of(None) == [(port, True) for port in scan.WEB_PORTS]
+    assert len(scan._ports_of([{"port": p} for p in range(1, 200)])) == scan.MAX_SCAN_PORTS
+
+
+def test_текст_страницы_без_тегов_и_скриптов():
+    # Страница контроллера ATLAS: `<title>` пуст, имя — в заставке тела (2026-11-08).
+    page = (
+        "<html><head><title id=title></title><style>.x{}</style></head><body>"
+        "<script>var a=1;</script><div class=title hidden>ATLAS - контроллер для управления\n"
+        "приточно-вытяжной установкой</div></body></html>"
+    )
+    assert scan._title(page) == ""
+    assert scan._text(page) == "ATLAS - контроллер для управления приточно-вытяжной установкой"
+    assert len(scan._text("<p>" + "я" * 500 + "</p>")) == scan.TEXT_CHARS
+    assert scan._text("<title>Камера</title>" + "\x00" * 50) == "Камера"
+
+
+def test_страница_снимается_только_с_веб_портов_задания_и_обеими_схемами_разом(monkeypatch):
+    asked: list[tuple[int, bool]] = []
+
+    async def fake_fetch(session, ip, port, tls):
+        asked.append((port, tls))
+        return {"status": 200, "server": "S", "title": "", "text": ""} if tls else None
+
+    monkeypatch.setattr(scan, "_fetch", fake_fetch)
+    hosts = [{"ip": "10.0.0.2", "ports": [{"port": 80, "tls": False}, {"port": 554, "tls": False}]}]
+    run(scan._fingerprint(FakeHost(), hosts, {80}))
+    # RTSP-порт без страницы; обе схемы спрошены, ответила HTTPS — порт помечен ею.
+    assert sorted(asked) == [(80, False), (80, True)]
+    assert hosts[0]["ports"][0]["tls"] is True and "status" not in hosts[0]["ports"][1]
+
+
+def test_не_ответила_ни_одна_схема_разом_ожидаемая_спрашивается_ещё_раз(monkeypatch):
+    # Камера, рвущая каждый второй запрос: разом сорвалась и ожидаемая HTTP — повтор её поднимает.
+    calls: list[bool] = []
+
+    async def fake_fetch(session, ip, port, tls):
+        calls.append(tls)
+        return {"status": 200, "server": "", "title": "cam", "text": ""} if (not tls and len(calls) > 2) else None
+
+    monkeypatch.setattr(scan, "_fetch", fake_fetch)
+    hosts = [{"ip": "10.0.0.3", "ports": [{"port": 80, "tls": False}]}]
+    run(scan._fingerprint(FakeHost(), hosts, {80}))
+    assert calls.count(False) == 2 and hosts[0]["ports"][0]["title"] == "cam"
