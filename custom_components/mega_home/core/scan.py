@@ -383,7 +383,8 @@ _TAG_RE = re.compile(r"<[^>]*>")
 def _text(page: str) -> str:
     """Видимый текст страницы — начало, без тегов, скриптов и стилей; смысл ему даёт менеджер."""
     text = _TAG_RE.sub(" ", _HIDDEN_RE.sub(" ", page))
-    return re.sub(r"\s+", " ", text).strip()[:TEXT_CHARS]
+    # Управляющие символы (поток нулей вместо страницы) — тоже пробел: `\s` их не берёт.
+    return re.sub(r"[\s\x00-\x1f\x7f]+", " ", text).strip()[:TEXT_CHARS]
 
 
 def _title(text: str) -> str:

@@ -115,6 +115,7 @@ def test_текст_страницы_без_тегов_и_скриптов():
     assert scan._title(page) == ""
     assert scan._text(page) == "ATLAS - контроллер для управления приточно-вытяжной установкой"
     assert len(scan._text("<p>" + "я" * 500 + "</p>")) == scan.TEXT_CHARS
+    assert scan._text("<title>Камера</title>" + "\x00" * 50) == "Камера"
 
 
 def test_страница_снимается_только_с_веб_портов_задания_и_обеими_схемами_разом(monkeypatch):
