@@ -41,9 +41,11 @@ from .ha_api import NAME as HA_SERVICE, HaApi
 from .host_system import switch_unit
 from .core.sip_bridge import SipBridge
 
-# Шторы на импульсных реле (`cover.py`) — единственные сущности интеграции: их
-# логика живёт в доме, потому что без обратной связи положение знает только он.
-PLATFORMS: list[Platform] = [Platform.COVER]
+# Сущности интеграции — только то, чью логику держит сам дом: шторы на импульсных
+# реле (`cover.py`: без обратной связи положение знает только он) и приборы с
+# состоянием по опросу (`polled.py`: климат, показания, авария — устройство без
+# интеграции HA, описанное менеджером).
+PLATFORMS: list[Platform] = [Platform.COVER, Platform.CLIMATE, Platform.SENSOR, Platform.BINARY_SENSOR]
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
