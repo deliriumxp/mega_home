@@ -12,13 +12,10 @@ from homeassistant.core import HomeAssistant
 from .core import ops
 from .core.ops_base import dumps
 from .core.const import CONF_MANAGER_URL, CONF_TOKEN, CONF_VERIFY_SSL, LOGGER
+from .core.relink import Relink
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
 
 WS_PATH = "/inbound/home"
-# Reconnect backoff. An object may be offline for good, so a dead link is an
-# ordinary state: back off to a minute and stay quiet rather than retry-storm.
-FIRST_RETRY = 5
-MAX_RETRY = 60
 # Our own keepalive on top of the server's ping: a NAT that silently drops an
 # idle connection is the classic way a link looks alive and delivers nothing.
 HEARTBEAT = 30
@@ -101,14 +98,15 @@ class ManagerLink:
         session = self._coordinator.env.session(self._entry.data.get(CONF_VERIFY_SSL, True))
         url = _ws_url(self._entry.data[CONF_MANAGER_URL])
         headers = {"Authorization": f"Bearer {self._entry.data[CONF_TOKEN]}"}
-        delay = FIRST_RETRY
+        # Пауза повтора: растущая при обрыве, частая при плановом перезапуске менеджера (`core/relink.py`).
+        relink = Relink()
         while True:
             try:
                 async with session.ws_connect(
                     url, headers=headers, heartbeat=HEARTBEAT
                 ) as socket:
                     self._connected = True
-                    delay = FIRST_RETRY
+                    relink.connected()
                     LOGGER.info("Manager link is up")
                     await socket.send_json(await self._hello())
                     # Сессии инженера живут ровно столько, сколько это
@@ -135,6 +133,7 @@ class ManagerLink:
                             aiohttp.WSMsgType.ERROR,
                         ):
                             break
+                    relink.closed(socket.close_code)
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001 - a link must never die
@@ -155,8 +154,7 @@ class ManagerLink:
                 if self._watch is not None:
                     self._watch.stop()
                     self._watch = None
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, MAX_RETRY)
+            await asyncio.sleep(relink.next())
 
     async def _answer(self, socket: Any, frame: dict[str, Any]) -> None:
         """Answer one request from the manager (a resident who is away).
