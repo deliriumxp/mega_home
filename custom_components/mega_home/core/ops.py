@@ -48,6 +48,7 @@ from .ops_base import (
 SCENARIO_ACTION = "Сценарий"
 from .probe import run as run_probe
 from .scan import run as run_scan
+from .netinfo import run as run_neighbors
 from .source import CommandRejected, CommandUnknown, EntityState, StateSource
 from .ops_camera import _camera_urls, _warm_cameras, camera_frame
 
@@ -136,6 +137,11 @@ async def run(coordinator: Any, op: str, payload: dict[str, Any] | None) -> Any:
         # устройства стоят и куда из них можно войти по веб-интерфейсу. Список
         # DHCP-аренд роутера этого не даёт — статика в нём не появляется.
         return await run_scan(coordinator.env, data)
+    if op == "neighbors":
+        # Соседи на проводе по заданию МЕНЕДЖЕРА (`netinfo.py`): кто шлёт ARP и кто
+        # отвечает на опрос подсети — в том числе ЧУЖОЙ, куда TCP через шлюз не дойдёт
+        # (сброшенный роутер с заводским адресом). Сеть хоста не меняется.
+        return await run_neighbors(coordinator.env, data)
     if op == "self-update":
         # Обновить интеграцию и перезапустить дом по кнопке инсталлятора. Как —
         # знает только адаптер (в HA это HACS и `homeassistant.restart`), ядро

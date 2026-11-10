@@ -324,7 +324,20 @@ class ManagerLink:
             # решает менеджер своей таблицей (`host_system.py`). Нет поля — дом
             # старый, менеджер молчит.
             "host": await self._host(),
+            # Своя сеть дома — адреса, шлюз, маршруты (`core/netinfo.py`): менеджер берёт из
+            # неё подсети сканирования и показывает, где дом стоит, вместо догадки по карточке.
+            "net": await self._net(),
         }
+
+    async def _net(self) -> dict[str, Any] | None:
+        """Сеть дома для hello; любая ошибка — `None`, канал важнее подсказки."""
+        from .core.netinfo import facts
+
+        try:
+            return await self._coordinator.env.run(facts)
+        except Exception as err:  # noqa: BLE001 - канал важнее подсказки
+            LOGGER.debug("Network facts are unavailable: %s", err)
+            return None
 
     async def _host(self) -> dict[str, Any] | None:
         """Факты о хосте для hello; любая ошибка — `None`, канал важнее подсказки."""
