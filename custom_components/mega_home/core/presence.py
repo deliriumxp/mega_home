@@ -29,6 +29,8 @@ from typing import Any
 
 from .const import LOGGER
 from .host import Host
+# Свои интерфейсы и кадр запроса — у `netinfo.py` (один владелец: им же пользуется задание соседей).
+from .netinfo import arp_request, interfaces as _interfaces
 
 # Сколько ждём ответов пачки. Запрос уходит дважды (второй — через `RESEND_S`): одиночная
 # потеря кадра в Wi-Fi не должна стоить «пропуска пульса».
@@ -37,7 +39,6 @@ RESEND_S = 0.5
 TCP_PORT = 9
 TCP_TIMEOUT_S = 2.0
 ETH_ARP = 0x0806
-SIOCGIFADDR, SIOCGIFNETMASK, SIOCGIFHWADDR = 0x8915, 0x891B, 0x8927
 
 # Есть ли права на сырой сокет — узнаём ОДИН раз за жизнь процесса: права контейнера HA
 # не меняются, а пробовать сокет на каждый пульс — это ошибка ядра в цикле.
@@ -72,43 +73,6 @@ async def check(env: Host, hosts: list[str]) -> dict[str, dict[str, Any]]:
         if link["ip"] in hosts:
             answers[link["ip"]] = {"ok": True, "method": "self"}
     return answers
-
-
-def _interfaces() -> list[dict[str, Any]]:
-    """Свои IPv4-интерфейсы: имя, адрес, подсеть, MAC. Не Linux — пусто (тогда ICMP/TCP)."""
-    try:
-        import fcntl  # noqa: PLC0415 - есть только на POSIX
-    except ImportError:
-        return []
-    links: list[dict[str, Any]] = []
-    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        for _index, name in socket.if_nameindex():
-            if name == "lo":
-                continue
-            packed = struct.pack("256s", name.encode()[:15])
-            try:
-                ip = socket.inet_ntoa(fcntl.ioctl(probe, SIOCGIFADDR, packed)[20:24])
-                mask = socket.inet_ntoa(fcntl.ioctl(probe, SIOCGIFNETMASK, packed)[20:24])
-                mac = fcntl.ioctl(probe, SIOCGIFHWADDR, packed)[18:24]
-            except OSError:
-                continue
-            net = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
-            # Точка-точка и туннели (/32, /31) — не L2: ARP там не ходит.
-            if net.prefixlen < 31:
-                links.append({"name": name, "ip": ip, "net": net, "mac": mac})
-    finally:
-        probe.close()
-    return links
-
-
-def arp_request(mac: bytes, ip: str, target: str) -> bytes:
-    """Кадр Ethernet с ARP-запросом «у кого `target`» на широковещательный адрес."""
-    return (
-        b"\xff" * 6 + mac + struct.pack("!H", ETH_ARP)
-        + struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1)
-        + mac + socket.inet_aton(ip) + b"\x00" * 6 + socket.inet_aton(target)
-    )
 
 
 def arp_reply(frame: bytes) -> tuple[str, str] | None:

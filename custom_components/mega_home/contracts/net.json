@@ -1,0 +1,20 @@
+{
+  "_": "Образец поля `net` кадра hello и ответа операции `neighbors` (core/netinfo.py, дом 0.6.21+). Контракт с менеджером: тест дома сверяет с ним форму, спека менеджера (home-net.contract.spec.ts) разбирает его своим кодом. Поле переименовано с одной стороны — падает другая.",
+  "hello": {
+    "interfaces": [{"name": "end0", "address": "192.168.0.23/24", "mac": "02:00:00:00:00:01"}],
+    "gateway": {"ip": "192.168.0.1", "iface": "end0"},
+    "routes": [
+      {"net": "192.168.0.0/24", "via": null, "iface": "end0"},
+      {"net": "172.30.32.0/23", "via": null, "iface": "hassio"},
+      {"net": "10.20.0.0/16", "via": "192.168.0.254", "iface": "end0"}
+    ]
+  },
+  "neighbors": {
+    "seconds": 4.0,
+    "swept": 254,
+    "seen": [
+      {"ip": "192.168.88.1", "mac": "f4:1e:57:a0:49:fa", "iface": "end0", "replied": true},
+      {"ip": "192.168.0.1", "mac": "aa:bb:cc:dd:ee:01", "iface": "end0", "replied": false}
+    ]
+  }
+}
