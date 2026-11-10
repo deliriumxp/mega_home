@@ -41,7 +41,7 @@ from . import host_load
 from .const import LOGGER
 from .go2rtc_embed import API_PORT
 from .recorder_index import Segment, SegmentIndex
-from .ts_sps import SpsFix
+from .ts_sps import SpsFix, TsTrack, closing_packet
 
 if TYPE_CHECKING:
     from .recorder import Recorder
@@ -122,6 +122,23 @@ def session_command(binary: str, playlist: Path, offset_s: float, audio: bool = 
     ]
 
 
+# Шаг кадра для продолжения времени: метка нового места — не раньше последней отданной плюс кадр (25 к/с).
+FRAME_S = 0.04
+
+
+def next_offset(session: PlaybackSession) -> float:
+    """Время на выходе для нового ffmpeg: секунды с первого байта, но НЕ раньше последней отданной метки.
+
+    ⚠ `-re` у ffmpeg 7.x отдаёт с опережением на 0,5 с (`readrate_initial_burst`): перемотка без паузы давала время
+    на выходе НАЗАД на ~0,45 с, и go2rtc с браузером спотыкались на метке из прошлого.
+    """
+    if session.first_byte_at is None:
+        return 0.0
+    by_clock = clock() - session.first_byte_at
+    last = session.track.last_pts
+    return by_clock if last is None else max(by_clock, last + FRAME_S)
+
+
 async def _default_keyframe(recorder: Any, path: Path, offset: float) -> float:
     from .recorder_api import keyframe_before  # noqa: PLC0415 — служба импортирует запись, не наоборот
 
@@ -178,6 +195,8 @@ class PlaybackSession:
     audio: bool | None = None
     # Первый кусок идущего списка: пропал с диска — его надо забыть (`_forget_gone`).
     head: Path | None = None
+    # Видео-PID, счётчик и последняя метка потока зрителю — через все ffmpeg сессии (`ts_sps.TsTrack`).
+    track: TsTrack = field(default_factory=TsTrack)
 
 
 @dataclass(frozen=True)
@@ -385,6 +404,14 @@ class PlaybackSessions:
             session.pump.cancel()
             session.pump = None
         await self._stop_proc(session)
+        # Застрявший в go2rtc последний кадр прежнего места — вытолкнуть СЕЙЧАС, а не первыми байтами нового
+        # (`ts_sps.closing_packet`). Зритель ушёл — некому.
+        packet = closing_packet(session.track) if session.reader is not None else None
+        if packet is not None:
+            try:
+                await session.reader.write(packet)
+            except (ConnectionError, RuntimeError):
+                pass
 
     async def _restart(self, session: PlaybackSession) -> None:
         await self._retire(session)
@@ -395,7 +422,7 @@ class PlaybackSessions:
         failures = 0
         stuck, stuck_at = 0, None
         while not session.closed and session.reader is not None and not session.paused and gen == session.gen:
-            offset = clock() - session.first_byte_at if session.first_byte_at is not None else 0.0
+            offset = next_offset(session)
             binary = await self.rec.env.run(shutil.which, "ffmpeg") or "ffmpeg"
             proc = await self.spawn(
                 *session_command(binary, session.playlist, offset, session.audio is not False),
@@ -476,7 +503,7 @@ class PlaybackSessions:
 
     async def _copy(self, session: PlaybackSession, proc: Any, gen: int) -> bool:
         sent = False
-        fix = SpsFix()
+        fix = SpsFix(session.track)
         while chunk := await proc.stdout.read(CHUNK):
             reader = session.reader
             if reader is None or gen != session.gen:

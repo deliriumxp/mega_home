@@ -19,6 +19,8 @@ WS_PATH = "/inbound/home"
 # Our own keepalive on top of the server's ping: a NAT that silently drops an
 # idle connection is the classic way a link looks alive and delivers nothing.
 HEARTBEAT = 30
+# Очередь кадров `event`/`dev-log` в сокет: буфер источника (100 событий) плюс очередь лога разработки — с запасом.
+EVENT_QUEUE_MAX = 500
 
 
 class ManagerLink:
@@ -215,10 +217,16 @@ class ManagerLink:
         sources = [s for s in (getattr(self._coordinator, n, None) for n in ("events", "dev_log")) if s]
         if not sources:
             return
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        # ⚠ С пределом: без него очередь росла, пока канал менеджера не качает, и обходила буфер источника
+        # (`EventHub.BUFFER`). Не влезло — `False`: кадр остаётся неподтверждённым у источника и уходит при
+        # следующем `attach`.
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=EVENT_QUEUE_MAX)
 
         def enqueue(frame: dict[str, Any]) -> bool:
-            queue.put_nowait(frame)
+            try:
+                queue.put_nowait(frame)
+            except asyncio.QueueFull:
+                return False
             return True
 
         for source in sources:

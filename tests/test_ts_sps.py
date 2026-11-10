@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from mega_home.core.ts_sps import SpsFix
+from mega_home.core.ts_sps import SpsFix, TsTrack, closing_packet
 
 SPS = bytes.fromhex("474d002999b01e0089f96100000303e800003e8084")
 PPS = bytes.fromhex("48ea43c8")
@@ -59,3 +59,39 @@ def test_нарезка_потока_на_куски_не_меняет_резу�
 def test_поток_без_пакетов_ts_отдаётся_как_есть() -> None:
     junk = b"\x00\x00\x01\x47 not a transport stream" * 20
     assert _run(SpsFix(), junk, [5, 9]) == junk
+
+
+def _pts_bytes(pts: int) -> bytes:
+    return bytes([
+        0x21 | ((pts >> 29) & 0x0E), (pts >> 22) & 0xFF, ((pts >> 14) & 0xFE) | 1, (pts >> 7) & 0xFF, ((pts << 1) & 0xFE) | 1,
+    ])
+
+
+def _pes_with_pts(seconds: float) -> bytes:
+    return b"\x00\x00\x01\xe0\x00\x00\x80\x80\x05" + _pts_bytes(int(seconds * 90_000)) + b"\x00\x00\x00\x01\x09\xf0"
+
+
+def test_слежение_за_видео_pid_счётчиком_и_меткой() -> None:
+    """Перемотка закрывает прежнее место на ТОМ ЖЕ PID со следующим счётчиком и продолжает время от последней метки."""
+    track = TsTrack()
+    audio = bytes([0x47, 0x41, 0x01, 0x13]) + b"\x00\x00\x01\xc0\x00\x00\x80\x80\x05" + _pts_bytes(99 * 90_000)
+    video = bytes([0x47, 0x41, 0x00, 0x17]) + _pes_with_pts(12.5)
+    cont = bytes([0x47, 0x01, 0x00, 0x18]) + b"\x00" * 10
+    SpsFix(track).feed(audio.ljust(188, b"\xff") + video.ljust(188, b"\xff") + cont.ljust(188, b"\xff"))
+    assert track.pid == 0x100 and track.cc == 8
+    assert track.last_pts == 12.5  # метка звука не в счёт
+
+
+def test_закрывающий_пакет_пустой_pes_на_видео_pid() -> None:
+    track = TsTrack()
+    assert closing_packet(track) is None  # видео ещё не было — закрывать нечего
+    track.pid, track.cc = 0x100, 15
+    packet = closing_packet(track)
+    assert packet is not None and len(packet) == 188
+    assert packet[:4] == bytes([0x47, 0x41, 0x00, 0x30])  # PUSI, PID 0x100, адаптация + данные, счётчик 0
+    assert packet[4] == 174 and packet[5] == 0x00
+    assert packet[-9:] == b"\x00\x00\x01\xe0\x00\x00\x80\x00\x00"
+    # Наш же разбор видит в нём начало видео-PES без метки: время не сдвигается.
+    again = TsTrack()
+    again.scan(packet)
+    assert again.pid == 0x100 and again.last_pts is None
