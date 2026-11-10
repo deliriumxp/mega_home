@@ -676,3 +676,36 @@ def test_метка_далеко_после_последней_записи_за
         asyncio.run(world.sessions.open("onvif-aa", end + 2 * 3600))
     near = rs.playlist_from(index, end + 60)  # идущий кусок ещё не в индексе
     assert near is not None and near[0][0][0] == BASE + 290
+
+
+def test_перемотка_выталкивает_кадр_прежнего_места_и_не_отматывает_время(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Застрявший в go2rtc кадр прежнего места уходит пустым PES сразу после остановки ffmpeg, а время нового места
+    не раньше последней отданной метки: `-re` забегает на 0,5 с вперёд часов (ffmpeg 7.x)."""
+    world = _World(tmp_path, monkeypatch)
+    pts = 10 * 90_000
+    stamp = bytes([0x21 | ((pts >> 29) & 0x0E), (pts >> 22) & 0xFF, ((pts >> 14) & 0xFE) | 1, (pts >> 7) & 0xFF, ((pts << 1) & 0xFE) | 1])
+    video = (bytes([0x47, 0x41, 0x00, 0x13]) + b"\x00\x00\x01\xe0\x00\x00\x80\x80\x05" + stamp).ljust(188, b"\xff")
+
+    async def scenario() -> tuple[str, bytes]:
+        sid, _stream, _start = await world.sessions.open("onvif-aa", BASE + 25)
+        client, response = await _serve(world, sid)
+        try:
+            await _until(lambda: world.procs)
+            world.procs[0].stdout.feed_data(video)
+            await response.content.readexactly(188)
+            world.clock[0] += 1.0  # часы отстали от отданного: метка 10 с, прошла секунда
+            seeking = asyncio.ensure_future(world.sessions.seek(sid, BASE + 120))
+            closing = await response.content.readexactly(188)
+            await _until(lambda: len(world.procs) == 2)
+            world.procs[1].stdout.feed_data(b"B" * 188)
+            await seeking
+            return _value(world.procs[1].argv, "-output_ts_offset"), closing
+        finally:
+            await world.sessions.close_all()
+            await client.close()
+
+    offset, closing = asyncio.run(scenario())
+    assert offset == "10.040"
+    assert closing[:4] == bytes([0x47, 0x41, 0x00, 0x34]) and closing[-9:-6] == b"\x00\x00\x01"
