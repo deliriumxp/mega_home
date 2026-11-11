@@ -1,6 +1,7 @@
-"""Платформа `sensor` — показания приборов с состоянием по опросу (`polled.py`).
+"""Платформа `sensor` — показания приборов с состоянием по опросу (`polled.py`) и показания по событиям
+устройств (`core/event_sensors.py`, вид `value`; общая часть — `event_entities.py`).
 
-Список показаний — раздел `sensors` описания: поле прибора, имя, единица, класс HA.
+Список показаний прибора — раздел `sensors` его описания: поле прибора, имя, единица, класс HA.
 Класс и единица — слова HA (`SensorDeviceClass`), их выбирает генератор менеджера.
 """
 
@@ -12,7 +13,9 @@ from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, Sen
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
+from .core.event_sensors import EventSensors, SensorSpec
 from .core.polled_device import DeviceSpec
+from .event_entities import EventEntity, enum_or_none, setup_event_entities
 from .polled import UNIQUE_PREFIX, PolledDevices, PolledEntity, polled_of, remove_orphans
 
 
@@ -42,6 +45,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: Any, async_add_entities:
     remove_orphans(hass, entry, "sensor", {f"{UNIQUE_PREFIX}{key}" for key in wanted()})
     entry.async_on_unload(polled.on_devices(sync))
     sync()
+    setup_event_entities(hass, entry, async_add_entities, "sensor", "value", MegaEventValue)
 
 
 class MegaPolledSensor(PolledEntity, SensorEntity):
@@ -67,3 +71,17 @@ class MegaPolledSensor(PolledEntity, SensorEntity):
             # Код состояния прибора словами описания («Установка работает»); незнакомый код — как есть.
             return self._labels.get(str(value), value)
         return value
+
+
+class MegaEventValue(EventEntity, SensorEntity):
+    """Показание по событиям устройства (вид `value`): число или текст из события, слова HA — из описания."""
+
+    def __init__(self, sensors: EventSensors, spec: SensorSpec) -> None:
+        super().__init__(sensors, spec, "sensor")
+        self._attr_native_unit_of_measurement = spec.unit or None
+        self._attr_device_class = enum_or_none(SensorDeviceClass, spec.device_class)
+        self._attr_state_class = enum_or_none(SensorStateClass, spec.state_class)
+
+    @property
+    def native_value(self) -> Any:
+        return self.sensors.value(self.spec.id)

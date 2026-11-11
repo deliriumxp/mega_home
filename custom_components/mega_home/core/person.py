@@ -162,29 +162,49 @@ async def read_bmp(np: Any, reader: asyncio.StreamReader) -> Any:
 
 
 class PersonWatch:
-    """Человек в одном окне движения: проверки не чаще `every` секунд, «есть» — после `frames` попаданий
-    подряд, и одно событие на окно."""
+    """Окно человека внутри окна движения: проверки не чаще `every` секунд, «есть» — после `frames` попаданий
+    подряд, «кончилось» — `hold` секунд без попадания или конец движения. Одно событие на окно человека.
 
-    def __init__(self, every: float = 1.0, threshold: float = 0.5, frames: int = 2) -> None:
-        self.every, self.threshold, self.frames = every, threshold, frames
+    ⚠ Проверки идут и пока человек «есть» (до 0.6.23 они на этом вставали): по событию строится датчик
+    (`event_sensors.py`), и без подтверждений ушедший человек числился бы до конца движения — у уличной
+    камеры с ветками это минуты.
+    """
+
+    def __init__(self, every: float = 1.0, threshold: float = 0.5, frames: int = 2, hold: float = 30.0) -> None:
+        self.every, self.threshold, self.frames, self.hold = every, threshold, frames, hold
         self.checked = -1e9
         self.hits = 0
         self.present = False
+        self.last_hit = -1e9
 
     def due(self, now: float) -> bool:
-        return not self.present and now - self.checked >= self.every
+        return now - self.checked >= self.every
 
     def seen(self, value: float, now: float) -> bool:
         """Ответ сети; True — человек подтвердился сейчас (событие «началось»)."""
         self.checked = now
-        self.hits = self.hits + 1 if value >= self.threshold else 0
-        if self.hits >= self.frames and not self.present:
-            self.present = True
+        hit = value >= self.threshold
+        self.hits = self.hits + 1 if hit else 0
+        if self.present:
+            # Уже подтверждённому человеку хватает одного попадания: `frames` подряд — защита от случайного
+            # «есть», а не условие «ещё здесь».
+            if hit:
+                self.last_hit = now
+            return False
+        if self.hits >= self.frames:
+            self.present, self.last_hit = True, now
             return True
         return False
+
+    def gone(self, now: float) -> bool:
+        """True — человек не подтверждался `hold` секунд (событие «кончилось»), окно движения идёт дальше."""
+        if not self.present or now - self.last_hit < self.hold:
+            return False
+        self.hits, self.present = 0, False
+        return True
 
     def end(self) -> bool:
         """Окно движения закрылось; True — был человек (событие «кончилось»)."""
         was = self.present
-        self.hits, self.present, self.checked = 0, False, -1e9
+        self.hits, self.present, self.checked, self.last_hit = 0, False, -1e9, -1e9
         return was

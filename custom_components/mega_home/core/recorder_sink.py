@@ -13,14 +13,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import re
 import shutil
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
-from . import activity
+from . import activity, event_words
 from .const import LOGGER
 from . import recorder_damage, recorder_events
 from .recorder_cache import cap_bytes, memory_available, shed
@@ -279,22 +277,10 @@ class RecordSink:
         """
         if frame.get("access") != self.spec.access or frame.get("source") != self.spec.events:
             return
-        data = frame.get("data") if isinstance(frame.get("data"), dict) else {}
-        # Ответ устройства — его текст; событие дома (своя детекция, `motion.py`) — данные одной
-        # строкой JSON без пробелов: подстроки `on`/`off` менеджер пишет под эту форму.
-        text = str(data.get("text") or "") or json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         at = float(frame.get("at") or time.time())
-        for message in text.split(self.spec.split) if self.spec.split else [text]:
-            if self.spec.require and not any(word in message for word in self.spec.require):
-                continue
-            if any(word in message for word in self.spec.skip):
-                continue
-            marks = sorted(
-                [(m.start(), True) for word in self.spec.on for m in re.finditer(re.escape(word), message)]
-                + [(m.start(), False) for word in self.spec.off for m in re.finditer(re.escape(word), message)]
-            )
-            for _pos, on in marks:
-                self._step(on, at)
+        spec = self.spec
+        for on in event_words.steps(event_words.text_of(frame), spec.on, spec.off, spec.split, spec.require, spec.skip):
+            self._step(on, at)
         self._expire(at)
 
     def _step(self, on: bool, at: float) -> None:

@@ -149,6 +149,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     coordinator.events.on_published = coordinator.event_files.on_event
     if coordinator.data:
         coordinator.event_files.apply(coordinator.data)
+    # Датчики по событиям (`event_sensors.py`, раздел `sensors[]`): состояние — из событий концентратора,
+    # доступность — жизнь их источника. Сущности заводит платформа `binary_sensor`.
+    from .core.event_sensors import EventSensors
+
+    coordinator.event_sensors = EventSensors(coordinator.events.alive)
+    entry.async_on_unload(coordinator.events.observe(coordinator.event_sensors.on_event))
+    entry.async_on_unload(coordinator.events.watch_alive(coordinator.event_sensors.on_alive))
+    entry.async_on_unload(coordinator.event_sensors.stop)
+    if coordinator.data:
+        coordinator.event_sensors.apply(coordinator.data)
 
     # Уведомления по датчикам (`alerts.py`) — ДО дверей, как `changes`: первый же `api/alerts`
     # отвечает правилами. Час ожидания менеджера: протечка при моргнувшем интернете обязана
@@ -273,7 +283,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # кладёт кадры своей детекции.
     from .core.recorder import Recorder
 
-    coordinator.recorder = Recorder(coordinator.env, coordinator.events.subscribe, coordinator.events.publish)
+    coordinator.recorder = Recorder(
+        coordinator.env, coordinator.events.subscribe, coordinator.events.publish, coordinator.events.running,
+    )
     if coordinator.data:
         coordinator.recorder.apply(coordinator.data)
 

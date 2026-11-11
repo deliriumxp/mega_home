@@ -251,6 +251,8 @@ class CameraPipeline:
             load_key=f"cam:{self.plan.id}:{spec.key}", person=(watch, model, tune) if watch is not None else None,
         )
         self._loops[spec.key] = run
+        # Детекция идёт — её события значимы и их молчание тоже (`event_sensors.py`); снимает `_retire`.
+        self.rec.running(self.plan.id, SOURCE, True)
         tasks: list[Any] = [asyncio.ensure_future(self._frames(proc, run, spec.key))]
         if person_r is not None:
             if watch is not None:
@@ -294,6 +296,7 @@ class CameraPipeline:
         run = self._loops.pop(key, None)
         if run is not None:
             run.close()
+            self.rec.running(self.plan.id, SOURCE, False)
         for item in self._consumers.pop(key, []):
             (item.close if hasattr(item, "is_closing") else item.cancel)()
 
