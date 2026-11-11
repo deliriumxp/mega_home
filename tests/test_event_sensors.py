@@ -208,3 +208,22 @@ def test_показание_устаревает_по_тишине_и_сбрас
 def test_показание_без_пути_и_выражения_или_с_битым_выражением_не_датчик() -> None:
     assert es.spec_of({"id": "x", "kind": "value", "access": "a"}) is None
     assert es.spec_of({"id": "x", "kind": "value", "access": "a", "pattern": "("}) is None
+
+
+def test_уверенность_человека_в_процентах_и_ноль_с_уходом() -> None:
+    """Показание «Человек — уверенность»: `score` события «началось» ×100, «кончилось» — `offValue` 0, а не
+    последнее значение (ушедший человек с уверенностью 97 % врал бы в реакциях по порогу)."""
+    hub, sensors, _ = _wired({
+        "id": "mega_person_score_cam", "kind": "value", "access": "onvif-1", "source": "motion", "event": "person",
+        "path": "score", "scale": 100, "off": ['"person":"stop"'], "offValue": 0, "unit": "%",
+    })
+    hub.running("onvif-1", "motion", True)
+    hub.publish("onvif-1", "motion", "motion", {"state": "start", "share": 0.1}, local=True)
+    assert sensors.value("mega_person_score_cam") is None
+    hub.publish("onvif-1", "motion", "person", {"person": "start", "score": 0.973}, local=True)
+    assert round(sensors.value("mega_person_score_cam"), 1) == 97.3
+    hub.publish("onvif-1", "motion", "person", {"person": "stop"}, local=True)
+    assert sensors.value("mega_person_score_cam") == 0
+    # Без `offValue` «кончилось» — «неизвестно».
+    plain = es.spec_of({"id": "x", "kind": "value", "access": "a", "path": "v", "off": ["stop"]})
+    assert plain is not None and plain.off_value is None

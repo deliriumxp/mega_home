@@ -10,7 +10,8 @@
   * `value` — показание: поле данных события по пути через точку (`path`, JSON внутри текста тоже —
     `conditions.value_at`) или первая группа выражения по тексту (`pattern`, для XML и строк), числом
     (`valueType: number`, умножается на `scale`) или текстом (`text`). Событие без значения состояние не
-    меняет. Единица, класс и `stateClass` — слова HA, их пишет менеджер.
+    меняет, кроме слова «кончилось» (`off[]`, дом 0.6.24+): оно ставит `offValue` или «неизвестно» — у
+    уверенности сети ушедший человек — 0, а не последнее значение. Единица, класс и `stateClass` — слова HA.
 
 Общее: `{id, entityId, name, deviceClass, access, source, event?, where?, require?, skip?, offAfterSec?}`. `event` —
 имя события источника, если значимо не каждое; `where` — `{путь: подстрока}` по полям данных события (тема MQTT,
@@ -63,6 +64,7 @@ class SensorSpec:
     unit: str = ""
     state_class: str = ""
     where: tuple[tuple[str, str], ...] = ()
+    off_value: float | None = None
 
 
 def spec_of(raw: Any) -> SensorSpec | None:
@@ -100,6 +102,7 @@ def spec_of(raw: Any) -> SensorSpec | None:
         unit=str(raw.get("unit") or ""),
         state_class=str(raw.get("stateClass") or ""),
         where=tuple((str(k), str(v)) for k, v in raw["where"].items()) if isinstance(raw.get("where"), dict) else (),
+        off_value=number(raw.get("offValue")),
     )
 
 
@@ -175,6 +178,11 @@ class EventSensors:
                 continue
             if spec.kind == "value":
                 state = reading_of(spec, frame)
+                if state is _MISSING and spec.off and False in event_words.steps(
+                    event_words.text_of(frame), (), spec.off, spec.split, spec.require, spec.skip,
+                ):
+                    # «Кончилось» без значения — `offValue` (уверенность ушедшего человека — 0) или «неизвестно».
+                    state = spec.off_value
                 if state is _MISSING:
                     continue
             else:
@@ -184,7 +192,7 @@ class EventSensors:
                 # Последняя смена — состояние после события: окно, открытое и закрытое одним ответом, датчик
                 # не держит включённым (запись по движению тот же ответ разбирает по шагам — ей важен каждый).
                 state = changes[-1]
-            if spec.off_after and state is not False:
+            if spec.off_after and state is not False and state is not None:
                 self._arm(spec)
             else:
                 self._disarm(spec.id)
