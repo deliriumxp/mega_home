@@ -36,6 +36,7 @@ from typing import Any
 
 import aiohttp
 
+from .connect_tls import tls_context
 from .const import LOGGER
 from .host import Host
 from .ops_base import OpError
@@ -358,7 +359,9 @@ async def _fetch(
             timeout=aiohttp.ClientTimeout(total=FINGERPRINT_TIMEOUT_S),
             # ⚠ Сертификат устройства не проверяем: у камер и контроллеров он
             # самоподписанный, и проверять его нечем (то же решение, что в пробе).
-            ssl=False,
+            # Контекст — общий для устройств LAN, со старыми шифрами (`connect_tls.legacy`):
+            # с `ssl=False` aiohttp не договаривался с видеорегистратором объекта 40.
+            ssl=tls_context(),
             allow_redirects=False,
         ) as answer:
             status = answer.status

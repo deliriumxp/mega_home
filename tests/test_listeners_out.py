@@ -113,19 +113,22 @@ def test_вход_не_чаще_pause(monkeypatch) -> None:
 
 
 def test_сессия_к_устройству_с_tls_без_проверки_сертификата() -> None:
-    """Регистратор на 8080/https с самоподписанным сертификатом: без `ssl=False`
+    """Регистратор на 8080/https с самоподписанным сертификатом: с проверкой
     `setup` падал на первом запросе и источник молча перезапускался
-    (живой объект 2026-09-20). Правило то же, что у `connect.py`."""
+    (живой объект 2026-09-20). Правило то же, что у `connect.py`: контекст без
+    проверки — общий для устройств LAN, со старыми шифрами (объект 40, 2026-11-11:
+    с `ssl=False` aiohttp не договаривался с регистратором)."""
     import asyncio
 
     from mega_home.core.devices import DeviceDescriptor, AuthSpec
+    from mega_home.core import connect_tls
     from mega_home.core import listeners_out as out
 
     async def scenario() -> tuple[bool, bool]:
         tls = await out._session(DeviceDescriptor(id="d", host="192.168.1.10", port=8080, tls=True, timeout=5.0, auth=AuthSpec(type="none", user="", password="p"), events=[]))
         plain = await out._session(DeviceDescriptor(id="d", host="192.168.1.10", port=80, tls=False, timeout=5.0, auth=AuthSpec(type="none", user="", password=""), events=[]))
         try:
-            return tls.connector._ssl is False, plain.connector._ssl is not False  # noqa: SLF001
+            return tls.connector._ssl is connect_tls.tls_context(), plain.connector._ssl is not connect_tls.tls_context()  # noqa: SLF001
         finally:
             await tls.close()
             await plain.close()

@@ -50,7 +50,23 @@ def tls_context() -> ssl.SSLContext:
         _TLS = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         _TLS.check_hostname = False
         _TLS.verify_mode = ssl.CERT_NONE
+        legacy(_TLS)
     return _TLS
+
+
+def legacy(context: ssl.SSLContext) -> ssl.SSLContext:
+    """Старые наборы шифров — контексту, который сертификат и так НЕ проверяет.
+
+    ⚠ Python в образах Home Assistant собран со своим набором шифров по умолчанию: только обмен ключом
+    ECDHE/DHE и `@SECLEVEL=2`. Видеорегистратор объекта (TLS 1.2, ключ RSA 1024, единственный шифр
+    `AES256-GCM-SHA384` — обмен по RSA) с ним не договаривался: `ClientConnectorSSLError` на каждом
+    `connect`, у жильца не было ни одной камеры (объект 40, 2026-11-11). Набор OpenSSL `DEFAULT` с
+    `@SECLEVEL=0` такие устройства пускает. Защиту это не ослабляет: подлинность адресата здесь не
+    проверяется вовсе, а проверенный контекст (`verified_tls`) — прежний. Нижняя версия TLS — как у
+    сборки OpenSSL: устройства только с TLS 1.0 на объектах не встречали.
+    """
+    context.set_ciphers("DEFAULT:@SECLEVEL=0")
+    return context
 
 
 async def verified_tls() -> ssl.SSLContext:
@@ -114,6 +130,7 @@ def _client_context(cert: str, key: str, loose: bool) -> ssl.SSLContext:
     if loose:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
+        legacy(context)
     paths: list[str] = []
     try:
         for text in (cert, key):
@@ -146,8 +163,9 @@ async def aiohttp_ssl(named: bool, opts: dict[str, Any]) -> Any:
         return aiohttp.Fingerprint(bytes.fromhex(opts["pin"]))
     if "client" in opts:
         return await context_for(named, opts)
-    # Как до опций: имя — проверенный контекст aiohttp, устройство LAN — без проверки.
-    return False if trusts_any(named, opts) else True
+    # Как до опций: имя — проверенный контекст aiohttp, устройство LAN — без проверки. ⚠ Не `False`:
+    # с ним aiohttp строит свой непроверяющий контекст с шифрами Python по умолчанию (`legacy`).
+    return tls_context() if trusts_any(named, opts) else True
 
 
 def check_pin(ssl_object: Any, opts: dict[str, Any]) -> None:

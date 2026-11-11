@@ -56,8 +56,22 @@ def test_http_с_отпечатком_и_клиентом_разом_отказ_
         asyncio.run(connect_tls.aiohttp_ssl(True, opts))
     fingerprint = asyncio.run(connect_tls.aiohttp_ssl(True, {"pin": "0" * 64}))
     assert fingerprint.__class__.__name__ == "Fingerprint"
-    assert asyncio.run(connect_tls.aiohttp_ssl(False, {})) is False
-    assert asyncio.run(connect_tls.aiohttp_ssl(True, {"insecure": True})) is False
+    # Без проверки — НАШ контекст со старыми шифрами, а не `False` (тот строит свой контекст aiohttp).
+    assert asyncio.run(connect_tls.aiohttp_ssl(False, {})) is connect_tls.tls_context()
+    assert asyncio.run(connect_tls.aiohttp_ssl(True, {"insecure": True})) is connect_tls.tls_context()
+    assert asyncio.run(connect_tls.aiohttp_ssl(True, {})) is True
+
+
+def test_устройству_lan_старые_шифры() -> None:
+    """Регистратор Trassir: TLS 1.2, ключ RSA 1024, единственный шифр с обменом по RSA. Набор шифров
+    Python по умолчанию (как в образе HA) его не берёт — контекст устройств LAN обязан брать."""
+    context = connect_tls.tls_context()
+    names = {c["name"] for c in context.get_ciphers()}
+    assert "AES256-GCM-SHA384" in names
+    assert context.verify_mode == ssl.CERT_NONE and not context.check_hostname
+    # Проверенный контекст (имя в интернете) — прежний, ослабление только там, где проверки нет.
+    verified = asyncio.run(connect_tls.verified_tls())
+    assert verified.verify_mode == ssl.CERT_REQUIRED
 
 
 def test_разбор_http_несёт_опции_tls() -> None:
