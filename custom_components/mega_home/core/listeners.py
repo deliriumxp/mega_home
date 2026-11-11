@@ -66,6 +66,8 @@ class Listeners:
         self._any_path: dict[str, tuple[DeviceDescriptor, dict[str, Any]]] = {}
         self._runner: web.AppRunner | None = None
         self._servers: list[Any] = []
+        # Источники, о которых сказано «работает», — `_stop_all` снимает их все разом.
+        self._live: set[tuple[str, str]] = set()
         self._stopped = False
         self.why = ""
 
@@ -154,6 +156,13 @@ class Listeners:
         for server in self._servers:
             server.close()
         self._servers = []
+        for access, source in list(self._live):
+            self._running(access, source, False)
+
+    def _running(self, access: str, source: str, alive: bool) -> None:
+        (self._live.add if alive else self._live.discard)((access, source))
+        if self._hub is not None:
+            self._hub.running(access, source, alive)
 
     def state(self) -> dict[str, Any]:
         return {
@@ -169,9 +178,13 @@ class Listeners:
         told = False
         while True:
             started = monotonic()
+            # Источник работает, пока идёт его цикл; отказ и пауза перед повтором — не работает
+            # (доступность датчиков по событиям, `event_sensors.py`).
+            self._running(descriptor.id, source, True)
             try:
                 await worker(self, descriptor, source, spec)
             except asyncio.CancelledError:
+                self._running(descriptor.id, source, False)
                 raise
             except Exception as err:  # noqa: BLE001 — источник не роняет дом
                 # ⚠ Первый отказ — ПРЕДУПРЕЖДЕНИЕМ, не отладкой: источник, который
@@ -184,6 +197,7 @@ class Listeners:
                     told = True
                 else:
                     LOGGER.debug("Источник событий %s: %s", name, type(err).__name__)
+            self._running(descriptor.id, source, False)
             if monotonic() - started > HEALTHY_S:
                 delay = RETRY_FIRST_S
             await asyncio.sleep(delay)
@@ -219,6 +233,9 @@ class Listeners:
                 await runner.cleanup()
                 raise
             self._runner, self.why = runner, ""
+            # Вебхук работает, пока порт принимает: устройство зовёт само, и молчание — не отказ.
+            for access, source in [*self._hooks, *((d.id, str(s.get("id") or "webhook")) for d, s in self._any_path.values())]:
+                self._running(access, source, True)
             return
 
     async def _hook(self, request: web.Request) -> web.Response:

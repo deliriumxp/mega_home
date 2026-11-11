@@ -362,6 +362,8 @@ class MotionLoop:
                 # ⚠ Своё имя события и свой ключ данных (`person`, а не `state`): запись по движению
                 # раздела `recorder` и лента ловят движение подстрокой `"state":"start"`.
                 self.emit("person", {"person": "start", "score": round(value, 3)}, ("image/jpeg", picture) if picture else None)
+        if watch is not None and watch.gone(now):
+            self.emit("person", {"person": "stop"}, None)
 
     def close(self) -> None:
         """Источник встал: окно записи и метка ленты не висят открытыми посреди движения."""
@@ -394,7 +396,7 @@ class PersonTune(NamedTuple):
 
 
 async def _person_setup(loop: asyncio.AbstractEventLoop, np: Any, spec: dict[str, Any]) -> tuple[Any, Any, PersonTune]:
-    """Сеть «человек» по описанию (`person: {every, threshold, frames, width, margin, shot}`); нет раздела или
+    """Сеть «человек» по описанию (`person: {every, threshold, frames, hold, width, margin, shot}`); нет раздела или
     весов — без сети: движение работает как прежде."""
     options = spec.get("person")
     if not isinstance(options, dict):
@@ -408,6 +410,8 @@ async def _person_setup(loop: asyncio.AbstractEventLoop, np: Any, spec: dict[str
         every=_number(options, "every", 1.0, 0.2, 10.0),
         threshold=_number(options, "threshold", 0.5, 0.05, 0.99),
         frames=int(_number(options, "frames", 2, 1, 10)),
+        # «Ушёл» — столько секунд без подтверждения сетью; умолчание — пауза «нет движения» (`offDelay`).
+        hold=_number(options, "hold", 30, 5, 600),
     )
     # Ширина — чётная: `scale=W:-2` ffmpeg.
     tune = PersonTune(

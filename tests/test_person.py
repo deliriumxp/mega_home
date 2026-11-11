@@ -100,9 +100,27 @@ def test_одно_событие_на_окно_после_попаданий_п�
     assert watch.seen(0.9, 2.0) is False
     assert not watch.due(2.5)
     assert watch.seen(0.9, 3.0) is True
-    # Человек уже есть — до конца окна больше не проверяем и не говорим.
-    assert not watch.due(10.0)
+    # Человек уже есть — проверки идут дальше (держат «ещё здесь»), но «началось» второй раз не говорится.
+    assert watch.due(10.0)
+    assert watch.seen(0.9, 10.0) is False
     assert watch.end() is True and watch.end() is False
+
+
+def test_человек_ушёл_по_тишине_сети_посреди_движения() -> None:
+    """Датчик «человек» (`event_sensors.py`) не держит ушедшего до конца движения: `hold` секунд без попадания —
+    «кончилось», а вернувшийся — новое окно человека."""
+    watch = person.PersonWatch(every=1.0, threshold=0.5, frames=2, hold=30.0)
+    watch.seen(0.9, 0.0)
+    assert watch.seen(0.9, 1.0) is True
+    # Подтверждённому хватает одного попадания: оно продлевает «здесь».
+    watch.seen(0.2, 2.0)
+    watch.seen(0.9, 20.0)
+    assert not watch.gone(49.0)
+    assert watch.gone(50.0) is True and not watch.gone(51.0)
+    # Конец движения после «ушёл» второго «кончилось» не даёт.
+    assert watch.end() is False
+    watch.seen(0.9, 60.0)
+    assert watch.seen(0.9, 61.0) is True
 
 
 def test_крупный_кадр_берёт_рамку_своего_момента() -> None:

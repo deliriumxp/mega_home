@@ -165,11 +165,14 @@ class Recorder:
         env: Host,
         subscribe: Callable[[Callable[[dict[str, Any]], None]], Callable[[], None]],
         publish: Callable[..., None] | None = None,
+        running: Callable[[str, str, bool], None] | None = None,
     ) -> None:
         self.env = env
         self._subscribe = subscribe
         # Концентратор событий (`device_events.EventHub.publish`): кадры своей детекции конвейера камеры.
         self.publish: Callable[..., None] = publish or (lambda *_args, **_kwargs: None)
+        # Работает ли детекция камеры (`EventHub.running`) — доступность датчиков по её событиям.
+        self.running: Callable[[str, str, bool], None] = running or (lambda *_args: None)
         # Раздел `video`: камера одним описанием, конвейер на камеру (`video_pipeline.py`).
         self.pipelines: dict[str, CameraPipeline] = {}
         self._pipe_unsubscribe: Callable[[], None] | None = None

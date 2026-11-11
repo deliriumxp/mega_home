@@ -106,6 +106,8 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.streams: set[Any] = set()
         # Вложения к событиям и лог разработки; ставятся в `async_setup_entry`.
         self.event_files: Any = None
+        # Датчики по событиям устройств (`event_sensors.py`); ставятся в `async_setup_entry`.
+        self.event_sensors: Any = None
         self.dev_log: Any = None
         # С какого момента приборы в своём состоянии (`changes.py`); ставится в `async_setup_entry`.
         self.changes: Any = None
@@ -293,10 +295,10 @@ class MegaHomeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.app_error = error
 
     def apply_config(self, config: dict[str, Any] | None) -> None:
-        """Правила вложений (`event_files.py`), фильтр лога разработки
-        (`dev_log.py`), ключи локальной двери и учётка службы `ha` — данные
-        конфига, как описания устройств."""
-        for part in (self.event_files, self.dev_log, self.local_keys, self.ha_api):
+        """Правила вложений (`event_files.py`), датчики по событиям (`event_sensors.py`), фильтр лога
+        разработки (`dev_log.py`), ключи локальной двери и учётка службы `ha` — данные конфига, как
+        описания устройств."""
+        for part in (self.event_files, self.event_sensors, self.dev_log, self.local_keys, self.ha_api):
             if config and part is not None:
                 part.apply(config)
 

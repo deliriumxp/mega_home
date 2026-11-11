@@ -1,8 +1,9 @@
-"""Платформа `binary_sensor` — авария приборов с состоянием по опросу (`polled.py`).
+"""Платформа `binary_sensor`: авария приборов с состоянием по опросу (`polled.py`) и двоичные датчики по событиям
+устройств (`core/event_sensors.py`, вид `binary`; общая часть — `event_entities.py`).
 
-Раздел `problem` описания: поле-маска аварий, имя и подписи битов. Включено, пока маска
-не ноль; какие аварии стоят — атрибутом `problems` словами описания (бит → подпись).
-Номер бита и текст — знание вендора, их пишет генератор менеджера.
+Авария — раздел `problem` описания прибора: поле-маска аварий, имя и подписи битов. Включено, пока маска
+не ноль; какие аварии стоят — атрибутом `problems` словами описания (бит → подпись). Номер бита и текст —
+знание вендора, их пишет генератор менеджера.
 """
 
 from __future__ import annotations
@@ -13,7 +14,9 @@ from homeassistant.components.binary_sensor import BinarySensorDeviceClass, Bina
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
+from .core.event_sensors import EventSensors, SensorSpec
 from .core.polled_device import DeviceSpec
+from .event_entities import EventEntity, enum_or_none, setup_event_entities
 from .polled import UNIQUE_PREFIX, PolledDevices, PolledEntity, polled_of, remove_orphans
 
 KEY = "problem"
@@ -42,6 +45,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: Any, async_add_entities:
     remove_orphans(hass, entry, "binary_sensor", {f"{UNIQUE_PREFIX}{s.id}_{KEY}" for s in polled.wanted().values()})
     entry.async_on_unload(polled.on_devices(sync))
     sync()
+    setup_event_entities(hass, entry, async_add_entities, "binary_sensor", "binary", MegaEventBinary)
 
 
 class MegaPolledProblem(PolledEntity, BinarySensorEntity):
@@ -70,3 +74,15 @@ class MegaPolledProblem(PolledEntity, BinarySensorEntity):
         if not mask or not isinstance(labels, dict):
             return {"problems": []}
         return {"problems": [str(text) for bit, text in labels.items() if str(bit).isdigit() and text and mask >> int(bit) & 1]}
+
+
+class MegaEventBinary(EventEntity, BinarySensorEntity):
+    """Двоичный датчик по событиям: «человек», «движение», «дверь открыта» и т. п."""
+
+    def __init__(self, sensors: EventSensors, spec: SensorSpec) -> None:
+        super().__init__(sensors, spec, "binary_sensor")
+        self._attr_device_class = enum_or_none(BinarySensorDeviceClass, spec.device_class)
+
+    @property
+    def is_on(self) -> bool:
+        return self.sensors.is_on(self.spec.id)

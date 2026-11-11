@@ -63,6 +63,14 @@ class EventHub:
         self._store = store
         # Каждое опубликованное событие — правилам вложений (`event_files.py`), со своим файлом источника.
         self.on_published: Callable[[dict[str, Any], tuple[str, bytes] | None], None] | None = None
+        # Внутренние потребители КАЖДОГО события, и не `local` тоже (датчики по событиям, `event_sensors.py`):
+        # наружу они отдают только своё состояние, а не тело события.
+        self._observers: list[Listener] = []
+        # Работает ли источник (доступ, источник) — говорит сам источник (`running`): слушатель — пока жив его
+        # цикл, конвейер камеры — пока идёт детекция. Датчику по событиям это его доступность: молчание источника
+        # — норма, а неработающий источник — «неизвестно», не «нет» (`docs/plan-monitoring-observations.md`).
+        self._alive: dict[tuple[str, str], bool] = {}
+        self._alive_listeners: list[Callable[[str, str, bool], None]] = []
 
     def publish(
         self,
@@ -100,11 +108,7 @@ class EventHub:
         }
         self.recent.append({k: frame[k] for k in ("at", "access", "source", "event")})
         if local:
-            for listener in list(self._listeners):
-                try:
-                    listener(frame)
-                except Exception:  # noqa: BLE001 — подписчик не роняет источник
-                    LOGGER.warning("Событие устройства: подписчик упал", exc_info=True)
+            _notify(self._listeners, frame)
             if self._store is not None:
                 self._store.add(frame)
         if ttl != BUFFER_TTL_S:
@@ -117,16 +121,35 @@ class EventHub:
         # задерживает его.
         if self.on_published is not None:
             self.on_published(frame, file)
+        _notify(self._observers, frame)
         return frame
 
     def subscribe(self, listener: Listener) -> Callable[[], None]:
-        self._listeners.append(listener)
+        """Только события с `local` — для локального потока приложения и записи."""
+        return add_listener(self._listeners, listener)
 
-        def unsubscribe() -> None:
-            if listener in self._listeners:
-                self._listeners.remove(listener)
+    def observe(self, listener: Listener) -> Callable[[], None]:
+        """Каждое событие — внутреннему потребителю дома, который наружу тело не отдаёт."""
+        return add_listener(self._observers, listener)
 
-        return unsubscribe
+    def running(self, access: str, source: str, alive: bool) -> None:
+        if self._alive.get((access, source), False) == alive:
+            return
+        if alive:
+            self._alive[(access, source)] = True
+        else:
+            self._alive.pop((access, source), None)
+        for listener in list(self._alive_listeners):
+            try:
+                listener(access, source, alive)
+            except Exception:  # noqa: BLE001 — подписчик не роняет источник
+                LOGGER.warning("Событие устройства: подписчик жизни источника упал", exc_info=True)
+
+    def alive(self, access: str, source: str) -> bool:
+        return self._alive.get((access, source), False)
+
+    def watch_alive(self, listener: Callable[[str, str, bool], None]) -> Callable[[], None]:
+        return add_listener(self._alive_listeners, listener)
 
     def attach(self, sender: Callable[[dict[str, Any]], bool]) -> list[dict[str, Any]]:
         """Канал поднялся: вернуть неподтверждённое свежее (в порядке событий)."""
@@ -180,6 +203,24 @@ class EventHub:
             i for i in self._unacked if now - self._born.get(i, now) > self._ttl.get(i, BUFFER_TTL_S)
         ]:
             self._forget(frame_id)
+
+
+def add_listener(listeners: list[Any], listener: Any) -> Callable[[], None]:
+    listeners.append(listener)
+
+    def remove() -> None:
+        if listener in listeners:
+            listeners.remove(listener)
+
+    return remove
+
+
+def _notify(listeners: list[Listener], frame: dict[str, Any]) -> None:
+    for listener in list(listeners):
+        try:
+            listener(frame)
+        except Exception:  # noqa: BLE001 — подписчик не роняет источник
+            LOGGER.warning("Событие устройства: подписчик упал", exc_info=True)
 
 
 def _bounded(data: Any) -> Any:
