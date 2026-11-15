@@ -8,7 +8,9 @@
     шаблона следующего запроса (`since`, `lastUpdateId`, адрес подписки);
   * `setup` — запрос ДО цикла (создать подписку у камеры протоколом
     PullPoint, поднять сессию UniFi) с теми же `carry`; `renew` — продление сессии
-    раз в `every`, `teardown` — её закрытие перед новым входом и на остановке;
+    раз в `every` (или долей срока из ответа: `from`/`to`/`fraction` у `setup` и `renew`), отказ
+    продления — вход заново, `teardown` — закрытие сессии перед новым входом и на
+    остановке; `retry: {pause, tries}` — сетевой сбой не пересоздаёт сессию, а ждёт;
   * `steps` у `ws`/`tcp` — вход внутри соединения: послать шаблон, забрать поля
     ответа (`capture`) — Shelly Gen2 с паролем, TCP с вызовом-ответом;
   * `keepalive: {every, send}` — прикладной ping, без которого устройство рвёт
@@ -30,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
 
@@ -49,6 +52,9 @@ TEARDOWN_S = 5.0
 # Вход после закрытия сессии: столько попыток с такой паузой при отказе соединения.
 SETUP_TRIES = 4
 SETUP_RETRY_S = 2.0
+# Срок подписки, названный устройством, короче этого считается этим: продлевать чаще минуты незачем
+# (интеграция камер HA: `MINIMUM_SUBSCRIPTION_SECONDS`).
+MIN_LEASE_S = 60.0
 
 def body_of(raw: bytes) -> dict[str, Any]:
     try:
@@ -200,6 +206,34 @@ def _resetup_matches(resetup: dict[str, Any], status: int, payload: bytes) -> bo
         return False
     return pick(parsed(payload), str(resetup.get("path", ""))) == str(resetup.get("equals"))
 
+def _instant(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+def lease_s(block: dict[str, Any] | None, payload: bytes) -> float | None:
+    """Через сколько продлевать: доля срока, который УСТРОЙСТВО назвало в ответе на вход или продление.
+
+    `from`/`to` блока — пути к двум меткам времени ответа (`CurrentTime`, `TerminationTime` у
+    PullPoint), `fraction` — доля (0,8); у входа (`setup`) и у продления (`renew`) свои пути: у
+    ответов разные имена элементов. Считается РАЗНИЦА меток одного ответа, часы дома
+    не участвуют. ⚠ Камера, давшая срок короче запрошенного, иначе теряла бы подписку раньше
+    фиксированного `every` (интеграция камер HA считает так же). Нет полей или меток — `None`,
+    и работает `every`.
+    """
+    if not isinstance(block, dict) or not block.get("from") or not block.get("to"):
+        return None
+    data = parsed(payload)
+    start, end = _instant(pick(data, str(block["from"]))), _instant(pick(data, str(block["to"])))
+    if start is None or end is None:
+        return None
+    try:
+        span = (end - start).total_seconds()
+    except TypeError:  # одна метка с поясом, другая без — срок не вычислить
+        return None
+    return max(span, MIN_LEASE_S) * min(seconds(block.get("fraction"), 0.8, 0.1), 0.95)
+
 def _wanted(spec: dict[str, Any], payload: bytes) -> bool:
     """Публиковать ли ответ: `onlyIf.contains` — подстрока, без которой ответ тишина.
 
@@ -241,7 +275,7 @@ async def poll(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[s
                 LOGGER.debug("Источник %s/%s: закрыть сессию не вышло: %s", descriptor.id, source, type(err).__name__)
 
         async def do_setup() -> None:
-            nonlocal opened, renewed_at
+            nonlocal opened, renewed_at, renew_in
             if setup_block is None:
                 return
             await do_teardown()
@@ -262,21 +296,33 @@ async def poll(ctx: Any, descriptor: DeviceDescriptor, source: str, spec: dict[s
                 await asyncio.sleep(SETUP_RETRY_S)
             carry(values, setup_block, setup_payload)
             opened, renewed_at = True, loop.time()
+            renew_in = lease_s(setup_block, setup_payload) or renew_every
 
         async def maybe_renew() -> None:
             """Продление — МЕЖДУ запросами опроса, а не своей задачей: устройство, которое держит
-            один запрос за раз, не ждёт продления до конца долгого опроса."""
-            nonlocal renewed_at
-            if renew_block is None or not opened or loop.time() - renewed_at < renew_every:
+            один запрос за раз, не ждёт продления до конца долгого опроса.
+
+            ⚠ Отказ продления (ответ ≥ 400, обрыв, молчание) — подписки больше нет: вход заново
+            сразу, а не после отказа очередного опроса (интеграция камер HA перезапускает подписку
+            так же). Следующий срок — по ответу на продление (`lease_s`), иначе `every`."""
+            nonlocal renewed_at, renew_in
+            if renew_block is None or not opened or loop.time() - renewed_at < renew_in:
                 return
             renewed_at = loop.time()
             try:
-                await _request(session, descriptor, renew_block, values)
-            except Exception as err:  # noqa: BLE001 — отказ продления ловит сам опрос (истёкшая сессия → resetup)
-                LOGGER.debug("Источник %s/%s: продление не прошло: %s", descriptor.id, source, type(err).__name__)
+                status, _, payload = await _request(session, descriptor, renew_block, values)
+            except Exception as err:  # noqa: BLE001 — любой отказ продления = подписки нет
+                failure = type(err).__name__
+            else:
+                failure = str(status) if status >= 400 else ""
+                renew_in = lease_s(renew_block, payload) or renew_every
+            if failure and setup_block is not None:
+                LOGGER.debug("Источник %s/%s: продление не прошло (%s) — вход заново", descriptor.id, source, failure)
+                await do_setup()
 
         loop = asyncio.get_running_loop()
         renew_every = seconds((renew_block or {}).get("every"), 300.0, 5.0)
+        renew_in = renew_every
         renewed_at = loop.time()
         try:
             await _poll_loop(ctx, session, descriptor, source, spec, values, do_setup, maybe_renew, setup_block, resetup)
@@ -299,20 +345,40 @@ async def _poll_loop(
     loop = asyncio.get_running_loop()
     # Право войти сразу, если самый первый ответ уже скажет «нет сессии».
     last_resetup = loop.time() - pause
+    retry = spec.get("retry") if isinstance(spec.get("retry"), dict) else None
+    retry_pause = seconds((retry or {}).get("pause"), 60.0, MIN_PAUSE_S)
+    retry_tries = int(seconds((retry or {}).get("tries"), 3.0, 1.0))
+    failures = 0
     while True:
         await maybe_renew()
         started = loop.time()
         try:
             status, kind, payload = await _request(session, descriptor, spec, values)
-        except aiohttp.ClientConnectionError:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            if retry is not None:
+                # ⚠ `retry` — как у интеграции камер HA: закрытое устройством соединение — норма (часть
+                # камер закрывает его сама), опрос идёт дальше по ТОЙ ЖЕ подписке, вход заново не нужен;
+                # прочий сбой — пауза подольше (Tapo ломается от частых входов) и повтор, а подряд
+                # `tries` сбоев — подписки, видимо, нет, вход заново. Отказ ответом (≥ 400) — по-прежнему
+                # `resetup`. Без поля — прежнее поведение ниже.
+                if not isinstance(err, aiohttp.ServerDisconnectedError):
+                    failures += 1
+                if failures >= retry_tries and setup_block is not None:
+                    failures = 0
+                    await asyncio.sleep(pause)
+                    await do_setup()
+                else:
+                    await asyncio.sleep(pause if isinstance(err, aiohttp.ServerDisconnectedError) else retry_pause)
+                continue
             # Обрыв посреди сессии — сессии больше нет (стенд Tapo перезапускает службу событий
             # через секунды после `Unsubscribe`): вход заново с его повторами. Устройство пропало —
             # вход упадёт сам, и источник перезапустится с растущей паузой (`listeners._forever`).
-            if setup_block is None:
+            if setup_block is None or not isinstance(err, aiohttp.ClientConnectionError):
                 raise
             await asyncio.sleep(pause)
             await do_setup()
             continue
+        failures = 0
         if resetup is not None and setup_block is not None and _resetup_matches(resetup, status, payload):
             # Отказ сессии — не событие жильцу (это состояние опроса, а не
             # устройства), и без него самого дом просто повторит запрос.

@@ -420,3 +420,140 @@ def test_обрыв_посреди_сессии_входит_заново(monkey
     with pytest.raises(_Done):
         asyncio.run(lo.poll(_Ctx(), _descriptor(), "events", _PULL_SPEC))
     assert log == ["setup1", "drop", "setup2", "pull 2"]
+
+
+_ISSUED = (
+    b"<e:Envelope xmlns:e='x'><e:Body><e:RenewResponse><e:CurrentTime>2026-11-15T10:00:00Z</e:CurrentTime>"
+    b"<e:TerminationTime>%s</e:TerminationTime></e:RenewResponse></e:Body></e:Envelope>"
+)
+_LEASE = {"from": "Envelope.Body.RenewResponse.CurrentTime", "to": "Envelope.Body.RenewResponse.TerminationTime"}
+
+
+def test_срок_продления_берётся_из_ответа_устройства() -> None:
+    """Устройство дало 10 минут — продлеваем через 8; дало 2 — через 96 с; меньше минуты считается минутой
+    (как интеграция ONVIF HA); нет меток или пояс у одной — `None`, работает `every`."""
+    assert lo.lease_s(_LEASE, _ISSUED % b"2026-11-15T10:10:00Z") == pytest.approx(480.0)
+    assert lo.lease_s(_LEASE, _ISSUED % b"2026-11-15T10:02:00Z") == pytest.approx(96.0)
+    assert lo.lease_s(_LEASE, _ISSUED % b"2026-11-15T10:00:10Z") == pytest.approx(48.0)
+    assert lo.lease_s({**_LEASE, "fraction": 0.5}, _ISSUED % b"2026-11-15T10:10:00Z") == pytest.approx(300.0)
+    assert lo.lease_s(_LEASE, _ISSUED % b"2026-11-15T10:10:00") is None
+    assert lo.lease_s(_LEASE, b"<none/>") is None
+    assert lo.lease_s({"every": 480}, _ISSUED % b"2026-11-15T10:10:00Z") is None
+    assert lo.lease_s(None, b"") is None
+
+
+def test_отказ_продления_входит_заново_сразу(monkeypatch) -> None:
+    """Подписки больше нет — вход заново не дожидаясь отказа опроса (интеграция ONVIF HA)."""
+    spec = {**_PULL_SPEC, "renew": {"every": 0, "method": "POST", "path": "{carry.address}"}}
+    log: list[str] = []
+
+    async def fake_request(session, descriptor, block, values):  # noqa: ANN001
+        if block is spec["setup"]:
+            log.append("setup")
+            return 200, "application/soap+xml", _CREATE
+        if block is spec["renew"]:
+            log.append("renew")
+            return (500, "", b"") if log.count("renew") == 1 else (200, "", b"")
+        if log.count("renew") > 1:
+            raise _Done
+        log.append("pull")
+        return 200, "application/soap+xml", _EMPTY
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(lo, "_request", fake_request)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(lo, "seconds", lambda value, default, low=0.1: float(value) if value is not None else default)
+    with pytest.raises(_Done):
+        asyncio.run(lo.poll(_Ctx(), _descriptor(), "events", spec))
+    assert log == ["setup", "renew", "setup", "pull", "renew"]
+
+
+def _retry_run(monkeypatch, errors: list[Exception]) -> tuple[list[str], list[float]]:  # noqa: ANN001
+    """`retry` у опроса: журнал запросов и пауз, пока не исчерпан список сбоев опроса."""
+    spec = {**_PULL_SPEC, "retry": {"pause": 60, "tries": 3}}
+    log: list[str] = []
+    sleeps: list[float] = []
+    queue = list(errors)
+
+    async def fake_request(session, descriptor, block, values):  # noqa: ANN001
+        if block is spec["setup"]:
+            log.append("setup")
+            return 200, "application/soap+xml", _CREATE
+        if not queue:
+            raise _Done
+        log.append("pull")
+        raise queue.pop(0)
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(lo, "_request", fake_request)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    with pytest.raises(_Done):
+        asyncio.run(lo.poll(_Ctx(), _descriptor(), "events", spec))
+    return log, sleeps
+
+
+def test_retry_закрытое_соединение_не_пересоздаёт_подписку(monkeypatch) -> None:
+    """Камера закрыла соединение (EYEPLUS — на каждом втором запросе): опрос идёт дальше по той же
+    подписке с обычной паузой, сколько бы раз подряд ни случилось."""
+    import aiohttp
+
+    log, sleeps = _retry_run(monkeypatch, [aiohttp.ServerDisconnectedError()] * 5)
+    assert log == ["setup"] + ["pull"] * 5
+    assert sleeps == [5.0] * 5
+
+
+def test_retry_прочий_сбой_ждёт_долго_и_после_серии_входит_заново(monkeypatch) -> None:
+    import aiohttp
+
+    errors = [asyncio.TimeoutError(), aiohttp.ClientPayloadError("lies"), aiohttp.ClientConnectionError("down")]
+    log, sleeps = _retry_run(monkeypatch, errors)
+    # Два сбоя — пауза минута, третий — серия: пауза опроса и вход заново.
+    assert log == ["setup", "pull", "pull", "pull", "setup"]
+    assert sleeps[:2] == [60.0, 60.0]
+    assert sleeps[2] == 5.0
+
+
+def test_без_retry_прежнее_поведение_обрыв_входит_заново_прочее_падает(monkeypatch) -> None:
+    async def fake_request(session, descriptor, block, values):  # noqa: ANN001
+        if block is _PULL_SPEC["setup"]:
+            return 200, "application/soap+xml", _CREATE
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(lo, "_request", fake_request)
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(lo.poll(_Ctx(), _descriptor(), "events", _PULL_SPEC))
+
+
+def test_срок_берётся_и_у_входа_и_у_продления_своими_путями(monkeypatch) -> None:
+    """Ответы входа и продления называют элементы по-разному: пути у каждого блока свои."""
+    spec = {**_PULL_SPEC, "renew": {"every": 0, "method": "POST", "path": "{carry.address}"}}
+    seen: list[object] = []
+    real = lo.lease_s
+
+    def spy(block, payload):  # noqa: ANN001
+        seen.append(block)
+        return real(block, payload)
+
+    async def fake_request(session, descriptor, block, values):  # noqa: ANN001
+        if block is spec["setup"]:
+            return 200, "application/soap+xml", _CREATE
+        if block is spec["renew"]:
+            return 200, "", b""
+        if seen.count(spec["renew"]):
+            raise _Done
+        return 200, "application/soap+xml", _EMPTY
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(lo, "_request", fake_request)
+    monkeypatch.setattr(lo, "lease_s", spy)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(lo, "seconds", lambda value, default, low=0.1: float(value) if value is not None else default)
+    with pytest.raises(_Done):
+        asyncio.run(lo.poll(_Ctx(), _descriptor(), "events", spec))
+    assert seen[0] is spec["setup"] and seen[1] is spec["renew"]
