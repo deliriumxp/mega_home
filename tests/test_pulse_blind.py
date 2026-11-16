@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from mega_home.core import pulse_blind
 from mega_home.core.pulse_blind import STOP_METHODS, PulseBlind, spec_of
 
 
@@ -166,3 +167,53 @@ def test_мусорная_штора_не_роняет_конфиг() -> None:
     assert spec_of({"id": "x"}) is None
     assert spec_of("мусор") is None
     assert spec_of({"id": "x", "open": "a", "close": "b", "stopMethod": "??"}).stop_method == "pulse_both"
+
+
+def test_неоткалиброванная_штора_сообщает_положение_на_ходу(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠ Ползунок у жильца обязан идти и тогда, когда положение ещё неизвестно.
+
+    Прежде оценка на ходу считалась только при известном старте, и неоткалиброванная
+    штора молчала весь ход — в приложении значение менялось лишь в конечном положении.
+    """
+    monkeypatch.setattr(pulse_blind, "POSITION_UPDATE_S", 0.05)
+
+    async def scenario() -> tuple[PulseBlind, list[int]]:
+        blind, _, _ = make(travelUp=0.6)
+        seen: list[int] = []
+        blind._on_change = lambda: seen.append(blind.position) if blind.position is not None else None
+        await blind.open()
+        await done(blind)
+        return blind, seen
+
+    blind, seen = asyncio.run(scenario())
+    assert blind.position == 100 and blind.calibrated
+    assert seen and seen[0] < seen[-1], "оценка положения меняется по ходу"
+    assert any(0 < value < 100 for value in seen), "промежуточные положения опубликованы"
+
+
+def test_уставка_50_на_неоткалиброванной_шторе_доезжает_до_упора_и_возвращается() -> None:
+    """⚠ Прежде это был НОЛЬ работы: 50 % совпадали с предположением «середина»."""
+
+    async def scenario() -> tuple[PulseBlind, list[str]]:
+        blind, calls, _ = make(stopMethod="none")
+        assert blind.position is None
+        await blind.set_position(50)
+        await done(blind)
+        return blind, ons(calls)
+
+    blind, starts = asyncio.run(scenario())
+    assert blind.position == 50
+    assert starts == ["switch.down", "switch.up"], "сначала до упора, потом — доля от него"
+
+
+def test_уставка_30_на_неоткалиброванной_шторе_идёт_от_ближнего_упора() -> None:
+    async def scenario() -> tuple[PulseBlind, list[str], list[int]]:
+        blind, calls, settled = make(stopMethod="none")
+        await blind.set_position(30)
+        await done(blind)
+        return blind, ons(calls), settled
+
+    blind, starts, settled = asyncio.run(scenario())
+    assert blind.position == 30
+    assert starts == ["switch.down", "switch.up"], "30 % ближе к низу — сначала закрываем"
+    assert settled[-1] == 30
