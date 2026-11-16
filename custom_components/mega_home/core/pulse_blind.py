@@ -120,10 +120,23 @@ class PulseBlind:
 
     async def set_position(self, target: int) -> None:
         target = min(max(int(target), 0), 100)
-        # Никогда не калиброванная — середина как лучшее предположение.
-        current = self.position if self.position is not None else 50
-        if target != current:
-            await self._start(OPEN if target > current else CLOSE, None if target in (0, 100) else target)
+        if self.position is not None:
+            if target != self.position:
+                await self._start(
+                    OPEN if target > self.position else CLOSE,
+                    None if target in (0, 100) else target,
+                )
+            return
+        # ⚠ Положение неизвестно (штора ещё ни разу не доезжала до упора и никто его
+        # не сообщил). Оценка «середина» годится только для выбора направления, а
+        # доля от неё — выдумка: «поставить 50 %» не сдвинуло бы штору вовсе (цель
+        # совпала бы с предположением), а любая другая доля встала бы мимо на
+        # неизвестную величину. Поэтому сначала доезжаем до ближайшего упора — он же
+        # и калибрует оценку, — а от него уже отсчитываем долю.
+        if target in (0, 100):
+            await self._start(OPEN if target == 100 else CLOSE, None)
+            return
+        await self._start(OPEN if target > 50 else CLOSE, None, then=target)
 
     async def stop(self) -> None:
         if self.moving:
@@ -158,7 +171,12 @@ class PulseBlind:
 
     # --- ход ---------------------------------------------------------------
 
-    async def _start(self, direction: str, target: int | None) -> None:
+    async def _start(
+        self,
+        direction: str,
+        target: int | None,
+        then: int | None = None,
+    ) -> None:
         # ⚠ Без «уже едем туда — пропустить»: цель частичного хода и полный ход —
         # разные длительности; пропуск оставил бы штору не доехавшей. Текущий ход
         # отменяется и ДОЖИДАЕТСЯ своего стоп-импульса — это и есть пауза перед
@@ -171,25 +189,69 @@ class PulseBlind:
                 self._cancel.set()
                 await self._move  # type: ignore[misc]
             self._cancel = asyncio.Event()
-            self._move = asyncio.ensure_future(self._run(direction, target))
+            self._move = asyncio.ensure_future(self._run(direction, target, then))
 
-    async def _run(self, direction: str, target: int | None) -> None:
+    async def _run(self, direction: str, target: int | None, then: int | None = None) -> None:
         full = target is None
         travel = self.spec.travel_up if direction == OPEN else self.spec.travel_down
-        start_position = self.position
+        # ⚠ Неизвестное положение — не повод молчать на ходу: оценка идёт от
+        # «середины», как у эталонного драйвера Control4 (`gLevel or 50`). Иначе у
+        # жильца ползунок стоял бы на месте весь ход неоткалиброванной шторы и
+        # прыгал бы в конце — ровно то, на что жаловались.
+        start_position = self.position if self.position is not None else 50
         if full:
             duration, final = travel + self.spec.failsafe, (100 if direction == OPEN else 0)
         else:
-            current = start_position if start_position is not None else 50
-            duration, final = travel * abs(target - current) / 100.0, target
+            duration, final = travel * abs(target - start_position) / 100.0, target
         if duration <= 0:
             return
+        # Видимый ход идёт по РЕАЛЬНОМУ времени, без запаса: иначе ползунок
+        # стоял бы «почти у края» весь запас.
+        if not await self._travel(
+            direction,
+            start_position,
+            final,
+            duration,
+            travel if full else duration,
+            calibrate=full,
+        ):
+            # Прервали: оценку `_travel` уже выставил, осталось опубликовать итог.
+            self._on_settled()
+            return
+        # Дошли до упора, а целью была доля от него — второй ход от точной точки.
+        if then is not None and then != final and not self._cancel.is_set():
+            await self._second_leg(then)
+        self._on_settled()
+
+    async def _second_leg(self, target: int) -> None:
+        """Ход от упора к промежуточной цели: упор дал точку отсчёта, а не «середину»."""
+        start = self.position if self.position is not None else 50
+        if target == start:
+            return
+        direction = OPEN if target > start else CLOSE
+        travel = self.spec.travel_up if direction == OPEN else self.spec.travel_down
+        if target in (0, 100):
+            duration, final, visual, calibrate = travel + self.spec.failsafe, target, travel, True
+        else:
+            duration = travel * abs(target - start) / 100.0
+            final, visual, calibrate = target, duration, False
+        if duration <= 0:
+            return
+        await self._travel(direction, start, final, duration, visual, calibrate)
+
+    async def _travel(
+        self,
+        direction: str,
+        start: int,
+        final: int,
+        duration: float,
+        visual: float,
+        calibrate: bool,
+    ) -> bool:
+        """Один ход: стартовый импульс, оценка раз в секунду. `False` — прервали стопом."""
         await self._pulse([self._relay(direction)], self.spec.pulse_move_ms)
         self.opening, self.closing = direction == OPEN, direction == CLOSE
         self._on_change()
-        # Видимый ход идёт по РЕАЛЬНОМУ времени, без запаса: иначе ползунок
-        # стоял бы «почти у края» весь запас.
-        visual = travel if full else duration
         started = monotonic()
         interrupted = False
         try:
@@ -201,23 +263,22 @@ class PulseBlind:
                     break
                 except asyncio.TimeoutError:
                     pass
-                if start_position is not None:
-                    self.position = _between(start_position, final, (monotonic() - started) / visual)
-                    self._on_change()
+                self.position = _between(start, final, (monotonic() - started) / visual)
+                self._on_change()
         finally:
-            if interrupted and start_position is not None:
-                self.position = _between(start_position, final, (monotonic() - started) / visual)
-            elif not interrupted:
+            if interrupted:
+                self.position = _between(start, final, (monotonic() - started) / visual)
+            else:
                 self.position = final
                 # Калибрует ТОЛЬКО полный ход, доведённый до конца.
-                self.calibrated = full
+                self.calibrated = calibrate
             self.last_direction = direction
             self.opening = self.closing = False
             # На концевике мотор уже стоит; лишний импульс может запустить его обратно.
-            if interrupted or not full:
+            if interrupted or not calibrate:
                 await self._stop_pulse()
             self._on_change()
-            self._on_settled()
+        return not interrupted
 
     def _relay(self, direction: str) -> str:
         return self.spec.open_switch if direction == OPEN else self.spec.close_switch
