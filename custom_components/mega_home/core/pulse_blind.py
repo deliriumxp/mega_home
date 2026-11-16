@@ -123,16 +123,12 @@ class PulseBlind:
         # Никогда не калиброванная — середина как лучшее предположение.
         current = self.position if self.position is not None else 50
         if target != current:
-            await self._start(OPEN if target > current else CLOSE, target)
+            await self._start(OPEN if target > current else CLOSE, None if target in (0, 100) else target)
 
     async def stop(self) -> None:
         if self.moving:
             self._cancel.set()
             await self._move  # type: ignore[misc]
-        else:
-            # Стоп без хода — штору могли тронуть руками, а жилец хочет гарантию,
-            # что мотор стоит. Не мешаем.
-            await self._stop_pulse()
 
     def calibrate(self, position: int) -> bool:
         """Сказать, где штора на самом деле, без движения. На ходу — отказ."""
@@ -199,7 +195,8 @@ class PulseBlind:
         try:
             while monotonic() - started < duration:
                 try:
-                    await asyncio.wait_for(self._cancel.wait(), POSITION_UPDATE_S)
+                    remaining = max(0.0, duration - (monotonic() - started))
+                    await asyncio.wait_for(self._cancel.wait(), min(POSITION_UPDATE_S, remaining))
                     interrupted = True
                     break
                 except asyncio.TimeoutError:
@@ -216,7 +213,9 @@ class PulseBlind:
                 self.calibrated = full
             self.last_direction = direction
             self.opening = self.closing = False
-            await self._stop_pulse()
+            # На концевике мотор уже стоит; лишний импульс может запустить его обратно.
+            if interrupted or not full:
+                await self._stop_pulse()
             self._on_change()
             self._on_settled()
 
