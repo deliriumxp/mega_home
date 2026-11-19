@@ -20,7 +20,7 @@ from yandex_music.utils.request_async import Request
 from ..core.const import LOGGER
 from ..core.host import Host, KeyStore
 from ..core.ops_base import OpError
-from .music_catalog import catalog, queue_ids, track_details
+from .music_catalog import catalog, favorite_ids, queue_ids, set_favorite, track_details
 from .music_stream import stream as stream_track
 
 
@@ -68,8 +68,11 @@ class MusicService:
 
     async def call(self, can_manage: bool, request: dict) -> dict:
         action = request.get("action")
-        if action not in ("status", "start", "cancel", "disconnect", "search", "liked", "playlists", "playlist", "album", "artist", "stream", "track_details"):
+        if action not in ("status", "start", "cancel", "disconnect", "search", "liked", "playlists", "playlist",
+                          "album", "artist", "stream", "track_details", "favorite_ids", "set_favorite"):
             raise OpError("Неизвестное действие Яндекс Музыки", 404)
+        if action == "set_favorite" and not can_manage:
+            raise OpError("Избранное Яндекс Музыки меняют жильцы с учётной записью дома", 403)
         if action in ("start", "cancel", "disconnect") and not can_manage:
             raise OpError("Аккаунтом Яндекс Музыки управляют жильцы дома", 403)
         try:
@@ -112,7 +115,8 @@ class MusicService:
 
     def _status(self, credentials: Credentials | None, can_manage: bool) -> dict:
         if credentials:
-            return {"state": "connected", "canManage": can_manage, "login": credentials.display_login if can_manage else None}
+            return {"state": "connected", "canManage": can_manage, "canEditFavorites": can_manage,
+                    "login": credentials.display_login if can_manage else None}
         if can_manage and self._attempt:
             return {**self._attempt.status, "canManage": True}
         return {"state": "disconnected", "canManage": can_manage}
@@ -164,6 +168,10 @@ class MusicService:
                 return await stream_track(client, request)
             if action == "track_details":
                 return await track_details(client, queue_ids(request.get("ids")))
+            if action == "favorite_ids":
+                return await favorite_ids(client)
+            if action == "set_favorite":
+                return await set_favorite(client, request)
             return await catalog(client, action, request)
 
         try:

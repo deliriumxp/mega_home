@@ -70,8 +70,12 @@ def test_вход_общий_для_семьи_и_гостей_но_изолир
 
         # Как после перезапуска: читается та же привязка дома с диска.
         home = music.MusicService(env, "one")
-        assert await home.call(True, {"action": "status"}) == {"state": "connected", "login": "семья", "canManage": True}
-        assert await home.call(False, {"action": "status"}) == {"state": "connected", "login": None, "canManage": False}
+        assert await home.call(True, {"action": "status"}) == {
+            "state": "connected", "login": "семья", "canManage": True, "canEditFavorites": True,
+        }
+        assert await home.call(False, {"action": "status"}) == {
+            "state": "connected", "login": None, "canManage": False, "canEditFavorites": False,
+        }
         guest_catalog = await home.call(False, {"action": "search", "query": "Кино", "kind": "track"})
         assert guest_catalog == {"items": [{"id": "1", "title": "Звезда", "kind": "track", "artist": "Кино"}], "more": False}
         assert await other.call(True, {"action": "status"}) == {"state": "disconnected", "canManage": True}
@@ -434,5 +438,54 @@ def test_отказ_музыкального_api_после_выдачи_ток�
         assert exc.value.status == 503
         assert (await service.call(True, {"action": "status"}))["state"] == "connected"
         await env.close()
+
+    asyncio.run(run())
+
+
+def test_сердечки_пишутся_в_аккаунт_дома_и_доступны_только_жильцу(monkeypatch, tmp_path):
+    liked = {"20": "20:100"}
+
+    class Client:
+        def __init__(self, token, **_):
+            assert token == "music-token"
+
+        async def init(self):
+            return self
+
+        async def users_likes_tracks(self):
+            return SimpleNamespace(tracks=[SimpleNamespace(track_id=id_) for id_ in liked.values()])
+
+        async def users_likes_tracks_add(self, id_):
+            if id_ == "99":
+                return False
+            liked[id_] = id_
+            return True
+
+        async def users_likes_tracks_remove(self, id_):
+            liked.pop(id_)
+            return True
+
+    monkeypatch.setattr(music, "ClientAsync", Client)
+
+    async def run():
+        env = PlainHost(tmp_path)
+        await music._save(env.store("mega_home_yandex_music.home", private=True), _credentials())
+        home = music.MusicService(env, "home")
+        assert await home.call(False, {"action": "favorite_ids"}) == {"ids": ["20"]}
+        with pytest.raises(OpError) as forbidden:
+            await home.call(False, {"action": "set_favorite", "id": "20", "liked": False})
+        assert forbidden.value.status == 403 and "20" in liked
+        assert await home.call(True, {"action": "set_favorite", "id": "23:42", "liked": True}) == {
+            "id": "23", "liked": True,
+        }
+        assert await home.call(True, {"action": "set_favorite", "id": "20:100", "liked": False}) == {
+            "id": "20", "liked": False,
+        }
+        assert await home.call(True, {"action": "favorite_ids"}) == {"ids": ["23"]}
+        with pytest.raises(OpError) as refused:
+            await home.call(True, {"action": "set_favorite", "id": "99", "liked": True})
+        assert refused.value.status == 502
+        with pytest.raises(OpError):
+            await home.call(True, {"action": "set_favorite", "id": "23", "liked": "false"})
 
     asyncio.run(run())

@@ -88,13 +88,35 @@ async def _search(client: Any, request: dict, page: int) -> dict:
 
 
 async def _liked(client: Any, page: int) -> dict:
-    result = await client.users_likes_tracks()
-    tracks = sorted(result.tracks or [], key=lambda track: str(track.timestamp or ""), reverse=True) if result else []
+    tracks = sorted(await _liked_tracks(client), key=lambda track: str(track.timestamp or ""), reverse=True)
     track_ids = [str(track.track_id) for track in tracks if track.track_id]
     offset = page * PAGE_SIZE
     ids = track_ids[offset:offset + PAGE_SIZE]
     details = await _tracks_by_id(client, ids)
     return {"items": _items((details.get(track_id.split(':', 1)[0]) for track_id in ids), "track"), "more": offset + PAGE_SIZE < len(track_ids)}
+
+
+async def _liked_tracks(client: Any) -> list:
+    result = await client.users_likes_tracks()
+    return (result.tracks or []) if result else []
+
+
+async def favorite_ids(client: Any) -> dict:
+    return {"ids": list(dict.fromkeys(
+        str(track.track_id).partition(":")[0]
+        for track in await _liked_tracks(client) if track.track_id
+    ))}
+
+
+async def set_favorite(client: Any, request: dict) -> dict:
+    track_id, liked = request.get("id"), request.get("liked")
+    if not isinstance(track_id, str) or not TRACK_ID.fullmatch(track_id) or type(liked) is not bool:
+        raise OpError("Неверная отметка трека")
+    track_id = track_id.partition(":")[0]
+    update = client.users_likes_tracks_add if liked else client.users_likes_tracks_remove
+    if not await update(track_id):
+        raise OpError("Яндекс Музыка не сохранила отметку", 502)
+    return {"id": track_id, "liked": liked}
 
 
 async def _tracks_by_id(client: Any, ids: list[str]) -> dict[str, Any]:

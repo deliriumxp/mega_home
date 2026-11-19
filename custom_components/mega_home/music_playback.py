@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from .station_auth import StationAuth
 
 TOPIC = "media/playback"
+FAVORITES_TOPIC = "media/favorites"
 
 
 class MusicPlayback:
@@ -56,6 +57,8 @@ class MusicPlayback:
         if action == "track_details":
             raise OpError("Неизвестное действие Яндекс Музыки", 404)
         answer = await self._station.call(can_manage, request)
+        if action == "set_favorite":
+            self._home.topics.bump(FAVORITES_TOPIC)
         if action == "disconnect":
             for queue in self._players.values():
                 queue.clear()

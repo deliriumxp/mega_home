@@ -59,6 +59,10 @@ class Catalog:
         if request["action"] == "liked":
             assert request["page"] == 1
             return {"items": [{"id": "2", "kind": "track", "title": "Следующая страница"}], "more": False}
+        if request["action"] == "set_favorite":
+            if request["id"] == "2":
+                raise OpError("Яндекс Музыка не сохранила отметку", 502)
+            return {"id": request["id"], "liked": request["liked"]}
         raise AssertionError(request)
 
 
@@ -186,6 +190,19 @@ def test_дом_загружает_следующую_страницу_сам_к
         assert catalog.actions == ["track_details", "liked"]
         assert home.source.calls[-1][2]["media_content_id"] == "2"
         assert not (await view(service, "station"))["next"]
+        service.close()
+
+    asyncio.run(run())
+
+
+def test_дом_публикует_смену_избранного_после_подтверждения_от_яндекса(tmp_path):
+    async def run():
+        service, home, _, _ = setup(tmp_path)
+        with pytest.raises(OpError):
+            await service.call(True, {"action": "set_favorite", "id": "2", "liked": True})
+        assert "media/favorites" not in home.topics.revs()
+        assert (await service.call(True, {"action": "set_favorite", "id": "1", "liked": True}))["liked"]
+        assert "media/favorites" in home.topics.revs()
         service.close()
 
     asyncio.run(run())
