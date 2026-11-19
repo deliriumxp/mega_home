@@ -78,6 +78,14 @@ def test_новый_секрет_снимает_все_ключи() -> None:
     assert not keys.valid(sign("s3cret", "panel"))
 
 
+def test_учётку_подтверждает_только_действующий_ключ_жильца() -> None:
+    keys = _keys()
+    assert keys.is_resident(VECTOR)
+    assert not keys.is_resident(sign("s3cret", "panel"))
+    assert not _keys(accounts={"42": 8}).is_resident(VECTOR)
+    assert not keys.is_resident(None)
+
+
 def test_подделка_и_мусор_не_проходят() -> None:
     keys = _keys(closed=True)
     assert not keys.valid(VECTOR[:-1] + ("A" if VECTOR[-1] != "A" else "B"))

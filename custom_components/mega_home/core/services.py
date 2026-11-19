@@ -18,6 +18,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from .ops_base import OpError, dumps
+
 
 @dataclass(frozen=True)
 class Service:
@@ -100,3 +102,26 @@ def resolve(name: str) -> int | None:
 def entry(name: str) -> Service | None:
     """Поднятая служба целиком — вместе с тем, что вызов к ней получает от дома."""
     return REGISTRY.get(name)
+
+
+async def call_resident(coordinator: Any, request: dict[str, Any], access: Any) -> dict | None:
+    """Внутренние службы дома принимают права от двери, отдельно от описания вызова."""
+    name = request.get("host")
+    if not isinstance(name, str):
+        return None
+    service = getattr(coordinator, "resident_services", {}).get(name)
+    if service is None:
+        return None
+    if access not in ("read", "manage"):
+        raise OpError("Откройте приложение этого дома", 403)
+    if request.get("kind") != "http" or request.get("method") != "POST":
+        raise OpError("Личная служба принимает запросы POST", 405)
+    body = request.get("body")
+    if not isinstance(body, str) or len(body) > 4096:
+        raise OpError("Некорректный запрос личной службы")
+    status = 200
+    try:
+        data = await service(access == "manage", body)
+    except OpError as error:
+        status, data = error.status, {"message": error.message}
+    return {"status": status, "headers": {"Content-Type": "application/json"}, "body": dumps(data)}

@@ -1,0 +1,170 @@
+"""Привязка на дом, чтение гостя и восстановление токенов."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+
+import pytest
+
+pytest.importorskip("ya_passport_auth")
+pytest.importorskip("yandex_music")
+
+from mega_home.core.host import PlainHost
+from mega_home.core.ops_base import OpError
+from mega_home.providers import yandex_music as music
+
+
+def _credentials() -> music.Credentials:
+    return music.Credentials(
+        x_token=music.SecretStr("passport-token"),
+        music_token=music.SecretStr("music-token"),
+        refresh_token=music.SecretStr("refresh-token"),
+        display_login="семья",
+    )
+
+
+def test_вход_общий_для_семьи_и_гостей_но_изолирован_по_домам(monkeypatch, tmp_path):
+    class Passport:
+        @staticmethod
+        @asynccontextmanager
+        async def create(**_):
+            yield Passport()
+
+        async def start_device_login(self, **_):
+            return SimpleNamespace(user_code="kod", verification_url="https://ya.ru/device", expires_in=300)
+
+        async def poll_device_until_confirmed(self, _device):
+            return _credentials()
+
+    class Client:
+        def __init__(self, token):
+            assert token == "music-token"
+
+        async def init(self):
+            return self
+
+        async def search(self, query, **_):
+            assert query == "Кино"
+            track = SimpleNamespace(id=1, title="Звезда", artists=[SimpleNamespace(name="Кино")])
+            return SimpleNamespace(tracks=SimpleNamespace(results=[track], per_page=10, total=1))
+
+    monkeypatch.setattr(music, "PassportClient", Passport)
+    monkeypatch.setattr(music, "ClientAsync", Client)
+
+    async def run():
+        env = PlainHost(tmp_path)
+        home = music.MusicService(env, "one")
+        other = music.MusicService(env, "two")
+        start = await home.call(True, '{"action":"start"}')
+        assert start["state"] == "pending" and start["code"] == "kod"
+        guest = await home.call(False, '{"action":"status"}')
+        assert guest == {"state": "disconnected", "canManage": False}
+        with pytest.raises(OpError) as denied:
+            await home.call(False, '{"action":"cancel","canManage":true}')
+        assert denied.value.status == 403
+        attempt = home._attempt
+        assert attempt is not None and attempt.task is not None
+        await attempt.task
+
+        # Как после перезапуска: читается та же привязка дома с диска.
+        home = music.MusicService(env, "one")
+        assert await home.call(True, '{"action":"status"}') == {"state": "connected", "login": "семья", "canManage": True}
+        assert await home.call(False, '{"action":"status"}') == {"state": "connected", "login": None, "canManage": False}
+        guest_catalog = await home.call(False, json.dumps({"action": "search", "query": "Кино", "kind": "track"}))
+        assert guest_catalog == {"items": [{"id": "1", "title": "Звезда", "kind": "track", "artist": "Кино"}], "more": False}
+        assert await other.call(True, '{"action":"status"}') == {"state": "disconnected", "canManage": True}
+        assert (tmp_path / "mega_home_yandex_music.one").stat().st_mode & 0o777 == 0o600
+        with pytest.raises(OpError) as denied:
+            await home.call(False, '{"action":"disconnect"}')
+        assert denied.value.status == 403
+        await home.call(True, '{"action":"disconnect"}')
+        assert (await home.call(False, '{"action":"status"}'))["state"] == "disconnected"
+        await env.close()
+
+    asyncio.run(run())
+
+
+def test_временный_отказ_сохраняет_привязку_и_обновление_токена_одно(monkeypatch, tmp_path):
+    from yandex_music.exceptions import NetworkError
+
+    refreshed = 0
+
+    class Passport:
+        @staticmethod
+        @asynccontextmanager
+        async def create(**_):
+            yield Passport()
+
+        async def refresh_music_token(self, _):
+            nonlocal refreshed
+            refreshed += 1
+            return music.SecretStr("new-token")
+
+    class Client:
+        def __init__(self, token):
+            self.token = token
+
+        async def init(self):
+            if self.token == "music-token":
+                raise music.UnauthorizedError("старый")
+            return self
+
+        async def search(self, *_args, **_kwargs):
+            raise NetworkError("Unavailable For Legal Reasons (451)")
+
+    monkeypatch.setattr(music, "PassportClient", Passport)
+    monkeypatch.setattr(music, "ClientAsync", Client)
+
+    async def run():
+        env = PlainHost(tmp_path)
+        service = music.MusicService(env, "home")
+        await music._save(env.store("mega_home_yandex_music.home", private=True), _credentials())
+        query = '{"action":"search","query":"Кино","kind":"track"}'
+        answers = await asyncio.gather(service.call(True, query), service.call(False, query), return_exceptions=True)
+        assert all(isinstance(answer, OpError) and answer.status == 503 and "из сети дома" in str(answer) for answer in answers)
+        assert refreshed == 1
+        assert (await service.call(True, '{"action":"status"}'))["state"] == "connected"
+        await env.close()
+
+    asyncio.run(run())
+
+
+def test_плейлисты_объединяются_и_их_треки_читаются_страницами():
+    from mega_home.providers.music_catalog import catalog, PAGE_SIZE
+
+    own = SimpleNamespace(owner=SimpleNamespace(uid=42), kind=1, title="Свой")
+    saved = SimpleNamespace(owner=SimpleNamespace(uid=21), kind=1, title="Сохранённый")
+    track = SimpleNamespace(id=11, title="Трек", artists=[])
+
+    class Client:
+        async def users_playlists_list(self):
+            return [own]
+
+        async def users_likes_playlists(self):
+            return [SimpleNamespace(playlist=own), SimpleNamespace(playlist=saved)]
+
+        async def users_playlists(self, kind, user_id):
+            assert (user_id, kind) == ("21", 1)
+            return SimpleNamespace(tracks=[SimpleNamespace(track=track)] * (PAGE_SIZE + 1))
+
+        async def users_likes_tracks(self):
+            return SimpleNamespace(tracks=[SimpleNamespace(track_id="11", timestamp=None)])
+
+        async def tracks(self, ids):
+            assert ids == ["11"]
+            return [track]
+
+    async def run():
+        client = Client()
+        items = (await catalog(client, "playlists", {}))["items"]
+        assert [item["id"] for item in items] == ["42:1", "21:1"]
+        first = await catalog(client, "playlist", {"id": "21:1", "page": 0})
+        assert len(first["items"]) == PAGE_SIZE and first["more"]
+        second = await catalog(client, "playlist", {"id": "21:1", "page": 1})
+        assert len(second["items"]) == 1 and not second["more"]
+        assert await catalog(client, "liked", {}) == second
+
+    asyncio.run(run())

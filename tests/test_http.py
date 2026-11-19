@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 from mega_home.http import _serve
@@ -57,6 +58,7 @@ class FakeRequest:
         self.method = method
         self.raw_path = raw_path
         self.headers: dict[str, str] = {}
+        self.cookies: dict[str, str] = {}
         self.content_length = len(body) or None
         self.can_read_body = bool(body)
         self._body = body
@@ -318,6 +320,32 @@ def test_локальная_дверь_идёт_общим_маршрутиза�
 
 async def _now(value: Any) -> Any:
     return value
+
+
+def test_локальный_каталог_открыт_зато_привязку_меняет_ключ_учётки():
+    from mega_home.core.local_keys import COOKIE, HEADER, LocalKeys, sign
+    from mega_home.http import MegaHomeConnectView
+
+    async def music(can_manage, _body):
+        return {"canManage": can_manage}
+
+    coordinator = FakeCoordinator()
+    coordinator.data = {"rooms": []}
+    coordinator.local_keys = LocalKeys()
+    coordinator.local_keys.apply({"house": {"local": {"secret": "secret", "accounts": {"42": 7}}}})
+    coordinator.resident_services = {"music": music}
+    body = b'{"kind":"http","host":"music","method":"POST","body":"{}"}'
+    request = FakeRequest(coordinator, method="POST", raw_path="/mega-home/api/connect", body=body)
+    request.headers = {"Content-Type": "application/json; charset=UTF-8"}
+    request.cookies = {COOKIE: sign("secret", "monitor")}
+
+    answer = asyncio.run(MegaHomeConnectView().post(request))
+    assert json.loads(json.loads(answer.body)["body"]) == {"canManage": False}
+    request.headers[HEADER] = sign("secret", "phone", "42", "7")
+    answer = asyncio.run(MegaHomeConnectView().post(request))
+    assert json.loads(json.loads(answer.body)["body"]) == {"canManage": True}
+    request.headers["Sec-Fetch-Site"] = "same-site"
+    assert asyncio.run(MegaHomeConnectView().post(request)).status == 403
 
 
 def test_несинхронизированный_дом_отвечает_503_на_любой_путь() -> None:

@@ -108,6 +108,26 @@ def test_состав_и_состояния_едут_теми_же_путями(
     assert json_of(call(coordinator, "GET", "api/states"))["configVersion"] == "sha256:abc"
 
 
+def test_служба_дома_получает_права_только_от_двери(coordinator):
+    async def service(can_manage, body):
+        return {"canManage": can_manage, "action": json.loads(body)["action"]}
+
+    coordinator.resident_services = {"catalog": service}
+    payload = {"kind": "http", "method": "POST", "host": "catalog", "residentAccess": "manage",
+               "body": json.dumps({"action": "status", "canManage": True})}
+    raw = json.dumps(payload).encode()
+    frame = {"method": "POST", "path": "api/connect", "body": base64.b64encode(raw).decode()}
+    with pytest.raises(ops.OpError, match="Откройте"):
+        asyncio.run(handle(coordinator, frame))
+    with pytest.raises(ops.OpError, match="Откройте"):
+        asyncio.run(dispatch(coordinator, "POST", "api/connect", raw, {}))
+
+    local = asyncio.run(dispatch(coordinator, "POST", "api/connect", raw, {}, resident_access="read"))
+    remote = asyncio.run(handle(coordinator, {**frame, "residentAccess": "read"}))
+    assert local[3] == remote["cacheControl"] == "no-store"
+    assert json.loads(json.loads(local[2])["body"]) == json.loads(json_of(remote)["body"]) == {"canManage": False, "action": "status"}
+
+
 def test_команда_прибором_идёт_через_тот_же_перенос(coordinator):
     answer = call(coordinator, "POST", "api/command", json.dumps({"id": "t1", "command": "turn_on"}).encode())
     assert json_of(answer)["accepted"] is True

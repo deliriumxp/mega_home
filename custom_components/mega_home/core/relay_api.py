@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, unquote
 
-from . import ops
+from . import ops, services
 from .alerts import MAX_RULE_BYTES, alert_key_known, rule_valid
 from .crops import crop_key_known, crop_keys, crop_value_valid
 from .imaging import asset_file, photo_file
@@ -81,7 +81,8 @@ async def handle(coordinator: Any, payload: dict[str, Any]) -> dict[str, Any]:
     # Подпись команды ставит МЕНЕДЖЕР рядом с запросом, а не в его теле: тело
     # пишет телефон, и верить ему в том, кто он, нельзя (`ops_base.actor`).
     status, content_type, raw, cache = await dispatch(
-        coordinator, method, path, _body(payload.get("body")), query, payload.get("actor"), VIA_REMOTE
+        coordinator, method, path, _body(payload.get("body")), query, payload.get("actor"), VIA_REMOTE,
+        resident_access=payload.get("residentAccess"),
     )
     if isinstance(raw, Path):
         raw = await coordinator.env.run(raw.read_bytes)
@@ -104,6 +105,8 @@ async def dispatch(
     query: dict[str, str],
     by: Any = None,
     via: str = VIA_LOCAL,
+    *,
+    resident_access: str | None = None,
 ) -> Reply:
     """Один запрос жильца по пути `api/...` — одинаково для обеих дверей.
 
@@ -137,7 +140,11 @@ async def dispatch(
     if path == "api/connect" and method == "POST":
         # Единственный контракт транспорта наружу — тот же код, что у операции
         # канала (`ops.py`, `op == "connect"`): ответы не должны разъезжаться.
-        return _json(await ops.connect(_json_body(body), bundle=True))
+        request = _json_body(body)
+        answer = await services.call_resident(coordinator, request, resident_access)
+        if answer is not None:
+            return (HTTPStatus.OK, JSON_TYPE, dumps(answer).encode("utf-8"), "no-store")
+        return _json(await ops.connect(request, bundle=True))
     if path == "api/connect" and method == "GET":
         # ⚠ ТОТ ЖЕ путь и тот же контракт, другой способ ПОТРЕБИТЬ ответ: тело
         # адресата уезжает как есть, с его типом, — кадр и файл браузер берёт

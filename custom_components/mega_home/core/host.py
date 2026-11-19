@@ -41,7 +41,7 @@ class Host(Protocol):
     def path(self, *parts: str) -> Path:
         """Путь в нашем каталоге хранения (в HA — `.storage/`)."""
 
-    def store(self, key: str, version: int = 1) -> KeyStore:
+    def store(self, key: str, version: int = 1, *, private: bool = False) -> KeyStore:
         """JSON-документ по ключу в каталоге хранения."""
 
     def every(
@@ -102,8 +102,9 @@ class JsonStore:
     с HA на демон, должен подняться со своим кэшем правил и учёток, а не с нуля.
     """
 
-    def __init__(self, path: Path, key: str, version: int) -> None:
+    def __init__(self, path: Path, key: str, version: int, *, private: bool = False) -> None:
         self._path, self._key, self._version = path, key, version
+        self._private = private
         self._delayed: asyncio.TimerHandle | None = None
         self._pending: asyncio.Task[None] | None = None
 
@@ -143,7 +144,11 @@ class JsonStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_name(f"{self._path.name}.tmp")
         envelope = {"version": self._version, "minor_version": 1, "key": self._key, "data": data}
-        tmp.write_text(json.dumps(envelope, ensure_ascii=False), "utf-8")
+        def open_private(path: str, flags: int) -> int:
+            return os.open(path, flags, 0o600)
+
+        with open(tmp, "w", encoding="utf-8", opener=open_private if self._private else None) as stream:
+            json.dump(envelope, stream, ensure_ascii=False)
         os.replace(tmp, self._path)
 
 
@@ -179,8 +184,8 @@ class PlainHost:
     def path(self, *parts: str) -> Path:
         return self._root.joinpath(*parts)
 
-    def store(self, key: str, version: int = 1) -> KeyStore:
-        return JsonStore(self.path(key), key, version)
+    def store(self, key: str, version: int = 1, *, private: bool = False) -> KeyStore:
+        return JsonStore(self.path(key), key, version, private=private)
 
     def every(
         self, interval: timedelta, action: Callable[[Any], Awaitable[None] | None]

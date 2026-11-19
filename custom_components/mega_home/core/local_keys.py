@@ -97,3 +97,7 @@ class LocalKeys:
         if not self.closed:
             return True, sign(self.secret, secrets.token_urlsafe(12)), True
         return False, None, False
+
+    def is_resident(self, key: str | None) -> bool:
+        """Ключ открытого дома даёт доступ к каталогу. Управление привязкой требует ключ учётки."""
+        return bool(key and self.valid(key) and key.split(".")[2] != NONE)

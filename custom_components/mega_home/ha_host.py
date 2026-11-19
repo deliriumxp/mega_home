@@ -37,8 +37,8 @@ class HaHost:
     def path(self, *parts: str) -> Path:
         return Path(self.hass.config.path(STORAGE_DIR, *parts))
 
-    def store(self, key: str, version: int = 1) -> Store[Any]:
-        return Store[Any](self.hass, version, key)
+    def store(self, key: str, version: int = 1, *, private: bool = False) -> Store[Any]:
+        return Store[Any](self.hass, version, key, private=private, atomic_writes=private)
 
     def every(
         self, interval: timedelta, action: Callable[[Any], Awaitable[None] | None]

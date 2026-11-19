@@ -101,7 +101,7 @@ class FakeHost(PlainHost):
         coro.close()
         return _Pending()
 
-    def store(self, key: str, version: int = 1) -> _MemoryStore:
+    def store(self, key: str, version: int = 1, *, private: bool = False) -> _MemoryStore:
         return self.stores.setdefault(key, _MemoryStore())
 
     def every(self, interval, action):  # noqa: ANN001, ANN201

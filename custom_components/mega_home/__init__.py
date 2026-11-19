@@ -182,6 +182,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     coordinator.shared = SharedDocs(coordinator.env)
     await coordinator.shared.async_load()
 
+    from .providers.yandex_music import MusicService
+
+    music = MusicService(coordinator.env, entry.unique_id or entry.entry_id)
+    coordinator.resident_services = {"yandex-music": music.call}
+    entry.async_on_unload(music.stop)
+
     def _track_alerts() -> None:
         alerts.track(coordinator.data)
 
