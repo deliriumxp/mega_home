@@ -193,6 +193,7 @@ _module(
     ConfigFlow=_ConfigFlow,
     ConfigFlowResult=dict,
 )
+_module("homeassistant.data_entry_flow", UnknownHandler=type("UnknownHandler", (Exception,), {}))
 # `voluptuous` и клиентская сессия нужны только для импорта модуля потока:
 # проверяется в нём функция разбора адреса, а не формы Home Assistant.
 class _Invalid(Exception):  # noqa: D101 - voluptuous' own rejection

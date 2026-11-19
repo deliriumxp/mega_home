@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from time import time
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import urlsplit
 
 from ya_passport_auth import (
@@ -14,6 +15,7 @@ from ya_passport_auth import (
 )
 from yandex_music import ClientAsync
 from yandex_music.exceptions import NotFoundError, UnauthorizedError, YandexMusicError
+from yandex_music.utils.request_async import Request
 
 from ..core.const import LOGGER
 from ..core.host import Host, KeyStore
@@ -26,6 +28,24 @@ from .music_stream import stream as stream_track
 class Attempt:
     status: dict[str, Any]
     task: asyncio.Task | None = None
+
+
+class MusicForbidden(YandexMusicError):
+    status_code = 403
+
+
+class MusicUnauthorized(UnauthorizedError):
+    status_code = 401
+
+
+class MusicRequest(Request):
+    def _handle_error_response(self, status_code: int, content: bytes) -> NoReturn:
+        # SDK сводит 401 и 403 к одному исключению. Только 401 требует обновления токена.
+        if status_code == 401:
+            raise MusicUnauthorized()
+        if status_code == 403:
+            raise MusicForbidden()
+        return super()._handle_error_response(status_code, content)
 
 
 class MusicService:
@@ -76,10 +96,19 @@ class MusicService:
                 return answer
         except NotFoundError:
             raise OpError("В Яндекс Музыке ничего не найдено", 404) from None
+        except MusicForbidden as error:
+            _log_failure(action, error)
+            message = "Яндекс Музыка не разрешила воспроизведение этого трека" if action == "stream" else "Яндекс Музыка ограничила доступ к этому разделу"
+            raise OpError(message, 503) from None
         except (YaPassportError, YandexMusicError, TimeoutError, ValueError, OSError) as error:
             _log_failure(action, error)
             message = "Каталог Яндекс Музыки недоступен из сети дома" if _restricted(error) else "Яндекс Музыка не ответила. Попробуйте ещё раз"
             raise OpError(message, 503) from None
+
+    async def with_passport(self, use: Callable[[Credentials | None], Awaitable[dict]]) -> dict:
+        # Выпуск и отключение привязки сериализованы с передачей учётки в HA.
+        async with self._lock:
+            return await use(_load(await self._store.async_load()))
 
     def _status(self, credentials: Credentials | None, can_manage: bool) -> dict:
         if credentials:
@@ -130,7 +159,7 @@ class MusicService:
         async def read(current: Credentials) -> dict:
             if current.music_token is None:
                 raise UnauthorizedError("Нет музыкального токена")
-            client = await ClientAsync(current.music_token.get_secret()).init()
+            client = await ClientAsync(current.music_token.get_secret(), request=MusicRequest()).init()
             if action == "stream":
                 return await stream_track(client, request)
             return await catalog(client, action, request)
@@ -142,9 +171,8 @@ class MusicService:
         refreshed = await self._refresh(credentials, revision)
         try:
             return await read(refreshed)
-        except UnauthorizedError:
-            # SDK объединяет 401 и 403. Отказ музыкального API с только что выданным
-            # токеном не доказывает, что Паспорт отозвал привязку дома.
+        except UnauthorizedError as error:
+            _log_failure(action, error)
             raise OpError("Яндекс Музыка отклонила запрос. Проверьте доступ в аккаунте Яндекса", 503) from None
 
     async def _refresh(self, rejected: Credentials, revision: int) -> Credentials:
@@ -161,10 +189,11 @@ class MusicService:
                         refreshed = replace(current, music_token=token)
                     except InvalidCredentialsError:
                         refreshed = await passport.refresh_credentials(current)
-            except InvalidCredentialsError:
-                await self._store.async_save({})
-                self._revision += 1
-                raise OpError("Войдите в Яндекс Музыку заново", 409) from None
+            except InvalidCredentialsError as error:
+                # Обмен токена Музыки может отказать даже после выдачи нового токена Паспорта.
+                # Сохраняем привязку дома до явного отключения жильцом.
+                _log_failure("refresh", error)
+                raise OpError("Яндекс не обновил сеанс Музыки. Переподключите аккаунт в настройках", 503) from None
             await _save(self._store, refreshed)
             return refreshed
 

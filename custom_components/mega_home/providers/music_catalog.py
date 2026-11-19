@@ -96,7 +96,7 @@ async def _liked(client: Any, page: int) -> dict:
 
 async def _tracks_by_id(client: Any, ids: list[str]) -> dict[str, Any]:
     tracks = await client.tracks(ids) if ids else []
-    return {str(track.id): track for track in tracks or [] if track is not None}
+    return {str(track.id).partition(":")[0]: track for track in tracks or [] if track is not None}
 
 
 async def _playlists(client: Any, page: int) -> dict:

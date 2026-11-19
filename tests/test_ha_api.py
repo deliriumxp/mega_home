@@ -64,6 +64,16 @@ def test_вход_websocket_до_кадров_вызывающего() -> None:
     assert socket_.sent == [{"type": "auth", "access_token": "T"}]
 
 
+@pytest.mark.parametrize("kind", ["marketplace/repository/install", "hacs/repository/download"])
+def test_каталог_интеграций_доступен_установщику_через_менеджер(kind: str) -> None:
+    HaApi(_hass()).apply({"house": {"ha": {"token": "T"}}})
+    frame = {"id": 1, "type": kind, "repository": "123"}
+    call = {"host": "ha", "kind": "ws", "messages": [frame]}
+    with pytest.raises(OpError, match="через менеджер"):
+        connect.with_service(call, bundle=True)
+    assert connect.with_service(call)["messages"] == [frame]
+
+
 def test_учётки_и_систему_ha_через_дом_не_меняют() -> None:
     """Выпуск токена и управление учётками и супервизором пережили бы любой отзыв ключа."""
     HaApi(_hass()).apply({"house": {"ha": {"token": "T"}}})

@@ -50,7 +50,17 @@ def bundle_guard(what: str, value: str) -> str | None:
         path = value.split("?", 1)[0].lower()
         if any(path == prefix or path.startswith(prefix + "/") for prefix in _CONFIG_FLOWS):
             return "Настройки интеграций Home Assistant доступны через менеджер"
+    if what == "frame" and str(_frame(value).get("type", "")).startswith(("marketplace/", "hacs/")):
+        return "Каталог интеграций Home Assistant доступен через менеджер"
     return None
+
+
+def _frame(value: str) -> dict:
+    try:
+        frame = json.loads(value)
+    except ValueError:
+        return {}
+    return frame if isinstance(frame, dict) else {}
 
 
 def guard(what: str, value: str) -> str | None:
@@ -65,12 +75,7 @@ def guard(what: str, value: str) -> str | None:
         return REFUSED_TEXT
     if what == "body":
         return None
-    try:
-        frame = json.loads(value)
-    except ValueError:
-        return None
-    if not isinstance(frame, dict):
-        return None
+    frame = _frame(value)
     kind = str(frame.get("type") or "")
     if kind in REFUSED_FRAMES or any(kind.startswith(p) for p in REFUSED_FRAMES if p.endswith("/")):
         return REFUSED_TEXT

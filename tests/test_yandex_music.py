@@ -39,7 +39,7 @@ def test_вход_общий_для_семьи_и_гостей_но_изолир
             return _credentials()
 
     class Client:
-        def __init__(self, token):
+        def __init__(self, token, *, request):
             assert token == "music-token"
 
         async def init(self):
@@ -103,7 +103,7 @@ def test_временный_отказ_сохраняет_привязку_и_о
             return music.SecretStr("new-token")
 
     class Client:
-        def __init__(self, token):
+        def __init__(self, token, *, request):
             self.token = token
 
         async def init(self):
@@ -173,11 +173,16 @@ def test_поток_трека_отдаёт_варианты_библиотек�
     """Свой подписанный запрос не нужен: варианты даёт клиент `yandex_music`."""
 
     class Client:
-        def __init__(self, _token):
+        def __init__(self, _token, *, request):
             pass
 
         async def init(self):
             return self
+
+        async def users_playlists(self, kind, user_id):
+            assert (kind, user_id) == (10, "42")
+            track = SimpleNamespace(id="123:456", title="Трек", artists=[])
+            return SimpleNamespace(tracks=[SimpleNamespace(track=track)])
 
         async def tracks_download_info(self, track_id):
             assert track_id == "123"
@@ -205,7 +210,9 @@ def test_поток_трека_отдаёт_варианты_библиотек�
         env = PlainHost(tmp_path)
         service = music.MusicService(env, "home")
         await music._save(env.store("mega_home_yandex_music.home", private=True), _credentials())
-        answer = await service.call(True, {"action": "stream", "id": "123"})
+        playlist = await service.call(True, {"action": "playlist", "id": "42:10"})
+        assert playlist["items"][0]["id"] == "123:456"
+        answer = await service.call(True, {"action": "stream", "id": playlist["items"][0]["id"]})
         assert answer == {
             "infos": [
                 {"url": "https://cdn.yandex/track.aac", "codec": "aac", "bitrate": 192},
@@ -215,6 +222,60 @@ def test_поток_трека_отдаёт_варианты_библиотек�
             "url": "https://cdn.yandex/track.mp3",
             "format": "mp3",
         }
+        await env.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["api_forbidden", "cdn_unauthorized", "passport_denied"])
+def test_ошибка_потока_из_плейлиста_не_стирает_учётку(monkeypatch, tmp_path, failure):
+    class Passport:
+        @staticmethod
+        @asynccontextmanager
+        async def create(**_):
+            assert failure == "passport_denied", "Отказ API 403 или отказ CDN не требует обновления токенов"
+            yield Passport()
+
+        async def refresh_music_token(self, _):
+            raise music.InvalidCredentialsError("music exchange denied")
+
+        async def refresh_credentials(self, _):
+            raise music.InvalidCredentialsError("refresh credentials denied")
+
+    class Client:
+        def __init__(self, _token, *, request):
+            self.request = request
+
+        async def init(self):
+            return self
+
+        async def tracks_download_info(self, track_id):
+            assert track_id == "123"
+            if failure == "api_forbidden":
+                self.request._handle_error_response(403, b"{}")
+            if failure == "passport_denied":
+                self.request._handle_error_response(401, b"{}")
+
+            async def denied():
+                raise music.UnauthorizedError("cdn refused")
+
+            return [SimpleNamespace(codec="mp3", bitrate_in_kbps=320, get_direct_link_async=denied)]
+
+    monkeypatch.setattr(music, "PassportClient", Passport)
+    monkeypatch.setattr(music, "ClientAsync", Client)
+
+    async def run():
+        env = PlainHost(tmp_path)
+        service = music.MusicService(env, "home")
+        store = env.store("mega_home_yandex_music.home", private=True)
+        credentials = _credentials()
+        await music._save(store, credentials)
+        for _ in range(2):
+            with pytest.raises(OpError) as exc:
+                await service.call(False, {"action": "stream", "id": "123:456"})
+            assert exc.value.status == 503
+        assert (await service.call(True, {"action": "status"}))["state"] == "connected"
+        assert music._load(await store.async_load()) == credentials
         await env.close()
 
     asyncio.run(run())
@@ -313,7 +374,7 @@ def test_отключение_не_ждёт_поиска_и_старый_отв�
         searching, continue_search = asyncio.Event(), asyncio.Event()
 
         class Client:
-            def __init__(self, _token):
+            def __init__(self, _token, *, request):
                 pass
 
             async def init(self):
@@ -352,7 +413,7 @@ def test_отказ_музыкального_api_после_выдачи_ток�
             return music.SecretStr("new-token")
 
     class Client:
-        def __init__(self, _token):
+        def __init__(self, _token, *, request):
             pass
 
         async def init(self):
