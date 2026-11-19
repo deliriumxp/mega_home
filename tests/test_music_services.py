@@ -42,7 +42,7 @@ class Music:
         request = json.loads(body)
         self.calls.append((can_manage, request))
         if request["action"] == "stream":
-            return {"url": "https://cdn.yandex/track.mp3", "format": "mp3"}
+            return {"infos": [{"url": "https://cdn.yandex/track.mp3", "codec": "mp3", "bitrate": 320}]}
         return {"items": [], "more": False}
 
 

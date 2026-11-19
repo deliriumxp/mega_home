@@ -24,6 +24,7 @@ from homeassistant.exceptions import HomeAssistantError
 
 from .core.const import DOMAIN, SERVICE_MUSIC, SERVICE_MUSIC_PLAY
 from .core.ops_base import OpError
+from .providers.music_pick import pick_stream, stream_format
 
 # `homeassistant.const.ATTR_ENTITY_ID` — та же строка; не тянем модуль ради одной константы.
 ENTITY = "entity_id"
@@ -62,14 +63,14 @@ async def _music_play(call: ServiceCall) -> None:
         stream = await _music(call)(False, json.dumps({"action": "stream", "id": track_id}))
     except OpError as error:
         raise HomeAssistantError(str(error)) from error
-    url = stream.get("url") if isinstance(stream, dict) else None
-    if not isinstance(url, str) or not url:
+    chosen = pick_stream(stream.get("infos") if isinstance(stream, dict) else None)
+    if not chosen:
         raise HomeAssistantError("Яндекс Музыка не отдала ссылку на трек")
-    content_type = _content_type(str(call.data.get("media_content_type") or "music"), str(stream.get("format") or "mp3"))
+    content_type = _content_type(str(call.data.get("media_content_type") or "music"), stream_format(chosen.get("codec")))
     await call.hass.services.async_call(
         "media_player",
         "play_media",
-        {"media_content_id": url, "media_content_type": content_type},
+        {"media_content_id": chosen["url"], "media_content_type": content_type},
         target={ENTITY: entity},
         blocking=True,
     )

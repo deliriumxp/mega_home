@@ -20,31 +20,39 @@ def _item(value: Any, kind: str, item_id: Any = None) -> dict | None:
     result = {"id": str(item_id), "title": title, "kind": kind}
     if artists:
         result["artist"] = ", ".join(artist.name for artist in artists if artist.name)
-    if cover := _cover(value):
-        result["cover"] = cover
+    if uri := _cover_uri(value):
+        result["coverUri"] = uri
     if kind == "track":
-        if album := _album_title(value):
-            result["album"] = album
+        album = (getattr(value, "albums", None) or [None])[0]
+        if album is not None:
+            if album_title := getattr(album, "title", None):
+                result["album"] = album_title
+            if album_id := getattr(album, "id", None):
+                result["albumId"] = str(album_id)
+            if year := getattr(album, "original_release_year", None) or getattr(album, "year", None):
+                result["year"] = int(year) if str(year).isdigit() else year
+            if genre := getattr(album, "genre", None):
+                result["genre"] = genre
         if duration := getattr(value, "duration_ms", None):
             result["durationMs"] = int(duration)
+        for source, target in (
+            ("explicit", "explicit"),
+            ("lyrics_available", "lyricsAvailable"),
+            ("content_warning", "contentWarning"),
+            ("version", "version"),
+        ):
+            if (field := getattr(value, source, None)) is not None:
+                result[target] = field
     return result
 
 
-def _cover(value: Any) -> str | None:
-    """Обложка Яндекс Музыки: `cover_uri` с размером вместо `%%` (правило MA, `parsers.py`)."""
+def _cover_uri(value: Any) -> str | None:
+    """Сырой `cover_uri` Яндекса; размер вместо `%%` подставляет бандл (`core/music-art.ts`)."""
     uri = getattr(value, "cover_uri", None)
     if not uri:
         albums = getattr(value, "albums", None) or []
         uri = getattr(albums[0], "cover_uri", None) if albums else None
-    if not isinstance(uri, str) or not uri:
-        return None
-    return uri if uri.startswith(("https://", "http://")) else f"https://{uri.replace('%%', '400x400')}"
-
-
-def _album_title(value: Any) -> str | None:
-    albums = getattr(value, "albums", None) or []
-    title = getattr(albums[0], "title", None) if albums else None
-    return title if isinstance(title, str) and title else None
+    return uri if isinstance(uri, str) and uri else None
 
 
 def _items(values: Any, kind: str) -> list[dict]:

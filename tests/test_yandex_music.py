@@ -170,53 +170,12 @@ def test_плейлисты_объединяются_и_их_треки_чита
     asyncio.run(run())
 
 
-def test_поток_трека_берёт_raw_ссылку_get_file_info(monkeypatch, tmp_path):
-    """`transports=raw` — ссылка без расшифровки, плеер забирает её сам."""
-    seen = {}
-
-    class Request:
-        async def get(self, url, params=None):
-            seen["url"], seen["params"] = url, params
-            return {"downloadInfo": {"url": "https://cdn.yandex/track.mp3", "codec": "mp3"}}
+def test_поток_трека_отдаёт_варианты_библиотеки(monkeypatch, tmp_path):
+    """Свой подписанный запрос не нужен: варианты даёт клиент `yandex_music`."""
 
     class Client:
-        base_url = "https://api.music.yandex.net"
-
         def __init__(self, _token):
-            self._request = Request()
-
-        async def init(self):
-            return self
-
-    monkeypatch.setattr(music, "ClientAsync", Client)
-
-    async def run():
-        env = PlainHost(tmp_path)
-        service = music.MusicService(env, "home")
-        await music._save(env.store("mega_home_yandex_music.home", private=True), _credentials())
-        answer = await service.call(True, '{"action":"stream","id":"123"}')
-        assert answer == {"url": "https://cdn.yandex/track.mp3", "format": "mp3"}
-        assert seen["url"] == "https://api.music.yandex.net/get-file-info"
-        assert seen["params"]["transports"] == "raw"
-        assert seen["params"]["trackId"] == "123"
-        assert len(seen["params"]["sign"]) == 43
-        await env.close()
-
-    asyncio.run(run())
-
-
-def test_поток_трека_падает_на_download_info_когда_ссылка_зашифрована(monkeypatch, tmp_path):
-    """Шифрованный поток плееру не отдать: берём прямую ссылку `download-info`."""
-
-    class Request:
-        async def get(self, _url, params=None):
-            return {"downloadInfo": {"url": "https://cdn.yandex/enc.aac", "codec": "aac", "key": "secret"}}
-
-    class Client:
-        base_url = "https://api.music.yandex.net"
-
-        def __init__(self, _token):
-            self._request = Request()
+            pass
 
         async def init(self):
             return self
@@ -225,7 +184,7 @@ def test_поток_трека_падает_на_download_info_когда_ссы
             assert (track_id, get_direct_links) == ("123", True)
             return [
                 SimpleNamespace(codec="aac", bitrate_in_kbps=192, direct_link="https://cdn.yandex/track.aac"),
-                SimpleNamespace(codec="mp3", bitrate_in_kbps=128, direct_link="https://cdn.yandex/track.mp3"),
+                SimpleNamespace(codec="mp3", bitrate_in_kbps=320, direct_link="https://cdn.yandex/track.mp3"),
             ]
 
     monkeypatch.setattr(music, "ClientAsync", Client)
@@ -235,10 +194,29 @@ def test_поток_трека_падает_на_download_info_когда_ссы
         service = music.MusicService(env, "home")
         await music._save(env.store("mega_home_yandex_music.home", private=True), _credentials())
         answer = await service.call(True, '{"action":"stream","id":"123"}')
-        assert answer == {"url": "https://cdn.yandex/track.mp3", "format": "mp3"}
+        assert answer == {
+            "infos": [
+                {"url": "https://cdn.yandex/track.aac", "codec": "aac", "bitrate": 192},
+                {"url": "https://cdn.yandex/track.mp3", "codec": "mp3", "bitrate": 320},
+            ]
+        }
         await env.close()
 
     asyncio.run(run())
+
+
+def test_выбор_варианта_и_формата_для_сценария():
+    from mega_home.providers.music_pick import pick_stream, stream_format
+
+    infos = [
+        {"url": "https://cdn/hi.flac", "codec": "flac", "bitrate": 900},
+        {"url": "https://cdn/aac.aac", "codec": "aac", "bitrate": 192},
+        {"url": "https://cdn/mp3.mp3", "codec": "mp3", "bitrate": 320},
+    ]
+    assert pick_stream(infos)["url"] == "https://cdn/mp3.mp3"
+    assert pick_stream([info for info in infos if info["codec"] != "mp3"])["url"] == "https://cdn/aac.aac"
+    assert stream_format("aac-mp4") == "aac"
+    assert stream_format("mp3") == "mp3"
 
 
 def test_поток_трека_отклоняет_чужой_адрес():
@@ -288,15 +266,26 @@ def test_обложка_альбом_и_длительность_доезжаю�
         title="Песня",
         artists=[SimpleNamespace(name="Кино")],
         cover_uri="avatars.yandex.net/get-music-content/1/2/%%",
-        albums=[SimpleNamespace(title="Звезда")],
+        albums=[SimpleNamespace(id=77, title="Звезда", original_release_year=1990, genre="rock")],
         duration_ms=180_000,
+        explicit=True,
+        lyrics_available=True,
+        content_warning="explicit",
+        version="Remaster",
     )
     assert _item(track, "track") == {
         "id": "5",
         "title": "Песня",
         "kind": "track",
         "artist": "Кино",
-        "cover": "https://avatars.yandex.net/get-music-content/1/2/400x400",
+        "coverUri": "avatars.yandex.net/get-music-content/1/2/%%",
         "album": "Звезда",
+        "albumId": "77",
+        "year": 1990,
+        "genre": "rock",
         "durationMs": 180_000,
+        "explicit": True,
+        "lyricsAvailable": True,
+        "contentWarning": "explicit",
+        "version": "Remaster",
     }
