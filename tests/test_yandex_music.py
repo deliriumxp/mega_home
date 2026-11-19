@@ -168,3 +168,85 @@ def test_плейлисты_объединяются_и_их_треки_чита
         assert await catalog(client, "liked", {}) == second
 
     asyncio.run(run())
+
+
+def test_поток_трека_берёт_raw_ссылку_get_file_info(monkeypatch, tmp_path):
+    """`transports=raw` — ссылка без расшифровки, плеер забирает её сам."""
+    seen = {}
+
+    class Request:
+        async def get(self, url, params=None):
+            seen["url"], seen["params"] = url, params
+            return {"downloadInfo": {"url": "https://cdn.yandex/track.mp3", "codec": "mp3"}}
+
+    class Client:
+        base_url = "https://api.music.yandex.net"
+
+        def __init__(self, _token):
+            self._request = Request()
+
+        async def init(self):
+            return self
+
+    monkeypatch.setattr(music, "ClientAsync", Client)
+
+    async def run():
+        env = PlainHost(tmp_path)
+        service = music.MusicService(env, "home")
+        await music._save(env.store("mega_home_yandex_music.home", private=True), _credentials())
+        answer = await service.call(True, '{"action":"stream","id":"123"}')
+        assert answer == {"url": "https://cdn.yandex/track.mp3", "format": "mp3"}
+        assert seen["url"] == "https://api.music.yandex.net/get-file-info"
+        assert seen["params"]["transports"] == "raw"
+        assert seen["params"]["trackId"] == "123"
+        assert len(seen["params"]["sign"]) == 43
+        await env.close()
+
+    asyncio.run(run())
+
+
+def test_поток_трека_падает_на_download_info_когда_ссылка_зашифрована(monkeypatch, tmp_path):
+    """Шифрованный поток плееру не отдать: берём прямую ссылку `download-info`."""
+
+    class Request:
+        async def get(self, _url, params=None):
+            return {"downloadInfo": {"url": "https://cdn.yandex/enc.aac", "codec": "aac", "key": "secret"}}
+
+    class Client:
+        base_url = "https://api.music.yandex.net"
+
+        def __init__(self, _token):
+            self._request = Request()
+
+        async def init(self):
+            return self
+
+        async def tracks_download_info(self, track_id, get_direct_links=True):
+            assert (track_id, get_direct_links) == ("123", True)
+            return [
+                SimpleNamespace(codec="aac", bitrate_in_kbps=192, direct_link="https://cdn.yandex/track.aac"),
+                SimpleNamespace(codec="mp3", bitrate_in_kbps=128, direct_link="https://cdn.yandex/track.mp3"),
+            ]
+
+    monkeypatch.setattr(music, "ClientAsync", Client)
+
+    async def run():
+        env = PlainHost(tmp_path)
+        service = music.MusicService(env, "home")
+        await music._save(env.store("mega_home_yandex_music.home", private=True), _credentials())
+        answer = await service.call(True, '{"action":"stream","id":"123"}')
+        assert answer == {"url": "https://cdn.yandex/track.mp3", "format": "mp3"}
+        await env.close()
+
+    asyncio.run(run())
+
+
+def test_поток_трека_отклоняет_чужой_адрес():
+    from mega_home.providers import music_stream
+
+    async def run():
+        with pytest.raises(OpError) as refused:
+            await music_stream.stream(SimpleNamespace(), {"id": "not-a-track"})
+        assert refused.value.status == 400
+
+    asyncio.run(run())

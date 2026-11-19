@@ -20,6 +20,7 @@ from ..core.const import LOGGER
 from ..core.host import Host, KeyStore
 from ..core.ops_base import OpError
 from .music_catalog import catalog
+from .music_stream import stream as stream_track
 
 
 @dataclass
@@ -50,7 +51,7 @@ class MusicService:
         except ValueError as error:
             raise OpError("Ожидается JSON-запрос") from error
         action = request.get("action") if isinstance(request, dict) else None
-        if action not in ("status", "start", "cancel", "disconnect", "search", "liked", "playlists", "playlist"):
+        if action not in ("status", "start", "cancel", "disconnect", "search", "liked", "playlists", "playlist", "stream"):
             raise OpError("Неизвестное действие Яндекс Музыки", 404)
         if action in ("start", "cancel", "disconnect") and not can_manage:
             raise OpError("Аккаунтом Яндекс Музыки управляют жильцы дома", 403)
@@ -127,6 +128,8 @@ class MusicService:
             if current.music_token is None:
                 raise UnauthorizedError("Нет музыкального токена")
             client = await ClientAsync(current.music_token.get_secret()).init()
+            if action == "stream":
+                return await stream_track(client, request)
             return await catalog(client, action, request)
 
         try:
