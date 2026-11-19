@@ -6,7 +6,8 @@
   ],
   "config_flow": true,
   "dependencies": [
-    "http"
+    "http",
+    "media_source"
   ],
   "documentation": "https://github.com/deliriumxp/mega_home",
   "integration_type": "service",
@@ -16,5 +17,5 @@
     "ya-passport-auth==1.8.0",
     "yandex-music[async]==3.0.0"
   ],
-  "version": "0.6.37"
+  "version": "0.6.38"
 }

@@ -192,7 +192,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # Короткие адреса трека для плееров с пределом длины (`providers/music_proxy.py`):
     # дом отдаёт их рядом с прямыми ссылками, а ссылку Яндекса разрешает по запросу
     # уже сам маршрут `/mega-home/stream/<токен>`.
-    links = MusicStreamLinks(stream_origin(hass, (coordinator.data or {}).get("house")))
+    links = MusicStreamLinks(lambda: stream_origin(hass, coordinator.data))
     coordinator.music = music
     coordinator.music_links = links
     station = StationAuth(hass, music)

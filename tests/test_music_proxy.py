@@ -42,7 +42,7 @@ def test_без_своего_адреса_короткой_ссылки_нет()
     assert links.with_address("1", {"infos": []}) == {"infos": []}
 
 
-def test_ответ_stream_получает_короткий_адрес_рядом_с_прямыми():
+def test_ответ_stream_получает_короткий_адрес_и_тёплую_ссылку_рядом_с_прямыми():
     links = MusicStreamLinks("http://home:8123")
     infos = [{"url": "https://cdn/1.mp3", "codec": "mp3", "bitrate": 320}]
 
@@ -51,6 +51,39 @@ def test_ответ_stream_получает_короткий_адрес_рядо
     assert answer["infos"] == infos
     assert answer["url"] == "https://cdn/1.mp3"
     assert answer["proxy"].startswith("http://home:8123/mega-home/stream/")
+    # Прогрев: плеер придёт через секунды, и второго запроса к Яндексу быть не должно.
+    assert links.resolved(_token(answer["proxy"])) == ("https://cdn/1.mp3", "audio/mpeg")
+
+
+def test_тот_же_трек_получает_тот_же_адрес():
+    links = MusicStreamLinks("http://home:8123")
+
+    first = links.address("1")
+    second = links.address("1")
+
+    assert first == second
+    assert links.address("2") != first
+
+
+def test_короткий_адрес_несёт_расширение_и_media_source_id():
+    links = MusicStreamLinks("http://home:8123")
+    infos = [{"url": "https://cdn/1.mp3", "codec": "mp3", "bitrate": 320}]
+
+    answer = links.with_address("7", {"infos": infos})
+
+    assert answer["proxy"].endswith(".mp3")
+    assert answer["mediaSource"].startswith("media-source://mega_home/track/")
+    token = answer["mediaSource"].rsplit("/", 1)[1]
+    assert links.public(token) == answer["proxy"]
+
+
+def test_mp4_кодек_отдаётся_как_audio_mp4_и_m4a():
+    from mega_home.providers.music_pick import stream_content_type, stream_extension
+
+    assert stream_content_type("aac-mp4") == "audio/mp4"
+    assert stream_extension("aac-mp4") == ".m4a"
+    assert stream_content_type("mp3") == "audio/mpeg"
+    assert stream_extension("mp3") == ".mp3"
 
 
 def test_неизвестный_токен_трек_не_называет():
@@ -62,9 +95,9 @@ def test_ссылка_яндекса_кэшируется_на_время_тре
     token = _token(links.address("1") or "")
 
     assert links.resolved(token) is None
-    links.remember(token, "https://cdn/1.mp3", "mp3")
-    assert links.resolved(token) == ("https://cdn/1.mp3", "mp3")
-    # Отказ CDN (403/404) — повод разрешить заново, а не отдать старую ссылку.
+    links.remember(token, "https://cdn/1.mp3", "audio/mpeg")
+    assert links.resolved(token) == ("https://cdn/1.mp3", "audio/mpeg")
+    # Отказ CDN (401/403/404/410) — повод разрешить заново, а не отдать старую ссылку.
     links.forget(token)
     assert links.resolved(token) is None
 
@@ -78,13 +111,31 @@ def test_просроченный_токен_и_просроченная_ссы�
     assert links.resolved(token) is None
 
 
-def test_адрес_дома_берётся_из_внутреннего_имени_или_своего_лица():
-    # Адрес, которым в дом ходит менеджер, — первый: в контейнере local_ip бывает мостом.
-    managed = SimpleNamespace(config=SimpleNamespace(internal_url="http://home.local:8123", api=None))
-    assert mega_http.stream_origin(managed, {"ha": {"url": "http://192.168.88.102:8123/"}}) == "http://192.168.88.102:8123"
+def test_потолок_вытесняет_только_при_выдаче_и_не_рвёт_чтение():
+    """⚠ Потолок в `_expire` удалял бы токен, который сейчас читают."""
+    links = MusicStreamLinks("http://home:8123")
+    tokens = [_token(links.address(str(i)) or "") for i in range(music_proxy.MAX_LINKS)]
 
+    assert links.track(tokens[0]) == "0"
+    assert links.address("новый") is not None
+    assert links.track(tokens[0]) is None
+    assert links.track(tokens[1]) == "1"
+
+
+def test_адрес_дома_берётся_из_конфига_дома_и_не_отдаёт_loopback():
+    hass = SimpleNamespace(config=SimpleNamespace(internal_url=None, api=None))
+
+    # localUrl — тот же адрес, что у локальной двери: порт и схема уже разобраны.
+    assert mega_http.stream_origin(hass, {"localUrl": "http://192.168.88.102:8123/mega-home/"}) == (
+        "http://192.168.88.102:8123"
+    )
+    # house.ha.url — запасной, если localUrl нет.
+    assert mega_http.stream_origin(hass, {"house": {"ha": {"url": "https://ha.example:8443/"}}}) == (
+        "https://ha.example:8443"
+    )
+    # localhost из конфига — не адрес для плеера: идём дальше по цепочке.
     named = SimpleNamespace(config=SimpleNamespace(internal_url="http://home.local:8123/", api=None))
-    assert mega_http.stream_origin(named) == "http://home.local:8123"
+    assert mega_http.stream_origin(named, {"localUrl": "http://localhost:8123/mega-home/"}) == "http://home.local:8123"
 
     own = SimpleNamespace(
         config=SimpleNamespace(
@@ -102,6 +153,14 @@ def test_адрес_дома_берётся_из_внутреннего_имен
     )
     assert mega_http.stream_origin(plain) == "http://192.168.88.102:80"
 
+    # IPv6 — в скобках, иначе адрес не разобрать.
+    v6 = SimpleNamespace(
+        config=SimpleNamespace(
+            internal_url=None, api=SimpleNamespace(use_ssl=False, local_ip="fe80::1", port=8123)
+        )
+    )
+    assert mega_http.stream_origin(v6) == "http://[fe80::1]:8123"
+
     # HTTPS без внутреннего имени не предлагаем: сертификат выписан на внешнее имя,
     # и плеер в локальной сети его не примет.
     secure = SimpleNamespace(
@@ -110,6 +169,15 @@ def test_адрес_дома_берётся_из_внутреннего_имен
         )
     )
     assert mega_http.stream_origin(secure) is None
+
+    # `internal_url`, записанный с localhost, тоже не годится.
+    loopback = SimpleNamespace(
+        config=SimpleNamespace(
+            internal_url="http://127.0.0.1:8123/",
+            api=SimpleNamespace(use_ssl=False, local_ip="192.168.88.102", port=8123),
+        )
+    )
+    assert mega_http.stream_origin(loopback) == "http://192.168.88.102:8123"
 
 
 class FakeEntries:
@@ -151,6 +219,10 @@ async def _upstream(request: web.Request) -> web.StreamResponse:
     first, _, last = value.removeprefix("bytes=").partition("-")
     start = int(first or 0)
     end = min(int(last) if last else len(BODY) - 1, len(BODY) - 1)
+    if start >= len(BODY):
+        return web.Response(
+            status=416, headers={**headers, "Content-Range": f"bytes */{len(BODY)}"}
+        )
     return web.Response(
         status=206,
         body=BODY[start : end + 1],
@@ -162,6 +234,45 @@ async def _upstream(request: web.Request) -> web.StreamResponse:
     )
 
 
+async def _broken(request: web.Request) -> web.StreamResponse:
+    """CDN отдал заголовки и половину тела — потом оборвался."""
+    response = web.StreamResponse(
+        headers={"Content-Type": "audio/mpeg", "Content-Length": str(len(BODY))}
+    )
+    await response.prepare(request)
+    await response.write(BODY[:10])
+    request.transport.close()  # type: ignore[union-attr]
+    return response
+
+
+def _view_app(coordinator: object) -> tuple[web.Application, mega_http.MegaHomeMusicStreamView]:
+    app = web.Application()
+    app["hass"] = _hass(coordinator)
+    view = mega_http.MegaHomeMusicStreamView()
+    # Заглушка `HomeAssistantView` в conftest отдаёт свой объект; здесь нужен
+    # настоящий ответ aiohttp, иначе сервер не сможет его отправить.
+    view.json_message = lambda message, status=400: web.json_response(  # type: ignore[method-assign]
+        {"message": message}, status=status
+    )
+    return app, view
+
+
+async def _mount(app: web.Application, view: mega_http.MegaHomeMusicStreamView) -> None:
+    path = "/mega-home/stream/{token}"
+
+    async def stream(request: web.Request) -> web.StreamResponse:
+        # HA передаёт части пути аргументами (`handler(request, **match_info)`);
+        # в голом aiohttp это делает обёртка.
+        return await view.get(request, **request.match_info)
+
+    async def head(request: web.Request) -> web.StreamResponse:
+        return await view.head(request, **request.match_info)
+
+    # `add_get` сам добавляет HEAD на GET-обработчик — здесь маршруты разные.
+    app.router.add_route("HEAD", path, head)
+    app.router.add_route("GET", path, stream)
+
+
 async def _case() -> None:
     upstream_app = web.Application()
     upstream_app.router.add_get("/track.mp3", _upstream)
@@ -169,46 +280,43 @@ async def _case() -> None:
 
     links = MusicStreamLinks("http://home:8123")
     token = _token(links.address("1") or "")
-    coordinator = SimpleNamespace(music=FakeMusic(f"http://127.0.0.1:{port}/track.mp3"), music_links=links)
-    hass = _hass(coordinator)
+    music = FakeMusic(f"http://127.0.0.1:{port}/track.mp3")
+    coordinator = SimpleNamespace(music=music, music_links=links)
 
-    app = web.Application()
-    app["hass"] = hass
-    view = mega_http.MegaHomeMusicStreamView()
-    # Заглушка `HomeAssistantView` в conftest отдаёт свой объект; здесь нужен
-    # настоящий ответ aiohttp, иначе сервер не сможет его отправить.
-    view.json_message = lambda message, status=400: web.json_response(  # type: ignore[method-assign]
-        {"message": message}, status=status
-    )
-
-    async def stream(request: web.Request) -> web.StreamResponse:
-        # HA передаёт части пути аргументами (`handler(request, **match_info)`);
-        # в голом aiohttp это делает обёртка.
-        return await view.get(request, **request.match_info)
-
-    app.router.add_get("/mega-home/stream/{token}", stream)
+    app, view = _view_app(coordinator)
+    await _mount(app, view)
     runner, home_port = await _serve(app)
 
     session = aiohttp.ClientSession()
     original = mega_http._client_session
     mega_http._client_session = lambda _hass: session
+    base = f"http://127.0.0.1:{home_port}/mega-home/stream"
     try:
-        async with session.get(f"http://127.0.0.1:{home_port}/mega-home/stream/{token}") as response:
+        async with session.get(f"{base}/{token}") as response:
             assert response.status == 200
             assert response.headers["Content-Type"] == "audio/mpeg"
             assert response.headers["Cache-Control"] == "no-store"
             assert await response.read() == BODY
 
-        async with session.get(
-            f"http://127.0.0.1:{home_port}/mega-home/stream/{token}",
-            headers={"Range": "bytes=0-9"},
-        ) as response:
+        async with session.get(f"{base}/{token}", headers={"Range": "bytes=0-9"}) as response:
             assert response.status == 206
             assert response.headers["Content-Range"] == f"bytes 0-9/{len(BODY)}"
             assert await response.read() == BODY[:10]
 
-        async with session.get(f"http://127.0.0.1:{home_port}/mega-home/stream/чужой") as response:
+        async with session.get(f"{base}/{token}", headers={"Range": "bytes=999999-"}) as response:
+            assert response.status == 416
+            assert response.headers["Content-Range"] == f"bytes */{len(BODY)}"
+
+        async with session.head(f"{base}/{token}") as response:
+            assert response.status == 200
+            assert response.headers["Content-Length"] == str(len(BODY))
+            assert await response.read() == b""
+
+        async with session.get(f"{base}/чужой") as response:
             assert response.status == 404
+
+        # Тёплая ссылка: первый GET разрешил, дальше Range/HEAD к Яндексу не ходят.
+        assert len(music.calls) == 1
     finally:
         mega_http._client_session = original
         await session.close()
@@ -216,8 +324,65 @@ async def _case() -> None:
         await upstream_runner.cleanup()
 
 
-def test_маршрут_отдаёт_поток_с_range_и_не_пускает_чужой_токен():
+def test_маршрут_отдаёт_поток_range_head_416_и_не_пускает_чужой_токен():
     asyncio.run(_case())
+
+
+async def _broken_case() -> None:
+    upstream_app = web.Application()
+    upstream_app.router.add_get("/broken.mp3", _broken)
+    upstream_runner, port = await _serve(upstream_app)
+
+    links = MusicStreamLinks("http://home:8123")
+    token = _token(links.address("1") or "")
+    coordinator = SimpleNamespace(music=FakeMusic(f"http://127.0.0.1:{port}/broken.mp3"), music_links=links)
+
+    app, view = _view_app(coordinator)
+    await _mount(app, view)
+    runner, home_port = await _serve(app)
+
+    session = aiohttp.ClientSession()
+    original = mega_http._client_session
+    mega_http._client_session = lambda _hass: session
+    try:
+        async with session.get(f"http://127.0.0.1:{home_port}/mega-home/stream/{token}") as response:
+            streamed = bytearray()
+            try:
+                async for chunk in response.content.iter_chunked(1024):
+                    streamed.extend(chunk)
+            except aiohttp.ClientPayloadError:
+                pass
+            # Обрыв CDN — короткое тело, а не второй HTTP-статус внутри аудио.
+            assert response.status == 200
+            assert streamed == BODY[:10]
+            assert b"HTTP/1.1" not in streamed
+    finally:
+        mega_http._client_session = original
+        await session.close()
+        await runner.cleanup()
+        await upstream_runner.cleanup()
+
+
+def test_обрыв_cdn_посреди_трека_не_пишет_второй_статус():
+    asyncio.run(_broken_case())
+
+
+async def _media_source_case() -> None:
+    links = MusicStreamLinks("http://home:8123")
+    answer = links.with_address("7", {"infos": [{"url": "https://cdn/1.mp3", "codec": "mp3", "bitrate": 320}]})
+    token = answer["mediaSource"].rsplit("/", 1)[1]
+    links.forget(token)  # ссылку ещё не разрешали для этого токена
+    music = FakeMusic("https://cdn/1.mp3")
+
+    ready = await music_proxy.resolve_for_media_source(music, links, token)
+
+    assert ready == (answer["proxy"], "audio/mpeg")
+    assert len(music.calls) == 1
+    assert links.public(token) == answer["proxy"]
+
+
+def test_media_source_разрешает_ссылку_тем_же_действием_что_приложение():
+    asyncio.run(_media_source_case())
 
 
 def test_маршрут_зарегистрирован_до_раздачи_бандла():

@@ -34,3 +34,28 @@ def stream_format(codec: Any) -> str:
     """Кодек Яндекса → формат `play_media` (`mp3` или `aac`)."""
     name = codec.lower() if isinstance(codec, str) else ""
     return "aac" if name.startswith(("aac", "he-aac")) else "mp3"
+
+
+def stream_content_type(codec: Any) -> str:
+    """Кодек Яндекса → `Content-Type` тела потока.
+
+    ⚠ `aac-mp4`/`he-aac-mp4` — это MP4-контейнер, а не ADTS AAC: отдать его как
+    `audio/aac` значит соврать плееру единственной подсказкой (у короткого адреса
+    нет расширения файла). Остальные AAC — ADTS.
+    """
+    name = codec.lower() if isinstance(codec, str) else ""
+    if name.endswith("-mp4"):
+        return "audio/mp4"
+    return "audio/aac" if name.startswith(("aac", "he-aac")) else "audio/mpeg"
+
+
+def stream_extension(codec: Any) -> str:
+    """Кодек Яндекса → расширение короткого адреса.
+
+    ⚠ Нужно плеерам, которые определяют формат по расширению (`play_url` HEOS/Marantz):
+    у `/mega-home/stream/<токен>` своего расширения нет, и без него поток не играет.
+    """
+    name = codec.lower() if isinstance(codec, str) else ""
+    if name.endswith("-mp4"):
+        return ".m4a"
+    return ".aac" if name.startswith(("aac", "he-aac")) else ".mp3"

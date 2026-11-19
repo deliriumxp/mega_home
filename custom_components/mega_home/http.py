@@ -21,9 +21,11 @@ commands straight from `hass`. The manager takes no part at runtime.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from http import HTTPStatus
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from aiohttp import ClientError, ClientTimeout, web
 
@@ -43,7 +45,7 @@ from .coordinator import MegaHomeCoordinator
 from .core.events import StateStream
 from .core.ops_base import OpError
 from .http_door import _MegaHomeView, _RoutedView, _coordinator
-from .providers.music_pick import pick_stream, stream_format
+from .providers.music_pick import pick_stream, stream_content_type
 
 # Сколько ждём отклика на ping удержания: уснувший телефон сокет не закрывает,
 # и без этого сессии к устройствам жили бы до своего часа (`stream.py`).
@@ -332,16 +334,21 @@ class MegaHomeMusicStreamView(_MegaHomeView):
             return self.json_message(
                 "Яндекс Музыка не подключена в этом доме", HTTPStatus.SERVICE_UNAVAILABLE
             )
+        lock = links.lock(token)
         ready = links.resolved(token)
         if ready is None:
-            ready = await _resolve_track(music, track, self)
-            if isinstance(ready, web.Response):
-                return ready
-            if ready is None:
-                return self.json_message(
-                    "Яндекс Музыка не отдала поток трека", HTTPStatus.BAD_GATEWAY
-                )
-        url, fmt = ready
+            async with lock:
+                # Пока ждали, соседний запрос мог уже разрешить ссылку.
+                ready = links.resolved(token)
+                if ready is None:
+                    ready = await _resolve_track(music, track, self)
+                    if isinstance(ready, web.Response):
+                        return ready
+                    if ready is None:
+                        return self.json_message(
+                            "Яндекс Музыка не отдала поток трека", HTTPStatus.BAD_GATEWAY
+                        )
+        url, content_type = ready
         session = _client_session(request.app["hass"])
         headers = {}
         if range_header := request.headers.get("Range"):
@@ -355,17 +362,25 @@ class MegaHomeMusicStreamView(_MegaHomeView):
                 async with session.get(
                     url, headers=headers, timeout=timeout, allow_redirects=True
                 ) as upstream:
-                    if upstream.status in (403, 404) and attempt == 0:
+                    if upstream.status in (401, 403, 404, 410) and attempt == 0:
                         # Ссылка истекла между выдачей и запросом: разрешаем заново,
                         # а не отдаём плееру отказ на ровном месте.
                         links.forget(token)
-                        refreshed = await _resolve_track(music, track, self)
-                        if isinstance(refreshed, web.Response):
-                            return refreshed
-                        if refreshed is None:
-                            break
-                        url, fmt = refreshed
+                        async with lock:
+                            refreshed = links.resolved(token)
+                            if refreshed is None:
+                                refreshed = await _resolve_track(music, track, self)
+                                if isinstance(refreshed, web.Response):
+                                    return refreshed
+                                if refreshed is None:
+                                    return self.json_message(
+                                        "Яндекс Музыка не отдала поток трека",
+                                        HTTPStatus.BAD_GATEWAY,
+                                    )
+                        url, content_type = refreshed
                         continue
+                    if upstream.status == HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE:
+                        return _range_refusal(upstream)
                     if upstream.status not in (200, 206):
                         LOGGER.warning(
                             "Яндекс Музыка: поток трека ответил %s", upstream.status
@@ -373,8 +388,8 @@ class MegaHomeMusicStreamView(_MegaHomeView):
                         return self.json_message(
                             "Поток трека недоступен", HTTPStatus.BAD_GATEWAY
                         )
-                    links.remember(token, url, fmt)
-                    return await _pipe(request, upstream, fmt, body)
+                    links.remember(token, url, content_type)
+                    return await _pipe(request, upstream, content_type, body)
             except (ClientError, TimeoutError, OSError) as err:
                 LOGGER.warning("Яндекс Музыка: поток трека не открылся: %s", err)
                 return self.json_message("Поток трека недоступен", HTTPStatus.BAD_GATEWAY)
@@ -384,7 +399,7 @@ class MegaHomeMusicStreamView(_MegaHomeView):
 async def _resolve_track(
     music: object, track: str, view: _MegaHomeView
 ) -> tuple[str, str] | web.Response | None:
-    """Ссылка Яндекса и формат для трека — тем же действием, что у приложения."""
+    """Ссылка Яндекса и её `Content-Type` — тем же действием, что у приложения."""
     try:
         answer = await music.call(False, {"action": "stream", "id": track})  # type: ignore[attr-defined]
     except OpError as err:
@@ -392,7 +407,7 @@ async def _resolve_track(
     chosen = pick_stream(answer.get("infos") if isinstance(answer, dict) else None)
     if chosen is None:
         return None
-    return chosen["url"], stream_format(chosen.get("codec"))
+    return chosen["url"], stream_content_type(chosen.get("codec"))
 
 
 def _client_session(hass: HomeAssistant) -> object:
@@ -402,15 +417,33 @@ def _client_session(hass: HomeAssistant) -> object:
     return async_get_clientsession(hass)
 
 
+def _range_refusal(upstream: object) -> web.Response:
+    """`416` — конец файла, а не «сервер сломан»: заголовок CDN отдаём как есть."""
+    headers = {"Cache-Control": "no-store"}
+    value = upstream.headers.get("Content-Range")  # type: ignore[attr-defined]
+    if value:
+        headers["Content-Range"] = value
+    return web.Response(status=HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE, headers=headers)
+
+
 async def _pipe(
-    request: web.Request, upstream: object, fmt: str, body: bool
+    request: web.Request, upstream: object, content_type: str, body: bool
 ) -> web.StreamResponse:
-    """Ответ плееру кусками — как пришло от CDN, включая `Range` и размер."""
+    """Ответ плееру кусками — как пришло от CDN, включая `Range` и размер.
+
+    ⚠ Ошибки ПОСЛЕ `prepare()` не превращаются в новый ответ: aiohttp записал бы вторую
+    строку статуса в уже начатое тело. Обрыв CDN или ушедший клиент — это обрыв потока:
+    закрываем соединение и возвращаем уже подготовленный ответ.
+    """
     headers = {
-        "Content-Type": "audio/mpeg" if fmt == "mp3" else "audio/aac",
+        "Content-Type": content_type,
         # Адрес — пропуск, кэшировать его нельзя.
         "Cache-Control": "no-store",
     }
+    # Тип от CDN главнее нашего: если он уже `audio/*`, значит знает контейнер точнее.
+    upstream_type = upstream.headers.get("Content-Type") or ""  # type: ignore[attr-defined]
+    if upstream_type.lower().startswith("audio/"):
+        headers["Content-Type"] = upstream_type
     for name in ("Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"):
         value = upstream.headers.get(name)  # type: ignore[attr-defined]
         if value:
@@ -420,40 +453,79 @@ async def _pipe(
     if body:
         try:
             async for chunk in upstream.content.iter_chunked(STREAM_CHUNK):  # type: ignore[attr-defined]
-                await response.write(chunk)
-        except ConnectionError:
-            # Плеер закрыл поток: пауза, перемотка, смена трека. Это норма, а не сбой.
+                try:
+                    await response.write(chunk)
+                except ConnectionError:
+                    # Плеер закрыл поток: пауза, перемотка, смена трека. Это норма.
+                    response.force_close()
+                    return response
+        except (ClientError, TimeoutError, OSError) as err:
+            # CDN оборвался уже после начала ответа — новый статус в тело не пишем.
+            LOGGER.warning("Яндекс Музыка: поток оборвался после начала ответа: %s", err)
+            response.force_close()
             return response
-    await response.write_eof()
+    try:
+        await response.write_eof()
+    except (ConnectionError, OSError):
+        response.force_close()
     return response
 
 
-def stream_origin(hass: HomeAssistant, house: dict | None = None) -> str | None:
+def stream_origin(hass: HomeAssistant, config: dict | None = None) -> str | None:
     """Адрес дома, по которому плеер локальной сети заберёт поток.
 
-    ⚠ Сперва адрес, которым в дом ходит МЕНЕДЖЕР (`house.ha.url`): в контейнере
-    `hass.config.api.local_ip` бывает адресом моста, а не сети объекта, и плеер
-    такой адрес не достанет. Дальше — `internal_url` («как зайти изнутри»), потом
-    адрес, которым HA назвал себя. `external_url` не берём: это публичное имя, а
-    плеер стоит в той же сети. HTTPS без внутреннего адреса не предлагаем:
-    сертификат выписан на внешнее имя, и плеер его не примет.
+    ⚠ Сперва `localUrl` конфига — адрес приложения в доме, который менеджер
+    собирает тем же `haTarget`, что локальная дверь: хост со схемой и порт уже
+    разобраны, HA-токен не нужен. Дальше — `house.ha.url` (адрес менеджера),
+    `internal_url` («как зайти изнутри») и адрес, которым HA назвал себя.
+    `external_url` не берём: это публичное имя, а плеер стоит в той же сети.
+    Адреса localhost/loopback отбрасываем — плеер по ним не достучится.
+    HTTPS без внутреннего адреса не предлагаем: сертификат выписан на внешнее
+    имя, и плеер его не примет.
     """
-    if isinstance(house, dict):
-        ha = house.get("ha")
-        managed = ha.get("url") if isinstance(ha, dict) else None
-        if isinstance(managed, str) and managed.startswith(("http://", "https://")):
-            return managed.rstrip("/")
-    internal = getattr(hass.config, "internal_url", None)
-    if isinstance(internal, str) and internal.startswith(("http://", "https://")):
-        return internal.rstrip("/")
+    if isinstance(config, dict):
+        local = _origin(config.get("localUrl"))
+        if local:
+            return local
+        house = config.get("house")
+        managed = house.get("ha") if isinstance(house, dict) else None
+        url = managed.get("url") if isinstance(managed, dict) else None
+        origin = _origin(url)
+        if origin:
+            return origin
+    origin = _origin(getattr(hass.config, "internal_url", None))
+    if origin:
+        return origin
     api = getattr(hass.config, "api", None)
     if api is None or getattr(api, "use_ssl", False):
         return None
     ip = getattr(api, "local_ip", None)
     port = getattr(api, "port", None)
-    if not isinstance(ip, str) or ip in ("", "0.0.0.0", "127.0.0.1", "::1") or not port:
+    if not isinstance(ip, str) or not port or _unreachable(ip):
         return None
-    return f"http://{ip}:{port}"
+    host = f"[{ip}]" if ":" in ip else ip
+    return f"http://{host}:{port}"
+
+
+def _origin(value: Any) -> str | None:
+    """`http://host:port/путь` → `http://host:port`; пусто/криво/loopback — `None`."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    parts = urlsplit(value.strip())
+    if parts.scheme not in ("http", "https") or not parts.hostname or _unreachable(parts.hostname):
+        return None
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def _unreachable(host: str) -> bool:
+    """Адрес, по которому плеер в локальной сети не достучится до дома."""
+    name = host.strip("[]").lower()
+    if name in ("localhost", "0.0.0.0", "::", "::1", "127.0.0.1"):
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
 
 
 class MegaHomeRelayView(_MegaHomeView):
