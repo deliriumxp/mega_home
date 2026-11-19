@@ -20,7 +20,31 @@ def _item(value: Any, kind: str, item_id: Any = None) -> dict | None:
     result = {"id": str(item_id), "title": title, "kind": kind}
     if artists:
         result["artist"] = ", ".join(artist.name for artist in artists if artist.name)
+    if cover := _cover(value):
+        result["cover"] = cover
+    if kind == "track":
+        if album := _album_title(value):
+            result["album"] = album
+        if duration := getattr(value, "duration_ms", None):
+            result["durationMs"] = int(duration)
     return result
+
+
+def _cover(value: Any) -> str | None:
+    """Обложка Яндекс Музыки: `cover_uri` с размером вместо `%%` (правило MA, `parsers.py`)."""
+    uri = getattr(value, "cover_uri", None)
+    if not uri:
+        albums = getattr(value, "albums", None) or []
+        uri = getattr(albums[0], "cover_uri", None) if albums else None
+    if not isinstance(uri, str) or not uri:
+        return None
+    return uri if uri.startswith(("https://", "http://")) else f"https://{uri.replace('%%', '400x400')}"
+
+
+def _album_title(value: Any) -> str | None:
+    albums = getattr(value, "albums", None) or []
+    title = getattr(albums[0], "title", None) if albums else None
+    return title if isinstance(title, str) and title else None
 
 
 def _items(values: Any, kind: str) -> list[dict]:

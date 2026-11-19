@@ -277,3 +277,26 @@ def test_альбом_и_исполнитель_отдают_треки_стра
         assert len(artist["items"]) == PAGE_SIZE and artist["more"]
 
     asyncio.run(run())
+
+
+def test_обложка_альбом_и_длительность_доезжают_до_плеера():
+    """Вкладка «Плеер» показывает композицию: обложка, альбом и длительность — из каталога."""
+    from mega_home.providers.music_catalog import _item
+
+    track = SimpleNamespace(
+        id=5,
+        title="Песня",
+        artists=[SimpleNamespace(name="Кино")],
+        cover_uri="avatars.yandex.net/get-music-content/1/2/%%",
+        albums=[SimpleNamespace(title="Звезда")],
+        duration_ms=180_000,
+    )
+    assert _item(track, "track") == {
+        "id": "5",
+        "title": "Песня",
+        "kind": "track",
+        "artist": "Кино",
+        "cover": "https://avatars.yandex.net/get-music-content/1/2/400x400",
+        "album": "Звезда",
+        "durationMs": 180_000,
+    }
