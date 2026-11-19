@@ -8,7 +8,9 @@ from typing import Any
 from ..core.ops_base import OpError
 
 PAGE_SIZE = 50
+QUEUE_LIMIT = 200
 PLAYLIST_ID = re.compile(r"[0-9]{1,20}:[0-9]{1,12}")
+TRACK_ID = re.compile(r"([0-9]{1,20})(?::[0-9]{1,20})?")
 
 
 def _item(value: Any, kind: str, item_id: Any = None) -> dict | None:
@@ -53,11 +55,12 @@ def _item(value: Any, kind: str, item_id: Any = None) -> dict | None:
 
 def _cover_uri(value: Any) -> str | None:
     """Сырой `cover_uri` Яндекса; размер вместо `%%` подставляет бандл (`core/music-art.ts`)."""
-    uri = getattr(value, "cover_uri", None)
-    if not uri:
-        albums = getattr(value, "albums", None) or []
-        uri = getattr(albums[0], "cover_uri", None) if albums else None
-    return uri if isinstance(uri, str) and uri else None
+    albums = getattr(value, "albums", None) or []
+    album = albums[0] if albums else None
+    return next((uri for uri in (
+        getattr(value, "cover_uri", None), getattr(getattr(value, "cover", None), "uri", None),
+        getattr(value, "og_image", None), getattr(album, "cover_uri", None), getattr(album, "og_image", None),
+    ) if isinstance(uri, str) and uri), None)
 
 
 def _cover_url(uri: str) -> str:
@@ -97,6 +100,27 @@ async def _liked(client: Any, page: int) -> dict:
 async def _tracks_by_id(client: Any, ids: list[str]) -> dict[str, Any]:
     tracks = await client.tracks(ids) if ids else []
     return {str(track.id).partition(":")[0]: track for track in tracks or [] if track is not None}
+
+
+def queue_ids(value: Any) -> list[str]:
+    if not isinstance(value, list) or not 1 <= len(value) <= QUEUE_LIMIT or any(
+        not isinstance(item, str) or not TRACK_ID.fullmatch(item) for item in value
+    ):
+        raise OpError("Неверный список треков")
+    return value
+
+
+async def track_details(client: Any, ids: list[str]) -> dict:
+    """Метаданные очереди из каталога, с сохранением порядка и повторов."""
+    items = []
+    for offset in range(0, len(ids), PAGE_SIZE):
+        batch = ids[offset:offset + PAGE_SIZE]
+        by_id = await _tracks_by_id(client, batch)
+        for track_id in batch:
+            value = by_id.get(track_id.partition(":")[0])
+            if value is not None and (item := _item(value, "track", track_id)):
+                items.append(item)
+    return {"items": items}
 
 
 async def _playlists(client: Any, page: int) -> dict:

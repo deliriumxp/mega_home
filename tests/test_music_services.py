@@ -90,3 +90,22 @@ def test_трек_разрешается_и_уходит_плееру_без_р�
         assert target == {"entity_id": "media_player.kitchen"}
 
     asyncio.run(run())
+
+
+def test_сценарий_отправляет_трек_настроенному_плееру_через_тот_же_выход():
+    hass, music = make()
+    handler, _options = hass.services.handlers[(DOMAIN, SERVICE_MUSIC_PLAY)]
+    calls = []
+
+    async def configured(entities, track):
+        calls.append((entities, track))
+        return []
+
+    hass.config_entries.entry.runtime_data.music_playback = SimpleNamespace(play_configured=configured)
+
+    async def run():
+        await handler(SimpleNamespace(data={"id": "123", "entity_id": "media_player.station"}, hass=hass))
+        assert calls == [(["media_player.station"], "123")]
+        assert not music.calls and not hass.services.calls
+
+    asyncio.run(run())

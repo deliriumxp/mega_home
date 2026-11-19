@@ -14,7 +14,7 @@ from time import monotonic
 import aiohttp
 from aiohttp import web
 
-from mega_home import http as mega_http
+from mega_home import http as mega_http, http_music
 from mega_home.providers import music_proxy
 from mega_home.providers.music_proxy import MusicStreamLinks
 
@@ -126,16 +126,16 @@ def test_адрес_дома_берётся_из_конфига_дома_и_не
     hass = SimpleNamespace(config=SimpleNamespace(internal_url=None, api=None))
 
     # localUrl — тот же адрес, что у локальной двери: порт и схема уже разобраны.
-    assert mega_http.stream_origin(hass, {"localUrl": "http://192.168.88.102:8123/mega-home/"}) == (
+    assert http_music.stream_origin(hass, {"localUrl": "http://192.168.88.102:8123/mega-home/"}) == (
         "http://192.168.88.102:8123"
     )
     # house.ha.url — запасной, если localUrl нет.
-    assert mega_http.stream_origin(hass, {"house": {"ha": {"url": "https://ha.example:8443/"}}}) == (
+    assert http_music.stream_origin(hass, {"house": {"ha": {"url": "https://ha.example:8443/"}}}) == (
         "https://ha.example:8443"
     )
     # localhost из конфига — не адрес для плеера: идём дальше по цепочке.
     named = SimpleNamespace(config=SimpleNamespace(internal_url="http://home.local:8123/", api=None))
-    assert mega_http.stream_origin(named, {"localUrl": "http://localhost:8123/mega-home/"}) == "http://home.local:8123"
+    assert http_music.stream_origin(named, {"localUrl": "http://localhost:8123/mega-home/"}) == "http://home.local:8123"
 
     own = SimpleNamespace(
         config=SimpleNamespace(
@@ -143,7 +143,7 @@ def test_адрес_дома_берётся_из_конфига_дома_и_не
             api=SimpleNamespace(use_ssl=False, local_ip="192.168.88.102", port=8123),
         )
     )
-    assert mega_http.stream_origin(own) == "http://192.168.88.102:8123"
+    assert http_music.stream_origin(own) == "http://192.168.88.102:8123"
 
     # Порт — тот, на котором HA реально слушает (новые версии — и на 80), а не константа.
     plain = SimpleNamespace(
@@ -151,7 +151,7 @@ def test_адрес_дома_берётся_из_конфига_дома_и_не
             internal_url=None, api=SimpleNamespace(use_ssl=False, local_ip="192.168.88.102", port=80)
         )
     )
-    assert mega_http.stream_origin(plain) == "http://192.168.88.102:80"
+    assert http_music.stream_origin(plain) == "http://192.168.88.102:80"
 
     # IPv6 — в скобках, иначе адрес не разобрать.
     v6 = SimpleNamespace(
@@ -159,7 +159,7 @@ def test_адрес_дома_берётся_из_конфига_дома_и_не
             internal_url=None, api=SimpleNamespace(use_ssl=False, local_ip="fe80::1", port=8123)
         )
     )
-    assert mega_http.stream_origin(v6) == "http://[fe80::1]:8123"
+    assert http_music.stream_origin(v6) == "http://[fe80::1]:8123"
 
     # HTTPS без внутреннего имени не предлагаем: сертификат выписан на внешнее имя,
     # и плеер в локальной сети его не примет.
@@ -168,7 +168,7 @@ def test_адрес_дома_берётся_из_конфига_дома_и_не
             internal_url=None, api=SimpleNamespace(use_ssl=True, local_ip="192.168.88.102", port=8123)
         )
     )
-    assert mega_http.stream_origin(secure) is None
+    assert http_music.stream_origin(secure) is None
 
     # `internal_url`, записанный с localhost, тоже не годится.
     loopback = SimpleNamespace(
@@ -177,7 +177,7 @@ def test_адрес_дома_берётся_из_конфига_дома_и_не
             api=SimpleNamespace(use_ssl=False, local_ip="192.168.88.102", port=8123),
         )
     )
-    assert mega_http.stream_origin(loopback) == "http://192.168.88.102:8123"
+    assert http_music.stream_origin(loopback) == "http://192.168.88.102:8123"
 
 
 class FakeEntries:
@@ -245,10 +245,10 @@ async def _broken(request: web.Request) -> web.StreamResponse:
     return response
 
 
-def _view_app(coordinator: object) -> tuple[web.Application, mega_http.MegaHomeMusicStreamView]:
+def _view_app(coordinator: object) -> tuple[web.Application, http_music.MegaHomeMusicStreamView]:
     app = web.Application()
     app["hass"] = _hass(coordinator)
-    view = mega_http.MegaHomeMusicStreamView()
+    view = http_music.MegaHomeMusicStreamView()
     # Заглушка `HomeAssistantView` в conftest отдаёт свой объект; здесь нужен
     # настоящий ответ aiohttp, иначе сервер не сможет его отправить.
     view.json_message = lambda message, status=400: web.json_response(  # type: ignore[method-assign]
@@ -257,7 +257,7 @@ def _view_app(coordinator: object) -> tuple[web.Application, mega_http.MegaHomeM
     return app, view
 
 
-async def _mount(app: web.Application, view: mega_http.MegaHomeMusicStreamView) -> None:
+async def _mount(app: web.Application, view: http_music.MegaHomeMusicStreamView) -> None:
     path = "/mega-home/stream/{token}"
 
     async def stream(request: web.Request) -> web.StreamResponse:
@@ -288,8 +288,8 @@ async def _case() -> None:
     runner, home_port = await _serve(app)
 
     session = aiohttp.ClientSession()
-    original = mega_http._client_session
-    mega_http._client_session = lambda _hass: session
+    original = http_music._client_session
+    http_music._client_session = lambda _hass: session
     base = f"http://127.0.0.1:{home_port}/mega-home/stream"
     try:
         async with session.get(f"{base}/{token}") as response:
@@ -318,7 +318,7 @@ async def _case() -> None:
         # Тёплая ссылка: первый GET разрешил, дальше Range/HEAD к Яндексу не ходят.
         assert len(music.calls) == 1
     finally:
-        mega_http._client_session = original
+        http_music._client_session = original
         await session.close()
         await runner.cleanup()
         await upstream_runner.cleanup()
@@ -342,8 +342,8 @@ async def _broken_case() -> None:
     runner, home_port = await _serve(app)
 
     session = aiohttp.ClientSession()
-    original = mega_http._client_session
-    mega_http._client_session = lambda _hass: session
+    original = http_music._client_session
+    http_music._client_session = lambda _hass: session
     try:
         async with session.get(f"http://127.0.0.1:{home_port}/mega-home/stream/{token}") as response:
             streamed = bytearray()
@@ -357,7 +357,7 @@ async def _broken_case() -> None:
             assert streamed == BODY[:10]
             assert b"HTTP/1.1" not in streamed
     finally:
-        mega_http._client_session = original
+        http_music._client_session = original
         await session.close()
         await runner.cleanup()
         await upstream_runner.cleanup()

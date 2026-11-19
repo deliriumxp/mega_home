@@ -31,7 +31,8 @@ from .core.const import (
     SERVICE_SYNC,
 )
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
-from .http import VIEWS as HTTP_VIEWS, async_register_http, stream_origin
+from .http import VIEWS as HTTP_VIEWS, async_register_http
+from .http_music import stream_origin
 from .music_services import async_register_music_services
 from .core import go2rtc_embed, services
 from .core.agent import AgentRunner
@@ -184,6 +185,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     coordinator.shared = SharedDocs(coordinator.env)
     await coordinator.shared.async_load()
 
+    from .music_playback import MusicPlayback
     from .providers.music_proxy import MusicStreamLinks
     from .providers.yandex_music import MusicService
     from .station_auth import StationAuth
@@ -197,12 +199,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     coordinator.music_links = links
     station = StationAuth(hass, music)
 
-    async def yandex_music(can_manage: bool, request: dict) -> dict:
-        answer = await station.call(can_manage, request)
-        # Ответ на `stream` — единственное место, где нужен короткий адрес.
-        return links.with_address(request.get("id"), answer) if request.get("action") == "stream" else answer
-
-    coordinator.resident_services = {"yandex-music": yandex_music}
+    playback = MusicPlayback(coordinator, music, station, links)
+    coordinator.music_playback = playback
+    coordinator.resident_services = {"yandex-music": playback.call}
+    entry.async_on_unload(coordinator.async_add_listener(playback.config_changed))
+    entry.async_on_unload(playback.close)
     entry.async_on_unload(music.stop)
 
     def _track_alerts() -> None:

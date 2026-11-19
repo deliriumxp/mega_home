@@ -76,12 +76,13 @@ class MusicStreamLinks:
         self._by_track: dict[str, str] = {}
         # Одно разрешение на токен: пачка `Range` не должна звать Яндекс столько же раз.
         self._locks: dict[str, asyncio.Lock] = {}
+        self._readers: dict[str, Callable[[], None]] = {}
 
     def _base(self) -> str | None:
         value = self._origin() if callable(self._origin) else self._origin
         return value.rstrip("/") if value else None
 
-    def address(self, track: Any, extension: str = "") -> str | None:
+    def address(self, track: Any, extension: str = "", on_read: Callable[[], None] | None = None) -> str | None:
         """Короткий адрес для трека или `None`, если дом не знает своего адреса.
 
         `extension` (`.mp3`/`.aac`/`.m4a`) — подсказка формата для плееров, которые
@@ -91,7 +92,7 @@ class MusicStreamLinks:
         if not base or not isinstance(track, str) or not track:
             return None
         self._expire()
-        token = self._by_track.get(track)
+        token = self._by_track.get(track) if on_read is None else None
         if token is not None and token in self._links:
             self._links[token] = _Link(track, monotonic(), extension)
             return f"{base}{URL_PREFIX}/stream/{token}{extension}"
@@ -101,10 +102,13 @@ class MusicStreamLinks:
         while token in self._links:
             token = secrets.token_urlsafe(9)
         self._links[token] = _Link(track, monotonic(), extension)
-        self._by_track[track] = token
+        if on_read is None:
+            self._by_track[track] = token
+        else:
+            self._readers[token] = on_read
         return f"{base}{URL_PREFIX}/stream/{token}{extension}"
 
-    def with_address(self, track: Any, answer: dict) -> dict:
+    def with_address(self, track: Any, answer: dict, on_read: Callable[[], None] | None = None) -> dict:
         """Ответ дома на действие `stream`: рядом с прямыми ссылками — короткая.
 
         Ссылку, которую дом уже разрешил для этого ответа, запоминаем сразу: плеер
@@ -112,7 +116,7 @@ class MusicStreamLinks:
         """
         chosen = pick_stream(answer.get("infos"))
         extension = stream_extension(chosen.get("codec")) if chosen is not None else ""
-        address = self.address(track, extension)
+        address = self.address(track, extension, on_read)
         if not address:
             return answer
         if chosen is not None:
@@ -149,12 +153,30 @@ class MusicStreamLinks:
             return None
         return ready.url, ready.content_type
 
+    def pick(self, token: str, infos: list[dict] | None) -> dict | None:
+        """Продолжаем отдавать тот же контейнер при перемотке и продлении ссылки."""
+        link = self._links.get(self._key(token))
+        if link and link.extension:
+            infos = [info for info in infos or [] if stream_extension(info.get("codec")) == link.extension]
+        return pick_stream(infos)
+
     def remember(self, token: str, url: str, content_type: str) -> None:
         self._expire()
         self._ready[self._key(token)] = _Ready(url, content_type, monotonic())
 
-    def forget(self, token: str) -> None:
-        self._ready.pop(self._key(token), None)
+    def forget(self, token: str, expected_url: str | None = None) -> None:
+        key = self._key(token)
+        ready = self._ready.get(key)
+        if ready and (expected_url is None or ready.url == expected_url):
+            self._ready.pop(key, None)
+
+    def opened(self, token: str) -> None:
+        """Аудио запросили по уникальному адресу этой попытки воспроизведения."""
+        if callback := self._readers.pop(self._key(token), None):
+            callback()
+
+    def unwatch(self, token: str) -> None:
+        self._readers.pop(self._key(token), None)
 
     def lock(self, token: str) -> asyncio.Lock:
         """Один на токен: параллельные запросы ждут одно разрешение, а не своё."""
@@ -169,6 +191,7 @@ class MusicStreamLinks:
     def _drop(self, token: str) -> None:
         link = self._links.pop(token, None)
         self._ready.pop(token, None)
+        self._readers.pop(token, None)
         if link is not None and self._by_track.get(link.track) == token:
             del self._by_track[link.track]
         held = self._locks.get(token)
@@ -184,6 +207,9 @@ class MusicStreamLinks:
         for token, ready in list(self._ready.items()):
             if now - ready.at > URL_TTL_S:
                 del self._ready[token]
+        for token in self._locks.keys() - self._links.keys():
+            if not self._locks[token].locked():
+                del self._locks[token]
 
 
 async def resolve_for_media_source(
@@ -197,16 +223,15 @@ async def resolve_for_media_source(
     track = links.track(token)
     if track is None:
         return None
-    ready = links.resolved(token)
-    if ready is not None:
-        url = links.public(token)
-        return (url, ready[1]) if url else None
-    answer = await music.call(False, {"action": "stream", "id": track})  # type: ignore[attr-defined]
-    chosen = pick_stream(answer.get("infos") if isinstance(answer, dict) else None)
-    if chosen is None:
-        return None
-    content_type = stream_content_type(chosen.get("codec"))
-    links.remember(token, chosen["url"], content_type)
+    async with links.lock(token):
+        ready = links.resolved(token)
+        if ready is None:
+            answer = await music.call(False, {"action": "stream", "id": track})  # type: ignore[attr-defined]
+            chosen = links.pick(token, answer.get("infos") if isinstance(answer, dict) else None)
+            if chosen is None:
+                return None
+            ready = chosen["url"], stream_content_type(chosen.get("codec"))
+            links.remember(token, *ready)
     url = links.public(token)
-    return (url, content_type) if url else None
+    return (url, ready[1]) if url else None
 

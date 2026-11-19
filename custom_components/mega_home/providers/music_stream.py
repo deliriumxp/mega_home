@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from typing import Any
 from xml.parsers.expat import ExpatError
 
@@ -20,9 +19,8 @@ from yandex_music.exceptions import YandexMusicError
 
 from ..core.const import LOGGER
 from ..core.ops_base import OpError
+from .music_catalog import TRACK_ID
 from .music_pick import pick_stream, stream_format
-
-TRACK_ID = re.compile(r"([0-9]{1,20})(?::[0-9]{1,20})?")
 
 
 async def stream(client: Any, request: dict) -> dict:

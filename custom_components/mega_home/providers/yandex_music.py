@@ -20,7 +20,7 @@ from yandex_music.utils.request_async import Request
 from ..core.const import LOGGER
 from ..core.host import Host, KeyStore
 from ..core.ops_base import OpError
-from .music_catalog import catalog
+from .music_catalog import catalog, queue_ids, track_details
 from .music_stream import stream as stream_track
 
 
@@ -68,7 +68,7 @@ class MusicService:
 
     async def call(self, can_manage: bool, request: dict) -> dict:
         action = request.get("action")
-        if action not in ("status", "start", "cancel", "disconnect", "search", "liked", "playlists", "playlist", "album", "artist", "stream"):
+        if action not in ("status", "start", "cancel", "disconnect", "search", "liked", "playlists", "playlist", "album", "artist", "stream", "track_details"):
             raise OpError("Неизвестное действие Яндекс Музыки", 404)
         if action in ("start", "cancel", "disconnect") and not can_manage:
             raise OpError("Аккаунтом Яндекс Музыки управляют жильцы дома", 403)
@@ -162,6 +162,8 @@ class MusicService:
             client = await ClientAsync(current.music_token.get_secret(), request=MusicRequest()).init()
             if action == "stream":
                 return await stream_track(client, request)
+            if action == "track_details":
+                return await track_details(client, queue_ids(request.get("ids")))
             return await catalog(client, action, request)
 
         try:

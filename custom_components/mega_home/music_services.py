@@ -60,6 +60,14 @@ async def _music_play(call: ServiceCall) -> None:
     if not isinstance(track_id, str) or not entity:
         raise HomeAssistantError("Нужны id трека и плеер")
     try:
+        playback = getattr(_runtime(call), "music_playback", None)
+        entities = entity if isinstance(entity, list) else [entity]
+        if playback and all(isinstance(item, str) and "," not in item for item in entities):
+            remaining = await playback.play_configured(entities, track_id)
+            if not remaining:
+                return
+            if remaining != entities:
+                entity = remaining
         stream = await _music(call)(False, {"action": "stream", "id": track_id})
     except OpError as error:
         raise HomeAssistantError(str(error)) from error
@@ -70,7 +78,7 @@ async def _music_play(call: ServiceCall) -> None:
     await call.hass.services.async_call(
         "media_player",
         "play_media",
-        {"media_content_id": chosen["url"], "media_content_type": content_type},
+        {"media_content_id": stream.get("mediaSource") or chosen["url"], "media_content_type": content_type},
         target={ENTITY: entity},
         blocking=True,
     )
@@ -89,7 +97,7 @@ def _request(call: ServiceCall) -> dict[str, Any]:
     return request
 
 
-def _music(call: ServiceCall):
+def _runtime(call: ServiceCall):
     """Привязка Яндекс Музыки нужного дома; без `entry_id` — единственного загруженного."""
     entries = call.hass.config_entries.async_loaded_entries(DOMAIN)
     entry_id = call.data.get("entry_id")
@@ -97,7 +105,11 @@ def _music(call: ServiceCall):
         entries = [entry for entry in entries if entry.entry_id == entry_id]
     if len(entries) != 1:
         raise HomeAssistantError("Укажите entry_id дома с Яндекс Музыкой")
-    music = getattr(entries[0].runtime_data, "resident_services", {}).get("yandex-music")
+    return entries[0].runtime_data
+
+
+def _music(call: ServiceCall):
+    music = getattr(_runtime(call), "resident_services", {}).get("yandex-music")
     if music is None:
         raise HomeAssistantError("Яндекс Музыка не подключена в этом доме")
     return music
