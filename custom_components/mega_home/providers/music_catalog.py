@@ -80,6 +80,31 @@ async def _playlist(client: Any, playlist_id: Any, page: int) -> dict:
     return {"items": _items(values, "track"), "more": offset + PAGE_SIZE < len(tracks)}
 
 
+async def _album(client: Any, album_id: Any, page: int) -> dict:
+    """Треки альбома — страницами; сценарий может играть альбом целиком."""
+    if not isinstance(album_id, str) or not album_id.isdigit():
+        raise OpError("Неверный адрес альбома")
+    album = await client.albums_with_tracks(album_id)
+    if album is None:
+        raise OpError("Альбом не найден", 404)
+    tracks = [track for volume in album.volumes or [] for track in volume]
+    offset = page * PAGE_SIZE
+    return {"items": _items(tracks[offset:offset + PAGE_SIZE], "track"), "more": offset + PAGE_SIZE < len(tracks)}
+
+
+async def _artist(client: Any, artist_id: Any, page: int) -> dict:
+    """Треки исполнителя — страницами; предел знает `pager`, без него — полнота страницы."""
+    if not isinstance(artist_id, str) or not artist_id.isdigit():
+        raise OpError("Неверный адрес исполнителя")
+    result = await client.artists_tracks(artist_id, page=page, page_size=PAGE_SIZE)
+    if result is None:
+        raise OpError("Исполнитель не найден", 404)
+    tracks = result.tracks or []
+    total = result.pager.total if result.pager else None
+    more = (page + 1) * PAGE_SIZE < total if total is not None else len(tracks) >= PAGE_SIZE
+    return {"items": _items(tracks, "track"), "more": more}
+
+
 async def catalog(client: Any, action: str, request: dict) -> dict:
     page = request.get("page", 0)
     if type(page) is not int or not 0 <= page <= 999:
@@ -92,4 +117,8 @@ async def catalog(client: Any, action: str, request: dict) -> dict:
         return await _playlists(client, page)
     if action == "playlist":
         return await _playlist(client, request.get("id"), page)
+    if action == "album":
+        return await _album(client, request.get("id"), page)
+    if action == "artist":
+        return await _artist(client, request.get("id"), page)
     raise OpError("Неизвестное действие каталога", 404)

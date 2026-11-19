@@ -32,6 +32,7 @@ from .core.const import (
 )
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
 from .http import VIEWS as HTTP_VIEWS, async_register_http
+from .music_services import async_register_music_services
 from .core import go2rtc_embed, services
 from .core.agent import AgentRunner
 from .core.observe import Observer
@@ -61,6 +62,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             await coordinator.async_request_refresh()
 
     hass.services.async_register(DOMAIN, SERVICE_SYNC, handle_sync)
+    async_register_music_services(hass)
     return True
 
 

@@ -250,3 +250,30 @@ def test_поток_трека_отклоняет_чужой_адрес():
         assert refused.value.status == 400
 
     asyncio.run(run())
+
+
+def test_альбом_и_исполнитель_отдают_треки_страницами():
+    """Сценариям нужны не только плейлисты: альбом и исполнитель — те же страницы."""
+    from mega_home.providers.music_catalog import PAGE_SIZE, catalog
+
+    track = SimpleNamespace(id=7, title="Трек", artists=[SimpleNamespace(name="Кино")])
+
+    class Client:
+        async def albums_with_tracks(self, album_id):
+            assert album_id == "42"
+            return SimpleNamespace(volumes=[[track] * (PAGE_SIZE + 1)])
+
+        async def artists_tracks(self, artist_id, page, page_size):
+            assert (artist_id, page, page_size) == ("9", 0, PAGE_SIZE)
+            return SimpleNamespace(tracks=[track] * PAGE_SIZE, pager=SimpleNamespace(total=PAGE_SIZE + 1))
+
+    async def run():
+        client = Client()
+        first = await catalog(client, "album", {"id": "42", "page": 0})
+        assert len(first["items"]) == PAGE_SIZE and first["more"]
+        second = await catalog(client, "album", {"id": "42", "page": 1})
+        assert len(second["items"]) == 1 and not second["more"]
+        artist = await catalog(client, "artist", {"id": "9", "page": 0})
+        assert len(artist["items"]) == PAGE_SIZE and artist["more"]
+
+    asyncio.run(run())

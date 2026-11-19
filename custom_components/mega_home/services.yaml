@@ -3,6 +3,39 @@ sync:
   # installer standing in the flat who has just changed the project in the
   # manager and does not want to wait for the next poll.
 
+yandex_music:
+  # Сценариям нужен каталог и прямая ссылка Яндекс Музыки, а токен живёт в доме.
+  # Действия те же, что у приложения: поиск, избранное, плейлисты, треки, поток.
+  fields:
+    request:
+      required: true
+      selector:
+        object:
+    entry_id:
+      required: false
+      selector:
+        text:
+
+yandex_music_play:
+  # Разрешить трек и запустить его на плеере. `media_content_type` — шаблон из
+  # описания плитки (`{mime}`/`{ext}`); схема радио к треку не применяется.
+  target:
+    entity:
+      domain: media_player
+  fields:
+    id:
+      required: true
+      selector:
+        text:
+    media_content_type:
+      required: false
+      selector:
+        text:
+    entry_id:
+      required: false
+      selector:
+        text:
+
 calibrate_position:
   # A pulse-relay blind has no position feedback: tell it where it really is,
   # without moving it (`cover.py`).

@@ -51,7 +51,7 @@ class MusicService:
         except ValueError as error:
             raise OpError("Ожидается JSON-запрос") from error
         action = request.get("action") if isinstance(request, dict) else None
-        if action not in ("status", "start", "cancel", "disconnect", "search", "liked", "playlists", "playlist", "stream"):
+        if action not in ("status", "start", "cancel", "disconnect", "search", "liked", "playlists", "playlist", "album", "artist", "stream"):
             raise OpError("Неизвестное действие Яндекс Музыки", 404)
         if action in ("start", "cancel", "disconnect") and not can_manage:
             raise OpError("Аккаунтом Яндекс Музыки управляют жильцы дома", 403)

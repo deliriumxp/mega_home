@@ -131,6 +131,8 @@ _module(
     callback=_callback,
     Event=dict,
     EventStateChangedData=dict,
+    ServiceCall=type("ServiceCall", (), {}),
+    SupportsResponse=type("SupportsResponse", (), {"NEVER": "never", "OPTIONAL": "optional", "ONLY": "only"}),
 )
 class _HomeAssistantError(Exception):  # noqa: D101 - the base HA failure
     pass

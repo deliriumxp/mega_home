@@ -26,7 +26,7 @@ LOGGER = logging.getLogger((__package__ or "").removesuffix(".core"))
 #
 # ⚠ Держится в паре с `manifest.json`, их сверяет `tests/test_version.py`:
 # поднимать ОБА, одним релизом.
-INTEGRATION_VERSION = "0.6.31"
+INTEGRATION_VERSION = "0.6.32"
 
 CONF_MANAGER_URL = "manager_url"
 CONF_TOKEN = "token"
@@ -98,3 +98,8 @@ API_RELAY = "/inbound/home-config/relay"
 RELAY_TIMEOUT = 60
 
 SERVICE_SYNC = "sync"
+# Службы Яндекс Музыки для сценариев (`music_services.py`): каталог/поток с ответом и
+# «разрешить трек и отдать плееру». Заведены заранее, чтобы новые шаги сценариев были
+# правкой менеджера, а не релизом интеграции.
+SERVICE_MUSIC = "yandex_music"
+SERVICE_MUSIC_PLAY = "yandex_music_play"
