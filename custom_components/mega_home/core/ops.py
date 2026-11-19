@@ -101,7 +101,7 @@ async def run(coordinator: Any, op: str, payload: dict[str, Any] | None) -> Any:
         # (`relay_api.py`), ответы одинаковые. Заменил собой именованные
         # операции по видам (`webrtc`, `gateway`) — глагол по классу
         # устройства был перечнем, а перечень и есть адаптер.
-        return await connect(data)
+        return await connect(coordinator, data)
     if op == "http":
         # Перенос ОБЫЧНОГО запроса к API ЭТОГО дома (`relay_api.py`): жилец
         # снаружи должен уметь ровно то же, что дома, и теми же путями (фото,
@@ -162,14 +162,17 @@ async def run(coordinator: Any, op: str, payload: dict[str, Any] | None) -> Any:
         return await switch(str(data.get("unit") or ""), bool(data.get("on")))
     raise OpError("Неизвестная операция", HTTPStatus.NOT_FOUND)
 
-async def connect(payload: dict[str, Any], bundle: bool = False) -> dict[str, Any]:
+async def connect(
+    coordinator: Any, payload: dict[str, Any], *, bundle: bool = False, resident_access: str | None = None,
+) -> dict[str, Any]:
     """Единственный контракт транспорта наружу (`docs/plan-thin-gateway.md`).
 
     Один примитив на TCP, UDP, HTTP и WebSocket вместо глагола на каждый класс
     устройства — исполнение живёт в `connect.py`, здесь только точка входа,
     общая с локальным маршрутом `api/connect` (`relay_api.py`, `bundle` — зовёт бандл).
     """
-    return await connect_mod.perform(payload, bundle)
+    answer = await services.call_resident(coordinator, payload, resident_access)
+    return answer if answer is not None else await connect_mod.perform(payload, bundle)
 
 async def connect_resource(payload: dict[str, Any]) -> tuple[int, str, bytes, str]:
     """Тот же `connect`, но ответ — РЕСУРС для браузера (`connect.resource`).

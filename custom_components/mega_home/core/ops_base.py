@@ -21,6 +21,18 @@ class OpError(Exception):
         self.message = message
         self.status = int(status)
 
+
+def json_body(body: bytes | str) -> dict[str, Any]:
+    if not body:
+        return {}
+    try:
+        parsed = json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
+    except (ValueError, UnicodeDecodeError) as err:
+        raise OpError("Ожидается JSON", HTTPStatus.BAD_REQUEST) from err
+    if not isinstance(parsed, dict):
+        raise OpError("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
+    return parsed
+
 # Кто скомандовал домом — для журнала источника состояний (в HA — «Mega Home:
 # Ноутбук, Локально — Включение — Люстра»; действие и прибор добавляет команда).
 #

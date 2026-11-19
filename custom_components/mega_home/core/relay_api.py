@@ -34,11 +34,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, unquote
 
-from . import ops, services
+from . import ops
 from .alerts import MAX_RULE_BYTES, alert_key_known, rule_valid
 from .crops import crop_key_known, crop_keys, crop_value_valid
 from .imaging import asset_file, photo_file
-from .ops_base import VIA_LOCAL, VIA_REMOTE, actor, dumps
+from .ops_base import VIA_LOCAL, VIA_REMOTE, actor, dumps, json_body
 from .photos import JPEG_MAGIC, MAX_PHOTO_BYTES, photo_key_known, photo_keys
 from .shared import name_valid
 from .topics import ALERTS, CROPS, PHOTOS, SHARED
@@ -129,22 +129,19 @@ async def dispatch(
         # канала (`http`): ответы не должны разъезжаться.
         return _json(ops.registry(coordinator))
     if path == "api/command" and method == "POST":
-        payload = _json_body(body)
+        payload = json_body(body)
         return _json(await ops.command(coordinator, payload, actor(by, payload, via)))
     if path == "api/scenario" and method == "POST":
-        payload = _json_body(body)
+        payload = json_body(body)
         return _json(await ops.scenario(coordinator, payload, actor(by, payload, via)))
     if path == "api/intercom" and method == "POST":
         # Отбой идущего вызова домофонии: тот же код, что у операции канала.
-        return _json(await ops.intercom(coordinator, _json_body(body)))
+        return _json(await ops.intercom(coordinator, json_body(body)))
     if path == "api/connect" and method == "POST":
         # Единственный контракт транспорта наружу — тот же код, что у операции
         # канала (`ops.py`, `op == "connect"`): ответы не должны разъезжаться.
-        request = _json_body(body)
-        answer = await services.call_resident(coordinator, request, resident_access)
-        if answer is not None:
-            return (HTTPStatus.OK, JSON_TYPE, dumps(answer).encode("utf-8"), "no-store")
-        return _json(await ops.connect(request, bundle=True))
+        answer = await ops.connect(coordinator, json_body(body), bundle=True, resident_access=resident_access)
+        return _json(answer, "no-store")
     if path == "api/connect" and method == "GET":
         # ⚠ ТОТ ЖЕ путь и тот же контракт, другой способ ПОТРЕБИТЬ ответ: тело
         # адресата уезжает как есть, с его типом, — кадр и файл браузер берёт
@@ -213,7 +210,7 @@ async def dispatch(
         # Лог разработки от приложения ВНУТРИ дома (`dev_log.py`): сессии
         # менеджера на странице дома нет, запись уходит каналом дома.
         log = getattr(coordinator, "dev_log", None)
-        taken = log.add_app(_json_body(body).get("records")) if log else 0
+        taken = log.add_app(json_body(body).get("records")) if log else 0
         return _json({"accepted": taken})
     if path.startswith("icons/") and method == "GET":
         return await _icon(coordinator, unquote(path[len("icons/") :]))
@@ -263,7 +260,7 @@ async def _crop(coordinator: Any, method: str, tile: str, body: bytes) -> Reply:
     if method == "POST":
         if not crop_key_known(coordinator.data, tile):
             raise ops.OpError("Плитка не найдена", HTTPStatus.NOT_FOUND)
-        payload = _json_body(body)
+        payload = json_body(body)
         if not crop_value_valid(payload):
             raise ops.OpError("Некорректный участок кадра", HTTPStatus.BAD_REQUEST)
         await coordinator.env.run(coordinator.crops.save, tile, payload)
@@ -290,7 +287,7 @@ async def _alert(coordinator: Any, method: str, tile: str, body: bytes) -> Reply
             raise ops.OpError("Датчик не найден", HTTPStatus.NOT_FOUND)
         if len(body) > MAX_RULE_BYTES:
             raise ops.OpError("Слишком большое правило", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-        rule = rule_valid(_json_body(body))
+        rule = rule_valid(json_body(body))
         if rule is None:
             raise ops.OpError("Некорректное правило", HTTPStatus.BAD_REQUEST)
         await alerts.save(tile, rule)
@@ -315,7 +312,7 @@ async def _shared(coordinator: Any, method: str, name: str, body: bytes) -> Repl
     if method == "GET":
         return _json(docs.get(name))
     if method == "POST":
-        payload = _json_body(body)
+        payload = json_body(body)
         answer = await docs.put(name, payload.get("rev"), payload.get("data"))
         if answer.get("accepted"):
             _changed(coordinator, SHARED + name)
@@ -335,8 +332,8 @@ async def _icon(coordinator: Any, name: str) -> Reply:
         raise ops.OpError("Иконка не найдена", HTTPStatus.NOT_FOUND)
     return (HTTPStatus.OK, "image/png", target, IMMUTABLE)
 
-def _json(payload: Any) -> Reply:
-    return (HTTPStatus.OK, JSON_TYPE, dumps(payload).encode("utf-8"), "")
+def _json(payload: Any, cache: str = "") -> Reply:
+    return HTTPStatus.OK, JSON_TYPE, dumps(payload).encode("utf-8"), cache
 
 def _resource_request(query: dict[str, str]) -> dict[str, Any]:
     """Описание вызова из параметра `req` — base64url от JSON.
@@ -356,17 +353,6 @@ def _resource_request(query: dict[str, str]) -> dict[str, Any]:
         raise ops.OpError("Описание вызова повреждено", HTTPStatus.BAD_REQUEST) from err
     if not isinstance(parsed, dict):
         raise ops.OpError("Описание вызова — объект JSON", HTTPStatus.BAD_REQUEST)
-    return parsed
-
-def _json_body(body: bytes) -> dict[str, Any]:
-    if not body:
-        return {}
-    try:
-        parsed = json.loads(body.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as err:
-        raise ops.OpError("Ожидается JSON", HTTPStatus.BAD_REQUEST) from err
-    if not isinstance(parsed, dict):
-        raise ops.OpError("Ожидается объект JSON", HTTPStatus.BAD_REQUEST)
     return parsed
 
 def _path(value: Any) -> tuple[str, dict[str, str]]:

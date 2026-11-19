@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -58,12 +57,12 @@ def test_вход_общий_для_семьи_и_гостей_но_изолир
         env = PlainHost(tmp_path)
         home = music.MusicService(env, "one")
         other = music.MusicService(env, "two")
-        start = await home.call(True, '{"action":"start"}')
+        start = await home.call(True, {"action": "start"})
         assert start["state"] == "pending" and start["code"] == "kod"
-        guest = await home.call(False, '{"action":"status"}')
+        guest = await home.call(False, {"action": "status"})
         assert guest == {"state": "disconnected", "canManage": False}
         with pytest.raises(OpError) as denied:
-            await home.call(False, '{"action":"cancel","canManage":true}')
+            await home.call(False, {"action": "cancel", "canManage": True})
         assert denied.value.status == 403
         attempt = home._attempt
         assert attempt is not None and attempt.task is not None
@@ -71,17 +70,17 @@ def test_вход_общий_для_семьи_и_гостей_но_изолир
 
         # Как после перезапуска: читается та же привязка дома с диска.
         home = music.MusicService(env, "one")
-        assert await home.call(True, '{"action":"status"}') == {"state": "connected", "login": "семья", "canManage": True}
-        assert await home.call(False, '{"action":"status"}') == {"state": "connected", "login": None, "canManage": False}
-        guest_catalog = await home.call(False, json.dumps({"action": "search", "query": "Кино", "kind": "track"}))
+        assert await home.call(True, {"action": "status"}) == {"state": "connected", "login": "семья", "canManage": True}
+        assert await home.call(False, {"action": "status"}) == {"state": "connected", "login": None, "canManage": False}
+        guest_catalog = await home.call(False, {"action": "search", "query": "Кино", "kind": "track"})
         assert guest_catalog == {"items": [{"id": "1", "title": "Звезда", "kind": "track", "artist": "Кино"}], "more": False}
-        assert await other.call(True, '{"action":"status"}') == {"state": "disconnected", "canManage": True}
+        assert await other.call(True, {"action": "status"}) == {"state": "disconnected", "canManage": True}
         assert (tmp_path / "mega_home_yandex_music.one").stat().st_mode & 0o777 == 0o600
         with pytest.raises(OpError) as denied:
-            await home.call(False, '{"action":"disconnect"}')
+            await home.call(False, {"action": "disconnect"})
         assert denied.value.status == 403
-        await home.call(True, '{"action":"disconnect"}')
-        assert (await home.call(False, '{"action":"status"}'))["state"] == "disconnected"
+        await home.call(True, {"action": "disconnect"})
+        assert (await home.call(False, {"action": "status"}))["state"] == "disconnected"
         await env.close()
 
     asyncio.run(run())
@@ -122,11 +121,11 @@ def test_временный_отказ_сохраняет_привязку_и_о
         env = PlainHost(tmp_path)
         service = music.MusicService(env, "home")
         await music._save(env.store("mega_home_yandex_music.home", private=True), _credentials())
-        query = '{"action":"search","query":"Кино","kind":"track"}'
+        query = {"action": "search", "query": "Кино", "kind": "track"}
         answers = await asyncio.gather(service.call(True, query), service.call(False, query), return_exceptions=True)
         assert all(isinstance(answer, OpError) and answer.status == 503 and "из сети дома" in str(answer) for answer in answers)
         assert refreshed == 1
-        assert (await service.call(True, '{"action":"status"}'))["state"] == "connected"
+        assert (await service.call(True, {"action": "status"}))["state"] == "connected"
         await env.close()
 
     asyncio.run(run())
@@ -180,11 +179,24 @@ def test_поток_трека_отдаёт_варианты_библиотек�
         async def init(self):
             return self
 
-        async def tracks_download_info(self, track_id, get_direct_links=True):
-            assert (track_id, get_direct_links) == ("123", True)
+        async def tracks_download_info(self, track_id):
+            assert track_id == "123"
+
+            async def aac():
+                return "https://cdn.yandex/track.aac"
+
+            async def mp3():
+                return "https://cdn.yandex/track.mp3"
+
+            async def broken():
+                from yandex_music.exceptions import NetworkError
+
+                raise NetworkError("CDN отказал")
+
             return [
-                SimpleNamespace(codec="aac", bitrate_in_kbps=192, direct_link="https://cdn.yandex/track.aac"),
-                SimpleNamespace(codec="mp3", bitrate_in_kbps=320, direct_link="https://cdn.yandex/track.mp3"),
+                SimpleNamespace(codec="aac", bitrate_in_kbps=192, get_direct_link_async=aac),
+                SimpleNamespace(codec="flac", bitrate_in_kbps=700, get_direct_link_async=broken),
+                SimpleNamespace(codec="mp3", bitrate_in_kbps=320, get_direct_link_async=mp3),
             ]
 
     monkeypatch.setattr(music, "ClientAsync", Client)
@@ -193,7 +205,7 @@ def test_поток_трека_отдаёт_варианты_библиотек�
         env = PlainHost(tmp_path)
         service = music.MusicService(env, "home")
         await music._save(env.store("mega_home_yandex_music.home", private=True), _credentials())
-        answer = await service.call(True, '{"action":"stream","id":"123"}')
+        answer = await service.call(True, {"action": "stream", "id": "123"})
         assert answer == {
             "infos": [
                 {"url": "https://cdn.yandex/track.aac", "codec": "aac", "bitrate": 192},
@@ -294,3 +306,72 @@ def test_обложка_альбом_и_длительность_доезжаю�
         "contentWarning": "explicit",
         "version": "Remaster",
     }
+
+
+def test_отключение_не_ждёт_поиска_и_старый_ответ_не_уходит_клиенту(monkeypatch, tmp_path):
+    async def run():
+        searching, continue_search = asyncio.Event(), asyncio.Event()
+
+        class Client:
+            def __init__(self, _token):
+                pass
+
+            async def init(self):
+                return self
+
+            async def search(self, *_args, **_kwargs):
+                searching.set()
+                await continue_search.wait()
+                return None
+
+        monkeypatch.setattr(music, "ClientAsync", Client)
+        env = PlainHost(tmp_path)
+        service = music.MusicService(env, "home")
+        await music._save(env.store("mega_home_yandex_music.home", private=True), _credentials())
+        pending = asyncio.create_task(service.call(False, {"action": "search", "query": "Кино", "kind": "track"}))
+        await searching.wait()
+        answer = await asyncio.wait_for(service.call(True, {"action": "disconnect"}), 1)
+        assert answer["state"] == "disconnected"
+        continue_search.set()
+        with pytest.raises(OpError) as exc:
+            await pending
+        assert exc.value.status == 412
+        await env.close()
+
+    asyncio.run(run())
+
+
+def test_отказ_музыкального_api_после_выдачи_токена_сохраняет_привязку(monkeypatch, tmp_path):
+    class Passport:
+        @staticmethod
+        @asynccontextmanager
+        async def create(**_):
+            yield Passport()
+
+        async def refresh_music_token(self, _):
+            return music.SecretStr("new-token")
+
+    class Client:
+        def __init__(self, _token):
+            pass
+
+        async def init(self):
+            return self
+
+        async def search(self, *_args, **_kwargs):
+            raise music.UnauthorizedError("api refused")
+
+    monkeypatch.setattr(music, "PassportClient", Passport)
+    monkeypatch.setattr(music, "ClientAsync", Client)
+
+    async def run():
+        env = PlainHost(tmp_path)
+        service = music.MusicService(env, "home")
+        await music._save(env.store("mega_home_yandex_music.home", private=True), _credentials())
+        with pytest.raises(OpError) as exc:
+            await service.call(False, {"action": "search", "query": "Кино", "kind": "track"})
+        assert exc.value.status == 503
+        assert (await service.call(True, {"action": "status"}))["state"] == "connected"
+        await env.close()
+
+    asyncio.run(run())

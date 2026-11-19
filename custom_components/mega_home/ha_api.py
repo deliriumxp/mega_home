@@ -36,6 +36,22 @@ REFUSED_PATHS = ("/auth/", "/api/hassio", "/api/onboarding", "/api/config/auth",
 REFUSED_FRAMES = ("auth", "auth/", "config/auth/", "config/auth_provider/", "hassio/", "supervisor/")
 REFUSED_TEXT = "Учётки и систему Home Assistant через дом не меняют"
 
+# Мастера интеграций могут вернуть долгоживущие реквизиты в форме шага. Их читает
+# менеджер по исходящему каналу и сам выделяет безопасный ответ для приложения.
+_CONFIG_FLOWS = (
+    "/api/config/config_entries/flow",
+    "/api/config/config_entries/options/flow",
+    "/api/config/config_entries/subentries/flow",
+)
+
+
+def bundle_guard(what: str, value: str) -> str | None:
+    if what == "path":
+        path = value.split("?", 1)[0].lower()
+        if any(path == prefix or path.startswith(prefix + "/") for prefix in _CONFIG_FLOWS):
+            return "Настройки интеграций Home Assistant доступны через менеджер"
+    return None
+
 
 def guard(what: str, value: str) -> str | None:
     """Запрет службы `ha` (`services.Service.guard`): путь, тело запроса или кадр сокета. Путь —
@@ -91,6 +107,7 @@ class HaApi:
             headers={"Authorization": f"Bearer {self.token}"},
             ws_open=self._login,
             guard=guard,
+            bundle_guard=bundle_guard,
         )
 
     async def _login(self, socket_: Any) -> None:

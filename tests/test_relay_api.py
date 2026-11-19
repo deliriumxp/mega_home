@@ -109,8 +109,8 @@ def test_состав_и_состояния_едут_теми_же_путями(
 
 
 def test_служба_дома_получает_права_только_от_двери(coordinator):
-    async def service(can_manage, body):
-        return {"canManage": can_manage, "action": json.loads(body)["action"]}
+    async def service(can_manage, request):
+        return {"canManage": can_manage, "action": request["action"]}
 
     coordinator.resident_services = {"catalog": service}
     payload = {"kind": "http", "method": "POST", "host": "catalog", "residentAccess": "manage",

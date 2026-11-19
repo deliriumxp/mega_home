@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import dataclass, replace
 from time import time
 from typing import Any
@@ -33,8 +32,10 @@ class MusicService:
     def __init__(self, env: Host, home_key: str) -> None:
         self._env = env
         self._store = env.store(f"mega_home_yandex_music.{home_key}", private=True)
-        # Смена привязки и запросы, обновляющие токены, идут по одному.
+        # Под блокировкой — запись привязки и обмен токенов. Каталог и поток читаются
+        # параллельно, иначе долгий поиск блокирует запуск трека у всей семьи.
         self._lock = asyncio.Lock()
+        self._revision = 0
         self._attempt: Attempt | None = None
 
     def stop(self) -> None:
@@ -45,12 +46,8 @@ class MusicService:
         if attempt and attempt.task:
             attempt.task.cancel()
 
-    async def call(self, can_manage: bool, body: str) -> dict:
-        try:
-            request = json.loads(body)
-        except ValueError as error:
-            raise OpError("Ожидается JSON-запрос") from error
-        action = request.get("action") if isinstance(request, dict) else None
+    async def call(self, can_manage: bool, request: dict) -> dict:
+        action = request.get("action")
         if action not in ("status", "start", "cancel", "disconnect", "search", "liked", "playlists", "playlist", "album", "artist", "stream"):
             raise OpError("Неизвестное действие Яндекс Музыки", 404)
         if action in ("start", "cancel", "disconnect") and not can_manage:
@@ -61,6 +58,7 @@ class MusicService:
                     if action == "disconnect":
                         self._cancel()
                         await self._store.async_save({})
+                        self._revision += 1
                         return {"state": "disconnected", "canManage": True}
                     credentials = _load(await self._store.async_load())
                     if action == "cancel":
@@ -71,7 +69,11 @@ class MusicService:
                         return await self._start()
                     if credentials is None:
                         raise OpError("Подключите аккаунт Яндекс Музыки", 409)
-                    return await self._catalog(credentials, action, request)
+                    revision = self._revision
+                answer = await self._catalog(credentials, revision, action, request)
+                if revision != self._revision:
+                    raise OpError("Привязка Яндекс Музыки изменилась. Повторите запрос", 412)
+                return answer
         except NotFoundError:
             raise OpError("В Яндекс Музыке ничего не найдено", 404) from None
         except (YaPassportError, YandexMusicError, TimeoutError, ValueError, OSError) as error:
@@ -114,6 +116,7 @@ class MusicService:
             async with self._lock:
                 if self._attempt is attempt:
                     await _save(self._store, credentials)
+                    self._revision += 1
                     self._attempt = None
         except (DeviceCodeTimeoutError, TimeoutError):
             attempt.status = {"state": "expired"}
@@ -123,7 +126,7 @@ class MusicService:
             _log_failure("confirm", error)
             attempt.status = {"state": "failed"}
 
-    async def _catalog(self, credentials: Credentials, action: str, request: dict) -> dict:
+    async def _catalog(self, credentials: Credentials, revision: int, action: str, request: dict) -> dict:
         async def read(current: Credentials) -> dict:
             if current.music_token is None:
                 raise UnauthorizedError("Нет музыкального токена")
@@ -136,20 +139,34 @@ class MusicService:
             return await read(credentials)
         except UnauthorizedError:
             pass
+        refreshed = await self._refresh(credentials, revision)
         try:
-            async with PassportClient.create(config=ClientConfig()) as passport:
-                try:
-                    token = await passport.refresh_music_token(credentials.x_token)
-                    refreshed = replace(credentials, music_token=token)
-                    await _save(self._store, refreshed)
-                    return await read(refreshed)
-                except (UnauthorizedError, InvalidCredentialsError):
-                    refreshed = await passport.refresh_credentials(credentials)
-                    await _save(self._store, refreshed)
             return await read(refreshed)
-        except (UnauthorizedError, InvalidCredentialsError):
-            await self._store.async_save({})
-            raise OpError("Войдите в Яндекс Музыку заново", 409) from None
+        except UnauthorizedError:
+            # SDK объединяет 401 и 403. Отказ музыкального API с только что выданным
+            # токеном не доказывает, что Паспорт отозвал привязку дома.
+            raise OpError("Яндекс Музыка отклонила запрос. Проверьте доступ в аккаунте Яндекса", 503) from None
+
+    async def _refresh(self, rejected: Credentials, revision: int) -> Credentials:
+        async with self._lock:
+            current = _load(await self._store.async_load())
+            if current is None or revision != self._revision:
+                raise OpError("Привязка Яндекс Музыки изменилась. Повторите запрос", 412)
+            if current != rejected:
+                return current
+            try:
+                async with PassportClient.create(config=ClientConfig()) as passport:
+                    try:
+                        token = await passport.refresh_music_token(current.x_token)
+                        refreshed = replace(current, music_token=token)
+                    except InvalidCredentialsError:
+                        refreshed = await passport.refresh_credentials(current)
+            except InvalidCredentialsError:
+                await self._store.async_save({})
+                self._revision += 1
+                raise OpError("Войдите в Яндекс Музыку заново", 409) from None
+            await _save(self._store, refreshed)
+            return refreshed
 
 
 def _load(data: Any) -> Credentials | None:

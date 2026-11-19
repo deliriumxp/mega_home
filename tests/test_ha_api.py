@@ -110,3 +110,12 @@ def test_отказ_входа_называется_словами() -> None:
     socket_ = _Socket([{"type": "auth_required"}, {"type": "auth_invalid"}])
     with pytest.raises(OpError, match="не принял токен"):
         asyncio.run(connect.open_ws({"host": "ha"}, socket_))
+
+
+def test_форму_настроек_читает_только_менеджер() -> None:
+    HaApi(_hass()).apply({"house": {"ha": {"token": "T"}}})
+    req = {"host": "ha", "path": "/api/config/config_entries/options/flow/flow-id"}
+    assert connect.with_service(req)["headers"] == {"Authorization": "Bearer T"}
+    with pytest.raises(OpError, match="через менеджер"):
+        connect.with_service(req, bundle=True)
+    assert connect.with_service({"host": "ha", "path": "/api/config/config_entries/entry"}, bundle=True)

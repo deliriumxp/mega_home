@@ -23,7 +23,7 @@ def _item(value: Any, kind: str, item_id: Any = None) -> dict | None:
     if uri := _cover_uri(value):
         result["coverUri"] = uri
         # ⚠ Совместимость: бандлы до 0.6.34 читают только готовый `cover` и без него
-        # показывают значок прибора. Убрать отдельным релизом по правилу «расширить, потом
+        # показывают значок прибора. Убрать при плановом обновлении по правилу «расширить, потом
         # сузить», когда ни одному объекту не раздаётся бандл без `coverUri`
         # (`docs/plan-bundle-compat.md`).
         result["cover"] = _cover_url(uri)
@@ -62,7 +62,8 @@ def _cover_uri(value: Any) -> str | None:
 
 def _cover_url(uri: str) -> str:
     """Готовая обложка 400×400 — прежний вид ответа для бандлов до 0.6.34."""
-    return uri if uri.startswith(("https://", "http://")) else f"https://{uri.replace('%%', '400x400')}"
+    value = uri.replace("%%", "400x400")
+    return value if value.startswith(("https://", "http://")) else f"https://{value.lstrip('/')}"
 
 
 def _items(values: Any, kind: str) -> list[dict]:
@@ -89,8 +90,13 @@ async def _liked(client: Any, page: int) -> dict:
     track_ids = [str(track.track_id) for track in tracks if track.track_id]
     offset = page * PAGE_SIZE
     ids = track_ids[offset:offset + PAGE_SIZE]
-    details = await client.tracks(ids) if ids else []
-    return {"items": _items(details or [], "track"), "more": offset + PAGE_SIZE < len(track_ids)}
+    details = await _tracks_by_id(client, ids)
+    return {"items": _items((details.get(track_id.split(':', 1)[0]) for track_id in ids), "track"), "more": offset + PAGE_SIZE < len(track_ids)}
+
+
+async def _tracks_by_id(client: Any, ids: list[str]) -> dict[str, Any]:
+    tracks = await client.tracks(ids) if ids else []
+    return {str(track.id): track for track in tracks or [] if track is not None}
 
 
 async def _playlists(client: Any, page: int) -> dict:
@@ -117,7 +123,7 @@ async def _playlist(client: Any, playlist_id: Any, page: int) -> dict:
     offset = page * PAGE_SIZE
     batch = tracks[offset:offset + PAGE_SIZE]
     missing = [str(entry.track_id) for entry in batch if not entry.track and entry.track_id]
-    resolved = {str(track.id): track for track in await client.tracks(missing)} if missing else {}
+    resolved = await _tracks_by_id(client, missing)
     values = [entry.track or resolved.get(str(entry.track_id).split(":", 1)[0]) for entry in batch]
     return {"items": _items(values, "track"), "more": offset + PAGE_SIZE < len(tracks)}
 

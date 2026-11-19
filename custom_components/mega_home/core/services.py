@@ -1,4 +1,4 @@
-"""Реестр loopback-служб дома: кто слушает петлю и на каком порту.
+"""Адресаты connect: процессы на петле и службы с доступом жильца.
 
 ⚠ Не список из головы (`docs/plan-thin-gateway.md`, замок 3): реестр ПУСТ до
 запуска процессов и наполняется ими самими. `go2rtc_embed` регистрирует
@@ -18,7 +18,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .ops_base import OpError, dumps
+from .ops_base import OpError, dumps, json_body
 
 
 @dataclass(frozen=True)
@@ -109,7 +109,7 @@ async def call_resident(coordinator: Any, request: dict[str, Any], access: Any) 
     name = request.get("host")
     if not isinstance(name, str):
         return None
-    service = getattr(coordinator, "resident_services", {}).get(name)
+    service = getattr(coordinator, "resident_services", {}).get(name.strip())
     if service is None:
         return None
     if access not in ("read", "manage"):
@@ -121,7 +121,7 @@ async def call_resident(coordinator: Any, request: dict[str, Any], access: Any) 
         raise OpError("Некорректный запрос личной службы")
     status = 200
     try:
-        data = await service(access == "manage", body)
+        data = await service(access == "manage", json_body(body))
     except OpError as error:
         status, data = error.status, {"message": error.message}
     return {"status": status, "headers": {"Content-Type": "application/json"}, "body": dumps(data)}

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -39,7 +38,7 @@ class Music:
         self.calls: list[tuple[bool, dict]] = []
 
     async def __call__(self, can_manage: bool, body: str) -> dict:
-        request = json.loads(body)
+        request = body
         self.calls.append((can_manage, request))
         if request["action"] == "stream":
             return {"infos": [{"url": "https://cdn.yandex/track.mp3", "codec": "mp3", "bitrate": 320}]}

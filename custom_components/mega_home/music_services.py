@@ -48,7 +48,7 @@ async def _music_call(call: ServiceCall) -> dict[str, Any]:
     """Ответ на действие каталога — тем же контрактом, что `connect` у приложения."""
     request = _request(call)
     try:
-        return await _music(call)(False, json.dumps(request))
+        return await _music(call)(False, request)
     except OpError as error:
         raise HomeAssistantError(str(error)) from error
 
@@ -60,7 +60,7 @@ async def _music_play(call: ServiceCall) -> None:
     if not isinstance(track_id, str) or not entity:
         raise HomeAssistantError("Нужны id трека и плеер")
     try:
-        stream = await _music(call)(False, json.dumps({"action": "stream", "id": track_id}))
+        stream = await _music(call)(False, {"action": "stream", "id": track_id})
     except OpError as error:
         raise HomeAssistantError(str(error)) from error
     chosen = pick_stream(stream.get("infos") if isinstance(stream, dict) else None)
@@ -84,7 +84,7 @@ def _request(call: ServiceCall) -> dict[str, Any]:
         except ValueError as error:
             raise HomeAssistantError("request — объект или JSON") from error
     action = request.get("action") if isinstance(request, dict) else None
-    if action not in READ_ACTIONS:
+    if not isinstance(action, str) or action not in READ_ACTIONS:
         raise HomeAssistantError("Служба читает каталог и поток; вход и отключение — в приложении")
     return request
 
