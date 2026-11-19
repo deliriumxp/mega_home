@@ -94,6 +94,14 @@ def test_адрес_дома_берётся_из_внутреннего_имен
     )
     assert mega_http.stream_origin(own) == "http://192.168.88.102:8123"
 
+    # Порт — тот, на котором HA реально слушает (новые версии — и на 80), а не константа.
+    plain = SimpleNamespace(
+        config=SimpleNamespace(
+            internal_url=None, api=SimpleNamespace(use_ssl=False, local_ip="192.168.88.102", port=80)
+        )
+    )
+    assert mega_http.stream_origin(plain) == "http://192.168.88.102:80"
+
     # HTTPS без внутреннего имени не предлагаем: сертификат выписан на внешнее имя,
     # и плеер в локальной сети его не примет.
     secure = SimpleNamespace(
