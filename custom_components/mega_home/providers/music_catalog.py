@@ -22,6 +22,11 @@ def _item(value: Any, kind: str, item_id: Any = None) -> dict | None:
         result["artist"] = ", ".join(artist.name for artist in artists if artist.name)
     if uri := _cover_uri(value):
         result["coverUri"] = uri
+        # ⚠ Совместимость: бандлы до 0.6.34 читают только готовый `cover` и без него
+        # показывают значок прибора. Убрать отдельным релизом по правилу «расширить, потом
+        # сузить», когда ни одному объекту не раздаётся бандл без `coverUri`
+        # (`docs/plan-bundle-compat.md`).
+        result["cover"] = _cover_url(uri)
     if kind == "track":
         album = (getattr(value, "albums", None) or [None])[0]
         if album is not None:
@@ -53,6 +58,11 @@ def _cover_uri(value: Any) -> str | None:
         albums = getattr(value, "albums", None) or []
         uri = getattr(albums[0], "cover_uri", None) if albums else None
     return uri if isinstance(uri, str) and uri else None
+
+
+def _cover_url(uri: str) -> str:
+    """Готовая обложка 400×400 — прежний вид ответа для бандлов до 0.6.34."""
+    return uri if uri.startswith(("https://", "http://")) else f"https://{uri.replace('%%', '400x400')}"
 
 
 def _items(values: Any, kind: str) -> list[dict]:

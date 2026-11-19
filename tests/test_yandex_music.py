@@ -198,7 +198,10 @@ def test_поток_трека_отдаёт_варианты_библиотек�
             "infos": [
                 {"url": "https://cdn.yandex/track.aac", "codec": "aac", "bitrate": 192},
                 {"url": "https://cdn.yandex/track.mp3", "codec": "mp3", "bitrate": 320},
-            ]
+            ],
+            # Прежний вид ответа: старый бандл читает `url`/`format`, а `infos` не знает.
+            "url": "https://cdn.yandex/track.mp3",
+            "format": "mp3",
         }
         await env.close()
 
@@ -279,6 +282,8 @@ def test_обложка_альбом_и_длительность_доезжаю�
         "kind": "track",
         "artist": "Кино",
         "coverUri": "avatars.yandex.net/get-music-content/1/2/%%",
+        # Прежнее поле для бандлов до 0.6.34: без него обложка не грузится.
+        "cover": "https://avatars.yandex.net/get-music-content/1/2/400x400",
         "album": "Звезда",
         "albumId": "77",
         "year": 1990,

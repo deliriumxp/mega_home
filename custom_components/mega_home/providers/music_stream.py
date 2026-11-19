@@ -17,12 +17,13 @@ from typing import Any
 from yandex_music.exceptions import UnauthorizedError, YandexMusicError
 
 from ..core.ops_base import OpError
+from .music_pick import pick_stream, stream_format
 
 TRACK_ID = re.compile(r"[0-9]{1,20}")
 
 
 async def stream(client: Any, request: dict) -> dict:
-    """Ответ на действие `stream`: варианты `{url, codec, bitrate}` без выбора."""
+    """Ответ на действие `stream`: варианты `{url, codec, bitrate}` и прежняя готовая ссылка."""
     track_id = request.get("id")
     if not isinstance(track_id, str) or not TRACK_ID.fullmatch(track_id):
         raise OpError("Неверный адрес трека")
@@ -41,6 +42,14 @@ async def stream(client: Any, request: dict) -> dict:
         for info in infos or []
         if getattr(info, "direct_link", None) and isinstance(getattr(info, "codec", None), str)
     ]
-    if not variants:
+    chosen = pick_stream(variants)
+    if chosen is None:
         raise OpError("Яндекс Музыка не отдала поток трека. Попробуйте ещё раз", 503)
-    return {"infos": variants}
+    return {
+        "infos": variants,
+        # ⚠ Совместимость: бандлы до 0.6.34 читают `url`/`format` и с `infos` получают
+        # «Дом не отдал ссылку на трек». Убрать отдельным релизом по правилу «расширить,
+        # потом сузить» (`docs/plan-bundle-compat.md`).
+        "url": chosen["url"],
+        "format": stream_format(chosen["codec"]),
+    }
