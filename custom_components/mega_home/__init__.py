@@ -31,7 +31,7 @@ from .core.const import (
     SERVICE_SYNC,
 )
 from .coordinator import MegaHomeConfigEntry, MegaHomeCoordinator
-from .http import VIEWS as HTTP_VIEWS, async_register_http
+from .http import VIEWS as HTTP_VIEWS, async_register_http, stream_origin
 from .music_services import async_register_music_services
 from .core import go2rtc_embed, services
 from .core.agent import AgentRunner
@@ -184,11 +184,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     coordinator.shared = SharedDocs(coordinator.env)
     await coordinator.shared.async_load()
 
+    from .providers.music_proxy import MusicStreamLinks
     from .providers.yandex_music import MusicService
     from .station_auth import StationAuth
 
     music = MusicService(coordinator.env, entry.unique_id or entry.entry_id)
-    coordinator.resident_services = {"yandex-music": StationAuth(hass, music).call}
+    # Короткие адреса трека для плееров с пределом длины (`providers/music_proxy.py`):
+    # дом отдаёт их рядом с прямыми ссылками, а ссылку Яндекса разрешает по запросу
+    # уже сам маршрут `/mega-home/stream/<токен>`.
+    links = MusicStreamLinks(stream_origin(hass, (coordinator.data or {}).get("house")))
+    coordinator.music = music
+    coordinator.music_links = links
+    station = StationAuth(hass, music)
+
+    async def yandex_music(can_manage: bool, request: dict) -> dict:
+        answer = await station.call(can_manage, request)
+        # Ответ на `stream` — единственное место, где нужен короткий адрес.
+        return links.with_address(request.get("id"), answer) if request.get("action") == "stream" else answer
+
+    coordinator.resident_services = {"yandex-music": yandex_music}
     entry.async_on_unload(music.stop)
 
     def _track_alerts() -> None:

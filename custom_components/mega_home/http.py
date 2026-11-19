@@ -25,7 +25,7 @@ import re
 from http import HTTPStatus
 from pathlib import Path
 
-from aiohttp import web
+from aiohttp import ClientError, ClientTimeout, web
 
 from homeassistant.components.http import HomeAssistantView, StaticPathConfig
 from homeassistant.core import HomeAssistant
@@ -41,7 +41,9 @@ from .core import stream
 from .core.api import ManagerError
 from .coordinator import MegaHomeCoordinator
 from .core.events import StateStream
+from .core.ops_base import OpError
 from .http_door import _MegaHomeView, _RoutedView, _coordinator
+from .providers.music_pick import pick_stream, stream_format
 
 # Сколько ждём отклика на ping удержания: уснувший телефон сокет не закрывает,
 # и без этого сессии к устройствам жили бы до своего часа (`stream.py`).
@@ -49,6 +51,12 @@ WS_HEARTBEAT_S = 25
 # Кадр крупнее мегабайта — не наш случай: тело запроса едет в описании, а данные
 # идут кусками. Огромный кадр рвёт сокет громко, а не теряется молча.
 WS_MAX_FRAME = 1024 * 1024
+
+# Поток трека: подключение к CDN и молчание в середине. Общего срока нет —
+# трек идёт минутами, а `Range` заставляет плеер ходить несколько раз.
+UPSTREAM_CONNECT_S = 10
+UPSTREAM_READ_S = 30
+STREAM_CHUNK = 64 * 1024
 
 # ⚠ Копии интерфейса в релизе НЕТ (2026-09-06): пока бандл не скачан, отдаём эту
 # страницу. Первый запуск считаем онлайн — а взамен релиз интеграции перестал
@@ -293,6 +301,161 @@ class MegaHomeEventsView(_MegaHomeView):
         return await StateStream(coordinator).run(request)
 
 
+class MegaHomeMusicStreamView(_MegaHomeView):
+    """`/mega-home/stream/<токен>` — короткий адрес трека Яндекс Музыки для плеера LAN.
+
+    ⚠ Без ключа устройства и без куки: адрес забирает не браузер, а плеер
+    (Sonos), и учётки у него нет. Пропуск — сам токен (`providers/music_proxy.py`):
+    он случайный и живёт в памяти дома. Ссылку Яндекса дом разрешает в момент
+    запроса — она длиннее предела плеера и истекает, поэтому хранить её в адресе
+    нельзя (замер obj68, 2026-11-19: 1023 из 1024 знаков, `GET` → 404).
+    """
+
+    url = f"{URL_PREFIX}/stream/{{token}}"
+    name = "mega_home:music_stream"
+
+    async def get(self, request: web.Request, token: str) -> web.StreamResponse:
+        return await self._stream(request, token, body=True)
+
+    async def head(self, request: web.Request, token: str) -> web.StreamResponse:
+        """Заголовки без тела: часть плееров сначала спрашивает размер и тип."""
+        return await self._stream(request, token, body=False)
+
+    async def _stream(self, request: web.Request, token: str, *, body: bool) -> web.StreamResponse:
+        coordinator = _coordinator(request.app["hass"])
+        links = getattr(coordinator, "music_links", None)
+        track = links.track(token) if links is not None else None
+        if track is None:
+            return self.json_message("Ссылка на трек устарела", HTTPStatus.NOT_FOUND)
+        music = getattr(coordinator, "music", None)
+        if music is None:
+            return self.json_message(
+                "Яндекс Музыка не подключена в этом доме", HTTPStatus.SERVICE_UNAVAILABLE
+            )
+        ready = links.resolved(token)
+        if ready is None:
+            ready = await _resolve_track(music, track, self)
+            if isinstance(ready, web.Response):
+                return ready
+            if ready is None:
+                return self.json_message(
+                    "Яндекс Музыка не отдала поток трека", HTTPStatus.BAD_GATEWAY
+                )
+        url, fmt = ready
+        session = _client_session(request.app["hass"])
+        headers = {}
+        if range_header := request.headers.get("Range"):
+            headers["Range"] = range_header
+        # Общего таймаута нет: трек идёт минутами. Сторожим подключение и молчание CDN.
+        timeout = ClientTimeout(
+            total=None, sock_connect=UPSTREAM_CONNECT_S, sock_read=UPSTREAM_READ_S
+        )
+        for attempt in (0, 1):
+            try:
+                async with session.get(
+                    url, headers=headers, timeout=timeout, allow_redirects=True
+                ) as upstream:
+                    if upstream.status in (403, 404) and attempt == 0:
+                        # Ссылка истекла между выдачей и запросом: разрешаем заново,
+                        # а не отдаём плееру отказ на ровном месте.
+                        links.forget(token)
+                        refreshed = await _resolve_track(music, track, self)
+                        if isinstance(refreshed, web.Response):
+                            return refreshed
+                        if refreshed is None:
+                            break
+                        url, fmt = refreshed
+                        continue
+                    if upstream.status not in (200, 206):
+                        LOGGER.warning(
+                            "Яндекс Музыка: поток трека ответил %s", upstream.status
+                        )
+                        return self.json_message(
+                            "Поток трека недоступен", HTTPStatus.BAD_GATEWAY
+                        )
+                    links.remember(token, url, fmt)
+                    return await _pipe(request, upstream, fmt, body)
+            except (ClientError, TimeoutError, OSError) as err:
+                LOGGER.warning("Яндекс Музыка: поток трека не открылся: %s", err)
+                return self.json_message("Поток трека недоступен", HTTPStatus.BAD_GATEWAY)
+        return self.json_message("Поток трека недоступен", HTTPStatus.BAD_GATEWAY)
+
+
+async def _resolve_track(
+    music: object, track: str, view: _MegaHomeView
+) -> tuple[str, str] | web.Response | None:
+    """Ссылка Яндекса и формат для трека — тем же действием, что у приложения."""
+    try:
+        answer = await music.call(False, {"action": "stream", "id": track})  # type: ignore[attr-defined]
+    except OpError as err:
+        return view.json_message(err.message, err.status)
+    chosen = pick_stream(answer.get("infos") if isinstance(answer, dict) else None)
+    if chosen is None:
+        return None
+    return chosen["url"], stream_format(chosen.get("codec"))
+
+
+def _client_session(hass: HomeAssistant) -> object:
+    """HTTP-сессия Home Assistant — её SSL и прокси; тесты подменяют эту функцию."""
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+    return async_get_clientsession(hass)
+
+
+async def _pipe(
+    request: web.Request, upstream: object, fmt: str, body: bool
+) -> web.StreamResponse:
+    """Ответ плееру кусками — как пришло от CDN, включая `Range` и размер."""
+    headers = {
+        "Content-Type": "audio/mpeg" if fmt == "mp3" else "audio/aac",
+        # Адрес — пропуск, кэшировать его нельзя.
+        "Cache-Control": "no-store",
+    }
+    for name in ("Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"):
+        value = upstream.headers.get(name)  # type: ignore[attr-defined]
+        if value:
+            headers[name] = value
+    response = web.StreamResponse(status=upstream.status, headers=headers)  # type: ignore[attr-defined]
+    await response.prepare(request)
+    if body:
+        try:
+            async for chunk in upstream.content.iter_chunked(STREAM_CHUNK):  # type: ignore[attr-defined]
+                await response.write(chunk)
+        except ConnectionError:
+            # Плеер закрыл поток: пауза, перемотка, смена трека. Это норма, а не сбой.
+            return response
+    await response.write_eof()
+    return response
+
+
+def stream_origin(hass: HomeAssistant, house: dict | None = None) -> str | None:
+    """Адрес дома, по которому плеер локальной сети заберёт поток.
+
+    ⚠ Сперва адрес, которым в дом ходит МЕНЕДЖЕР (`house.ha.url`): в контейнере
+    `hass.config.api.local_ip` бывает адресом моста, а не сети объекта, и плеер
+    такой адрес не достанет. Дальше — `internal_url` («как зайти изнутри»), потом
+    адрес, которым HA назвал себя. `external_url` не берём: это публичное имя, а
+    плеер стоит в той же сети. HTTPS без внутреннего адреса не предлагаем:
+    сертификат выписан на внешнее имя, и плеер его не примет.
+    """
+    if isinstance(house, dict):
+        ha = house.get("ha")
+        managed = ha.get("url") if isinstance(ha, dict) else None
+        if isinstance(managed, str) and managed.startswith(("http://", "https://")):
+            return managed.rstrip("/")
+    internal = getattr(hass.config, "internal_url", None)
+    if isinstance(internal, str) and internal.startswith(("http://", "https://")):
+        return internal.rstrip("/")
+    api = getattr(hass.config, "api", None)
+    if api is None or getattr(api, "use_ssl", False):
+        return None
+    ip = getattr(api, "local_ip", None)
+    port = getattr(api, "port", None)
+    if not isinstance(ip, str) or ip in ("", "0.0.0.0", "127.0.0.1", "::1") or not port:
+        return None
+    return f"http://{ip}:{port}"
+
+
 class MegaHomeRelayView(_MegaHomeView):
     """Ask the MANAGER something on behalf of the app, and return the answer.
 
@@ -514,6 +677,7 @@ VIEWS: tuple[type[HomeAssistantView], ...] = (
     MegaHomeDeviceEventsView,
     MegaHomeEventFileView,
     MegaHomeDevLogView,
+    MegaHomeMusicStreamView,
     MegaHomeRelayView,
     MegaHomeServiceWorkerView,
     MegaHomeAppRootView,
