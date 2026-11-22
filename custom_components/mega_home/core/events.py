@@ -132,7 +132,8 @@ class StateStream:
             self._put(
                 "entity",
                 ops.entity_view(
-                    tile, state, self.coordinator.source.cameras, getattr(self.coordinator, "changes", None)
+                    tile, state, self.coordinator.source.cameras, getattr(self.coordinator, "changes", None),
+                    ops.groups_of(self.coordinator),
                 ),
             )
 

@@ -303,12 +303,14 @@ def registry(coordinator: Any) -> dict[str, Any]:
 def states(coordinator: Any) -> dict[str, Any]:
     """Current states of every tile, read straight from the source of this home."""
     source: StateSource = coordinator.source
+    groups = groups_of(coordinator)
     entities = [
         entity_view(
             tile,
             source.get(tile["entityId"]) if tile.get("entityId") else None,
             source.cameras,
             getattr(coordinator, "changes", None),
+            groups,
         )
         for tile in coordinator.data.get("tiles", [])
     ]
@@ -387,6 +389,14 @@ async def command(
         data = arguments(spec, payload.get("value"), state.attributes if state else {})
     except ValueError as err:
         raise OpError(str(err)) from err
+
+    # Мультирум: наша группа — не группировка HA (вне одной интеграции её нет), состав ведёт
+    # музыкальная служба дома и она же берёт такую команду себе (`join`/`unjoin`).
+    playback = getattr(coordinator, "music_playback", None)
+    if name in ("join", "unjoin") and playback is not None:
+        handled = await playback.group_command(tile, name, data, by)
+        if handled is not None:
+            return handled
 
     # `response` в описании — службе нужен её ОТВЕТ (`weather.get_forecasts`,
     # `calendar.get_events`, `todo.get_items`: этих данных нет в атрибутах).
@@ -500,8 +510,16 @@ def _public_attributes(attributes: Any) -> dict[str, Any]:
         if key not in HIDDEN_ATTRIBUTES
     }
 
+def groups_of(coordinator: Any) -> dict[str, list[str]]:
+    """Составы НАШИХ групп мультирума — для ответа о приборе (`entity_view`, `group_members`)."""
+    playback = getattr(coordinator, "music_playback", None)
+    state_groups = getattr(playback, "state_groups", None)
+    return state_groups() if state_groups is not None else {}
+
+
 def entity_view(
-    tile: dict[str, Any], state: EntityState | None, cameras: Any = None, changes: Any = None
+    tile: dict[str, Any], state: EntityState | None, cameras: Any = None, changes: Any = None,
+    groups: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Что дом отвечает о приборе: сырое состояние Home Assistant и атрибуты.
 
@@ -560,6 +578,11 @@ def entity_view(
         values["streamType"] = attributes.get("frontend_stream_type")
 
     available = state is not None and not unavailable
+    # ⚠ Наша группа мультирума — тем же полем, что штатная группировка HA (`group_members`,
+    # «ведущий первым»): приложение читает состав ОДНИМ путём (`core/media-group.ts`). HA вне
+    # одной интеграции группировать не умеет — состав ведёт музыкальная служба дома.
+    if groups and (members := groups.get(tile.get("entityId"))):
+        attributes = {**attributes, "group_members": list(members)}
 
     return {
         "id": tile["id"],

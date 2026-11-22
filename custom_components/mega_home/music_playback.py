@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
-from .core.ops import command_spec
+from .core.ops import call, command_spec
 from .core.ops_base import OpError, arguments, find
 from .providers.media_queue import PlayerQueue
 from .providers.music_catalog import queue_ids
@@ -34,6 +34,12 @@ class MusicPlayback:
         # Сессии потока: у `flow`-плеера адрес один на всю сессию (`providers/music_flow.py`).
         # Без адреса дома (`origin` = None) сессию не отдать — плееру ответит честный отказ.
         self._flow = flow if flow is not None else FlowStreams(lambda: None)
+        # Наши группы мультирума: сущность ведущего → сущности участников (ведущего в списке нет).
+        # ⚠ Группа — НЕ группировка HA: `media_player.join` группирует только внутри одной интеграции
+        # (`entity-media-player.md`), а Sonos с HEOS и прошитый Echo HA не сгруппирует никогда.
+        # У нас звук и так один — поток дома (`providers/music_flow.py`): участнику достаточно дать
+        # ТОТ ЖЕ адрес сессии, и он играет вместе, без своей очереди.
+        self.groups: dict[str, list[str]] = {}
         self._players: dict[str, PlayerQueue] = {}
         self._profiles: dict[str, dict] = {}
         self._changed()
@@ -137,6 +143,99 @@ class MusicPlayback:
             return items, bool(answer.get("more")) and cursor["page"] <= 999
 
         await queue.replace(load, prepare, more if cursor else None)
+        # Группа: участникам нужен адрес сессии, пока поток ещё НЕ читают (иначе команда лишняя —
+        # элемент сменяется внутри того же потока).
+        if self.groups.get(entity) and profile.get("flow") is True and not self._flow.session(tile["id"]).reading:
+            await self._wake_group(entity)
+
+    def state_groups(self) -> dict[str, list[str]]:
+        """Составы групп для ответа о приборе: каждая сущность группы → весь состав, ведущий первым.
+
+        ⚠ Приложение читает состав ОДНИМ полем (`group_members`, `core/media-group.ts`), не различая
+        штатную группировку HA и нашу: иначе у него был бы второй путь «кто с кем играет».
+        """
+        out: dict[str, list[str]] = {}
+        for leader, members in self.groups.items():
+            if not members:
+                continue
+            line = [leader, *members]
+            for entity in line:
+                out[entity] = line
+        return out
+
+    async def group_command(self, tile: dict, name: str, data: dict, by: Any) -> dict | None:
+        """`join`/`unjoin` для НАШИХ групп (`core/ops.py` зовёт до штатной службы HA).
+
+        `None` — команда не наша: плеер не берёт поток дома, и `media_player.join` решает как раньше.
+        """
+        profile = tile.get("stream")
+        entity = self._entity(tile)
+        if not isinstance(profile, dict) or profile.get("flow") is not True or not entity:
+            return None
+        if name == "unjoin":
+            return await self._leave_group(entity)
+        members = [str(member) for member in (data.get("group_members") or []) if str(member) != entity]
+        for member in dict.fromkeys(members):
+            member_profile = (self._tile_of(member) or {}).get("stream")
+            if not isinstance(member_profile, dict) or member_profile.get("flow") is not True:
+                raise OpError("В одну группу — только плееры, которые играют поток дома", 409)
+        if any(entity in group for group in self.groups.values()):
+            await self._leave_group(entity)  # был участником чужой группы — сперва выходим
+        self.groups[entity] = list(dict.fromkeys(members))
+        self._changed()
+        await self._wake_group(entity)
+        return {"accepted": True, "group": [entity, *self.groups[entity]]}
+
+    async def _leave_group(self, entity: str) -> dict:
+        """Выйти из группы: ушедший гаснет, ведущий и остальные участники играют дальше."""
+        for leader, members in list(self.groups.items()):
+            if entity == leader:
+                self.groups.pop(leader, None)
+                await self._stop_players(members)
+            elif entity in members:
+                left = [member for member in members if member != entity]
+                if left:
+                    self.groups[leader] = left
+                else:
+                    self.groups.pop(leader, None)
+                await self._stop_players([entity])
+            else:
+                continue
+            self._changed()
+        return {"accepted": True}
+
+    async def _stop_players(self, entities: list[str]) -> None:
+        for entity in entities:
+            await call(self._home.source, "media_player", "media_stop", {"entity_id": entity})
+
+    async def _wake_group(self, leader: str) -> None:
+        """Участникам — ТОТ ЖЕ адрес сессии ведущего: их плеер забирает поток сам, без очереди.
+
+        ⚠ Команду зовём только когда поток ещё НЕ читают (`_play`/`_play_station`): у устройства,
+        которое новый `media_url` поверх живого потока не берёт, повторная команда была бы
+        бесполезна, а на смену элемента внутри потока она и не нужна — адрес тот же.
+        """
+        members = self.groups.get(leader) or []
+        if not members:
+            return
+        tile = self._tile_of(leader)
+        session = self._flow.session(tile["id"]) if tile is not None else None
+        address = self._flow.address(session) if session is not None else None
+        if address is None:
+            raise OpError("Дом не знает своего адреса для потока", 503)
+        for member in members:
+            member_tile = self._tile_of(member)
+            if member_tile is None:
+                continue
+            fields = _stream_fields(
+                member_tile, member,
+                {"media_content_id": address, "media_content_type": flow_content_type(member_tile["stream"])},
+                self._home.source,
+            )
+            await call(self._home.source, "media_player", "play_media", {"entity_id": member, **fields})
+
+    def _tile_of(self, entity: str) -> dict | None:
+        return next((tile for tile in self._tiles() if self._entity(tile) == entity), None)
 
     async def _play_station(self, request: dict) -> None:
         """Станция каталога на плеере — элемент очереди дома, как трек Яндекса.
@@ -186,6 +285,8 @@ class MusicPlayback:
             )
 
         await queue.replace(load, prepare, None)
+        if self.groups.get(entity) and profile.get("flow") is True and not self._flow.session(tile["id"]).reading:
+            await self._wake_group(entity)
 
     def _queue_for(self, tile: dict, entity: str) -> PlayerQueue:
         """Очередь плеера; у `flow`-плеера — с его сессией потока (`providers/music_flow.py`)."""
@@ -243,6 +344,7 @@ class MusicPlayback:
             queue.close()
         self._players.clear()
         self._profiles.clear()
+        self.groups.clear()
         self._flow.close()
 
 

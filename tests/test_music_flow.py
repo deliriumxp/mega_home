@@ -12,6 +12,7 @@ import asyncio
 from array import array
 from types import SimpleNamespace
 
+from mega_home.core import ops
 from mega_home.core.host import PlainHost
 from mega_home.core.source import PlainState
 from mega_home.core.topics import Topics
@@ -103,10 +104,18 @@ def flow_tile(flow: bool = True, entity: str = "media_player.echo") -> dict:
     return {
         "id": "echo", "domain": "media_player", "entityId": entity,
         "stream": {"type": "music", "opaqueTrackId": True, **({"flow": True} if flow else {})},
-        "commands": {"play_stream": {
-            "domain": "media_player", "service": "play_media", "label": "Радиостанция",
-            "fields": {"media_content_id": {"type": "string"}, "media_content_type": {"type": "string"}},
-        }},
+        "commands": {
+            "play_stream": {
+                "domain": "media_player", "service": "play_media", "label": "Радиостанция",
+                "fields": {"media_content_id": {"type": "string"}, "media_content_type": {"type": "string"}},
+            },
+            # Мультирум: та же пара команд, что у плитки с соседями (таблица команд менеджера).
+            "join": {
+                "domain": "media_player", "service": "join", "label": "Объединение в группу",
+                "fields": {"group_members": {"type": "list", "of": {"type": "string"}}},
+            },
+            "unjoin": {"domain": "media_player", "service": "unjoin", "label": "Выход из группы"},
+        },
     }
 
 
@@ -281,6 +290,68 @@ def test_трек_на_плеере_потока_переключается_бе
         assert len(home.source.calls) == calls
         assert session.current.id == "2"
         assert (await view(service, "echo"))["track"]["id"] == "2"
+        service.close()
+
+    asyncio.run(run())
+
+
+def test_мультирум_даёт_участнику_тот_же_адрес_сессии(tmp_path):
+    """Sonos с HEOS HA не сгруппирует; у нас группа — один поток дома на всех участников."""
+
+    async def run():
+        service, home, _catalog, streams = setup(tmp_path)
+        source = home.source
+        living = flow_tile(entity="media_player.living")
+        living["id"] = "living"
+        home.data["tiles"].append(living)
+        source.states["media_player.living"] = PlainState("idle")
+        station = {"id": "rock", "title": "Радио Рекорд", "url": "https://cdn.example/rock.aac"}
+        fields = {"media_content_id": station["url"], "media_content_type": "audio/aac"}
+        await service.call(False, {"action": "play_station", "player": "echo", "station": station, "fields": fields})
+        session = streams.session("echo")
+        address = "http://home.local:8123/mega-home/stream/" + session.token
+
+        # Ведущий зовёт соседа: ему уходит ТОТ ЖЕ адрес сессии, а не своя очередь.
+        assert (await ops.command(
+            SimpleNamespace(data=home.data, source=source, music_playback=service),
+            {"id": "echo", "command": "join", "value": {"group_members": ["media_player.living"]}},
+        ))["accepted"]
+        assert source.calls[-1] == (
+            "media_player", "play_media",
+            {"entity_id": "media_player.living", "media_content_id": address, "media_content_type": "music"},
+        )
+        # Состав — тем же полем, что штатная группировка HA: приложение читает ОДНИМ путём.
+        line = ["media_player.echo", "media_player.living"]
+        assert ops.groups_of(SimpleNamespace(music_playback=service)) == {
+            "media_player.echo": line, "media_player.living": line,
+        }
+        view = ops.entity_view(flow_tile(), None, None, None, ops.groups_of(SimpleNamespace(music_playback=service)))
+        assert view["attributes"]["group_members"] == line
+
+        # Сосед выходит: гаснет он, ведущий играет дальше.
+        await ops.command(
+            SimpleNamespace(data=home.data, source=source, music_playback=service),
+            {"id": "living", "command": "unjoin", "value": {}},
+        )
+        assert source.calls[-1] == ("media_player", "media_stop", {"entity_id": "media_player.living"})
+        assert ops.groups_of(SimpleNamespace(music_playback=service)) == {}
+        service.close()
+
+    asyncio.run(run())
+
+
+def test_мультирум_не_трогает_плеер_без_потока_дома(tmp_path):
+    async def run():
+        service, home, _catalog, streams = setup(tmp_path, flow=False)
+        tile = home.data["tiles"][0]
+        # Не наша команда: у плеера нет потока дома, и `media_player.join` решает как раньше.
+        assert await service.group_command(tile, "join", {"group_members": ["media_player.living"]}, None) is None
+        # Группа пробуждается на старте музыки — но только у потока.
+        service.groups["media_player.echo"] = ["media_player.living"]
+        await service.call(False, {"action": "play_station", "player": "echo",
+                                   "station": {"id": "rock", "title": "Рок", "url": "https://cdn.example/r.aac"},
+                                   "fields": {"media_content_id": "https://cdn.example/r.aac", "media_content_type": "audio/aac"}})
+        assert all(call[2].get("entity_id") != "media_player.living" for call in home.source.calls)
         service.close()
 
     asyncio.run(run())
