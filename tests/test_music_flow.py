@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from array import array
 from types import SimpleNamespace
 
@@ -218,7 +219,7 @@ def test_станция_на_плеере_потока_идёт_адресом_�
         command = home.source.calls[-1][2]
         assert command["entity_id"] == "media_player.echo"
         # Плееру уходит адрес СЕССИИ дома, а не ссылка станции: дальше элементы сменяет дом.
-        assert command["media_content_id"] == "http://home.local:8123/mega-home/stream/" + streams.session("echo").token
+        assert command["media_content_id"] == streams.address(streams.session("echo"), "media_player.echo")
         assert command["media_content_type"] == "music"
 
         # Плеер заиграл — но подтверждения ещё нет: у такого плеера свидетельство одно, и это
@@ -271,7 +272,7 @@ def test_трек_на_плеере_потока_переключается_бе
         await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1", "2"], "index": 0})
         first = home.source.calls[-1][2]
         session = streams.session("echo")
-        assert first["media_content_id"] == "http://home.local:8123/mega-home/stream/" + session.token
+        assert first["media_content_id"] == streams.address(session, "media_player.echo")
         assert session.current.id == "1"
         home.source.report("media_player.echo", "playing")
         # Устройство взяло поток: так это помечает `FlowSession.play` (дома — маршрут потока).
@@ -304,9 +305,9 @@ def test_мультирум_даёт_участнику_тот_же_адрес_�
         fields = {"media_content_id": station["url"], "media_content_type": "audio/aac"}
         await service.call(False, {"action": "play_station", "player": "echo", "station": station, "fields": fields})
         session = streams.session("echo")
-        address = "http://home.local:8123/mega-home/stream/" + session.token
+        address = streams.address(session, "media_player.living")
 
-        # Ведущий зовёт соседа: ему уходит ТОТ ЖЕ адрес сессии, а не своя очередь.
+        # Ведущий зовёт соседа: ему уходит адрес ТОЙ ЖЕ сессии (свой токен — задержка на плеера).
         assert (await ops.command(
             SimpleNamespace(data=home.data, source=source, music_playback=service),
             {"id": "echo", "command": "join", "value": {"group_members": ["media_player.living"]}},
@@ -393,7 +394,7 @@ def test_яндекс_станция_встаёт_в_группу_проводо
         await service.call(False, {"action": "play_station", "player": "echo", "station": station,
                                    "fields": {"media_content_id": station["url"], "media_content_type": "audio/aac"}})
         session = streams.session("echo")
-        address = "http://home.local:8123/mega-home/stream/" + session.token
+        address = streams.address(session, "media_player.station")
         assert (await service.group_command(
             home.data["tiles"][0], "join", {"group_members": ["media_player.station"]}, None,
         ))["accepted"]
@@ -534,5 +535,45 @@ def test_поток_фейдит_стык_и_на_смене_станции(tmp_
         assert samples(audio[8:16]) == [1000, 1250, 1500, 1750]
         assert samples(audio[16:]) == [2000] * 4
         service.close()
+
+    asyncio.run(run())
+
+
+def test_задержка_плеера_сдвигает_его_чтение_и_меняется_на_ходу():
+    """Задержка — на ПЛЕЕРА и живая: инсталлятор крутит её в составе, музыка играет."""
+
+    async def run():
+        session = FlowSession("t")
+        session.set_items((SimpleNamespace(source="a"),), 0)
+        asked: list[str] = []
+        seen: list[str] = []
+        value = [40.0]
+        written: list[bytes] = []
+
+        async def source_of(item):
+            return item.source
+
+        async def decoder(url):
+            asked.append(url)
+            return FakeProcess([b"AA" * 8] * 4, piece=8)
+
+        def delay_of(player: str) -> float:
+            seen.append(player)
+            return value[0]
+
+        async def write(chunk):
+            written.append(chunk)
+            await asyncio.sleep(0)
+            value[0] = 0.0  # задержку уменьшили на ходу — лишнее выбрасываем
+
+        session.source_of, session.delay_of = source_of, delay_of
+        started = time.monotonic()
+        await session.serve(write, decoder, player="media_player.station")
+        elapsed = time.monotonic() - started
+        # Задержку спросили у ИМЕННО этого плеера и реально подождали её.
+        assert seen and all(player == "media_player.station" for player in seen)
+        assert elapsed >= 0.03
+        # Сброшенная задержка выбросила хвост: байт записано меньше, чем отдал декодер.
+        assert len(b"".join(written)) < 32
 
     asyncio.run(run())

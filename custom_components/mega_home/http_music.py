@@ -50,7 +50,7 @@ class MegaHomeMusicStreamView(_MegaHomeView):
         return await self._stream(request, token, body=False)
 
     async def _stream_flow(
-        self, request: web.Request, session: FlowSession, coordinator: Any, *, body: bool,
+        self, request: web.Request, session: FlowSession, coordinator: Any, *, body: bool, player: str,
     ) -> web.StreamResponse:
         """Поток сессии плеера: один адрес на всю сессию, элементы сменяет дом.
 
@@ -73,7 +73,9 @@ class MegaHomeMusicStreamView(_MegaHomeView):
             await response.write(chunk)
 
         try:
-            await session.serve(write, lambda url: ffmpeg_decoder(binary, url), lambda out: ffmpeg_encoder(binary, out))
+            await session.serve(
+                write, lambda url: ffmpeg_decoder(binary, url), lambda out: ffmpeg_encoder(binary, out), player,
+            )
         except (ConnectionError, OSError):
             # Плеер закрыл поток (пауза, смена источника, выключение) — это норма, не ошибка.
             response.force_close()
@@ -89,9 +91,10 @@ class MegaHomeMusicStreamView(_MegaHomeView):
         # Сессия потока узнаётся ПЕРВОЙ: у неё тот же адрес, но за ним не трек, а живой поток
         # (`providers/music_flow.py`) — элементов в нём столько, сколько скажет очередь дома.
         playback = getattr(coordinator, "music_playback", None)
-        session = playback.flow.find(token) if playback is not None else None
-        if session is not None:
-            return await self._stream_flow(request, session, coordinator, body=body)
+        found = playback.flow.find(token) if playback is not None else None
+        if found is not None:
+            session, player = found
+            return await self._stream_flow(request, session, coordinator, body=body, player=player)
         links = getattr(coordinator, "music_links", None)
         track = links.track(token) if links is not None else None
         if track is None:

@@ -11,6 +11,9 @@ from .core.ops_base import OpError, arguments, find
 from .providers.media_queue import PlayerQueue
 from .providers.music_catalog import queue_ids
 from .providers.music_flow import FLOW_CHANNELS, FLOW_RATE, FLOW_WIDTH, FlowSession, FlowStreams
+
+# Потолок задержки плеера, мс: как у MA (0–5000), больше — уже не выравнивание, а рассинхрон.
+MAX_DELAY_MS = 5000
 from .providers.music_pick import pick_stream
 from .providers.music_proxy import MusicStreamLinks
 from .providers.player_output import MediaItem, Output, native_output, number, stream_output
@@ -127,7 +130,7 @@ class MusicPlayback:
             if session is not None:
                 # Плеер берёт поток ОДНИМ адресом на сессию: элементы сменяются внутри неё
                 # (`providers/music_flow.py`), новой команды на каждый трек не нужно.
-                return flow_output(self._flow, session, profile, opened)
+                return flow_output(self._flow, session, profile, opened, entity)
             if output := native_output(item.id, profile):
                 return output
             answer = await self._music.call(False, {"action": "stream", "id": item.id})
@@ -234,13 +237,14 @@ class MusicPlayback:
             return
         tile = self._tile_of(leader)
         session = self._flow.session(tile["id"]) if tile is not None else None
-        address = self._flow.address(session) if session is not None else None
-        if address is None:
-            raise OpError("Дом не знает своего адреса для потока", 503)
         for member in members:
             member_tile = self._tile_of(member)
             if member_tile is None:
                 continue
+            # Токен — СВОЙ у участника: по нему дом знает, чью задержку применить к чтению.
+            address = self._flow.address(session, member) if session is not None else None
+            if address is None:
+                raise OpError("Дом не знает своего адреса для потока", 503)
             media_type = flow_content_type(member_tile.get("stream") or {})
             options = _member_accepts(member_tile)
             if options is not None and media_type not in options:
@@ -294,7 +298,7 @@ class MusicPlayback:
             ):
                 raise OpError("Этот плеер сейчас недоступен", 409)
             if session is not None:
-                return flow_output(self._flow, session, profile, opened)
+                return flow_output(self._flow, session, profile, opened, entity)
             # ⚠ Запуск подтверждает ВЛАДЕЛЕЦ, а не плеер: адрес у станции чужой (CDN источника), и
             # о себе такой плеер может не рассказывать вовсе. Команду приняла HA — этого довольно.
             return Output(
@@ -319,7 +323,21 @@ class MusicPlayback:
             # Элемент доигран внутри потока — очередь говорит, что дальше; команды плееру нет.
             session.on_end = queue.flow_end
             session.fade_bytes = fade_bytes(profile)
+            # Задержка плеера — из текущего конфига на каждый кусок: правка в составе слышна сразу.
+            session.delay_of = self._delay
         return queue
+
+    def _delay(self, entity: str) -> int:
+        """Задержка плеера, мс — из ТЕКУЩЕГО состава, а не из снимка на старте потока.
+
+        ⚠ Инсталлятор включает музыку и крутит задержку в свойствах плеера: значение обязано
+        доехать до играющего потока без перезапуска (просьба заказчика 2026-11-22).
+        """
+        tile = self._tile_of(entity)
+        value = ((tile or {}).get("stream") or {}).get("delayMs")
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+            return 0
+        return min(int(value), MAX_DELAY_MS)
 
     async def _flow_source(self, item: MediaItem) -> str | None:
         """Звук элемента для потока сессии: у станции адрес дан бандлом, у трека — из Яндекса."""
@@ -368,6 +386,7 @@ class MusicPlayback:
 
 def flow_output(
     flow: FlowStreams, session: FlowSession, profile: Mapping[str, Any], opened: Callable[[], None],
+    player: str,
 ) -> Output:
     """Выход потока-сессии: адрес один на сессию, содержимое меняет дом (`providers/music_flow.py`).
 
@@ -375,7 +394,7 @@ def flow_output(
     источник. Подтверждение запуска — начало чтения потока (`on_read` → `Attempt.opened`): у
     плеера, который о себе не рассказывает, другого свидетельства не бывает.
     """
-    address = flow.address(session)
+    address = flow.address(session, player)
     if address is None:
         raise OpError("Дом не знает своего адреса для потока", 503)
     session.on_read = opened

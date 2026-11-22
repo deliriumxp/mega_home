@@ -81,6 +81,9 @@ class FlowSession:
         # Окно фейда на стыке элементов, байты PCM (0 — без фейда). Ставит владелец очереди из
         # описания плитки (`fadeMs`): фейд нужен и на смене ТРЕКА, и на смене станции.
         self.fade_bytes = 0
+        # Задержка КОНКРЕТНОГО плеера, мс (`stream.delayMs` состава). Читается на каждый кусок:
+        # инсталлятор крутит её в свойствах плеера, музыка играет — и сдвиг слышен сразу.
+        self.delay_of: Callable[[str], int] | None = None
         # ⚠ Провод у сессии ОДИН и он MP3 — всегда: группе нельзя менять формат на ходу (открытый
         # ответ уже несёт свой), а участник может объявлять свои типы (Яндекс Станция берёт только
         # `stream.mp3`/`stream.aac`). Так же делает MA для плееров из HA («output codec… defaults to
@@ -111,6 +114,7 @@ class FlowSession:
     async def serve(
         self, write: Callable[[bytes], Awaitable[None]], decoder: Decoder,
         encoder: Callable[[Callable[[bytes], Awaitable[None]]], Awaitable["FlowProcess"]] | None = None,
+        player: str = "",
     ) -> None:
         """Подключить ОДНОГО читателя (устройство). Звук сессии общий, `_pump` — один на всех.
 
@@ -128,6 +132,9 @@ class FlowSession:
         queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=READER_QUEUE)
         self._readers.add(queue)
         self.reading = True
+        # Задержка ЭТОГО плеера, уже применённая к его чтению, и остаток звука, который надо выбросить.
+        applied = 0.0
+        drop = 0
         if self._pump is None or self._pump.done():
             self._pump = asyncio.ensure_future(self._run(decoder, encoder))
         if self.on_read is not None:
@@ -135,6 +142,20 @@ class FlowSession:
             on_read()
         try:
             while (chunk := await queue.get()) is not None:
+                # ⚠ Задержка ЖИВАЯ: правка в составе слышна сразу. Больше — читаем позже (очередь
+                # ждёт), меньше — выбрасываем лишнее из уже полученного; перезапуска потока нет.
+                want = float(self.delay_of(player)) if self.delay_of is not None else 0.0
+                if want > applied:
+                    await asyncio.sleep((want - applied) / 1000)
+                    applied = want
+                elif want < applied:
+                    drop += int((applied - want) * FLOW_RATE * FLOW_CHANNELS * FLOW_WIDTH / 1000)
+                    applied = want
+                if drop:
+                    if len(chunk) <= drop:
+                        drop -= len(chunk)
+                        continue
+                    chunk, drop = chunk[drop:], 0
                 await write(chunk)
         except (ConnectionError, OSError):
             return  # плеер ушёл — это норма (пауза, смена источника, выключение)
@@ -413,7 +434,9 @@ class FlowStreams:
     def __init__(self, origin: Callable[[], str | None]) -> None:
         self._origin = origin
         self._by_player: dict[str, FlowSession] = {}
-        self._tokens: dict[str, FlowSession] = {}
+        # Токен адреса → (сессия, плеер); токен один на пару, чтобы правка задержки не меняла адрес.
+        self._tokens: dict[tuple[str, str], str] = {}
+        self._players: dict[str, tuple[FlowSession, str]] = {}
 
     def session(self, player: str) -> FlowSession:
         """Сессия плеера; у одного плеера — одна на весь дом (адрес её не меняется)."""
@@ -421,27 +444,39 @@ class FlowStreams:
         if session is None:
             session = FlowSession(secrets.token_urlsafe(9))
             self._by_player[player] = session
-            self._tokens[session.token] = session
         return session
 
-    def address(self, session: FlowSession) -> str | None:
-        """Абсолютный адрес сессии для плеера; `None` — дом не знает своего адреса."""
-        base = self._origin()
-        # Тот же путь, что у короткого адреса трека (`http_music.py`): токен различает владельца —
-        # сессию потока или ссылку на трек.
-        return f"{base.rstrip('/')}{URL_PREFIX}/stream/{session.token}" if base else None
+    def address(self, session: FlowSession, player: str) -> str | None:
+        """Абсолютный адрес сессии ДЛЯ ЭТОГО плеера; `None` — дом не знает своего адреса.
 
-    def find(self, token: str) -> FlowSession | None:
-        return self._tokens.get(token)
+        ⚠ Токен — на (сессия, плеер), а не один на сессию: по нему маршрут узнаёт, ЧЬЁ это чтение,
+        и применяет его задержку (`FlowSession.serve`, `delay_of`). Группе адрес один по звуку,
+        но у каждого участника свой токен.
+        """
+        base = self._origin()
+        if not base:
+            return None
+        token = self._tokens.setdefault((session.token, player), secrets.token_urlsafe(9))
+        self._players[token] = (session, player)
+        # Тот же путь, что у короткого адреса трека (`http_music.py`).
+        return f"{base.rstrip('/')}{URL_PREFIX}/stream/{token}"
+
+    def find(self, token: str) -> tuple[FlowSession, str] | None:
+        """Сессия и плеер по адресу; `None` — не наш токен."""
+        return self._players.get(token)
 
     def drop(self, player: str) -> None:
         session = self._by_player.pop(player, None)
         if session is not None:
-            self._tokens.pop(session.token, None)
+            for key, token in list(self._tokens.items()):
+                if key[0] == session.token:
+                    self._tokens.pop(key, None)
+                    self._players.pop(token, None)
             session.stop()
 
     def close(self) -> None:
-        for session in list(self._tokens.values()):
+        for session in list(self._by_player.values()):
             session.stop()
         self._by_player.clear()
         self._tokens.clear()
+        self._players.clear()
