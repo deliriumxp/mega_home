@@ -43,6 +43,7 @@ from .coordinator import MegaHomeCoordinator
 from .core.events import StateStream
 from .http_door import _MegaHomeView, _RoutedView, _coordinator
 from .http_music import MegaHomeMusicStreamView
+from .music_measure import MegaHomeMarkerSpecView, MegaHomeMarkerView
 
 # Сколько ждём отклика на ping удержания: уснувший телефон сокет не закрывает,
 # и без этого сессии к устройствам жили бы до своего часа (`stream.py`).
@@ -516,6 +517,8 @@ VIEWS: tuple[type[HomeAssistantView], ...] = (
     MegaHomeEventFileView,
     MegaHomeDevLogView,
     MegaHomeMusicStreamView,
+    MegaHomeMarkerView,
+    MegaHomeMarkerSpecView,
     MegaHomeRelayView,
     MegaHomeServiceWorkerView,
     MegaHomeAppRootView,
