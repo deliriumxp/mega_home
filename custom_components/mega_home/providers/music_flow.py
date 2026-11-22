@@ -23,6 +23,8 @@ import asyncio
 import contextlib
 import secrets
 import struct
+import sys
+from array import array
 from collections.abc import Awaitable, Callable
 
 from ..core.const import LOGGER, URL_PREFIX
@@ -81,6 +83,9 @@ class FlowSession:
         # (`media_queue.py`, `Attempt.opened`) — у плеера, который ничего о себе не сообщает,
         # другого подтверждения нет и быть не может.
         self.on_read: Callable[[], None] | None = None
+        # Окно фейда на стыке элементов, байты PCM (0 — без фейда). Ставит владелец очереди из
+        # описания плитки (`fadeMs`): фейд нужен и на смене ТРЕКА, и на смене станции.
+        self.fade_bytes = 0
         # Элемент сменён (next/previous/замена очереди): текущий ffmpeg гасим, поток продолжается.
         self.switch = asyncio.Event()
         # Устройство читает прямо сейчас: с открытым потоком команда плееру не нужна.
@@ -102,12 +107,18 @@ class FlowSession:
         self.switch.set()
 
     async def play(self, write: Callable[[bytes], Awaitable[None]], decoder: Decoder) -> None:
-        """Отдать поток до конца очереди. `write` без ответа плеера — поток кончился, выходим."""
+        """Отдать поток до конца очереди. `write` без ответа плеера — поток кончился, выходим.
+
+        Стык элементов смешивается на `fade_bytes` (фейд, `_Fader`): хвост прежнего элемента
+        придерживается и микшуется с головкой следующего — и на доигранном треке, и когда элемент
+        сменили на ходу (станция, «дальше»).
+        """
         await write(wav_header())
         self.reading = True
         if self.on_read is not None:
             on_read, self.on_read = self.on_read, None
             on_read()
+        fader = _Fader(self.fade_bytes)
         try:
             while (item := self.current) is not None:
                 if self.source_of is None:
@@ -119,11 +130,17 @@ class FlowSession:
                 self.switch.clear()
                 process = await decoder(source)
                 try:
+                    # Головку нового элемента читаем сразу: с ней микшуется придержанный хвост.
+                    out = fader.join(await _read_head(process, self.fade_bytes))
+                    if out:
+                        await write(out)
                     while True:
                         chunk = await process.read(FLOW_CHUNK)
                         if not chunk:
                             break
-                        await write(chunk)
+                        out = fader.feed(chunk)
+                        if out:
+                            await write(out)
                         # Смену элемента замечаем на ближайшем куске звука: он приходит постоянно.
                         if self.switch.is_set() or self.current is not item:
                             break
@@ -133,7 +150,9 @@ class FlowSession:
                     continue
                 if self.on_end is not None:
                     await self.on_end()
-                if self.current is item:  # очередь кончилась: поток закрывается
+                if self.current is item:  # очередь кончилась: дописываем придержанное и закрываем
+                    if tail := fader.flush():
+                        await write(tail)
                     return
         finally:
             self.reading = False
@@ -145,6 +164,76 @@ async def _stop(process: FlowProcess) -> None:
         await asyncio.wait_for(process.stop(), STOP_TIMEOUT_S)
     except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041 — 3.10 и 3.11 зовут по-разному
         LOGGER.warning("Поток сессии: ffmpeg не остановился за %s с", STOP_TIMEOUT_S)
+
+
+async def _read_head(process: FlowProcess, size: int) -> bytes:
+    """Первые `size` байт элемента: с ними микшуется придержанный хвост прежнего."""
+    if size <= 0:
+        return b""
+    head = b""
+    while len(head) < size:
+        chunk = await process.read(size - len(head))
+        if not chunk:
+            break
+        head += chunk
+    return head
+
+
+class _Fader:
+    """Фейд на стыке элементов: хвост придерживается и микшуется с головкой следующего.
+
+    ⚠ Хвост держим ВСЕГДА (в размере окна фейда): к моменту стыка его иначе уже не вернуть — звук
+    ушёл плееру. Цена — задержка первого звука сессии на окно фейда (сотни миллисекунд).
+
+    Фейд делается и когда элемент сменили на ходу (другая станция, «дальше»): это тот же стык.
+    """
+
+    def __init__(self, fade: int) -> None:
+        self._fade = max(0, fade)
+        self._held = b""
+
+    def feed(self, chunk: bytes) -> bytes:
+        """Отдать всё, кроме хвоста окна: он ждёт стыка."""
+        if not self._fade:
+            return chunk
+        data = self._held + chunk
+        if len(data) <= self._fade:
+            self._held = data
+            return b""
+        self._held = data[-self._fade :]
+        return data[: -self._fade]
+
+    def join(self, head: bytes) -> bytes:
+        """Смешать придержанный хвост с головкой нового элемента: микс и остатки обоих кусков."""
+        held, self._held = self._held, b""
+        if not held:
+            return head
+        border = min(len(held), len(head)) // 2 * 2
+        rest = held[border:] if len(held) > len(head) else head[border:]
+        return mix_pcm(held[:border], head[:border]) + rest
+
+    def flush(self) -> bytes:
+        """Поток кончился: придержанное дописываем как есть."""
+        held, self._held = self._held, b""
+        return held
+
+
+def mix_pcm(tail: bytes, head: bytes) -> bytes:
+    """Кроссфейд кусков PCM s16le: хвост гаснет, головка нарастает (линейно).
+
+    ⚠ `array('h')` читает РОДНОЙ порядок байт: PCM у нас little-endian, и на x86/ARM (где живут
+    дома) это одно и то же. Дом на big-endian — фейда не делаем: отдаём хвост как есть (шум хуже
+    стыка). Длина микса — по короткому куску, байты не теряются.
+    """
+    count = min(len(tail), len(head)) // 2
+    if not count or sys.byteorder != "little":  # pragma: no cover — второе недостижимо на парке
+        return tail[: count * 2]
+    out, incoming = array("h"), array("h")
+    out.frombytes(tail[: count * 2])
+    incoming.frombytes(head[: count * 2])
+    for index in range(count):
+        out[index] = (out[index] * (count - index) + incoming[index] * index) // count
+    return out.tobytes()
 
 
 class FfmpegProcess(FlowProcess):

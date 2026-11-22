@@ -10,7 +10,7 @@ from .core.ops import command_spec
 from .core.ops_base import OpError, arguments, find
 from .providers.media_queue import PlayerQueue
 from .providers.music_catalog import queue_ids
-from .providers.music_flow import FlowSession, FlowStreams
+from .providers.music_flow import FLOW_CHANNELS, FLOW_RATE, FLOW_WIDTH, FlowSession, FlowStreams
 from .providers.music_pick import pick_stream
 from .providers.music_proxy import MusicStreamLinks
 from .providers.player_output import MediaItem, Output, native_output, number, stream_output
@@ -199,6 +199,7 @@ class MusicPlayback:
             session.source_of = self._flow_source
             # Элемент доигран внутри потока — очередь говорит, что дальше; команды плееру нет.
             session.on_end = queue.flow_end
+            session.fade_bytes = fade_bytes(profile)
         return queue
 
     async def _flow_source(self, item: MediaItem) -> str | None:
@@ -267,6 +268,18 @@ def flow_output(
 def flow_content_type(profile: Mapping[str, Any]) -> str:
     """Тип `media_content_type` адреса сессии: дом отдаёт WAV (`providers/music_flow.py`)."""
     return str(profile.get("type") or "music").replace("{mime}", "audio/wav").replace("{ext}", "wav")
+
+
+def fade_bytes(profile: Mapping[str, Any]) -> int:
+    """Окно фейда на стыке элементов, байты PCM: `fadeMs` описания плитки, не больше 3 с.
+
+    ⚠ Фейд делает ДОМ (`providers/music_flow.py`, `_Fader`), и только у потока: у плеера, который
+    берёт ссылку на элемент, смешивать нечего — там стык как был. Нет `fadeMs` — стык как был.
+    """
+    value = profile.get("fadeMs")
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        return 0
+    return min(int(value), 3000) * FLOW_CHANNELS * FLOW_WIDTH * FLOW_RATE // 1000
 
 
 def _station(value: Any) -> MediaItem:

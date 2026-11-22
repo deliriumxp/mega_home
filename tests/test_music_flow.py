@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+from array import array
 from types import SimpleNamespace
 
 from mega_home.core.host import PlainHost
@@ -20,14 +21,26 @@ from mega_home.providers.music_proxy import MusicStreamLinks
 
 
 class FakeProcess:
-    """Декодер элемента: отдаёт заготовленные куски звука и помнит, что его гасили."""
+    """Декодер элемента: труба — отдаёт не больше `piece` байт за чтение и помнит остановку.
 
-    def __init__(self, chunks: list[bytes]) -> None:
-        self.chunks = list(chunks)
+    ⚠ Именно труба, а не «весь кусок разом»: дом читает PCM порциями, и фейд считает окно по ним.
+    """
+
+    def __init__(self, chunks: list[bytes], piece: int = 8) -> None:
+        self.data = b"".join(chunks)
+        self.piece = piece
+        self.at = 0
         self.stopped = False
 
+    @property
+    def left(self) -> int:
+        """Сколько звука декодер ещё не отдал (после смены элемента хвост не доигрывается)."""
+        return len(self.data) - self.at
+
     async def read(self, size: int) -> bytes:
-        return self.chunks.pop(0) if self.chunks else b""
+        chunk = self.data[self.at : self.at + min(size, self.piece)]
+        self.at += len(chunk)
+        return chunk
 
     async def stop(self) -> None:
         self.stopped = True
@@ -35,7 +48,6 @@ class FakeProcess:
 
 class Source:
     """Плеер дома: состояния и вызовы служб, как их видит очередь."""
-
     def __init__(self, entity: str) -> None:
         self.states = {entity: PlainState("idle")}
         self.callbacks = {}
@@ -73,6 +85,18 @@ class Catalog:
         if request["action"] == "stream":
             return {"infos": [{"url": f"https://cdn.example/{request['id']}.mp3", "codec": "mp3", "bitrate": 320}]}
         raise AssertionError(request)
+
+
+def pcm(value: int, count: int) -> bytes:
+    """PCM s16le из одного значения — по нему видно, что фейд делает со стыком."""
+    return array("h", [value] * count).tobytes()
+
+
+def samples(data: bytes) -> list[int]:
+    """Отсчёты PCM s16le — для проверки микса."""
+    out = array("h")
+    out.frombytes(data)
+    return list(out)
 
 
 def flow_tile(flow: bool = True, entity: str = "media_player.echo") -> dict:
@@ -170,9 +194,9 @@ def test_смена_элемента_приходит_в_тот_же_поток(
         # Тот же ответ, другой звук: дом сам погасил прежний декодер и взял следующий элемент.
         assert asked == ["src0", "src1"]
         assert made[0].stopped is True
-        # Хвост прежнего элемента не доигран (его куски остались у декодера) — переключились сразу.
-        assert len(made[0].chunks) == 2
-        assert len(audio) == 6
+        # Хвост прежнего элемента не доигран (он остался у декодера) — переключились сразу.
+        assert made[0].left == 48
+        assert sum(len(chunk) for chunk in audio) == 80
 
     asyncio.run(run())
 
@@ -264,3 +288,46 @@ def test_трек_на_плеере_потока_переключается_бе
 
 async def view(service, player):
     return (await service.call(False, {"action": "playback_state"}))["players"].get(player)
+
+
+def test_поток_фейдит_стык_и_на_смене_станции(tmp_path):
+    """Фейд — на ЛЮБОМ стыке элементов: и трек доигран, и станцию сменили на ходу."""
+
+    async def run():
+        service, home, _catalog, streams = setup(tmp_path)
+        session = streams.session("echo")
+        session.fade_bytes = 8  # 4 отсчёта PCM — короткое окно, чтобы посчитать ожидаемое
+        first = pcm(1000, 8)
+        second = pcm(2000, 8)
+        session.set_items((SimpleNamespace(id="station:a", source="a"),), 0)
+        asked: list[str] = []
+
+        async def source_of(item):
+            return item.source
+
+        async def decoder(url):
+            asked.append(url)
+            return FakeProcess([first if url == "a" else second])
+
+        session.source_of = source_of
+        written: list[bytes] = []
+
+        async def write(chunk):
+            written.append(chunk)
+            await asyncio.sleep(0)
+            # Первую станцию слушают недолго: её сменяют, не доиграв (как станцию в каталоге).
+            if chunk == first[: len(first) - session.fade_bytes]:
+                session.set_items((SimpleNamespace(id="station:b", source="b"),), 0)
+
+        await session.play(write, decoder)
+        await asyncio.sleep(0)
+
+        audio = b"".join(written[1:])
+        # Бананов не теряем: 16 + 16 байт минус окно фейда (8) = 24.
+        assert len(audio) == 24
+        # Первая станция гаснет, вторая нарастает: 1000 → 1000, 1250, 1500, 1750.
+        assert samples(audio[8:16]) == [1000, 1250, 1500, 1750]
+        assert samples(audio[16:]) == [2000] * 4
+        service.close()
+
+    asyncio.run(run())
