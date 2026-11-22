@@ -12,8 +12,11 @@ import asyncio
 from array import array
 from types import SimpleNamespace
 
+import pytest
+
 from mega_home.core import ops
 from mega_home.core.host import PlainHost
+from mega_home.core.ops_base import OpError
 from mega_home.core.source import PlainState
 from mega_home.core.topics import Topics
 from mega_home.music_playback import MusicPlayback
@@ -353,6 +356,93 @@ def test_мультирум_не_трогает_плеер_без_потока_�
                                    "fields": {"media_content_id": "https://cdn.example/r.aac", "media_content_type": "audio/aac"}})
         assert all(call[2].get("entity_id") != "media_player.living" for call in home.source.calls)
         service.close()
+
+    asyncio.run(run())
+
+
+def station_tile(entity: str = "media_player.station") -> dict:
+    """Яндекс Станция: объявляет СВОИ типы потока (`stream.mp3`/`stream.aac`), WAV ей не отдать."""
+    return {
+        "id": "station", "domain": "media_player", "entityId": entity,
+        "stream": {"type": "stream.{ext}", "needsKnownState": True, "nativeTrackType": "track"},
+        "commands": {
+            "play_stream": {
+                "domain": "media_player", "service": "play_media", "label": "Радиостанция",
+                "fields": {
+                    "media_content_id": {"type": "string"},
+                    "media_content_type": {"type": "string", "options": ["stream.aac", "stream.mp3"]},
+                },
+            },
+        },
+    }
+
+
+def test_яндекс_станция_встаёт_в_группу_проводом_mp3(tmp_path):
+    """Станция в группе: участник — любой плеер со `stream`, а провод группы — MP3 (её типы)."""
+
+    async def run():
+        service, home, _catalog, streams = setup(tmp_path)
+        source = home.source
+        home.data["tiles"].append(station_tile())
+        source.states["media_player.station"] = PlainState("idle")
+        station = {"id": "rock", "title": "Рок", "url": "https://cdn.example/rock.aac"}
+        await service.call(False, {"action": "play_station", "player": "echo", "station": station,
+                                   "fields": {"media_content_id": station["url"], "media_content_type": "audio/aac"}})
+        session = streams.session("echo")
+        address = "http://home.local:8123/mega-home/stream/" + session.token
+        assert (await service.group_command(
+            home.data["tiles"][0], "join", {"group_members": ["media_player.station"]}, None,
+        ))["accepted"]
+        # Тип — из списка САМОЙ станции, а не наш WAV: иначе она поток не возьмёт.
+        assert source.calls[-1] == ("media_player", "play_media", {
+            "entity_id": "media_player.station", "media_content_id": address, "media_content_type": "stream.mp3",
+        })
+        assert session.codec == "mp3"
+        # В облачном режиме (`assumed_state`) станция поток не примет — честный отказ, а не тишина.
+        source.states["media_player.station"] = PlainState("playing", {"assumed_state": True})
+        with pytest.raises(OpError):
+            await service.group_command(home.data["tiles"][0], "join", {"group_members": ["media_player.station"]}, None)
+        service.close()
+
+    asyncio.run(run())
+
+
+def test_поток_в_mp3_идёт_через_кодировщик():
+    async def run():
+        session = FlowSession("t")
+        session.codec = "mp3"
+        session.set_items((SimpleNamespace(source="a"),), 0)
+        written: list[bytes] = []
+        fed: list[bytes] = []
+
+        async def write(chunk):
+            written.append(chunk)
+
+        async def source_of(item):
+            return item.source
+
+        async def decoder(url):
+            return FakeProcess([pcm(1000, 8)])
+
+        class Encoder:
+            async def write(self, chunk):
+                fed.append(chunk)
+                await write(b"MP3")
+
+            async def stop(self):
+                await write(b"END")
+
+            async def read(self, size):
+                return b""
+
+        async def encoder(_write):
+            return Encoder()
+
+        session.source_of = source_of
+        await session.play(write, decoder, encoder)
+        # WAV-заголовка нет; PCM ушёл кодировщику, плееру — его выход.
+        assert b"RIFF" not in b"".join(written)
+        assert fed and written[-1] == b"END"
 
     asyncio.run(run())
 

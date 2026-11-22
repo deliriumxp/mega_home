@@ -16,7 +16,7 @@ from homeassistant.core import HomeAssistant
 from .core.const import LOGGER, URL_PREFIX
 from .core.ops_base import OpError
 from .http_door import _MegaHomeView, _coordinator
-from .providers.music_flow import FlowSession, ffmpeg_decoder
+from .providers.music_flow import FlowSession, ffmpeg_decoder, ffmpeg_encoder
 from .providers.music_pick import stream_content_type
 from .providers.music_proxy import MusicStreamLinks
 
@@ -73,7 +73,7 @@ class MegaHomeMusicStreamView(_MegaHomeView):
             await response.write(chunk)
 
         try:
-            await session.play(write, lambda url: ffmpeg_decoder(binary, url))
+            await session.play(write, lambda url: ffmpeg_decoder(binary, url), lambda out: ffmpeg_encoder(binary, out))
         except (ConnectionError, OSError):
             # Плеер закрыл поток (пауза, смена источника, выключение) — это норма, не ошибка.
             response.force_close()

@@ -57,9 +57,12 @@ Decoder = Callable[[str], Awaitable["FlowProcess"]]
 
 
 class FlowProcess:
-    """Процесс декодирования элемента: труба со звуком и остановка."""
+    """Процесс потока: чтение звука (декодер) или запись (кодировщик) и остановка."""
 
     async def read(self, size: int) -> bytes:  # pragma: no cover — интерфейс
+        raise NotImplementedError
+
+    async def write(self, chunk: bytes) -> None:  # pragma: no cover — интерфейс
         raise NotImplementedError
 
     async def stop(self) -> None:  # pragma: no cover — интерфейс
@@ -86,6 +89,10 @@ class FlowSession:
         # Окно фейда на стыке элементов, байты PCM (0 — без фейда). Ставит владелец очереди из
         # описания плитки (`fadeMs`): фейд нужен и на смене ТРЕКА, и на смене станции.
         self.fade_bytes = 0
+        # Формат провода: `wav` (PCM как есть, декодирование без перекодирования) или `mp3`
+        # (когда участник группы объявляет СВОИ типы: Яндекс Станция берёт только `stream.mp3`/
+        # `stream.aac` — WAV ей не отдать). Кодек один на группу: участники читают один поток.
+        self.codec = "wav"
         # Элемент сменён (next/previous/замена очереди): текущий ffmpeg гасим, поток продолжается.
         self.switch = asyncio.Event()
         # Устройство читает прямо сейчас: с открытым потоком команда плееру не нужна.
@@ -106,14 +113,26 @@ class FlowSession:
         self.items, self.index = (), 0
         self.switch.set()
 
-    async def play(self, write: Callable[[bytes], Awaitable[None]], decoder: Decoder) -> None:
+    async def play(
+        self, write: Callable[[bytes], Awaitable[None]], decoder: Decoder,
+        encoder: Callable[[Callable[[bytes], Awaitable[None]]], Awaitable["FlowProcess"]] | None = None,
+    ) -> None:
         """Отдать поток до конца очереди. `write` без ответа плеера — поток кончился, выходим.
 
         Стык элементов смешивается на `fade_bytes` (фейд, `_Fader`): хвост прежнего элемента
         придерживается и микшуется с головкой следующего — и на доигранном треке, и когда элемент
         сменили на ходу (станция, «дальше»).
+
+        `encoder` — только когда провод не PCM (`codec == "mp3"`): звук идёт в него, а плееру
+        отдаётся его выход. Фейд и склейка остаются на PCM — кодировщик один на всю сессию.
         """
-        await write(wav_header())
+        pcm = write
+        sink: FlowProcess | None = None
+        if self.codec == "mp3" and encoder is not None:
+            sink = await encoder(write)
+            pcm = sink.write
+        if self.codec == "wav":
+            await pcm(wav_header())
         self.reading = True
         if self.on_read is not None:
             on_read, self.on_read = self.on_read, None
@@ -133,14 +152,14 @@ class FlowSession:
                     # Головку нового элемента читаем сразу: с ней микшуется придержанный хвост.
                     out = fader.join(await _read_head(process, self.fade_bytes))
                     if out:
-                        await write(out)
+                        await pcm(out)
                     while True:
                         chunk = await process.read(FLOW_CHUNK)
                         if not chunk:
                             break
                         out = fader.feed(chunk)
                         if out:
-                            await write(out)
+                            await pcm(out)
                         # Смену элемента замечаем на ближайшем куске звука: он приходит постоянно.
                         if self.switch.is_set() or self.current is not item:
                             break
@@ -152,10 +171,12 @@ class FlowSession:
                     await self.on_end()
                 if self.current is item:  # очередь кончилась: дописываем придержанное и закрываем
                     if tail := fader.flush():
-                        await write(tail)
+                        await pcm(tail)
                     return
         finally:
             self.reading = False
+            if sink is not None:
+                await sink.stop()
 
 
 async def _stop(process: FlowProcess) -> None:
@@ -237,7 +258,7 @@ def mix_pcm(tail: bytes, head: bytes) -> bytes:
 
 
 class FfmpegProcess(FlowProcess):
-    """Декодер элемента: ffmpeg отдаёт PCM в трубу, дом — плееру."""
+    """Процесс ffmpeg: декодер (PCM в трубе чтения) или кодировщик (PCM в трубе записи)."""
 
     def __init__(self, process: asyncio.subprocess.Process) -> None:
         self._process = process
@@ -247,8 +268,21 @@ class FfmpegProcess(FlowProcess):
             return b""
         return await self._process.stdout.read(size)
 
+    async def write(self, chunk: bytes) -> None:
+        stdin = self._process.stdin
+        if stdin is None:  # pragma: no cover — трубу заказывает сам кодировщик
+            return
+        try:
+            stdin.write(chunk)
+            await stdin.drain()
+        except (ConnectionError, BrokenPipeError):
+            # Плеер ушёл — дописывать некуда; закрытие разберёт `stop`.
+            return
+
     async def stop(self) -> None:
         process = self._process
+        if process.stdin is not None and not process.stdin.is_closing():
+            process.stdin.close()
         if process.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 process.kill()
@@ -272,6 +306,72 @@ async def ffmpeg_decoder(binary: str, url: str) -> FlowProcess:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     ))
+
+
+async def ffmpeg_encoder(binary: str, write: Callable[[bytes], Awaitable[None]]) -> FlowProcess:
+    """PCM 48 кГц моно → MP3 (192 кбит/с): провод для участников, которые объявляют свой формат.
+
+    ⚠ Один на сессию: склейка и фейд идут на PCM, а провод у группы один (Яндекс Станция берёт
+    только `stream.mp3`/`stream.aac`; ESPHome и Sonos читают что дадут — HA им перекодирует сам).
+    """
+    process = await asyncio.create_subprocess_exec(
+        binary,
+        "-f", "s16le", "-ar", str(FLOW_RATE), "-ac", str(FLOW_CHANNELS), "-i", "pipe:",
+        "-f", "mp3", "-codec:a", "libmp3lame", "-b:a", "192k",
+        "-loglevel", "error", "-nostats", "pipe:",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    return Mp3Encoder(process, write)
+
+
+class Mp3Encoder(FlowProcess):
+    """Кодировщик сессии: PCM в трубу записи, MP3 из трубы чтения — насосом плееру."""
+
+    def __init__(
+        self, process: asyncio.subprocess.Process, write: Callable[[bytes], Awaitable[None]]
+    ) -> None:
+        self._process = process
+        self._write = write
+        self._pump = asyncio.ensure_future(self._run())
+
+    async def _run(self) -> None:
+        stdout = self._process.stdout
+        if stdout is None:  # pragma: no cover — трубу заказывает сам кодировщик
+            return
+        try:
+            while chunk := await stdout.read(FLOW_CHUNK):
+                await self._write(chunk)
+        except (ConnectionError, OSError):
+            return  # плеер ушёл — остановку разберёт `stop`
+
+    async def read(self, size: int) -> bytes:  # pragma: no cover — у кодировщика читает насос
+        return b""
+
+    async def write(self, chunk: bytes) -> None:
+        stdin = self._process.stdin
+        if stdin is None or stdin.is_closing():  # pragma: no cover
+            return
+        try:
+            stdin.write(chunk)
+            await stdin.drain()
+        except (ConnectionError, BrokenPipeError):
+            return
+
+    async def stop(self) -> None:
+        process = self._process
+        if process.stdin is not None and not process.stdin.is_closing():
+            process.stdin.close()
+        try:
+            await asyncio.wait_for(self._pump, STOP_TIMEOUT_S)
+        except (TimeoutError, asyncio.TimeoutError):
+            self._pump.cancel()
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+        with contextlib.suppress(ProcessLookupError):
+            await process.wait()
 
 
 class FlowStreams:
