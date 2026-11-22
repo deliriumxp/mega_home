@@ -1,9 +1,13 @@
-"""Маркерный сигнал акустического выравнивания колонок — сам сигнал, без слоя HTTP.
+"""Маркерный сигнал акустического выравнивания колонок — сигнал и раскладка по кругу.
 
-⚠ Числа шаблона — КОНТРАКТ дома и приложения (`frontend/src/app/pages/app-preview/core/sync-probe.ts`):
-щелчки разной высоты нужны, чтобы приложение понимало, какой именно щелчок услышало (без номера щелчка
-фазу сдвигало бы место начала записи), а тишина после них задаёт сверхпериод, в пределах которого фаза
-однозначна. Описание отдаётся `/mega-home/marker.json`, чтобы у приложения не было своей копии чисел.
+Как это работает (протокол заказчика 2026-11-22): колонки щёлкают ПО КРУГУ — по одной с паузой в
+секунду, круг повторяется. Жилец проходит по дому один раз, ничего не переключая: приложение пишет
+микрофоном непрерывно, а каждый щелчок опознаёт по ВЫСОТЕ (своя у каждой колонки — это её место в
+круге) и по ГРОМКОСТИ (громче всех слышно ту колонку, рядом с которой телефон). Разница фаз прихода
+двух колонок и есть разница их задержек: часы дома и микрофонный тракт телефона в фазу не входят.
+
+⚠ Числа раскладки — КОНТРАКТ дома и приложения (`frontend/src/app/pages/app-preview/core/sync-probe.ts`).
+Описание отдаётся `/mega-home/marker.json`, чтобы у приложения не было своей копии чисел.
 """
 
 from __future__ import annotations
@@ -12,66 +16,61 @@ import math
 import struct
 from typing import Any
 
-from .music_flow import FLOW_RATE  # ⚠ тот же провод, что у потока сессии: кодировщик ждёт 48 кГц моно
+from .music_flow import FLOW_RATE
 
-# Высоты щелчков шаблона, Гц.
-PITCHES = (900, 1350, 1800, 2250)
-# Между щелчками шаблона, мс.
-SPACING_MS = 500
-# Тишина после щелчков, мс: вместе со щелчками даёт сверхпериод 6.5 с.
-SILENCE_MS = 5000
+# Пауза между щелчками круга, мс.
+SPACING_MS = 1000
 # Длина щелчка, мс.
 CLICK_MS = 20
-# Сверхпериод шаблона, мс.
-PERIOD_MS = (len(PITCHES) - 1) * SPACING_MS + SILENCE_MS
-# Прохождений в файле: плееру с большим заливом буфера первый шаблон достаётся обрезанным.
-PERIODS = 2
+# Высоты по номеру колонки в круге, Гц: соседние различаются на 200 Гц — этого хватает, чтобы
+# приложение не спутало колонки, а жильцу не резало слух.
+PITCHES = (700, 900, 1100, 1300, 1500, 1700, 1900, 2100)
+# Сколько колонок в круге максимум: больше в одном мультируме дома не бывает.
+SLOTS_MAX = len(PITCHES)
 # Амплитуда: тише половины шкалы — перегрузка срезала бы щелчок и смазала приход.
 AMPLITUDE = 0.6
 
-_PCM: bytes | None = None
+_CYCLES: dict[tuple[int, int], bytes] = {}
 
 
-def marker_description() -> dict[str, Any]:
-    """Описание шаблона для приложения: одно место правды о числах маркера."""
+def marker_description(slots: int = 1) -> dict[str, Any]:
+    """Описание раскладки для приложения: одно место правды о числах маркера."""
     return {
-        "pitches": list(PITCHES),
         "spacingMs": SPACING_MS,
-        "silenceMs": SILENCE_MS,
         "clickMs": CLICK_MS,
-        "periodMs": PERIOD_MS,
-        "periods": PERIODS,
+        "rotateMs": max(1, slots) * SPACING_MS,
+        "slots": max(1, slots),
+        "pitches": list(PITCHES[: max(1, slots)]),
     }
 
 
-def marker_pcm(periods: int = PERIODS) -> bytes:
-    """PCM 48 кГц моно (s16le) — ровно тот сигнал, который услышит телефон."""
-    global _PCM
-    if periods != PERIODS:
-        return _build_pcm(periods)
-    if _PCM is None:
-        _PCM = _build_pcm(PERIODS)
-    return _PCM
+def cycle_pcm(slot: int, slots: int) -> bytes:
+    """PCM 48 кГц моно одного КРУГА для этой колонки: тишина и её щелчок в её слоте.
+
+    ⚠ Не бесконечная запись: поток крутит этот круг снова и снова (`music_measure.py`), поэтому
+    кэшируется ровно один круг на колонку — сотни килобайт вместо мегабайтов файла.
+    """
+    key = (slot, slots)
+    cached = _CYCLES.get(key)
+    if cached is None:
+        cached = _build_cycle(slot, slots)
+        _CYCLES[key] = cached
+    return cached
 
 
-def _build_pcm(periods: int) -> bytes:
+def _build_cycle(slot: int, slots: int) -> bytes:
     rate = FLOW_RATE
     length = int(CLICK_MS / 1000 * rate)
-    clicks = [
-        [
-            math.sin(2 * math.pi * pitch * index / rate)
-            * (0.5 - 0.5 * math.cos(2 * math.pi * index / (length - 1)))
-            for index in range(length)
-        ]
-        for pitch in PITCHES
+    pitch = PITCHES[slot]
+    click = [
+        math.sin(2 * math.pi * pitch * index / rate) * (0.5 - 0.5 * math.cos(2 * math.pi * index / (length - 1)))
+        for index in range(length)
     ]
-    total = int(periods * PERIOD_MS / 1000 * rate)
+    total = int(slots * SPACING_MS / 1000 * rate)
     samples = [0.0] * total
-    for period in range(periods):
-        for order, click in enumerate(clicks):
-            at = int(period * PERIOD_MS / 1000 * rate) + int(order * SPACING_MS / 1000 * rate)
-            for index, value in enumerate(click):
-                if at + index < total:
-                    samples[at + index] += value
+    at = int(slot * SPACING_MS / 1000 * rate)
+    for index, value in enumerate(click):
+        if at + index < total:
+            samples[at + index] = value
     scale = 32767 * AMPLITUDE
     return struct.pack(f"<{total}h", *(int(max(-1.0, min(1.0, value)) * scale) for value in samples))
