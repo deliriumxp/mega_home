@@ -221,8 +221,8 @@ class MusicPlayback:
         которое новый `media_url` поверх живого потока не берёт, повторная команда была бы
         бесполезна, а на смену элемента внутри потока она и не нужна — адрес тот же.
 
-        Формат провода — ОДИН на группу: если участник объявил свои типы и WAV среди них нет
-        (Яндекс Станция — только `stream.mp3`/`stream.aac`), группа отдаёт MP3.
+        Формат провода — MP3 всегда (`providers/music_flow.py`): участник объявляет свои типы, и
+        `stream.mp3` в его списке обязан быть — иначе честный отказ, а не тишина.
         """
         members = self.groups.get(leader) or []
         if not members:
@@ -232,26 +232,14 @@ class MusicPlayback:
         address = self._flow.address(session) if session is not None else None
         if address is None:
             raise OpError("Дом не знает своего адреса для потока", 503)
-        codec = "wav"
         for member in members:
             member_tile = self._tile_of(member)
             if member_tile is None:
                 continue
+            media_type = flow_content_type(member_tile.get("stream") or {})
             options = _member_accepts(member_tile)
-            wav, mp3 = _member_types(member_tile)
-            if options is not None and wav not in options:
-                if mp3 not in options:
-                    raise OpError("Плеер не примет поток дома в этом формате", 409)
-                codec = "mp3"
-        if session is not None:
-            session.codec = codec
-        for member in members:
-            member_tile = self._tile_of(member)
-            if member_tile is None:
-                continue
-            options = _member_accepts(member_tile)
-            wav, mp3 = _member_types(member_tile)
-            media_type = mp3 if (options is not None and wav not in options) else wav
+            if options is not None and media_type not in options:
+                raise OpError("Плеер не примет поток дома в этом формате", 409)
             fields = _stream_fields(
                 member_tile, member,
                 {"media_content_id": address, "media_content_type": media_type},
@@ -387,33 +375,25 @@ def flow_output(
         raise OpError("Дом не знает своего адреса для потока", 503)
     session.on_read = opened
     return Output(
-        address, flow_content_type(profile, session.codec),
+        address, flow_content_type(profile),
         opaque=profile.get("opaqueTrackId") is True, flow=True,
     )
 
 
-def flow_content_type(profile: Mapping[str, Any], codec: str = "wav") -> str:
-    """Тип `media_content_type` адреса сессии: WAV (по умолчанию) или MP3 (`stream.mp3` у станции)."""
-    mime, ext = ("audio/mpeg", "mp3") if codec == "mp3" else ("audio/wav", "wav")
-    return str(profile.get("type") or "music").replace("{mime}", mime).replace("{ext}", ext)
+def flow_content_type(profile: Mapping[str, Any]) -> str:
+    """Тип `media_content_type` адреса сессии. ⚠ Поток дома — MP3 (см. `providers/music_flow.py`)."""
+    return str(profile.get("type") or "music").replace("{mime}", "audio/mpeg").replace("{ext}", "mp3")
 
 
 def _member_accepts(tile: dict) -> list[str] | None:
     """Какие типы потока участник объявил (`options` его команды `play_stream`); `None` — не объявлял.
 
-    ⚠ Свои типы объявляет Яндекс Станция (`stream.{ext}` → `stream.aac`/`stream.mp3`): WAV ей не
-    отдать, и группе придётся отдавать MP3 (`FlowSession.codec`). ESPHome, Sonos, HEOS типов не
-    объявляют — им можно что угодно (HA перекодирует сам).
+    ⚠ Свои типы объявляет Яндекс Станция (`stream.{ext}` → `stream.aac`/`stream.mp3`); наш поток —
+    MP3, и в её списке он есть. ESPHome, Sonos, HEOS типов не объявляют — им можно что угодно.
     """
     spec = command_spec(tile, "play_stream") or {}
     options = ((spec.get("fields") or {}).get("media_content_type") or {}).get("options")
     return options if isinstance(options, list) else None
-
-
-def _member_types(tile: dict) -> tuple[str, str]:
-    """Типы провода для участника: (WAV, MP3) по его описанию плитки."""
-    profile = tile.get("stream") or {}
-    return flow_content_type(profile), flow_content_type(profile, "mp3")
 
 
 def fade_bytes(profile: Mapping[str, Any]) -> int:

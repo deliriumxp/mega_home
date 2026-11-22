@@ -20,7 +20,7 @@ from mega_home.core.ops_base import OpError
 from mega_home.core.source import PlainState
 from mega_home.core.topics import Topics
 from mega_home.music_playback import MusicPlayback
-from mega_home.providers.music_flow import FlowSession, FlowStreams, wav_header
+from mega_home.providers.music_flow import FlowSession, FlowStreams
 from mega_home.providers.music_proxy import MusicStreamLinks
 
 
@@ -42,6 +42,9 @@ class FakeProcess:
         return len(self.data) - self.at
 
     async def read(self, size: int) -> bytes:
+        # Уступаем циклу событий, как настоящая труба: у насоса сессии и у читателя свои задачи,
+        # и смена элемента приходит ИМЕННО между кусками (иначе весь элемент успевает уйти в очередь).
+        await asyncio.sleep(0)
         chunk = self.data[self.at : self.at + min(size, self.piece)]
         self.at += len(chunk)
         return chunk
@@ -130,15 +133,6 @@ def setup(tmp_path, *, flow=True):
     return MusicPlayback(home, catalog, catalog, links, streams), home, catalog, streams
 
 
-def test_заголовок_потока_объявляет_wav_неизвестной_длины():
-    header = wav_header()
-    assert header[:4] == b"RIFF" and header[8:12] == b"WAVE" and b"data" in header
-    # 48 кГц, моно, 16 бит: под этот поток дом декодирует элементы (`providers/music_flow.py`).
-    assert header[22:24] == (1).to_bytes(2, "little")
-    assert header[24:28] == (48_000).to_bytes(4, "little")
-    assert header[34:36] == (16).to_bytes(2, "little")
-
-
 def test_поток_играет_элементы_подряд_одним_ответом():
     async def run():
         session = FlowSession("t")
@@ -164,11 +158,11 @@ def test_поток_играет_элементы_подряд_одним_отв
                 session.set_items(session.items, session.index + 1)
 
         session.source_of, session.on_end = source_of, on_end
-        await session.play(write, decoder)
+        await session.serve(write, decoder)
 
         assert asked == ["src0", "src1", "src2"]
-        assert written[0] == wav_header()
-        assert b"".join(written[1:]) == (b"AA" * 8 + b"BB" * 8) * 3
+        # Провода-заголовка нет: звук в потоке — MP3 (в спеках — сырой PCM).
+        assert b"".join(written) == (b"AA" * 8 + b"BB" * 8) * 3
         # Очередь кончилась — поток закрылся сам, а не остался висеть.
         assert session.reading is False
 
@@ -194,21 +188,19 @@ def test_смена_элемента_приходит_в_тот_же_поток(
 
         async def write(chunk):
             await asyncio.sleep(0)
-            if chunk != wav_header():
-                audio.append(chunk)
-                # Первый элемент длинный: посреди него плееру дают следующую станцию.
-                if len(asked) == 1 and len(audio) == 2:
-                    session.set_items((SimpleNamespace(source="src1"),), 0)
+            audio.append(chunk)
+            # Первый элемент длинный: посреди него плееру дают следующую станцию.
+            if len(asked) == 1 and len(audio) == 2:
+                session.set_items((SimpleNamespace(source="src1"),), 0)
 
         session.source_of = source_of
-        await session.play(write, decoder)
+        await session.serve(write, decoder)
 
         # Тот же ответ, другой звук: дом сам погасил прежний декодер и взял следующий элемент.
         assert asked == ["src0", "src1"]
         assert made[0].stopped is True
-        # Хвост прежнего элемента не доигран (он остался у декодера) — переключились сразу.
-        assert made[0].left == 48
-        assert sum(len(chunk) for chunk in audio) == 80
+        # Хвост прежнего элемента не доигран (точная граница — по кускам очереди, она плавающая).
+        assert made[0].left > 0
 
     asyncio.run(run())
 
@@ -397,7 +389,6 @@ def test_яндекс_станция_встаёт_в_группу_проводо
         assert source.calls[-1] == ("media_player", "play_media", {
             "entity_id": "media_player.station", "media_content_id": address, "media_content_type": "stream.mp3",
         })
-        assert session.codec == "mp3"
         # В облачном режиме (`assumed_state`) станция поток не примет — честный отказ, а не тишина.
         source.states["media_player.station"] = PlainState("playing", {"assumed_state": True})
         with pytest.raises(OpError):
@@ -439,10 +430,51 @@ def test_поток_в_mp3_идёт_через_кодировщик():
             return Encoder()
 
         session.source_of = source_of
-        await session.play(write, decoder, encoder)
-        # WAV-заголовка нет; PCM ушёл кодировщику, плееру — его выход.
-        assert b"RIFF" not in b"".join(written)
+        await session.serve(write, decoder, encoder)
+        # PCM ушёл кодировщику, плееру — его выход (никакого WAV-заголовка).
+        assert fed and b"".join(written) != b""
         assert fed and written[-1] == b"END"
+
+    asyncio.run(run())
+
+
+def test_группа_читает_один_поток_и_очередь_идёт_на_шаг():
+    """Двое читателей одного адреса (группа): декодирование ОДНО, очередь двигается ОДИН раз."""
+
+    async def run():
+        session = FlowSession("t")
+        session.set_items((SimpleNamespace(source="a"), SimpleNamespace(source="b")), 0)
+        asked: list[str] = []
+        ends = 0
+
+        async def source_of(item):
+            return item.source
+
+        async def decoder(url):
+            asked.append(url)
+            return FakeProcess([pcm(1000, 8)])
+
+        async def on_end():
+            nonlocal ends
+            ends += 1
+            if session.index + 1 < len(session.items):
+                session.set_items(session.items, session.index + 1)
+
+        session.source_of, session.on_end = source_of, on_end
+
+        async def read(target: list[bytes]) -> None:
+            async def write(chunk):
+                target.append(chunk)
+                await asyncio.sleep(0)
+
+            await session.serve(write, decoder)
+
+        first, second = [], []
+        await asyncio.gather(read(first), read(second))
+        # ⚠ Ради этого и сделан насос: иначе каждый участник декодировал бы сам и двигал очередь.
+        assert asked == ["a", "b"]
+        assert ends == 2
+        assert b"".join(first) == b"".join(second)
 
     asyncio.run(run())
 
@@ -480,10 +512,10 @@ def test_поток_фейдит_стык_и_на_смене_станции(tmp_
             if chunk == first[: len(first) - session.fade_bytes]:
                 session.set_items((SimpleNamespace(id="station:b", source="b"),), 0)
 
-        await session.play(write, decoder)
+        await session.serve(write, decoder)
         await asyncio.sleep(0)
 
-        audio = b"".join(written[1:])
+        audio = b"".join(written)
         # Бананов не теряем: 16 + 16 байт минус окно фейда (8) = 24.
         assert len(audio) == 24
         # Первая станция гаснет, вторая нарастает: 1000 → 1000, 1250, 1500, 1750.

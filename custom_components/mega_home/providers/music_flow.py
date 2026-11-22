@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import secrets
-import struct
 import sys
 from array import array
 from collections.abc import Awaitable, Callable
@@ -34,22 +33,10 @@ FLOW_RATE = 48_000
 FLOW_CHANNELS = 1
 FLOW_WIDTH = 2
 FLOW_CHUNK = 64 * 1024
+# Очередь ОДНОГО читателя сессии (группа: у каждого участника своя). 64 куска ≈ 43 с звука:
+# живой прибор тянет поток в темпе воспроизведения и её не переполнит, а мёртвый не вешает группу.
+READER_QUEUE = 64
 STOP_TIMEOUT_S = 5
-
-# Потолок размера — «неизвестно»: поток идёт, пока играет очередь. Так же отдают поток живые
-# источники, и ffmpeg/плееры это принимают (иначе размер пришлось бы знать заранее).
-UNKNOWN_SIZE = 0xFFFFFFFF
-
-
-def wav_header() -> bytes:
-    """Заголовок WAV на весь поток: RIFF + fmt PCM + data неизвестной длины."""
-    block = FLOW_CHANNELS * FLOW_WIDTH
-    fmt = struct.pack("<HHIIHH", 1, FLOW_CHANNELS, FLOW_RATE, FLOW_RATE * block, block, FLOW_WIDTH * 8)
-    return (
-        b"RIFF" + struct.pack("<I", UNKNOWN_SIZE) + b"WAVE"
-        + b"fmt " + struct.pack("<I", len(fmt)) + fmt
-        + b"data" + struct.pack("<I", UNKNOWN_SIZE)
-    )
 
 
 # Чем дом декодирует элемент: свой процесс на элемент, звук — PCM в трубу. Тесты подменяют это.
@@ -70,10 +57,15 @@ class FlowProcess:
 
 
 class FlowSession:
-    """Сессия одного плеера: элементы, позиция в них и признак «устройство читает поток».
+    """Сессия одного плеера: элементы, позиция в них и читатели одного потока.
 
     ⚠ Игроки сессии — очередь дома: она задаёт `items`/`index` (`set_items`) и просит следующего
     (`on_end`). Сессия не решает, что играть, — только отдаёт это одним потоком.
+
+    ⚠⚠ ЧИТАТЕЛЕЙ МОЖЕТ БЫТЬ НЕСКОЛЬКО (группа мультирума: им даётся ТОТ ЖЕ адрес), а звук
+    декодируется ОДИН раз: `_pump` раскидывает куски по очередям читателей. Иначе каждый участник
+    тянул бы свою декодировку того же элемента, и `on_end` срабатывал бы столько раз, сколько
+    читателей, — очередь уезжала бы вперёд в N раз, а процессор дома горел бы в N раз сильнее.
     """
 
     def __init__(self, token: str) -> None:
@@ -89,14 +81,17 @@ class FlowSession:
         # Окно фейда на стыке элементов, байты PCM (0 — без фейда). Ставит владелец очереди из
         # описания плитки (`fadeMs`): фейд нужен и на смене ТРЕКА, и на смене станции.
         self.fade_bytes = 0
-        # Формат провода: `wav` (PCM как есть, декодирование без перекодирования) или `mp3`
-        # (когда участник группы объявляет СВОИ типы: Яндекс Станция берёт только `stream.mp3`/
-        # `stream.aac` — WAV ей не отдать). Кодек один на группу: участники читают один поток.
-        self.codec = "wav"
+        # ⚠ Провод у сессии ОДИН и он MP3 — всегда: группе нельзя менять формат на ходу (открытый
+        # ответ уже несёт свой), а участник может объявлять свои типы (Яндекс Станция берёт только
+        # `stream.mp3`/`stream.aac`). Так же делает MA для плееров из HA («output codec… defaults to
+        # MP3 here rather than FLAC»). ESPHome и Sonos получают mp3 без проблем (HA перекодирует).
+        # Цена: кодирование на доме — один процесс на играющую сессию.
         # Элемент сменён (next/previous/замена очереди): текущий ffmpeg гасим, поток продолжается.
         self.switch = asyncio.Event()
         # Устройство читает прямо сейчас: с открытым потоком команда плееру не нужна.
         self.reading = False
+        self._readers: set[asyncio.Queue[bytes | None]] = set()
+        self._pump: asyncio.Task[None] | None = None
 
     @property
     def current(self) -> MediaItem | None:
@@ -113,34 +108,60 @@ class FlowSession:
         self.items, self.index = (), 0
         self.switch.set()
 
-    async def play(
+    async def serve(
         self, write: Callable[[bytes], Awaitable[None]], decoder: Decoder,
         encoder: Callable[[Callable[[bytes], Awaitable[None]]], Awaitable["FlowProcess"]] | None = None,
     ) -> None:
-        """Отдать поток до конца очереди. `write` без ответа плеера — поток кончился, выходим.
+        """Подключить ОДНОГО читателя (устройство). Звук сессии общий, `_pump` — один на всех.
 
         Стык элементов смешивается на `fade_bytes` (фейд, `_Fader`): хвост прежнего элемента
         придерживается и микшуется с головкой следующего — и на доигранном треке, и когда элемент
         сменили на ходу (станция, «дальше»).
 
-        `encoder` — только когда провод не PCM (`codec == "mp3"`): звук идёт в него, а плееру
-        отдаётся его выход. Фейд и склейка остаются на PCM — кодировщик один на всю сессию.
+        `encoder` — провод сессии (MP3): звук идёт в него, а читателям отдаётся его выход. Фейд и
+        склейка остаются на PCM — кодировщик один на всю сессию. Без него (спеки) отдаётся PCM.
+
+        ⚠ Очередь читателя не ждёт: медленный (или ушедший) участник теряет свои куски, но НЕ
+        останавливает группу. Живой прибор тянет поток в темпе воспроизведения — очередь в
+        десятки секунд звука его не переполнит, а мёртвый (закрытый ответ) не должен вешать всех.
         """
-        pcm = write
-        sink: FlowProcess | None = None
-        if self.codec == "mp3" and encoder is not None:
-            sink = await encoder(write)
-            pcm = sink.write
-        if self.codec == "wav":
-            await pcm(wav_header())
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=READER_QUEUE)
+        self._readers.add(queue)
         self.reading = True
+        if self._pump is None or self._pump.done():
+            self._pump = asyncio.ensure_future(self._run(decoder, encoder))
         if self.on_read is not None:
             on_read, self.on_read = self.on_read, None
             on_read()
+        try:
+            while (chunk := await queue.get()) is not None:
+                await write(chunk)
+        except (ConnectionError, OSError):
+            return  # плеер ушёл — это норма (пауза, смена источника, выключение)
+        finally:
+            self._readers.discard(queue)
+            self.reading = bool(self._readers)
+
+    async def _run(self, decoder: Decoder, encoder: Callable[..., Awaitable["FlowProcess"]] | None) -> None:
+        """Один декодер (и один кодировщик) на сессию: куски уходят ВСЕМ читателям."""
+
+        async def broadcast(chunk: bytes) -> None:
+            for queue in list(self._readers):
+                try:
+                    queue.put_nowait(chunk)
+                except asyncio.QueueFull:
+                    # Медленный или ушедший читатель: его куски теряются, группа играет дальше.
+                    continue
+
+        pcm = broadcast
+        sink: FlowProcess | None = None
+        if encoder is not None:
+            sink = await encoder(broadcast)
+            pcm = sink.write
         fader = _Fader(self.fade_bytes)
         try:
             while (item := self.current) is not None:
-                if self.source_of is None:
+                if self.source_of is None or not self._readers:
                     return
                 source = await self.source_of(item)
                 if source is None:
@@ -163,6 +184,8 @@ class FlowSession:
                         # Смену элемента замечаем на ближайшем куске звука: он приходит постоянно.
                         if self.switch.is_set() or self.current is not item:
                             break
+                        if not self._readers:  # все ушли — декодировать некуда
+                            return
                 finally:
                     await _stop(process)
                 if self.switch.is_set() or self.current is not item:
@@ -173,10 +196,16 @@ class FlowSession:
                     if tail := fader.flush():
                         await pcm(tail)
                     return
+        except Exception:  # noqa: BLE001 — упавший поток не должен вешать читателей молча
+            LOGGER.exception("Поток сессии %s упал", self.token)
         finally:
-            self.reading = False
             if sink is not None:
                 await sink.stop()
+            for queue in list(self._readers):
+                try:
+                    queue.put_nowait(None)  # поток кончился: читателям пора закрывать ответ
+                except asyncio.QueueFull:
+                    continue
 
 
 async def _stop(process: FlowProcess) -> None:

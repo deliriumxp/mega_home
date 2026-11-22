@@ -20,8 +20,8 @@ from .providers.music_flow import FlowSession, ffmpeg_decoder, ffmpeg_encoder
 from .providers.music_pick import stream_content_type
 from .providers.music_proxy import MusicStreamLinks
 
-# Поток сессии неизвестной длины: объявлять нечего, кэшировать нельзя (адрес — пропуск).
-FLOW_HEADERS = {"Content-Type": "audio/wav", "Cache-Control": "no-store"}
+# Поток сессии: MP3 неизвестной длины — объявлять нечего, кэшировать нельзя (адрес — пропуск).
+FLOW_HEADERS = {"Content-Type": "audio/mpeg", "Cache-Control": "no-store"}
 
 # Поток трека: подключение к CDN и молчание в середине. Общего срока нет —
 # трек идёт минутами, а `Range` заставляет плеер ходить несколько раз.
@@ -73,7 +73,7 @@ class MegaHomeMusicStreamView(_MegaHomeView):
             await response.write(chunk)
 
         try:
-            await session.play(write, lambda url: ffmpeg_decoder(binary, url), lambda out: ffmpeg_encoder(binary, out))
+            await session.serve(write, lambda url: ffmpeg_decoder(binary, url), lambda out: ffmpeg_encoder(binary, out))
         except (ConnectionError, OSError):
             # Плеер закрыл поток (пауза, смена источника, выключение) — это норма, не ошибка.
             response.force_close()
