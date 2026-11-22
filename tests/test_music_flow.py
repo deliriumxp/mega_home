@@ -336,18 +336,33 @@ def test_мультирум_даёт_участнику_тот_же_адрес_�
     asyncio.run(run())
 
 
-def test_мультирум_не_трогает_плеер_без_потока_дома(tmp_path):
+def test_мультирум_ведущим_может_быть_плеер_без_потока_дома(tmp_path):
+    """Источник звука — дом: вести группу может ЛЮБОЙ плеер со `stream` (заказчик 2026-11-22).
+
+    ⚠ Раньше ведущим был только «потоковый» плеер, и такой `join` уходил в HA (`None`). Теперь дом
+    переводит ведущего на свой поток и повторяет его же запрос — иначе участникам нечего слушать.
+    """
+
     async def run():
         service, home, _catalog, streams = setup(tmp_path, flow=False)
         tile = home.data["tiles"][0]
-        # Не наша команда: у плеера нет потока дома, и `media_player.join` решает как раньше.
-        assert await service.group_command(tile, "join", {"group_members": ["media_player.living"]}, None) is None
-        # Группа пробуждается на старте музыки — но только у потока.
-        service.groups["media_player.echo"] = ["media_player.living"]
-        await service.call(False, {"action": "play_station", "player": "echo",
-                                   "station": {"id": "rock", "title": "Рок", "url": "https://cdn.example/r.aac"},
-                                   "fields": {"media_content_id": "https://cdn.example/r.aac", "media_content_type": "audio/aac"}})
-        assert all(call[2].get("entity_id") != "media_player.living" for call in home.source.calls)
+        home.data["tiles"].append(station_tile())
+        answer = await service.group_command(tile, "join", {"group_members": ["media_player.station"]}, None)
+        assert answer and answer["accepted"] and answer["group"][0] == "media_player.echo"
+        # Ведущий и участник получили адрес ОДНОГО потока дома.
+        addresses = [str(call[2].get("media_content_id", "")) for call in home.source.calls]
+        assert any("/mega-home/stream/" in address for address in addresses)
+        # Участник без потока дома в группу не годится — отказ, а не тишина.
+        with pytest.raises(OpError):
+            await service.group_command(tile, "join", {"group_members": ["media_player.living"]}, None)
+
+    asyncio.run(run())
+
+
+def test_мультирум_гасит_плеер_участника_без_потока_дома(tmp_path):
+    async def run():
+        service, home, _catalog, streams = setup(tmp_path, flow=False)
+        tile = home.data["tiles"][0]
         # Снятие отметки принимается с ЛЮБОГО участника (у станции нет потока дома): её музыка
         # гаснет, а не уходит в HA пустым `unjoin` (живой баг 2026-11-22).
         home.data["tiles"].append(station_tile())

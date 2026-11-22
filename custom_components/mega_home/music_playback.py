@@ -37,6 +37,10 @@ class MusicPlayback:
         # Сессии потока: у `flow`-плеера адрес один на всю сессию (`providers/music_flow.py`).
         # Без адреса дома (`origin` = None) сессию не отдать — плееру ответит честный отказ.
         self._flow = flow if flow is not None else FlowStreams(lambda: None)
+        # Плееры, которых перевели на поток дома, и их последний запрос воспроизведения: ведущим группы
+        # может стать любой плеер (`group_command`), а участникам нужен поток дома, а не его нативная дорожка.
+        self._forced: set[str] = set()
+        self._requests: dict[str, dict] = {}
         # Наши группы мультирума: сущность ведущего → сущности участников (ведущего в списке нет).
         # ⚠ Группа — НЕ группировка HA: `media_player.join` группирует только внутри одной интеграции
         # (`entity-media-player.md`), а Sonos с HEOS и прошитый Echo HA не сгруппирует никогда.
@@ -66,11 +70,12 @@ class MusicPlayback:
         action = request.get("action")
         if action == "playback_state":
             return {"players": self._views()}
-        if action == "play_queue":
-            await self._play(request)
-            return {"accepted": True}
-        if action == "play_station":
-            await self._play_station(request)
+        if action in ("play_queue", "play_station"):
+            entity = self._entity(find(self._tiles(), request.get("player")))
+            if entity:
+                # Помним, чем плеер играет: ведущему группы повторим ЕГО же запрос, уже через дом.
+                self._requests[entity] = dict(request)
+            await (self._play(request) if action == "play_queue" else self._play_station(request))
             return {"accepted": True}
         if action == "queue_control":
             command = request.get("command")
@@ -110,7 +115,14 @@ class MusicPlayback:
             queue = self._queue_for(tile, entity)
             self._players[entity] = queue
             self._profiles[entity] = profile
-        session = self._flow.session(tile["id"]) if profile.get("flow") is True else None
+        # ⚠ Сессию потока заводим ЛЮБОМУ плееру со `stream`, а не только «потоковому»: источник звука —
+        # дом (заказчик 2026-11-22), поэтому вести группу может любой плеер («выбрал любой плеер, включил
+        # музыку, добавил другие»), а участникам нужно, чтобы ведущий уже играл поток дома.
+        session = (
+            self._flow.session(tile["id"])
+            if profile and (profile.get("flow") is True or entity in self._forced)
+            else None
+        )
 
         async def load() -> tuple[tuple[MediaItem, ...], int]:
             answer = await self._music.call(False, {"action": "track_details", "ids": ids})
@@ -148,7 +160,7 @@ class MusicPlayback:
         await queue.replace(load, prepare, more if cursor else None)
         # Группа: участникам нужен адрес сессии, пока поток ещё НЕ читают (иначе команда лишняя —
         # элемент сменяется внутри того же потока).
-        if self.groups.get(entity) and profile.get("flow") is True and not self._flow.session(tile["id"]).reading:
+        if self.groups.get(entity) and not self._flow.session(tile["id"]).reading:
             await self._wake_group(entity)
 
     def state_groups(self) -> dict[str, list[str]]:
@@ -180,8 +192,15 @@ class MusicPlayback:
             # ведущего: `unjoin` для плитки без потока дома ушёл бы в HA и не погасил бы ничего —
             # музыка на снятом плеере продолжала играть (живой баг 2026-11-22).
             return await self._leave_group(entity)
-        if profile.get("flow") is not True:
-            return None  # ведущим группы может быть только плеер с потоком дома
+        if profile.get("flow") is not True and not self._flow.session(tile["id"]).reading:
+            # ⚠ Ведущим может быть ЛЮБОЙ плеер со `stream`: источник звука — дом (заказчик 2026-11-22).
+            # Плеер, который играл сам (нативная дорожка станции, своя ссылка), переводим на поток дома и
+            # повторяем ЕГО ЖЕ запрос — иначе участникам группы нечего слушать. Текущий трек начнётся
+            # заново: другого способа отдать группе один поток у плеера без потока нет.
+            self._forced.add(entity)
+            request = self._requests.get(entity)
+            if request is not None:
+                await self.call(True, request)
         members = [str(member) for member in (data.get("group_members") or []) if str(member) != entity]
         for member in dict.fromkeys(members):
             member_tile = self._tile_of(member)
@@ -284,7 +303,14 @@ class MusicPlayback:
             queue = self._queue_for(tile, entity)
             self._players[entity] = queue
             self._profiles[entity] = profile
-        session = self._flow.session(tile["id"]) if profile.get("flow") is True else None
+        # ⚠ Сессию потока заводим ЛЮБОМУ плееру со `stream`, а не только «потоковому»: источник звука —
+        # дом (заказчик 2026-11-22), поэтому вести группу может любой плеер («выбрал любой плеер, включил
+        # музыку, добавил другие»), а участникам нужно, чтобы ведущий уже играл поток дома.
+        session = (
+            self._flow.session(tile["id"])
+            if profile and (profile.get("flow") is True or entity in self._forced)
+            else None
+        )
 
         async def load() -> tuple[tuple[MediaItem, ...], int]:
             if not any(self._entity(current) == entity and current["stream"] == profile for current in self._tiles()):
@@ -307,13 +333,20 @@ class MusicPlayback:
             )
 
         await queue.replace(load, prepare, None)
-        if self.groups.get(entity) and profile.get("flow") is True and not self._flow.session(tile["id"]).reading:
+        if self.groups.get(entity) and not self._flow.session(tile["id"]).reading:
             await self._wake_group(entity)
 
     def _queue_for(self, tile: dict, entity: str) -> PlayerQueue:
         """Очередь плеера; у `flow`-плеера — с его сессией потока (`providers/music_flow.py`)."""
         profile = tile["stream"]
-        session = self._flow.session(tile["id"]) if profile.get("flow") is True else None
+        # ⚠ Сессию потока заводим ЛЮБОМУ плееру со `stream`, а не только «потоковому»: источник звука —
+        # дом (заказчик 2026-11-22), поэтому вести группу может любой плеер («выбрал любой плеер, включил
+        # музыку, добавил другие»), а участникам нужно, чтобы ведущий уже играл поток дома.
+        session = (
+            self._flow.session(tile["id"])
+            if profile and (profile.get("flow") is True or entity in self._forced)
+            else None
+        )
         queue = PlayerQueue(
             entity, self._home.source, self._home.env, self._changed, self._links.unwatch,
             flow=session,

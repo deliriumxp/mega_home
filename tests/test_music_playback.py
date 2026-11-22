@@ -12,6 +12,7 @@ from mega_home.core.host import PlainHost
 from mega_home.core.ops_base import OpError
 from mega_home.core.source import PlainState
 from mega_home.core.topics import Topics
+from mega_home.providers.music_flow import FlowStreams
 from mega_home.music_playback import MusicPlayback, TOPIC
 from mega_home.providers.music_catalog import _cover_uri
 from mega_home.providers.music_proxy import MusicStreamLinks
@@ -76,7 +77,9 @@ def setup(tmp_path):
     ]
     home = SimpleNamespace(data={"tiles": tiles}, source=source, env=PlainHost(tmp_path), topics=Topics())
     links = MusicStreamLinks("http://home.local:8123")
-    return MusicPlayback(home, catalog, catalog, links), home, catalog, links
+    # ⚠ Адрес дома для потока обязателен: сессию получает ЛЮБОЙ плеер со `stream` (источник — дом).
+    flow = FlowStreams(lambda: "http://home.local:8123")
+    return MusicPlayback(home, catalog, catalog, links, flow), home, catalog, links
 
 
 async def play(service, player, index=0):
