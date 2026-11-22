@@ -170,10 +170,15 @@ class MusicPlayback:
         """
         profile = tile.get("stream")
         entity = self._entity(tile)
-        if not isinstance(profile, dict) or profile.get("flow") is not True or not entity:
+        if not isinstance(profile, dict) or not entity:
             return None
         if name == "unjoin":
+            # ⚠ Снять отметку приложение может С ЛЮБОГО участника (Sonos, станция), а не только с
+            # ведущего: `unjoin` для плитки без потока дома ушёл бы в HA и не погасил бы ничего —
+            # музыка на снятом плеере продолжала играть (живой баг 2026-11-22).
             return await self._leave_group(entity)
+        if profile.get("flow") is not True:
+            return None  # ведущим группы может быть только плеер с потоком дома
         members = [str(member) for member in (data.get("group_members") or []) if str(member) != entity]
         for member in dict.fromkeys(members):
             member_tile = self._tile_of(member)

@@ -347,6 +347,17 @@ def test_мультирум_не_трогает_плеер_без_потока_�
                                    "station": {"id": "rock", "title": "Рок", "url": "https://cdn.example/r.aac"},
                                    "fields": {"media_content_id": "https://cdn.example/r.aac", "media_content_type": "audio/aac"}})
         assert all(call[2].get("entity_id") != "media_player.living" for call in home.source.calls)
+        # Снятие отметки принимается с ЛЮБОГО участника (у станции нет потока дома): её музыка
+        # гаснет, а не уходит в HA пустым `unjoin` (живой баг 2026-11-22).
+        home.data["tiles"].append(station_tile())
+        source = home.source
+        source.states["media_player.station"] = PlainState("playing")
+        service.groups["media_player.echo"] = ["media_player.station"]
+        assert (await ops.command(
+            SimpleNamespace(data=home.data, source=source, music_playback=service),
+            {"id": "station", "command": "unjoin", "value": {}},
+        ))["accepted"]
+        assert source.calls[-1] == ("media_player", "media_stop", {"entity_id": "media_player.station"})
         service.close()
 
     asyncio.run(run())
@@ -365,6 +376,7 @@ def station_tile(entity: str = "media_player.station") -> dict:
                     "media_content_type": {"type": "string", "options": ["stream.aac", "stream.mp3"]},
                 },
             },
+            "unjoin": {"domain": "media_player", "service": "unjoin", "label": "Выход из группы"},
         },
     }
 
