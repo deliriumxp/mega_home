@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from time import monotonic
-from typing import Any
+from typing import Any, Protocol
 
 from ..core.const import LOGGER
 from ..core.host import Host
@@ -49,16 +49,32 @@ class Queue:
         return self.items[self.index]
 
 
+class FlowPort(Protocol):
+    """Сессия потока плеера глазами очереди (`providers/music_flow.py`).
+
+    ⚠ Очередь владеет элементами, сессия — только звуком: адрес один на сессию, а что в нём
+    играет, говорит очередь (`set_items`). Так «что играет» остаётся в одном месте.
+    """
+
+    reading: bool
+
+    def set_items(self, items: tuple[MediaItem, ...], index: int) -> None: ...
+
+    def stop(self) -> None: ...
+
+
 class PlayerQueue:
     def __init__(
         self, entity: str, source: StateSource, host: Host, changed: Callable[[], None],
         unwatch_stream: Callable[[str], None],
+        flow: FlowPort | None = None,
     ) -> None:
         self.entity = entity
         self._source = source
         self._host = host
         self._changed = changed
         self._unwatch_stream = unwatch_stream
+        self._flow = flow
         self._lock = asyncio.Lock()
         self._queue: Queue | None = None
         self._unsubscribe: Callable[[], None] | None = None
@@ -93,8 +109,12 @@ class PlayerQueue:
                 raise OpError("Музыкальная очередь отключена", 503)
             if revision != self._replace_revision:
                 return
-            self.clear()
+            self._drop()
             self._queue = Queue(items, index, prepare, more)
+            # ⚠ Элементы ставим ПОСЛЕ снятия прежней очереди и ДО запуска: у потока-сессии тот же
+            # адрес, и смена очереди обязана пройти внутри уже открытого потока, а не оборвать его.
+            if self._flow is not None:
+                self._flow.set_items(tuple(items), index)
             self._unsubscribe = self._source.subscribe([self.entity], self._observe)
             await self._launch(self._queue)
 
@@ -132,10 +152,27 @@ class PlayerQueue:
             return False
         self._discard_attempt(queue)
         queue.index = index
+        if self._flow is not None:
+            self._flow.set_items(tuple(queue.items), index)
         await self._launch(queue)
         return True
 
+    async def flow_end(self) -> bool:
+        """Элемент доигран ВНУТРИ потока сессии: дальше по очереди, без команды плееру."""
+        async with self._lock:
+            queue = self._queue
+            if queue is None:
+                return False
+            return await self._move(queue, 1)
+
     def clear(self, error: str | None = None) -> None:
+        """Снять очередь. Владелец очереди остановлен — поток сессии закрывается тоже."""
+        self._drop(error)
+        if self._flow is not None:
+            self._flow.stop()
+
+    def _drop(self, error: str | None = None) -> None:
+        """Снять очередь, НЕ трогая поток сессии: замена очереди меняет звук внутри него."""
         queue, self._queue = self._queue, None
         changed = queue is not None or error != self._error
         self._error = error
@@ -176,12 +213,28 @@ class PlayerQueue:
                 self._discard_attempt(queue)
                 return
             attempt.before = Sample.read(self._source.get(self.entity))
+            # ⚠ Поток сессии уже читается устройством: адрес тот же, команды плееру не нужно —
+            # элемент сменён внутри открытого потока (`providers/music_flow.py`). Это и есть
+            # переключение без «Стоп» у плеера, который новый `media_url` поверх потока не берёт.
+            if attempt.output.flow and self._flow is not None and self._flow.reading:
+                attempt.accepted = True
+                attempt.started = attempt.last = attempt.before
+                attempt.anchor = monotonic()
+                self._changed()
+                return
             await call(self._source, "media_player", "play_media", {
                 "entity_id": self.entity, **attempt.output.data(queue.item),
             })
             if self._queue is not queue:
                 return
             attempt.accepted = True
+            if attempt.output.owner:
+                # Содержимое наше, свидетельства от плеера не будет: команду приняла HA — этого
+                # довольно, и ждать подтверждения нечем (`Output.owner`).
+                attempt.started = attempt.last = Sample.read(self._source.get(self.entity))
+                attempt.anchor = monotonic()
+                self._changed()
+                return
             attempt.timeout = asyncio.get_running_loop().call_later(START_TIMEOUT, self._timed_out, attempt)
             self._observe(self.entity, self._source.get(self.entity))
         except (Exception, asyncio.CancelledError):

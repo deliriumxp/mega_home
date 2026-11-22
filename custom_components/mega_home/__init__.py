@@ -186,6 +186,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     await coordinator.shared.async_load()
 
     from .music_playback import MusicPlayback
+    from .providers.music_flow import FlowStreams
     from .providers.music_proxy import MusicStreamLinks
     from .providers.yandex_music import MusicService
     from .station_auth import StationAuth
@@ -198,8 +199,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     coordinator.music = music
     coordinator.music_links = links
     station = StationAuth(hass, music)
+    # Поток сессии для `flow`-плееров (`providers/music_flow.py`): адрес — тот же короткий на дом,
+    # за ним живой поток, а элементы сменяет очередь.
+    flow = FlowStreams(lambda: stream_origin(hass, coordinator.data))
 
-    playback = MusicPlayback(coordinator, music, station, links)
+    playback = MusicPlayback(coordinator, music, station, links, flow)
     coordinator.music_playback = playback
     coordinator.resident_services = {"yandex-music": playback.call}
     entry.async_on_unload(coordinator.async_add_listener(playback.config_changed))

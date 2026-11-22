@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import shutil
 from collections.abc import Callable
 from http import HTTPStatus
 from typing import Any
@@ -15,8 +16,12 @@ from homeassistant.core import HomeAssistant
 from .core.const import LOGGER, URL_PREFIX
 from .core.ops_base import OpError
 from .http_door import _MegaHomeView, _coordinator
+from .providers.music_flow import FlowSession, ffmpeg_decoder
 from .providers.music_pick import stream_content_type
 from .providers.music_proxy import MusicStreamLinks
+
+# Поток сессии неизвестной длины: объявлять нечего, кэшировать нельзя (адрес — пропуск).
+FLOW_HEADERS = {"Content-Type": "audio/wav", "Cache-Control": "no-store"}
 
 # Поток трека: подключение к CDN и молчание в середине. Общего срока нет —
 # трек идёт минутами, а `Range` заставляет плеер ходить несколько раз.
@@ -44,8 +49,49 @@ class MegaHomeMusicStreamView(_MegaHomeView):
         """Заголовки без тела: часть плееров сначала спрашивает размер и тип."""
         return await self._stream(request, token, body=False)
 
+    async def _stream_flow(
+        self, request: web.Request, session: FlowSession, coordinator: Any, *, body: bool,
+    ) -> web.StreamResponse:
+        """Поток сессии плеера: один адрес на всю сессию, элементы сменяет дом.
+
+        ⚠ Плеер забирает такой адрес ОДИН раз и держит соединение: смена элемента приходит внутрь
+        этого же ответа (`FlowSession.switch`). Так играет и плеер, который новый `media_url` поверх
+        живого потока не берёт (прошитый Amazon Echo, живой случай 2026-11-22).
+        """
+        if not body:
+            # HEAD: у потока неизвестной длины объявлять нечего, тело не открываем.
+            return web.Response(status=HTTPStatus.OK, headers=FLOW_HEADERS)
+        binary = await _ffmpeg(coordinator)
+        if not binary:
+            return self.json_message(
+                "В этом доме нет ffmpeg — поток отдать нечем", HTTPStatus.SERVICE_UNAVAILABLE
+            )
+        response = web.StreamResponse(status=HTTPStatus.OK, headers=FLOW_HEADERS)
+        await response.prepare(request)
+
+        async def write(chunk: bytes) -> None:
+            await response.write(chunk)
+
+        try:
+            await session.play(write, lambda url: ffmpeg_decoder(binary, url))
+        except (ConnectionError, OSError):
+            # Плеер закрыл поток (пауза, смена источника, выключение) — это норма, не ошибка.
+            response.force_close()
+            return response
+        try:
+            await response.write_eof()
+        except (ConnectionError, OSError):
+            response.force_close()
+        return response
+
     async def _stream(self, request: web.Request, token: str, *, body: bool) -> web.StreamResponse:
         coordinator = _coordinator(request.app["hass"])
+        # Сессия потока узнаётся ПЕРВОЙ: у неё тот же адрес, но за ним не трек, а живой поток
+        # (`providers/music_flow.py`) — элементов в нём столько, сколько скажет очередь дома.
+        playback = getattr(coordinator, "music_playback", None)
+        session = playback.flow.find(token) if playback is not None else None
+        if session is not None:
+            return await self._stream_flow(request, session, coordinator, body=body)
         links = getattr(coordinator, "music_links", None)
         track = links.track(token) if links is not None else None
         if track is None:
@@ -130,6 +176,14 @@ async def _resolve_track(
     if chosen is None:
         return None
     return chosen["url"], stream_content_type(chosen.get("codec"))
+
+
+async def _ffmpeg(coordinator: Any) -> str | None:
+    """Бинарь ffmpeg дома: им же живут go2rtc и запись камер — в образе Home Assistant он есть."""
+    env = getattr(coordinator, "env", None)
+    if env is None:
+        return None
+    return await env.run(shutil.which, "ffmpeg")
 
 
 def _client_session(hass: HomeAssistant) -> object:

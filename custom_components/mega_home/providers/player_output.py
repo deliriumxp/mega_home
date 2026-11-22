@@ -27,6 +27,9 @@ class MediaItem:
     album: str = ""
     image: str = ""
     duration: float = 0
+    # ⚠ Станция каталога: адрес её потока приходит данными от бандла (трека Яндекса у неё нет).
+    # У трека пусто — адрес даёт Яндекс (`music_playback.py`, действие `stream`).
+    source: str = ""
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,13 @@ class Output:
     proxy: str = ""
     native: bool = False
     opaque: bool = False
+    # Адрес СЕССИИ (`providers/music_flow.py`): содержимое меняется внутри уже открытого потока,
+    # новой команды плееру на каждый элемент не нужно. Так плеер, который не берёт новый
+    # `media_url` поверх живого потока (прошитый Echo), всё равно переключается.
+    flow: bool = False
+    # ⚠ Содержимое НАШЕ (станция каталога: адрес у плеера чужой, наш — только команда): запуск
+    # подтверждает владелец, а не плеер. Свидетельства от устройства тут не будет ни у кого.
+    owner: bool = False
 
     def matches(self, sample: Sample) -> bool:
         if self.native:
@@ -84,7 +94,10 @@ class Output:
 
     def data(self, item: MediaItem) -> dict:
         data = {"media_content_id": self.content, "media_content_type": self.content_type}
-        if not self.native:
+        # ⚠ Метаданные несут только ссылки на элемент (прокси дома): у станции за адресом чужой
+        # CDN, у потока — WAV дома, и подпись элемента там неоткуда взять. Плееру с метаданными
+        # уезжало бы имя станции альбомом чужому плееру (Sonos собирает из них трек).
+        if not self.native and not self.flow and not self.owner:
             data["extra"] = {"metadata": {
                 "metadataType": 3,
                 "title": item.title,
