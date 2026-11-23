@@ -391,12 +391,16 @@ def test_мультирум_гасит_плеер_участника_без_по
     asyncio.run(run())
 
 
-def vendor_tile(entity: str, uid: str) -> dict:
-    """Sonos/HEOS/WiiM: у системы СВОЙ мультирум — группирует штатный `media_player.join` HA."""
+def vendor_tile(entity: str, uid: str, sync: str) -> dict:
+    """Колонка системы со СВОИМ мультирумом: одна система — группирует штатный `join` HA."""
     return {
         "id": uid, "domain": "media_player", "entityId": entity,
-        "stream": {"type": "music", "vendorGroup": True},
+        "stream": {"type": "music", "sync": sync},
         "commands": {
+            "play_stream": {
+                "domain": "media_player", "service": "play_media", "label": "Радиостанция",
+                "fields": {"media_content_id": {"type": "string"}, "media_content_type": {"type": "string"}},
+            },
             "join": {"domain": "media_player", "service": "join",
                      "fields": {"group_members": {"type": "list", "of": {"type": "string"}}}},
             "unjoin": {"domain": "media_player", "service": "unjoin"},
@@ -404,8 +408,8 @@ def vendor_tile(entity: str, uid: str) -> dict:
     }
 
 
-def test_вендорский_мультирум_уходит_в_ha_а_не_в_наш_поток(tmp_path):
-    """Sonos+Sonos и HEOS+HEOS группирует ВЕНДОР через HA (заказчик 2026-11-23).
+def test_одна_система_группируется_вендором_через_ha(tmp_path):
+    """Sonos+Sonos и HEOS+HEOS сводит ВЕНДОР, а не мы (заказчик, с самого начала).
 
     ⚠ Живой отказ: дом перехватывал `join` у любой плитки со `stream`, и до HA команда не доходила —
     «сонос+сонос не работает». `None` здесь означает «команда не наша»: `core/ops.py` позовёт
@@ -414,18 +418,100 @@ def test_вендорский_мультирум_уходит_в_ha_а_не_в_�
 
     async def run():
         service, home, _catalog, streams = setup(tmp_path)
-        sonos = vendor_tile("media_player.living", "sonos")
-        home.data["tiles"].append(sonos)
+        sonos = vendor_tile("media_player.living", "sonos", "sync:sonos")
+        sonos_2 = vendor_tile("media_player.hall", "sonos2", "sync:sonos")
+        home.data["tiles"] += [sonos, sonos_2]
         home.source.states["media_player.living"] = PlainState("playing")
+        # Все участники — ОДНА система: команда не наша, её исполняет HA.
         answer = await service.group_command(
-            sonos, "join", {"group_members": ["media_player.other"]}, None,
+            sonos, "join", {"group_members": ["media_player.hall"]}, None,
         )
         assert answer is None
-        # Наша группа не завелась, музыку не переводили на поток дома, команд плееру не было.
         assert service.groups == {}
         assert home.source.calls == []
-        # И снятие отметки тоже уходит в HA — иначе оно не погасило бы вендорскую группу.
-        assert await service.group_command(sonos, "unjoin", {}, None) is None
+
+    asyncio.run(run())
+
+
+def test_разные_системы_группирует_наш_поток(tmp_path):
+    """Sonos+HEOS — ЗАКОННАЯ группа, и собираем её мы (заказчик, с самого начала).
+
+    ⚠ «Колонки одного вендора группируются средствами вендора, колонки разных вендоров — нашим
+    мини-MA с выравниванием задержек». HA вне одной интеграции не группирует вовсе
+    (`entity-media-player.md`), поэтому смешанный `join` в HA отклонился бы — жилец видел бы
+    «Home Assistant отклонил команду». Группу ведёт дом: участнику уходит адрес потока ведущего.
+    """
+
+    async def run():
+        service, home, _catalog, streams = setup(tmp_path)
+        sonos = vendor_tile("media_player.living", "sonos", "sync:sonos")
+        heos = vendor_tile("media_player.hall", "heos", "sync:heos")
+        home.data["tiles"] += [sonos, heos]
+        home.source.states["media_player.living"] = PlainState("idle")
+        home.source.states["media_player.hall"] = PlainState("idle")
+        fields = {"media_content_id": "https://cdn.example/rock.aac", "media_content_type": "audio/aac"}
+        # Ведущий — ПЕРВЫЙ, кого отметил жилец: музыку включили на нём.
+        await service.call(False, {"action": "play_station", "player": "sonos",
+                                   "station": {"id": "rock", "title": "Рок", "url": fields["media_content_id"]},
+                                   "fields": fields})
+        answer = await service.group_command(
+            sonos, "join", {"group_members": ["media_player.hall"]}, None,
+        )
+        assert answer and answer["accepted"]
+        assert service.groups == {"media_player.living": ["media_player.hall"]}
+        # Ведущий HEOS получил ТОТ ЖЕ поток дома — синхронность между системами держим мы.
+        assert home.source.calls[-1] == (
+            "media_player", "play_media",
+            {
+                "entity_id": "media_player.hall",
+                "media_content_id": streams.address(streams.session("sonos"), "media_player.hall"),
+                "media_content_type": "music",
+            },
+        )
+
+    asyncio.run(run())
+
+
+def test_колонки_второй_системы_сводит_вендор_вокруг_её_ведущего(tmp_path):
+    """Заказчик 2026-11-23: «ведущий одной системы — с ведущим другой; остальные колонки системы
+    раздать, если пользователь их отметил».
+
+    ⚠ Наш поток получает ТОЛЬКО первый отмеченный колонки системы: остальные её колонки вендор
+    сводит вокруг него сам, штатным `join` HA. Иначе мы забирали бы у вендора его работу, и его
+    внутренняя синхронность ломалась бы.
+    """
+
+    async def run():
+        service, home, _catalog, streams = setup(tmp_path)
+        sonos = vendor_tile("media_player.sonos_head", "s1", "sync:sonos")
+        sonos_2 = vendor_tile("media_player.sonos_2", "s2", "sync:sonos")
+        heos = vendor_tile("media_player.heos", "h1", "sync:heos")
+        home.data["tiles"] += [sonos, sonos_2, heos]
+        for entity in ("media_player.sonos_head", "media_player.sonos_2", "media_player.heos"):
+            home.source.states[entity] = PlainState("idle")
+        fields = {"media_content_id": "https://cdn.example/rock.aac", "media_content_type": "audio/aac"}
+        await service.call(False, {"action": "play_station", "player": "s1",
+                                   "station": {"id": "rock", "title": "Рок", "url": fields["media_content_id"]},
+                                   "fields": fields})
+        await service.group_command(
+            sonos, "join",
+            {"group_members": ["media_player.sonos_2", "media_player.heos"]}, None,
+        )
+        # Наш поток — ведущему HEOS (вторая система)…
+        assert ("media_player", "play_media", {
+            "entity_id": "media_player.heos",
+            "media_content_id": streams.address(streams.session("s1"), "media_player.heos"),
+            "media_content_type": "music",
+        }) in home.source.calls
+        # …а вторая колонка Sonos присоединена ВЕНДОРОМ к ведущему своей системы, а не потоком дома.
+        assert ("media_player", "join", {
+            "entity_id": "media_player.sonos_head", "group_members": ["media_player.sonos_2"],
+        }) in home.source.calls
+        stream_to_sonos_2 = [
+            call for call in home.source.calls
+            if call[1] == "play_media" and call[2].get("entity_id") == "media_player.sonos_2"
+        ]
+        assert stream_to_sonos_2 == []
 
     asyncio.run(run())
 
@@ -446,6 +532,35 @@ def test_яндекс_станция_своей_группой_идёт_наши
         )
         assert answer and answer["accepted"]
         assert service.groups == {"media_player.echo": ["media_player.station"]}
+
+    asyncio.run(run())
+
+
+def test_вторая_отметка_добавляется_к_группе_а_не_стирает_первую(tmp_path):
+    """`join` ДОБАВЛЯЕТ к группе, как служба HA (живой симптом 2026-11-23).
+
+    ⚠ Раньше состав перезаписывался целиком: жилец ставил вторую галку — и первая колонка
+    выпадала из группы молча. Симптом был ровно «отметка колонок ничего не включает».
+    """
+
+    async def run():
+        service, home, _catalog, streams = setup(tmp_path)
+        sonos = vendor_tile("media_player.sonos", "sonos", "sync:sonos")
+        heos = vendor_tile("media_player.heos", "heos", "sync:heos")
+        station = station_tile("media_player.station")
+        home.data["tiles"] += [sonos, heos, station]
+        for entity in ("media_player.sonos", "media_player.heos", "media_player.station"):
+            home.source.states[entity] = PlainState("idle")
+        fields = {"media_content_id": "https://cdn.example/rock.aac", "media_content_type": "audio/aac"}
+        await service.call(False, {"action": "play_station", "player": "sonos",
+                                   "station": {"id": "rock", "title": "Рок", "url": fields["media_content_id"]},
+                                   "fields": fields})
+        await service.group_command(sonos, "join", {"group_members": ["media_player.heos"]}, None)
+        await service.group_command(sonos, "join", {"group_members": ["media_player.station"]}, None)
+        assert service.groups == {"media_player.sonos": ["media_player.heos", "media_player.station"]}
+        # Повторная отметка того же участника ничего не задваивает и не перезапускает его.
+        await service.group_command(sonos, "join", {"group_members": ["media_player.heos"]}, None)
+        assert service.groups == {"media_player.sonos": ["media_player.heos", "media_player.station"]}
 
     asyncio.run(run())
 

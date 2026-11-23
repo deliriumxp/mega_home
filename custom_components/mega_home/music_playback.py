@@ -206,25 +206,33 @@ class MusicPlayback:
         entity = self._entity(tile)
         if not isinstance(profile, dict) or not entity:
             return None
-        ours = self._is_ours(profile)
         if name == "unjoin":
-            # Снять отметку можно с ЛЮБОГО участника НАШЕЙ группы (не только с ведущего) — иначе
-            # `unjoin` ушёл бы в HA и не погасил музыку на снятой колонке (живой баг 2026-11-22).
-            # Вендорскую группу снимает HA: у Sonos/HEOS/WiiM штатный `unjoin` обязан дойти до неё.
+            # Нашу группу снимаем сами, вендорскую — отдаём HA.
             if not self._in_our_group(entity):
                 return None
             return await self._leave_group(entity)
-        # ⚠⚠ ГЛАВНЫЙ случай: у системы СВОЙ мультирум (Sonos, HEOS, WiiM, LinkPlay) — `join` ведёт
-        # штатная служба HA, и мы в него не вмешиваемся вовсе. Живой разбор 2026-11-23: дом
-        # перехватывал `join` у Sonos и HEOS, до HA команда не доходила, и «сонос+сонос» не
-        # группировался. У Яндекс Станции своего мультирума нет — там работает только наша группа.
-        if not ours:
+        members = [str(member) for member in (data.get("group_members") or []) if str(member) != entity]
+        # ⚠⚠ ГЛАВНОЕ РЕШЕНИЕ, и оно про СОСТАВ, а не про марку ведущего. Заказчик (с самого начала,
+        # повторено 2026-11-23): «колонки одного вендора группируются средствами вендора, колонки
+        # разных вендоров — нашим мини-MA с выравниванием задержек».
+        #
+        # Одна система → штатный `media_player.join` HA, вендор сводит свои колонки сам. Разные
+        # системы → группу ведёт дом: HA вне одной интеграции не группирует вовсе
+        # (`entity-media-player.md`), и смешанный `join` он отклонил бы — жилец видел бы «Home
+        # Assistant отклонил команду». У станции своего мультирума нет — она всегда наша.
+        if self._same_system(entity, members):
             return None
         if profile.get("flow") is not True and not self._flow.session(tile["id"]).reading:
             # ⚠ Ведущим нашей группы может быть ЛЮБОЙ плеер со `stream`: источник звука — дом
             # (заказчик 2026-11-22). Плеер, игравший сам (нативная дорожка станции, своя ссылка),
             # переводим на поток дома и повторяем ЕГО ЖЕ запрос — иначе участникам нечего слушать.
+            #
+            # ⚠⚠ Очередь СНИМАЕМ: она могла быть заведена до этого решения и тогда ведёт плеер БЕЗ
+            # сессии потока (`_queue_for` смотрит на `_forced` на момент создания). Повторный запуск
+            # с прежней очередью сессию не завёл бы, и участникам достался бы пустой поток — ровно
+            # то, отчего «отметка колонок ничего не включает».
             self._forced.add(entity)
+            self._drop_queue(entity, tile)
             request = self._requests.get(entity)
             if request is not None:
                 await self.call(True, request)
@@ -241,19 +249,50 @@ class MusicPlayback:
                 raise OpError("Плеер в облачном режиме поток дома не примет", 409)
         if any(entity in group for group in self.groups.values()):
             await self._leave_group(entity)  # был участником чужой группы — сперва выходим
-        self.groups[entity] = list(dict.fromkeys(members))
+        # ⚠⚠ `join` ДОБАВЛЯЕТ к группе, как одноимённая служба HA, а не заменяет состав: жилец
+        # отмечает колонки по одной, и каждая следующая отметка иначе стирала бы предыдущую
+        # (живой симптом 2026-11-23: «отметка колонок ничего не включает» при второй галке).
+        known = self.groups.get(entity, [])
+        fresh = [member for member in dict.fromkeys(members) if member not in known]
+        self.groups[entity] = [*known, *fresh]
         self._changed()
-        await self._wake_group(entity)
+        # Будим ТОЛЬКО новых участников: у уже играющих адрес тот же, и лишняя команда оборвала бы
+        # им поток на середине.
+        await self._wake_group(entity, only=fresh)
         return {"accepted": True, "group": [entity, *self.groups[entity]]}
 
-    def _is_ours(self, profile: Mapping[str, Any]) -> bool:
-        """Группа НАША: у системы НЕТ своего мультирума.
+    def _same_system(self, leader: str, members: list[str]) -> bool:
+        """Все участники — ОДНА система вендора? Тогда `join` исполняет штатная служба HA.
 
-        ⚠ Мультирум есть у Sonos, HEOS, WiiM и LinkPlay (`stream.vendorGroup` описания плитки) — там
-        группирует ШТАТНЫЙ `media_player.join` HA, и наша группа не заводится никогда. У Яндекс
-        Станции своего мультирума нет (заказчик 2026-11-23) — там работает только наша реализация.
+        ⚠ Правило заказчика (с самого начала, повторено 2026-11-23): «колонки одного вендора
+        группируются средствами вендора, колонки разных вендоров — нашим мини-MA с выравниванием
+        задержек». Решает СОСТАВ, а не марка ведущего: Sonos+Sonos и HEOS+HEOS сводит вендор,
+        Sonos+HEOS — только мы.
+
+        ⚠ Плеер без системы (`sync` в описании потока нет — Яндекс Станция, прошитый Echo) своей
+        системой не считается НИКОГДА: у станции своего мультирума нет («Яндекс не умеет в
+        мультирум, поэтому там только наша реализация»), а Echo — наш поток. Поэтому группа с ним
+        всегда наша, даже если он один: пустая система ≠ система.
         """
-        return profile.get("vendorGroup") is not True
+        systems = {self._system_of(entity) for entity in (leader, *members)}
+        return len(systems) == 1 and None not in systems
+
+    def _drop_queue(self, entity: str, tile: dict) -> None:
+        """Снять очередь и сессию плеера: следующий запуск заведёт их по НОВЫМ правилам.
+
+        ⚠ Нужно именно при переводе на поток дома: `_queue_for` решает про сессию по `_forced` на
+        момент создания, и очередь, заведённая раньше, осталась бы без неё навсегда.
+        """
+        if (queue := self._players.pop(entity, None)) is not None:
+            queue.close()
+        self._profiles.pop(entity, None)
+        self._flow.drop(tile["id"])
+
+    def _system_of(self, entity: str) -> str | None:
+        """Ключ системы вендора по описанию плитки; `None` — своего мультирума у плеера нет."""
+        tile = self._tile_of(entity)
+        system = ((tile or {}).get("stream") or {}).get("sync")
+        return system if isinstance(system, str) and system else None
 
     def _in_our_group(self, entity: str) -> bool:
         return entity in self.groups or any(entity in members for members in self.groups.values())
@@ -291,8 +330,11 @@ class MusicPlayback:
             service = "media_stop" if features & _STOP_FEATURE else "media_pause"
             await call(self._home.source, "media_player", service, {"entity_id": entity})
 
-    async def _wake_group(self, leader: str) -> None:
+    async def _wake_group(self, leader: str, only: list[str] | None = None) -> None:
         """Участникам — ТОТ ЖЕ адрес сессии ведущего: их плеер забирает поток сам, без очереди.
+
+        `only` — разбудить ТОЛЬКО этих участников (новых в группе): у уже играющих адрес тот же, и
+        повторная команда оборвала бы им звук.
 
         ⚠ Пустой поток не отдаём НИКОГДА. Если у ведущего очередь не заведена (музыку включили не из
         приложения — с пульта, голосом, у вендора), адрес его сессии существует, но за ним нет ни
@@ -308,6 +350,8 @@ class MusicPlayback:
         `stream.mp3` в его списке обязан быть — иначе честный отказ, а не тишина.
         """
         members = self.groups.get(leader) or []
+        if only is not None:
+            members = [member for member in members if member in only]
         if not members:
             return
         tile = self._tile_of(leader)
@@ -319,6 +363,35 @@ class MusicPlayback:
             raise OpError(
                 "Сначала включите музыку на этой колонке — тогда к ней добавятся остальные", 409
             )
+        # ⚠⚠ РАЗНЫЕ СИСТЕМЫ СВОДИМ ЧЕРЕЗ ИХ ВЕДУЩИХ (заказчик 2026-11-23): «ведущий плеер одной
+        # системы через мини-MA сгруппировать с ведущим другой системы (ведущим — первый выбранный),
+        # и раздать на остальные колонки системы, если пользователь их отметил».
+        #
+        # Значит наш поток получает ТОЛЬКО первый отмеченный колонки каждой системы, а остальные её
+        # колонки вендор сводит вокруг него сам (штатный `join` HA). Иначе мы забирали бы у вендора
+        # его собственную работу и его синхронность — то, из-за чего Sonos+Sonos перестал звучать.
+        #
+        # Плеер без системы (Яндекс Станция, прошитый Echo) — система из одной колонки: свой мультирум
+        # вендор ему не дал, поэтому наш поток получает каждая такая колонка (`_system_of` → None).
+        delegates: list[str] = []
+        rest: dict[str, list[str]] = {}
+        heads: dict[str, str] = {}
+        for member in dict.fromkeys([leader, *members]):
+            system = self._system_of(member)
+            if system is None:
+                delegates.append(member)  # своя «система» из одной колонки — вести её некому
+            elif system not in heads:
+                heads[system] = member
+                delegates.append(member)
+            else:
+                rest.setdefault(system, []).append(member)
+        # Ведущий группы уже играет свой поток — ему не переотдаём (это оборвало бы звук).
+        await self._give_stream(session, [member for member in delegates if member != leader])
+        for system, members_of in rest.items():
+            await self._vendor_join(heads[system], members_of)
+
+    async def _give_stream(self, session: Any, members: list[str]) -> None:
+        """Отдать НАШ поток этим колонкам — по одной команде `play_media` каждой."""
         for member in members:
             member_tile = self._tile_of(member)
             if member_tile is None:
@@ -338,6 +411,21 @@ class MusicPlayback:
                 self._home.source,
             )
             await call(self._home.source, "media_player", "play_media", {"entity_id": member, **fields})
+
+    async def _vendor_join(self, delegate: str, members: list[str]) -> None:
+        """Остальные колонки системы — штатным `join` HA вокруг её ведущего.
+
+        ⚠ Вендор сводит свои колонки точнее нас: звук им даёт не дом, а своя система, поэтому
+        достаточно присоединить их к ведущему, который уже играет наш поток.
+        """
+        tile = self._tile_of(delegate)
+        if tile is None:
+            return
+        for member in members:
+            await call(
+                self._home.source, "media_player", "join",
+                {"entity_id": delegate, "group_members": [member]},
+            )
 
     def _tile_of(self, entity: str) -> dict | None:
         return next((tile for tile in self._tiles() if self._entity(tile) == entity), None)
