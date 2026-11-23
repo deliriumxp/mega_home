@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from typing import TYPE_CHECKING
 
 from .core.ops import call
@@ -14,6 +16,7 @@ if TYPE_CHECKING:
 
 # MediaPlayerEntityFeature.STOP, docs/docs-ha/core-media-player-const.py.
 _STOP_FEATURE = 4096
+_PAUSE_FEATURE = 1
 
 
 class MusicGroups:
@@ -43,6 +46,9 @@ class MusicGroups:
             return None
         if name == "unjoin":
             return await self.leave(entity) if self.contains(entity) else None
+        if name in ("play", "pause", "play_pause", "stop"):
+            owner = self.owner(entity)
+            return await self.transport(owner, name) if owner is not None else None
         if name != "join":
             return None
         return await self._join_group(tile, entity, data.get("group_members") or [])
@@ -181,6 +187,50 @@ class MusicGroups:
                 for member in members:
                     self._vendor.pop(member, None)
             self.playback._home.topics.bump(MEDIA_GROUPS)
+        return {"accepted": True}
+
+    async def transport(self, leader: str, command: str) -> dict:
+        tile = self.playback._tile_of(leader)
+        if tile is None:
+            raise OpError("Ведущая колонка сейчас недоступна", 409)
+        source = self.playback._home.source
+        session = self.playback._flow.session(tile["id"])
+        queue = self.playback._players.get(leader)
+        state = source.get(leader)
+        resume = command == "play" or (command == "play_pause" and (
+            (queue is not None and queue.group_paused) or state is None or state.state not in ("playing", "buffering")
+        ))
+        if resume and session.current is None:
+            raise OpError("Сначала включите музыку на ведущей колонке", 409)
+        if resume:
+            session.resume()
+        else:
+            session.pause()
+            if queue is not None:
+                queue.group_paused = True
+
+        async def apply(entity: str) -> None:
+            if resume:
+                fields = (self.playback._stream_output_fields(session, entity)
+                          if not session.reading_player(entity) else {})
+                service = "play_media" if fields else "media_play"
+            else:
+                current = source.get(entity)
+                mask = current.attributes.get("supported_features") if current is not None else None
+                features = int(mask) if type(mask) in (int, float) else 0
+                service = "media_pause" if features & _PAUSE_FEATURE or not features & _STOP_FEATURE else "media_stop"
+                fields = {}
+            await call(source, "media_player", service, {"entity_id": entity, **fields})
+            if service == "media_stop":
+                session.disconnect(entity)
+
+        delegates = [leader, *(member for member in self.groups[leader] if member not in self._vendor)]
+        results = await asyncio.gather(*(apply(entity) for entity in delegates), return_exceptions=True)
+        if resume and queue is not None and not isinstance(results[0], BaseException):
+            queue.group_paused = False
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
         return {"accepted": True}
 
     async def stop_player(self, entity: str) -> None:

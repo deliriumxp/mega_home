@@ -92,12 +92,15 @@ class FlowSession:
         # Цена: кодирование на доме — один процесс на играющую сессию.
         # Элемент сменён (next/previous/замена очереди): текущий ffmpeg гасим, поток продолжается.
         self.switch = asyncio.Event()
+        self._playing = asyncio.Event()
+        self._playing.set()
         # Устройство читает прямо сейчас: с открытым потоком команда плееру не нужна.
         self._readers: dict[asyncio.Queue[bytes | None], str] = {}
         self._opened: set[str] = set()
         self.retired = False
         self._pump: asyncio.Task[None] | None = None
         self.marker_frames: dict[str, tuple[bytes, ...]] = {}
+        self.marker_ready = asyncio.Event()
         self._marker_cursor = -1
         self.marker_epoch: float | None = None
 
@@ -111,9 +114,16 @@ class FlowSession:
         self.items, self.index = tuple(items), index
         self.switch.set()
 
+    def pause(self) -> None:
+        self._playing.clear()
+
+    def resume(self) -> None:
+        self._playing.set()
+
     def stop(self) -> None:
         """Снять звук: очередь снята или плеер оставлен. Поток закроется на ближайшем куске."""
         self.items, self.index = (), 0
+        self._playing.set()
         self.switch.set()
 
     @property
@@ -171,6 +181,8 @@ class FlowSession:
             self.disconnect(player)
         self._readers[queue] = player
         self._opened.add(player)
+        if self.marker_frames and self.marker_frames.keys() <= set(self._readers.values()):
+            self.marker_ready.set()
         # Задержка ЭТОГО плеера, уже применённая к его чтению, и остаток звука, который надо выбросить.
         applied = 0.0
         drop = 0
@@ -181,6 +193,9 @@ class FlowSession:
             on_read()
         try:
             while (chunk := await queue.get()) is not None:
+                await self._playing.wait()
+                if queue not in self._readers:
+                    break
                 # ⚠ Задержка ЖИВАЯ: правка в составе слышна сразу. Больше — читаем позже (очередь
                 # ждёт), меньше — выбрасываем лишнее из уже полученного; перезапуска потока нет.
                 want = float(self.delay_of(player)) if self.delay_of is not None else 0.0
@@ -216,6 +231,7 @@ class FlowSession:
         clock = asyncio.get_running_loop().time
         frame_s = MP3_FRAME_MS / 1000
         try:
+            await self.marker_ready.wait()
             while self._readers and not self.switch.is_set():
                 now = clock()
                 if self.marker_epoch is None:
@@ -243,6 +259,7 @@ class FlowSession:
 
         async def broadcast(chunk: bytes) -> None:
             nonlocal deadline
+            await self._playing.wait()
             if encoder is not None:
                 now = clock()
                 if deadline is None or now - deadline > 0.250:
@@ -291,6 +308,9 @@ class FlowSession:
                             return
                 finally:
                     await _stop(process)
+                if self.switch.is_set() or self.current is not item:
+                    continue
+                await self._playing.wait()
                 if self.switch.is_set() or self.current is not item:
                     continue
                 if self.on_end is not None:

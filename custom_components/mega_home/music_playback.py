@@ -91,6 +91,8 @@ class MusicPlayback:
                 raise OpError("Команда очереди не поддерживается")
             entity = self._entity(find(self._tiles(), request.get("player")))
             async with self._group_lock:
+                if command == "stop" and entity and self.multiroom.contains(entity):
+                    return {"handled": False}
                 queue = self._players.get(entity) if entity else None
                 return {"handled": await queue.control(command) if queue else False}
         if action == "track_details":
@@ -129,7 +131,7 @@ class MusicPlayback:
         if binary is None:
             raise OpError("В доме нет ffmpeg для акустического замера", 503)
         try:
-            session = await asyncio.wait_for(prepare(binary, entities), timeout=15)
+            session = await asyncio.wait_for(prepare(binary, entities), timeout=8)
         except (OSError, RuntimeError, TimeoutError) as error:
             raise OpError("Дом не смог подготовить маркеры", 503) from error
         delays = {entity: self._delay(entity) for entity in entities}
@@ -139,7 +141,7 @@ class MusicPlayback:
             fields = [(entity, self._stream_output_fields(session, entity)) for entity in entities]
             for entity, _ in fields:
                 tile = self._tile_of(entity)
-                if tile is not None:
+                if tile is not None and not self.multiroom.contains(entity):
                     self._drop_queue(entity, tile)
             results = await asyncio.gather(*(
                 asyncio.wait_for(
@@ -148,24 +150,34 @@ class MusicPlayback:
                 )
                 for entity, data in fields
             ), return_exceptions=True)
-            for result in results:
+            for entity, result in zip(entities, results, strict=True):
+                if isinstance(result, Exception):
+                    label = self._calibration_label(entity)
+                    reason = "колонка не ответила" if isinstance(result, TimeoutError) else str(result)
+                    raise OpError(f"{label}: {reason}", 409) from result
                 if isinstance(result, BaseException):
                     raise result
-        except BaseException as error:
+            try:
+                await asyncio.wait_for(session.marker_ready.wait(), timeout=8)
+            except TimeoutError as error:
+                missing = [self._calibration_label(entity) for entity in entities if not session.reading_player(entity)]
+                raise OpError(f"Не открыли поток для замера: {', '.join(missing)}", 409) from error
+        except BaseException:
             self._stop_calibration()
-            if isinstance(error, TimeoutError):
-                raise OpError("Колонка не ответила на запуск замера", 504) from error
             raise
         self._calibration_timer = asyncio.get_running_loop().call_later(
             300, lambda: asyncio.create_task(self._expire_calibration(session.token)),
         )
         return {"session": session.token, "marker": layout(len(entities)), "delays": list(delays.values())}
 
+    def _calibration_label(self, entity: str) -> str:
+        return (self._tile_of(entity) or {}).get("name") or entity
+
     def calibration_output(self, entity: str) -> str:
         owner = self.multiroom.owner(entity)
         if owner is not None:
             queue = self._players.get(owner)
-            if queue is not None and queue.view() and queue.view().get("track"):
+            if queue is not None and not queue.group_paused and (view := queue.view()) and view.get("track"):
                 raise OpError("Остановите музыку в группе перед замером", 409)
         if self._system_of(entity) is not None:
             state = self._home.source.get(entity)

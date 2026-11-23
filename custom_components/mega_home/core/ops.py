@@ -393,7 +393,7 @@ async def command(
     # Мультирум: наша группа — не группировка HA (вне одной интеграции её нет), состав ведёт
     # музыкальная служба дома и она же берёт такую команду себе (`join`/`unjoin`).
     playback = getattr(coordinator, "music_playback", None)
-    if name in ("join", "unjoin") and playback is not None:
+    if name in ("join", "unjoin", "play", "pause", "play_pause", "stop") and playback is not None:
         handled = await playback.group_command(tile, name, data, by)
         if handled is not None:
             return handled

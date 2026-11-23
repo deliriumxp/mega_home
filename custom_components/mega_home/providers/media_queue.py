@@ -58,6 +58,8 @@ class FlowPort(Protocol):
 
     def reading_player(self, player: str) -> bool: ...
 
+    def resume(self) -> None: ...
+
     def set_items(self, items: tuple[MediaItem, ...], index: int) -> None: ...
 
     def stop(self) -> None: ...
@@ -75,6 +77,7 @@ class PlayerQueue:
         self._changed = changed
         self._unwatch_stream = unwatch_stream
         self._flow = flow
+        self.group_paused = False
         self._lock = asyncio.Lock()
         self._queue: Queue | None = None
         self._unsubscribe: Callable[[], None] | None = None
@@ -114,6 +117,8 @@ class PlayerQueue:
             # ⚠ Элементы ставим ПОСЛЕ снятия прежней очереди и ДО запуска: у потока-сессии тот же
             # адрес, и смена очереди обязана пройти внутри уже открытого потока, а не оборвать его.
             if self._flow is not None:
+                self.group_paused = False
+                self._flow.resume()
                 self._flow.set_items(tuple(items), index)
             self._unsubscribe = self._source.subscribe([self.entity], self._observe)
             await self._launch(self._queue)
@@ -247,6 +252,7 @@ class PlayerQueue:
                 # Содержимое наше, свидетельства от плеера не будет: команду приняла HA — этого
                 # довольно, и ждать подтверждения нечем (`Output.owner`).
                 attempt.started = attempt.last = Sample.read(self._source.get(self.entity))
+                attempt.opened = attempt.started.state == "playing" and attempt.output.matches(attempt.started)
                 attempt.anchor = monotonic()
                 self._changed()
                 return
@@ -264,10 +270,13 @@ class PlayerQueue:
     def _observe(self, _entity_id: str, state: EntityState | None) -> None:
         queue = self._queue
         attempt = queue.attempt if queue else None
-        if queue is None or attempt is None or not attempt.accepted or attempt.output is None:
+        if self.group_paused or queue is None or attempt is None or not attempt.accepted or attempt.output is None:
             return
         current = Sample.read(state)
         output = attempt.output
+        if output.owner:
+            self._observe_station(attempt, current)
+            return
         owned = output.matches(current)
         if attempt.started is None:
             reset = current.position is not None and current.position <= START_SLACK < (attempt.before.position or 0)
@@ -290,6 +299,11 @@ class PlayerQueue:
             return
         if current.state == "buffering":
             return
+        if output.flow:
+            # Позицию очереди меняет декодер. HA сообщает позицию своего HTTP-выхода,
+            # которая может обнулиться при буферизации или переподключении.
+            attempt.last = current
+            return
         opaque_match = output.opaque and current.identity == attempt.started.identity
         cleared_on_pause = current.state == "paused" and not current.content and not any(current.identity)
         if current.state == "playing" and not (owned or opaque_match):
@@ -311,6 +325,27 @@ class PlayerQueue:
         if current.state == "playing" and prior.state == "paused" and current.position is None:
             attempt.anchor += max(0, monotonic() - prior.at)
         attempt.last = current
+
+    def _observe_station(self, attempt: Attempt, current: Sample) -> None:
+        # HA может принять команду, пока медиаплеер ещё сообщает старый источник.
+        # У радио меняются метаданные эфира, а некоторые плееры скрывают сам URL.
+        if current.state in STOPPED:
+            self.clear()
+            return
+        if current.state == "playing":
+            if attempt.opened and attempt.last is not None:
+                previous = attempt.last
+                changed_source = bool(current.identity[1] and previous.identity[1]
+                                      and current.identity[1] != previous.identity[1])
+                changed_url = ("://" in current.content and "://" in previous.content
+                               and current.content != previous.content)
+                if changed_source or changed_url:
+                    self.clear()
+                    return
+            attempt.opened = True
+            attempt.last = current
+        elif current.state == "idle" and (attempt.opened or monotonic() - attempt.anchor >= START_TIMEOUT):
+            self.clear()
 
     @staticmethod
     def _finished(queue: Queue, attempt: Attempt, current: Sample) -> bool:

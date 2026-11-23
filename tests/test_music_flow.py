@@ -266,6 +266,30 @@ def test_станция_на_плеере_без_потока_идёт_поля�
     asyncio.run(run())
 
 
+def test_радио_остаётся_источником_группы_после_обновления_метаданных(tmp_path):
+    async def run():
+        service, home, _, streams = setup(tmp_path, flow=False)
+        lead = home.data["tiles"][0]
+        member = "media_player.heos"
+        home.data["tiles"].append(vendor_tile(member, "h1", "sync:heos"))
+        home.source.states[member] = PlainState("idle")
+        url = "https://cdn.example/radio.aac"
+        await service.call(False, {
+            "action": "play_station", "player": "echo",
+            "station": {"id": "radio", "title": "Радио", "url": url},
+            "fields": {"media_content_id": url, "media_content_type": "audio/aac"},
+        })
+        home.source.report("media_player.echo", "idle")
+        home.source.report("media_player.echo", "playing", media_title="Первая песня")
+        home.source.report("media_player.echo", "playing", media_title="Вторая песня")
+        await service.group_command(lead, "join", {"group_members": [member]}, None)
+        assert streams.session("echo").current.source == url
+        assert service.state_groups()[member] == ["media_player.echo", member]
+        service.close()
+
+    asyncio.run(run())
+
+
 def test_трек_на_плеере_потока_переключается_без_команды_плееру(tmp_path):
     async def run():
         service, home, _catalog, streams = setup(tmp_path)
@@ -974,6 +998,28 @@ def test_замер_на_двух_выходах_раздаёт_кадры_од�
         home.data["tiles"][0]["stream"]["delayMs"] = 120
         home.data["tiles"].append(vendor_tile(heos, "h1", "sync:heos"))
         home.source.states[heos] = PlainState("idle")
+        readers = []
+        wrote = asyncio.Event()
+        source_call = home.source.call
+
+        async def writer(frame):
+            assert len(frame) == 576
+            wrote.set()
+
+        async def unused(*_):
+            pytest.fail("Круг уже закодирован, декодер для него не запускается")
+
+        async def connect_player(domain, name, data, response, by):
+            await source_call(domain, name, data, response, by)
+            if name == "play_media":
+                token = data["media_content_id"].rsplit("/", 1)[-1]
+                session, player = streams.find(token)
+                if player == heos:
+                    await asyncio.sleep(0.05)
+                    assert not wrote.is_set()
+                readers.append(asyncio.create_task(session.serve(writer, unused, unused, player=player)))
+
+        home.source.call = connect_player
         start = await service.call(False, {"action": "calibration_start", "players": ["echo", "h1"]})
         tokens = [data["media_content_id"].rsplit("/", 1)[-1] for _, name, data in home.source.calls if name == "play_media"]
         first, second = (streams.find(token) for token in tokens)
@@ -985,19 +1031,9 @@ def test_замер_на_двух_выходах_раздаёт_кадры_од�
         for frames in session.marker_frames.values():
             assert len(frames) == 84
             assert all(len(frame) == 576 and frame[:2] == b"\xff\xfb" for frame in frames)
-        wrote = asyncio.Event()
-
-        async def writer(frame):
-            assert len(frame) == 576
-            wrote.set()
-
-        async def unused(*_):
-            pytest.fail("Круг уже закодирован, декодер для него не запускается")
-
-        reader = asyncio.create_task(session.serve(writer, unused, unused, player=heos))
         await asyncio.wait_for(wrote.wait(), timeout=1)
         await service.call(False, {"action": "calibration_stop", "session": start["session"]})
-        await asyncio.wait_for(reader, timeout=1)
+        await asyncio.wait_for(asyncio.gather(*readers), timeout=1)
         assert all(streams.find(token) is None for token in tokens)
         assert not session.reading
 
@@ -1032,5 +1068,51 @@ def test_отказ_ha_сохраняет_подтверждённый_сост�
         home.source.call = original
         await service.group_command(lead, "join", {"group_members": [refused]}, None)
         assert service.state_groups()[refused] == ["media_player.echo", accepted, refused]
+
+    asyncio.run(run())
+
+
+def test_пауза_группы_управляет_ведущими_систем_и_сохраняет_источник(tmp_path):
+    async def run():
+        service, home, _, streams = setup(tmp_path)
+        leader, first, second = "media_player.echo", "media_player.heos_1", "media_player.heos_2"
+        home.data["tiles"] += [vendor_tile(first, "h1", "sync:heos"), vendor_tile(second, "h2", "sync:heos")]
+        home.source.states[leader] = PlainState("playing", {"supported_features": 1})
+        for entity in (first, second):
+            home.source.states[entity] = PlainState("playing", {"supported_features": 4096})
+        await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1", "2"], "index": 0})
+        await service.group_command(home.data["tiles"][0], "join", {"group_members": [first, second]}, None)
+        assert await service.call(False, {"action": "queue_control", "player": "echo", "command": "stop"}) == {"handled": False}
+        home.source.calls.clear()
+        await service.group_command(home.data["tiles"][0], "play_pause", {}, None)
+        assert {(name, data["entity_id"]) for _, name, data in home.source.calls} == {
+            ("media_pause", leader), ("media_stop", first),
+        }
+        home.source.report(leader, "idle")
+        assert streams.session("echo").current.id == "1"
+        home.source.calls.clear()
+        await service.group_command(home.data["tiles"][0], "play", {}, None)
+        assert {(name, data["entity_id"]) for _, name, data in home.source.calls} == {
+            ("play_media", leader), ("play_media", first),
+        }
+        service.close()
+
+    asyncio.run(run())
+
+
+def test_сброс_позиции_ha_не_переключает_трек_в_потоке(tmp_path):
+    async def run():
+        service, home, _, streams = setup(tmp_path)
+        await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1", "2"], "index": 0})
+        entity = "media_player.echo"
+        session = streams.session("echo")
+        url = streams.address(session, entity)
+        home.source.report(entity, "playing", media_content_id=url, media_position=59, media_duration=60)
+        home.source.report(entity, "idle", media_position=60)
+        await asyncio.sleep(0)
+        assert session.current.id == "1"
+        await session.on_end()
+        assert session.current.id == "2"
+        service.close()
 
     asyncio.run(run())
