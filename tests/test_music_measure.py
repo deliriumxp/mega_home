@@ -44,11 +44,24 @@ def level(values: tuple[int, ...]) -> float:
     return math.sqrt(sum(value * value for value in values) / max(1, len(values)))
 
 
-def tone_level(values: tuple[int, ...], freq: int) -> float:
-    """Уровень тона в окне (один бин ДПФ) — им и опознаётся высота щелчка."""
-    re = sum(value * math.cos(2 * math.pi * freq * index / RATE) for index, value in enumerate(values))
-    im = sum(value * math.sin(2 * math.pi * freq * index / RATE) for index, value in enumerate(values))
-    return math.hypot(re, im) / max(1, len(values))
+def chirp_template(slot: int) -> tuple[float, ...]:
+    """Плавающий эталон дома: sweep от своей высоты к удвоенной, окно Ханна."""
+    length = int(CLICK_MS / 1000 * RATE)
+    start = PITCHES[slot]
+    sweep = (start * 2 - start) / (CLICK_MS / 1000)
+    return tuple(
+        math.sin(2 * math.pi * (start * index / RATE + 0.5 * sweep * (index / RATE) ** 2))
+        * (0.5 - 0.5 * math.cos(2 * math.pi * index / (length - 1)))
+        for index in range(length)
+    )
+
+
+def chirp_match(values: tuple[int, ...], slot: int) -> float:
+    """Нормированная корреляция с шаблоном слота — именно её делает детектор приложения."""
+    template = chirp_template(slot)
+    own = math.sqrt(sum(value * value for value in values))
+    ref = math.sqrt(sum(value * value for value in template))
+    return abs(sum(value * ref for value, ref in zip(values, template))) / max(1e-9, own * ref)
 
 
 def test_описание_отдаёт_раскладку_круга():
@@ -71,12 +84,11 @@ def test_каждая_колонка_щёлкает_в_своём_слоте_и_
             click = window(values, other * SPACING_MS, CLICK_MS)
             if other == slot:
                 assert level(click) > 3000, f"колонка {slot} не щёлкает в слоте {other}"
-                mine = tone_level(click, PITCHES[slot])
-                others = max(
-                    tone_level(click, pitch) for index, pitch in enumerate(PITCHES[:slots]) if index != slot
-                )
-                # Своя высота заметно сильнее чужой: иначе приложение не поймёт, чья это колонка.
-                assert mine > others * 2, f"высота колонки {slot} не опознаётся"
+                mine = chirp_match(click, slot)
+                others = max(chirp_match(click, other) for other in range(slots) if other != slot)
+                # Свой sweep коррелирует эталоном почти в единицу, чужие — околонулевые.
+                assert mine > 0.98, f"chirp колонки {slot} не опознаётся"
+                assert others < 0.05, f"chirp колонки {slot} похож на чужой слот"
             else:
                 assert level(click) < 100, f"колонка {slot} звучит в чужом слоте {other}"
 

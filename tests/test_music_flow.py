@@ -145,7 +145,7 @@ def test_поток_играет_элементы_подряд_одним_отв
         async def source_of(item):
             return item.source
 
-        async def decoder(url):
+        async def decoder(url, start=0.0):
             asked.append(url)
             return FakeProcess([b"AA" * 8, b"BB" * 8])
 
@@ -181,7 +181,7 @@ def test_смена_элемента_приходит_в_тот_же_поток(
         async def source_of(item):
             return item.source
 
-        async def decoder(url):
+        async def decoder(url, start=0.0):
             asked.append(url)
             process = FakeProcess([b"AA" * 8] * 4)
             made.append(process)
@@ -781,7 +781,7 @@ def test_поток_в_mp3_идёт_через_кодировщик():
         async def source_of(item):
             return item.source
 
-        async def decoder(url):
+        async def decoder(url, start=0.0):
             return FakeProcess([pcm(1000, 8)])
 
         class Encoder:
@@ -819,7 +819,7 @@ def test_группа_читает_один_поток_и_очередь_идё�
         async def source_of(item):
             return item.source
 
-        async def decoder(url):
+        async def decoder(url, start=0.0):
             asked.append(url)
             return FakeProcess([pcm(1000, 8)])
 
@@ -867,7 +867,7 @@ def test_поток_фейдит_стык_и_на_смене_станции(tmp_
         async def source_of(item):
             return item.source
 
-        async def decoder(url):
+        async def decoder(url, start=0.0):
             asked.append(url)
             return FakeProcess([first if url == "a" else second])
 
@@ -909,7 +909,7 @@ def test_задержка_плеера_сдвигает_его_чтение_и_�
         async def source_of(item):
             return item.source
 
-        async def decoder(url):
+        async def decoder(url, start=0.0):
             asked.append(url)
             return FakeProcess([b"AA" * 8] * 4, piece=8)
 
@@ -1082,7 +1082,6 @@ def test_пауза_группы_управляет_ведущими_систе�
             home.source.states[entity] = PlainState("playing", {"supported_features": 4096})
         await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1", "2"], "index": 0})
         await service.group_command(home.data["tiles"][0], "join", {"group_members": [first, second]}, None)
-        assert await service.call(False, {"action": "queue_control", "player": "echo", "command": "stop"}) == {"handled": False}
         home.source.calls.clear()
         await service.group_command(home.data["tiles"][0], "play_pause", {}, None)
         assert {(name, data["entity_id"]) for _, name, data in home.source.calls} == {
@@ -1113,6 +1112,103 @@ def test_сброс_позиции_ha_не_переключает_трек_в_п
         assert session.current.id == "1"
         await session.on_end()
         assert session.current.id == "2"
+        service.close()
+
+    asyncio.run(run())
+
+
+def test_seek_перематывает_декодер_внутри_открытого_потока():
+    async def run():
+        session = FlowSession("t")
+        session.set_items((SimpleNamespace(source="src"),), 0)
+        starts: list[tuple[str, float]] = []
+        made: list[FakeProcess] = []
+        written: list[bytes] = []
+        seeked = False
+
+        async def source_of(item):
+            return item.source
+
+        async def decoder(url, start=0.0):
+            starts.append((url, start))
+            process = FakeProcess([b"AA" * 8] * 4 if not made else [b"BB" * 8])
+            made.append(process)
+            return process
+
+        async def write(chunk):
+            nonlocal seeked
+            written.append(chunk)
+            await asyncio.sleep(0)
+            if not seeked:
+                seeked = True
+                session.seek(12.5)
+
+        session.source_of = source_of
+        await session.serve(write, decoder)
+
+        # Читатель не переподключался: тот же serve дождался нового декодера с позицией.
+        assert starts == [("src", 0.0), ("src", 12.5)]
+        assert len(made) == 2 and made[0].stopped
+        assert written[0] == b"A" * 8 and written[-1] == b"B" * 8
+
+    asyncio.run(run())
+
+
+def test_seek_очереди_идёт_в_поток_без_команды_плееру(tmp_path):
+    async def run():
+        service, home, _, streams = setup(tmp_path)
+        await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1"], "index": 0})
+        calls = list(home.source.calls)
+        answer = await service.call(False, {
+            "action": "queue_control", "player": "echo", "command": "seek", "value": 10.2,
+        })
+        assert answer == {"handled": True}
+        assert home.source.calls == calls
+        view = service._views()["echo"]
+        assert view["seek"] is True
+        assert 10 <= view["position"] <= 12
+        assert streams.session("echo").seek_offset == 10.2
+        service.close()
+
+    asyncio.run(run())
+
+
+def test_команды_участника_группы_идут_в_очередь_ведущего(tmp_path):
+    async def run():
+        service, home, _, streams = setup(tmp_path)
+        member_tile = flow_tile(entity="media_player.kitchen")
+        member_tile["id"] = "kitchen"
+        member = member_tile["entityId"]
+        home.data["tiles"].append(member_tile)
+        home.source.states[member] = PlainState("idle")
+        await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1", "2"], "index": 0})
+        await service.group_command(home.data["tiles"][0], "join", {"group_members": [member]}, None)
+        assert service.state_groups()[member] == ["media_player.echo", member]
+        answer = await service.call(False, {"action": "queue_control", "player": "kitchen", "command": "next"})
+        assert answer == {"handled": True}
+        assert streams.session("echo").current.id == "2"
+        await service.call(False, {"action": "play_queue", "player": "kitchen", "ids": ["3"], "index": 0})
+        assert service.state_groups()[member] == ["media_player.echo", member]
+        assert streams.session("echo").current.id == "3"
+        service.close()
+
+    asyncio.run(run())
+
+
+def test_выключение_участника_снимает_его_с_группы(tmp_path):
+    async def run():
+        service, home, _, _streams = setup(tmp_path)
+        member_tile = flow_tile(entity="media_player.kitchen")
+        member_tile["id"] = "kitchen"
+        member = member_tile["entityId"]
+        home.data["tiles"].append(member_tile)
+        home.source.states[member] = PlainState("idle")
+        await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1"], "index": 0})
+        await service.group_command(home.data["tiles"][0], "join", {"group_members": [member]}, None)
+        answer = await service.group_command(member_tile, "turn_off", {}, None)
+        assert answer == {"accepted": True}
+        assert service.state_groups() == {}
+        assert service.multiroom.contains(member) is False
         service.close()
 
     asyncio.run(run())

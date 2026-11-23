@@ -78,7 +78,8 @@ class MegaHomeMusicStreamView(_MegaHomeView):
         try:
             if authorized():
                 await session.serve(
-                    write, lambda url: ffmpeg_decoder(binary, url), lambda out: ffmpeg_encoder(binary, out), player,
+                    write, lambda url, start=0.0: ffmpeg_decoder(binary, url, start),
+                    lambda out: ffmpeg_encoder(binary, out), player,
                 )
         except (ConnectionError, OSError):
             # Плеер закрыл поток (пауза, смена источника, выключение) — это норма, не ошибка.

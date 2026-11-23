@@ -32,12 +32,36 @@ class MusicGroups:
         self._served.clear()
 
     def state_groups(self) -> dict[str, list[str]]:
-        return {
-            entity: [leader, *members]
-            for leader, members in self.groups.items()
-            if members
-            for entity in (leader, *members)
-        }
+        groups = {}
+        for leader, members in self.groups.items():
+            state = self.playback._home.source.get(leader)
+            if state is None or state.state in ("unknown", "unavailable"):
+                continue
+            live = [member for member in members if self._available(member)]
+            if live:
+                groups[leader] = live
+                for entity in (leader, *live):
+                    groups[entity] = [leader, *live]
+        return groups
+
+    def reconcile(self, alive: set[str]) -> None:
+        """Убрать из наших записей выходы, которых больше нет в составе."""
+        for leader, members in list(self.groups.items()):
+            if leader not in alive:
+                self.groups.pop(leader, None)
+                continue
+            live = [member for member in members if member in alive]
+            if live != members:
+                self.groups[leader] = live
+            for member in members:
+                if member not in alive:
+                    self._vendor.pop(member, None)
+                    self._served.pop(member, None)
+
+    def _available(self, entity: str) -> bool:
+        tile = self.playback._tile_of(entity)
+        state = self.playback._home.source.get(entity)
+        return tile is not None and state is not None and state.state not in ("unknown", "unavailable")
 
     async def command(self, tile: dict, name: str, data: dict) -> dict | None:
         """Перестройка смешанной группы выполняется целиком одним вызовом."""
@@ -45,6 +69,8 @@ class MusicGroups:
         if entity is None:
             return None
         if name == "unjoin":
+            return await self.leave(entity) if self.contains(entity) else None
+        if name == "turn_off":
             return await self.leave(entity) if self.contains(entity) else None
         if name in ("play", "pause", "play_pause", "stop"):
             owner = self.owner(entity)
@@ -206,8 +232,6 @@ class MusicGroups:
             session.resume()
         else:
             session.pause()
-            if queue is not None:
-                queue.group_paused = True
 
         async def apply(entity: str) -> None:
             if resume:
@@ -226,8 +250,20 @@ class MusicGroups:
 
         delegates = [leader, *(member for member in self.groups[leader] if member not in self._vendor)]
         results = await asyncio.gather(*(apply(entity) for entity in delegates), return_exceptions=True)
-        if resume and queue is not None and not isinstance(results[0], BaseException):
-            queue.group_paused = False
+        leader_ok = bool(results) and not isinstance(results[0], BaseException)
+        if leader_ok:
+            # Состояние очереди фиксируем только по ведущему: участник мог не ответить, но это
+            # повод докомандовать ему при следующем нажатии, а не считать группу в другой фазе.
+            if resume:
+                if queue is not None:
+                    queue.group_paused = False
+            else:
+                if queue is not None:
+                    queue.group_paused = True
+        elif resume:
+            # Ведущий не возобновился: общий поток снова держим на паузе, следующий play_pause
+            # сделает resume, а не лишний проход по уже играющим участникам.
+            session.pause()
         for result in results:
             if isinstance(result, BaseException):
                 raise result

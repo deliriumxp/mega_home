@@ -81,20 +81,29 @@ class MusicPlayback:
             async with self._group_lock:
                 if self._calibration is not None and entity in self._calibration.marker_frames:
                     await self._end_calibration(self._calibration.token)
-                if entity and entity not in self.multiroom.groups and self.multiroom.contains(entity):
-                    await self.multiroom.leave(entity)
+                # Выбор музыки у участника меняет общий источник группы через её ведущего:
+                # открытый поток остаётся тем же, разъединение — только явный `unjoin`.
+                owner = self.multiroom.owner(entity) if entity else None
+                if owner is not None and owner != entity:
+                    owner_tile = self._tile_of(owner)
+                    if owner_tile is None:
+                        raise OpError("Ведущая колонка сейчас недоступна", 409)
+                    request = {**request, "player": owner_tile["id"]}
                 await self._play_request(request)
             return {"accepted": True}
         if action == "queue_control":
             command = request.get("command")
-            if command not in ("previous", "next", "stop"):
+            if command not in ("previous", "next", "stop", "seek"):
                 raise OpError("Команда очереди не поддерживается")
             entity = self._entity(find(self._tiles(), request.get("player")))
+            raw_position = request.get("value")
+            position = raw_position if isinstance(raw_position, (int, float)) and not isinstance(raw_position, bool) else None
             async with self._group_lock:
-                if command == "stop" and entity and self.multiroom.contains(entity):
-                    return {"handled": False}
-                queue = self._players.get(entity) if entity else None
-                return {"handled": await queue.control(command) if queue else False}
+                # У участника своей очереди нет: общий поток ведёт владелец группы, поэтому
+                # «назад/вперёд/стоп/перемотка» переводим на его очередь, а не шлём напрямую в HA.
+                owner = self.multiroom.owner(entity) if entity else None
+                queue = self._players.get(owner or entity) if entity else None
+                return {"handled": await queue.control(command, position) if queue else False}
         if action == "track_details":
             raise OpError("Неизвестное действие Яндекс Музыки", 404)
         answer = await self._station.call(can_manage, request)
@@ -157,11 +166,8 @@ class MusicPlayback:
                     raise OpError(f"{label}: {reason}", 409) from result
                 if isinstance(result, BaseException):
                     raise result
-            try:
-                await asyncio.wait_for(session.marker_ready.wait(), timeout=8)
-            except TimeoutError as error:
-                missing = [self._calibration_label(entity) for entity in entities if not session.reading_player(entity)]
-                raise OpError(f"Не открыли поток для замера: {', '.join(missing)}", 409) from error
+            # Запись уже идёт: не ждём, пока ВСЕ плееры откроют поток. Медленная колонка
+            # не должна задерживать разбор щелчков тех, кто уже звучит.
         except BaseException:
             self._stop_calibration()
             raise
@@ -292,7 +298,7 @@ class MusicPlayback:
             return await self.multiroom.command(tile, name, data)
 
     async def replace_player_source(
-        self, tile: dict, execute: Callable[[], Awaitable[dict]],
+        self, tile: dict, name: str, data: dict, execute: Callable[[], Awaitable[dict]],
     ) -> dict:
         entity = self._entity(tile)
         if entity is None:
@@ -300,10 +306,51 @@ class MusicPlayback:
         async with self._group_lock:
             if self._calibration is not None and entity in self._calibration.marker_frames:
                 await self._end_calibration(self._calibration.token)
+            # Выбор у участника меняет общую группу, а не выводит его из неё молча.
+            owner = self.multiroom.owner(entity)
+            if owner is not None and owner != entity:
+                owner_tile = self._tile_of(owner)
+                if owner_tile is None:
+                    raise OpError("Ведущая колонка сейчас недоступна", 409)
+                tile, entity = owner_tile, owner
             if self.multiroom.contains(entity):
-                await self.multiroom.leave(entity)
+                if name == "play_stream":
+                    return await self._replace_group_stream(tile, entity, data)
+                # TV/USB/line-in захватить в общий поток нельзя — это звук самого ведущего.
+                # Оставлять группу на старом потоке после смены входа ещё хуже: жилец видел бы
+                # новый источник на ведущем и старую музыку у участников.
+                raise OpError("Аппаратный источник ведущего недоступен в группе — разъедините её", 409)
             self._drop_queue(entity, tile)
             return await execute()
+
+    async def _replace_group_stream(self, tile: dict, entity: str, data: dict) -> dict:
+        """Прямой URL как элемент общей очереди: поток группы не пересоздаётся."""
+        url = str(data.get("media_content_id") or "")
+        if not url:
+            raise OpError("Поток без адреса", 400)
+        metadata = ((data.get("extra") or {}).get("metadata") or {}) if isinstance(data.get("extra"), dict) else {}
+        item = MediaItem(
+            id=f"stream:{url}", title=metadata.get("title") or url, artist=metadata.get("artist") or "",
+            album=metadata.get("album") or "", image=metadata.get("imageUrl") or "", source=url,
+        )
+        profile = tile["stream"]
+        queue = self._players.get(entity)
+        if queue is None:
+            queue = self._queue_for(tile, entity)
+            self._players[entity] = queue
+            self._profiles[entity] = output_profile(profile)
+        async def load() -> tuple[tuple[MediaItem, ...], int]:
+            return (item,), 0
+        async def prepare(_item: MediaItem, opened: Callable[[], None]) -> Output:
+            state = self._home.source.get(entity)
+            if not state or state.state in ("unknown", "unavailable"):
+                raise OpError("Этот плеер сейчас недоступен", 409)
+            if isinstance(session := queue.flow, FlowSession):
+                return flow_output(self._flow, session, profile, opened, entity)
+            return Output(url, str(data.get("media_content_type") or "music"))
+        await queue.replace(load, prepare, None)
+        await self.multiroom.wake(entity)
+        return {"accepted": True}
 
     async def _play_request(self, request: dict) -> None:
         await (self._play(request) if request["action"] == "play_queue" else self._play_station(request))
@@ -459,6 +506,7 @@ class MusicPlayback:
 
     def config_changed(self) -> None:
         current = {entity: tile for tile in self._tiles() if (entity := self._entity(tile))}
+        self.multiroom.reconcile(set(current))
         for entity, profile in list(self._profiles.items()):
             tile = current.get(entity)
             if tile is not None and output_profile(tile["stream"]) == profile:

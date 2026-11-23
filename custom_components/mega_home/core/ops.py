@@ -393,7 +393,7 @@ async def command(
     # Мультирум: наша группа — не группировка HA (вне одной интеграции её нет), состав ведёт
     # музыкальная служба дома и она же берёт такую команду себе (`join`/`unjoin`).
     playback = getattr(coordinator, "music_playback", None)
-    if name in ("join", "unjoin", "play", "pause", "play_pause", "stop") and playback is not None:
+    if name in ("join", "unjoin", "play", "pause", "play_pause", "stop", "turn_off") and playback is not None:
         handled = await playback.group_command(tile, name, data, by)
         if handled is not None:
             return handled
@@ -415,7 +415,7 @@ async def command(
 
     replace_source = getattr(playback, "replace_player_source", None)
     if name in ("play_stream", "set_source") and replace_source is not None:
-        answer = await replace_source(tile, execute)
+        answer = await replace_source(tile, name, data, execute)
     else:
         answer = await execute()
     # ⚠ Только «выполнено». Здесь отдавалось состояние сразу после вызова с

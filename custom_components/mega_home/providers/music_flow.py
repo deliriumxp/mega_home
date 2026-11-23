@@ -39,8 +39,9 @@ READER_QUEUE = 320
 STOP_TIMEOUT_S = 5
 
 
-# Чем дом декодирует элемент: свой процесс на элемент, звук — PCM в трубу. Тесты подменяют это.
-Decoder = Callable[[str], Awaitable["FlowProcess"]]
+# Чем дом декодирует элемент: свой процесс на элемент, звук — PCM в трубу. Второй аргумент —
+# стартовая позиция элемента, сек (перемотка внутри уже открытого потока). Тесты подменяют это.
+Decoder = Callable[[str, float], Awaitable["FlowProcess"]]
 
 
 class FlowProcess:
@@ -72,6 +73,9 @@ class FlowSession:
         self.token = token
         self.items: tuple[MediaItem, ...] = ()
         self.index = 0
+        # Позиция перемотки следующего запуска текущего элемента, сек. Плееру команда не идёт:
+        # `_run` меняет декодер внутри того же открытого ответа, читатели продолжают адрес.
+        self.seek_offset = 0.0
         self.source_of: Callable[[MediaItem], Awaitable[str | None]] | None = None
         self.on_end: Callable[[], Awaitable[None]] | None = None
         # Устройство начало читать поток: очередь дома по этому признаку подтверждает запуск
@@ -112,6 +116,12 @@ class FlowSession:
     def set_items(self, items: tuple[MediaItem, ...], index: int) -> None:
         """Очередь и место в ней — от владельца (очереди дома). Меняет звук, не адрес."""
         self.items, self.index = tuple(items), index
+        self.seek_offset = 0.0
+        self.switch.set()
+
+    def seek(self, position: float) -> None:
+        """Перемотать текущий элемент внутри потока; читателям адрес и команда не меняются."""
+        self.seek_offset = max(0.0, position)
         self.switch.set()
 
     def pause(self) -> None:
@@ -288,7 +298,9 @@ class FlowSession:
                     LOGGER.warning("Поток сессии %s: источник не отдал ссылку", self.token)
                     return
                 self.switch.clear()
-                process = await decoder(source)
+                start = self.seek_offset
+                self.seek_offset = 0.0
+                process = await decoder(source, start)
                 try:
                     # Головку нового элемента читаем сразу: с ней микшуется придержанный хвост.
                     out = fader.join(await _read_head(process, self.fade_bytes))
@@ -439,15 +451,19 @@ class FfmpegProcess(FlowProcess):
             await process.wait()
 
 
-async def ffmpeg_decoder(binary: str, url: str) -> FlowProcess:
+async def ffmpeg_decoder(binary: str, url: str, start: float = 0.0) -> FlowProcess:
     """Элемент → PCM 48 кГц моно одной трубой: декодируем, а не перекодируем.
 
+    `start` — перемотка внутри элемента: `-ss` до входа, ffmpeg ищет ближайший ключевой кадр и
+    докодирует до точного места. Плееру при этом команда не нужна — поток продолжается внутри.
     Так звук не теряет качества на стыке, а склейка элементов идёт на PCM: ей формат источника не
     важен (MP3 Яндекса и AAC станции в одном потоке). Цена — процессор дома на играющий плеер;
     MA платит тем же (он ещё и перекодирует в FLAC/MP3, у нас играет исходный звук).
     """
+    seek = [] if start <= 0 else ["-ss", f"{start:.3f}"]
     return FfmpegProcess(await asyncio.create_subprocess_exec(
         binary,
+        *seek,
         "-i", url,
         "-f", "s16le", "-ar", str(FLOW_RATE), "-ac", str(FLOW_CHANNELS),
         "-loglevel", "error", "-nostats",

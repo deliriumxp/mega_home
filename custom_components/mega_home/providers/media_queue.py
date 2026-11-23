@@ -43,6 +43,8 @@ class Queue:
     prepare: Prepare
     more: LoadMore | None
     attempt: Attempt | None = None
+    # Позиция текущего элемента для потока сессии, сек: seek меняет декодер внутри того же ответа.
+    position: float = 0.0
 
     @property
     def item(self) -> MediaItem:
@@ -59,6 +61,8 @@ class FlowPort(Protocol):
     def reading_player(self, player: str) -> bool: ...
 
     def resume(self) -> None: ...
+
+    def seek(self, position: float) -> None: ...
 
     def set_items(self, items: tuple[MediaItem, ...], index: int) -> None: ...
 
@@ -91,14 +95,20 @@ class PlayerQueue:
         if queue is None:
             return {"error": self._error} if self._error else None
         track = queue.item
+        attempt = queue.attempt
+        position = None
+        if attempt and attempt.started and attempt.output and attempt.output.flow:
+            position = int(queue.position + max(0, monotonic() - attempt.anchor))
         return {
             "track": {
                 "id": track.id, "title": track.title, "artist": track.artist, "album": track.album,
                 "image": track.image, "duration": track.duration,
             },
-            "started": bool(queue.attempt and queue.attempt.started),
+            "started": bool(attempt and attempt.started),
             "next": queue.index + 1 < len(queue.items) or queue.more is not None,
             "previous": queue.index > 0,
+            "seek": track.duration > 0,
+            **({"position": min(position, int(track.duration))} if position is not None else {}),
         }
 
     async def replace(self, load: Load, prepare: Prepare, more: LoadMore | None = None) -> None:
@@ -138,7 +148,7 @@ class PlayerQueue:
             await self._launch(queue)
             return True
 
-    async def control(self, action: str) -> bool:
+    async def control(self, action: str, position: float | None = None) -> bool:
         async with self._lock:
             queue = self._queue
             if queue is None:
@@ -146,6 +156,22 @@ class PlayerQueue:
             if action == "stop":
                 self.clear()
                 return True
+            if action == "seek":
+                # Обычный выход перематывает сам плеер — HA справится напрямую. У потока сессии
+                # перемотка происходит ВНУТРИ уже открытого ответа: декодер перезапускается с
+                # новой позиции, команда плееру и разрыв соединения не нужны.
+                if self._flow is None or queue.item.duration <= 0 or position is None:
+                    return False
+                seek = min(max(0.0, position), max(0.0, queue.item.duration - 0.5))
+                queue.position = seek
+                self._flow.seek(seek)
+                if (attempt := queue.attempt) is not None:
+                    now = Sample.read(self._source.get(self.entity))
+                    attempt.started = attempt.last = now
+                    attempt.anchor = monotonic()
+                self._changed()
+                return True
+            queue.position = 0.0
             await self._move(queue, 1 if action == "next" else -1)
             return True
 
