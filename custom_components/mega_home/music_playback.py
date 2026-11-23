@@ -195,22 +195,35 @@ class MusicPlayback:
     async def group_command(self, tile: dict, name: str, data: dict, by: Any) -> dict | None:
         """`join`/`unjoin` для НАШИХ групп (`core/ops.py` зовёт до штатной службы HA).
 
-        `None` — команда не наша: плеер не берёт поток дома, и `media_player.join` решает как раньше.
+        ⚠⚠ `None` — команда НЕ наша, и это ГЛАВНЫЙ случай: Sonos, HEOS, WiiM, LinkPlay — одна система
+        со своим мультирумом, и группирует её ШТАТНО Home Assistant (`media_player.join`, бит GROUPING).
+        Наша группа существует только там, где своего мультирума нет: её ведёт поток дома
+        (`stream.flow`, прошитый Echo), и участником становится любой плеер со `stream` — в одиночку.
+        Живой разбор 2026-11-23: дом перехватывал `join` у Sonos и HEOS, до HA команда не доходила, и
+        «сонос+сонос» не группировался вовсе. Правило: свой мультирум — вендору, наш — где его нет.
         """
         profile = tile.get("stream")
         entity = self._entity(tile)
         if not isinstance(profile, dict) or not entity:
             return None
+        ours = self._is_ours(profile)
         if name == "unjoin":
-            # ⚠ Снять отметку приложение может С ЛЮБОГО участника (Sonos, станция), а не только с
-            # ведущего: `unjoin` для плитки без потока дома ушёл бы в HA и не погасил бы ничего —
-            # музыка на снятом плеере продолжала играть (живой баг 2026-11-22).
+            # Снять отметку можно с ЛЮБОГО участника НАШЕЙ группы (не только с ведущего) — иначе
+            # `unjoin` ушёл бы в HA и не погасил музыку на снятой колонке (живой баг 2026-11-22).
+            # Вендорскую группу снимает HA: у Sonos/HEOS/WiiM штатный `unjoin` обязан дойти до неё.
+            if not self._in_our_group(entity):
+                return None
             return await self._leave_group(entity)
+        # ⚠⚠ ГЛАВНЫЙ случай: у системы СВОЙ мультирум (Sonos, HEOS, WiiM, LinkPlay) — `join` ведёт
+        # штатная служба HA, и мы в него не вмешиваемся вовсе. Живой разбор 2026-11-23: дом
+        # перехватывал `join` у Sonos и HEOS, до HA команда не доходила, и «сонос+сонос» не
+        # группировался. У Яндекс Станции своего мультирума нет — там работает только наша группа.
+        if not ours:
+            return None
         if profile.get("flow") is not True and not self._flow.session(tile["id"]).reading:
-            # ⚠ Ведущим может быть ЛЮБОЙ плеер со `stream`: источник звука — дом (заказчик 2026-11-22).
-            # Плеер, который играл сам (нативная дорожка станции, своя ссылка), переводим на поток дома и
-            # повторяем ЕГО ЖЕ запрос — иначе участникам группы нечего слушать. Текущий трек начнётся
-            # заново: другого способа отдать группе один поток у плеера без потока нет.
+            # ⚠ Ведущим нашей группы может быть ЛЮБОЙ плеер со `stream`: источник звука — дом
+            # (заказчик 2026-11-22). Плеер, игравший сам (нативная дорожка станции, своя ссылка),
+            # переводим на поток дома и повторяем ЕГО ЖЕ запрос — иначе участникам нечего слушать.
             self._forced.add(entity)
             request = self._requests.get(entity)
             if request is not None:
@@ -232,6 +245,18 @@ class MusicPlayback:
         self._changed()
         await self._wake_group(entity)
         return {"accepted": True, "group": [entity, *self.groups[entity]]}
+
+    def _is_ours(self, profile: Mapping[str, Any]) -> bool:
+        """Группа НАША: у системы НЕТ своего мультирума.
+
+        ⚠ Мультирум есть у Sonos, HEOS, WiiM и LinkPlay (`stream.vendorGroup` описания плитки) — там
+        группирует ШТАТНЫЙ `media_player.join` HA, и наша группа не заводится никогда. У Яндекс
+        Станции своего мультирума нет (заказчик 2026-11-23) — там работает только наша реализация.
+        """
+        return profile.get("vendorGroup") is not True
+
+    def _in_our_group(self, entity: str) -> bool:
+        return entity in self.groups or any(entity in members for members in self.groups.values())
 
     async def _leave_group(self, entity: str) -> dict:
         """Выйти из группы: ушедший гаснет, ведущий и остальные участники играют дальше."""
@@ -302,7 +327,8 @@ class MusicPlayback:
             address = self._flow.address(session, member)
             if address is None:
                 raise OpError("Дом не знает своего адреса для потока", 503)
-            media_type = flow_content_type(member_tile.get("stream") or {})
+            member_profile = member_tile.get("stream") or {}
+            media_type = flow_content_type(member_profile)
             options = _member_accepts(member_tile)
             if options is not None and media_type not in options:
                 raise OpError("Плеер не примет поток дома в этом формате", 409)
@@ -455,22 +481,38 @@ class MusicPlayback:
         self._flow.close()
 
 
+def flow_address(profile: Mapping[str, Any], address: str) -> str:
+    """Адрес сессии В ВИДЕ, который примет ЭТОТ плеер: схема из описания плитки.
+
+    ⚠ Без схемы Sonos отклоняет адрес — HA отдаёт отказ службы, и жилец видит «Home Assistant
+    отклонил команду» (живой разбор 2026-11-23: «сонос+сонос не работает»). Sonos нужен
+    `x-rincon-mp3radio://`, и `https` остаётся ВНУТРИ схемы: без неё он идёт по http, а Яндекс-CDN
+    отдаёт только https. То же правило в приложении — `streamAddress` (`core/radio-play.ts`).
+    """
+    scheme = profile.get("scheme")
+    if not isinstance(scheme, str) or not scheme:
+        return address
+    if address.startswith("https://"):
+        return f"{scheme}://{address}"
+    return address.replace("http://", f"{scheme}://", 1)
+
+
 def flow_output(
     flow: FlowStreams, session: FlowSession, profile: Mapping[str, Any], opened: Callable[[], None],
     player: str,
 ) -> Output:
     """Выход потока-сессии: адрес один на сессию, содержимое меняет дом (`providers/music_flow.py`).
 
-    ⚠ Тип и схема адреса элемента тут не при чём: плееру уходит WAV-поток дома, а не ссылка на
-    источник. Подтверждение запуска — начало чтения потока (`on_read` → `Attempt.opened`): у
-    плеера, который о себе не рассказывает, другого свидетельства не бывает.
+    ⚠ Звук отдаёт дом, но адрес всё равно приводится к схеме ЭТОГО плеера (`flow_address`): у Sonos
+    он без схемы не принимается. Подтверждение запуска — начало чтения потока (`on_read` →
+    `Attempt.opened`): у плеера, который о себе не рассказывает, другого свидетельства не бывает.
     """
     address = flow.address(session, player)
     if address is None:
         raise OpError("Дом не знает своего адреса для потока", 503)
     session.on_read = opened
     return Output(
-        address, flow_content_type(profile),
+        flow_address(profile, address), flow_content_type(profile),
         opaque=profile.get("opaqueTrackId") is True, flow=True,
     )
 

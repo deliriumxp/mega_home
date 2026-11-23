@@ -391,6 +391,65 @@ def test_мультирум_гасит_плеер_участника_без_по
     asyncio.run(run())
 
 
+def vendor_tile(entity: str, uid: str) -> dict:
+    """Sonos/HEOS/WiiM: у системы СВОЙ мультирум — группирует штатный `media_player.join` HA."""
+    return {
+        "id": uid, "domain": "media_player", "entityId": entity,
+        "stream": {"type": "music", "vendorGroup": True},
+        "commands": {
+            "join": {"domain": "media_player", "service": "join",
+                     "fields": {"group_members": {"type": "list", "of": {"type": "string"}}}},
+            "unjoin": {"domain": "media_player", "service": "unjoin"},
+        },
+    }
+
+
+def test_вендорский_мультирум_уходит_в_ha_а_не_в_наш_поток(tmp_path):
+    """Sonos+Sonos и HEOS+HEOS группирует ВЕНДОР через HA (заказчик 2026-11-23).
+
+    ⚠ Живой отказ: дом перехватывал `join` у любой плитки со `stream`, и до HA команда не доходила —
+    «сонос+сонос не работает». `None` здесь означает «команда не наша»: `core/ops.py` позовёт
+    штатную службу HA, и сработает вендорская синхронность.
+    """
+
+    async def run():
+        service, home, _catalog, streams = setup(tmp_path)
+        sonos = vendor_tile("media_player.living", "sonos")
+        home.data["tiles"].append(sonos)
+        home.source.states["media_player.living"] = PlainState("playing")
+        answer = await service.group_command(
+            sonos, "join", {"group_members": ["media_player.other"]}, None,
+        )
+        assert answer is None
+        # Наша группа не завелась, музыку не переводили на поток дома, команд плееру не было.
+        assert service.groups == {}
+        assert home.source.calls == []
+        # И снятие отметки тоже уходит в HA — иначе оно не погасило бы вендорскую группу.
+        assert await service.group_command(sonos, "unjoin", {}, None) is None
+
+    asyncio.run(run())
+
+
+def test_яндекс_станция_своей_группой_идёт_нашим_путём(tmp_path):
+    """У станции своего мультирума НЕТ — там работает только наша реализация (заказчик 2026-11-23)."""
+
+    async def run():
+        service, home, _catalog, streams = setup(tmp_path)
+        home.data["tiles"].append(station_tile())
+        home.source.states["media_player.station"] = PlainState("idle")
+        fields = {"media_content_id": "https://cdn.example/rock.aac", "media_content_type": "audio/aac"}
+        await service.call(False, {"action": "play_station", "player": "echo",
+                                   "station": {"id": "rock", "title": "Рок", "url": fields["media_content_id"]},
+                                   "fields": fields})
+        answer = await service.group_command(
+            home.data["tiles"][0], "join", {"group_members": ["media_player.station"]}, None,
+        )
+        assert answer and answer["accepted"]
+        assert service.groups == {"media_player.echo": ["media_player.station"]}
+
+    asyncio.run(run())
+
+
 def station_tile(entity: str = "media_player.station") -> dict:
     """Яндекс Станция: объявляет СВОИ типы потока (`stream.mp3`/`stream.aac`), WAV ей не отдать."""
     return {
