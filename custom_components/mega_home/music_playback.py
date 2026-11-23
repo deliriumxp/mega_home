@@ -50,6 +50,13 @@ class MusicPlayback:
         # У нас звук и так один — поток дома (`providers/music_flow.py`): участнику достаточно дать
         # ТОТ ЖЕ адрес сессии, и он играет вместе, без своей очереди.
         self.groups: dict[str, list[str]] = {}
+        # Колонки, присоединённые к ведущему ВЕНДОРОМ (вторая и дальше колонка одной системы):
+        # участник → ведущий. Снимаются `unjoin`, а не паузой — иначе остаются в группе вендора.
+        self._vendor: dict[str, str] = {}
+        # Кому и какую сессию дома уже отдали: участник → токен сессии. Без этого каждая смена
+        # элемента повторяла `play_media` ВСЕМ участникам, и колонки уходили вразнобой — живой
+        # симптом «плееры играют разные источники».
+        self._served: dict[str, str] = {}
         self._players: dict[str, PlayerQueue] = {}
         self._profiles: dict[str, dict] = {}
         self._changed()
@@ -182,12 +189,22 @@ class MusicPlayback:
 
         ⚠ Приложение читает состав ОДНИМ полем (`group_members`, `core/media-group.ts`), не различая
         штатную группировку HA и нашу: иначе у него был бы второй путь «кто с кем играет».
+
+        ⚠⚠ Колонки, сведённые ВЕНДОРОМ вокруг своего ведущего, тоже в составе: жилец отметил их, и
+        галка обязана стоять. Без них приложение показывало группу из одного ведущего, и снять
+        отметку с такой колонки было нечем (живой симптом 2026-11-23).
         """
         out: dict[str, list[str]] = {}
         for leader, members in self.groups.items():
             if not members:
                 continue
+            # Порядок — как жилец отметил: ведущий, затем участники нашей группы, затем вендорские.
             line = [leader, *members]
+            for member, head in self._vendor.items():
+                if head in line and member not in line:
+                    line.append(member)
+            if len(line) < 2:
+                continue
             for entity in line:
                 out[entity] = line
         return out
@@ -295,7 +312,15 @@ class MusicPlayback:
         return system if isinstance(system, str) and system else None
 
     def _in_our_group(self, entity: str) -> bool:
-        return entity in self.groups or any(entity in members for members in self.groups.values())
+        """Колонка в группе, которую ВЕДЁТ ДОМ: ведущая, наш участник или вендорский.
+
+        ⚠ Вендорский участник тоже наш: группу собрал дом (ведущему дали поток, остальные колонки
+        его системы свели штатным `join`). Без него `unjoin` такой колонки уходил в HA и звук на ней
+        не гас — живой симптом 2026-11-23 «не отключают звук при снятии отметки».
+        """
+        return entity in self.groups or entity in self._vendor or any(
+            entity in members for members in self.groups.values()
+        )
 
     async def _leave_group(self, entity: str) -> dict:
         """Выйти из группы: ушедший гаснет, ведущий и остальные участники играют дальше."""
@@ -303,13 +328,20 @@ class MusicPlayback:
             if entity == leader:
                 self.groups.pop(leader, None)
                 await self._stop_players(members)
+                # Колонки, сведённые вендором вокруг этого ведущего, гасим вместе с ним: он больше
+                # не играет, а вендорская группа без звука живёт своей жизнью (свои списки треков).
+                for member in [m for m, head in self._vendor.items() if head == leader]:
+                    self._vendor.pop(member, None)
+                    self._served.pop(member, None)
+                    await self._stop_players([member])
             elif entity in members:
                 left = [member for member in members if member != entity]
                 if left:
                     self.groups[leader] = left
                 else:
                     self.groups.pop(leader, None)
-                await self._stop_players([entity])
+                if not await self._vendor_leave(entity):
+                    await self._stop_players([entity])
             else:
                 continue
             self._changed()
@@ -324,6 +356,8 @@ class MusicPlayback:
         на снятии галки мультирума. У HEOS и станции STOP нет, пауза есть: гасим паузой.
         """
         for entity in entities:
+            # Плеер больше не играет наш поток: следующая отметка обязана отдать его заново.
+            self._served.pop(entity, None)
             state = self._home.source.get(entity)
             mask = getattr(state, "attributes", {}).get("supported_features") if state else None
             features = int(mask) if isinstance(mask, (int, float)) and not isinstance(mask, bool) else 0
@@ -391,11 +425,23 @@ class MusicPlayback:
             await self._vendor_join(heads[system], members_of)
 
     async def _give_stream(self, session: Any, members: list[str]) -> None:
-        """Отдать НАШ поток этим колонкам — по одной команде `play_media` каждой."""
+        """Отдать НАШ поток этим колонкам — по одной команде `play_media` каждой.
+
+        ⚠⚠ Команда уходит ТОЛЬКО тому, у кого этой сессии ещё нет. Адрес один на сессию, элементы
+        сменяются внутри неё — повторная команда на каждой смене трека (и на каждой новой отметке)
+        перезапускала плееру поток, колонки стартовали вразнобой и расходились: живой симптом
+        «плееры играют разные источники» (2026-11-23).
+        """
         for member in members:
             member_tile = self._tile_of(member)
             if member_tile is None:
                 continue
+            # ⚠⚠ Участник перестаёт играть СВОЁ: его очередь и сессию снимаем. Иначе прежняя
+            # очередь продолжала следить за плеером, видела «играет» и перезапускала ЕГО источник —
+            # живой симптом «плееры играют разные источники» (и плитка показывала свой трек).
+            self._drop_queue(member, member_tile)
+            if self._served.get(member) == session.token and session.reading:
+                continue  # поток этого плеера ЖИВ — повторная команда оборвала бы ему звук
             # Токен — СВОЙ у участника: по нему дом знает, чью задержку применить к чтению.
             address = self._flow.address(session, member)
             if address is None:
@@ -407,25 +453,46 @@ class MusicPlayback:
                 raise OpError("Плеер не примет поток дома в этом формате", 409)
             fields = _stream_fields(
                 member_tile, member,
-                {"media_content_id": address, "media_content_type": media_type},
+                # ⚠⚠ Адрес приводится к схеме ЭТОГО плеера, как в `flow_output`: Sonos принимает
+                # только `x-rincon-mp3radio://…`, и на голом `https` отклоняет `play_media` — жилец
+                # видел «Home Assistant отклонил команду», а колонка молчала (живой разбор 2026-11-23).
+                {"media_content_id": flow_address(member_profile, address), "media_content_type": media_type},
                 self._home.source,
             )
             await call(self._home.source, "media_player", "play_media", {"entity_id": member, **fields})
+            self._served[member] = session.token
 
     async def _vendor_join(self, delegate: str, members: list[str]) -> None:
         """Остальные колонки системы — штатным `join` HA вокруг её ведущего.
 
         ⚠ Вендор сводит свои колонки точнее нас: звук им даёт не дом, а своя система, поэтому
-        достаточно присоединить их к ведущему, который уже играет наш поток.
+        достаточно присоединить их к ведущему, который уже играет наш поток. Связь запоминаем:
+        снимать такую колонку нужно `unjoin`, а не паузой (пауза из вендорской группы не выводит).
+
+        ⚠ Повторный `join` уже сведённой пары не зовём: служба принимает его молча, но вендор
+        пересобирает группу — и звук на секунду рвётся у всех её колонок.
         """
-        tile = self._tile_of(delegate)
-        if tile is None:
+        if self._tile_of(delegate) is None:
             return
         for member in members:
+            if self._vendor.get(member) == delegate:
+                continue
             await call(
                 self._home.source, "media_player", "join",
                 {"entity_id": delegate, "group_members": [member]},
             )
+            self._vendor[member] = delegate
+
+    async def _vendor_leave(self, member: str) -> bool:
+        """Вывести колонку из ВЕНДОРСКОЙ группы; `False` — она в неё не входила у нас."""
+        head = self._vendor.pop(member, None)
+        if head is None:
+            return False
+        self._served.pop(member, None)
+        # `unjoin` — у самой колонки: так она выходит из группы, которую собрал вендор. Пауза
+        # оставила бы её участником, и звук вернулся бы на первом же воспроизведении.
+        await call(self._home.source, "media_player", "unjoin", {"entity_id": member})
+        return True
 
     def _tile_of(self, entity: str) -> dict | None:
         return next((tile for tile in self._tiles() if self._entity(tile) == entity), None)
@@ -566,6 +633,7 @@ class MusicPlayback:
         self._players.clear()
         self._profiles.clear()
         self.groups.clear()
+        self._vendor.clear()
         self._flow.close()
 
 

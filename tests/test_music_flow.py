@@ -565,6 +565,134 @@ def test_вторая_отметка_добавляется_к_группе_а_�
     asyncio.run(run())
 
 
+def test_участник_перестаёт_играть_свой_источник(tmp_path):
+    """Отмеченная колонка играет НАШ поток, а не свой (живой отказ 2026-11-23).
+
+    ⚠ Дом отдавал участнику адрес сессии, но его собственная очередь оставалась жива: она видела
+    «играет» и перезапускала ЕГО источник. Плееры пели разное.
+    """
+
+    async def run():
+        service, home, _catalog, streams = setup(tmp_path)
+        sonos = vendor_tile("media_player.sonos", "s1", "sync:sonos")
+        heos = vendor_tile("media_player.heos", "h1", "sync:heos")
+        home.data["tiles"] += [sonos, heos]
+        for entity in ("media_player.sonos", "media_player.heos"):
+            home.source.states[entity] = PlainState("idle")
+        fields = {"media_content_id": "https://cdn.example/rock.aac", "media_content_type": "audio/aac"}
+        # HEOS играл СВОЁ до отметки: у него заведена своя очередь.
+        await service.call(False, {"action": "play_station", "player": "h1",
+                                   "station": {"id": "jazz", "title": "Джаз", "url": "https://cdn.example/jazz.aac"},
+                                   "fields": fields})
+        assert service._players.get("media_player.heos") is not None
+        # Ведущий — Sonos: музыку включили на нём.
+        await service.call(False, {"action": "play_station", "player": "s1",
+                                   "station": {"id": "rock", "title": "Рок", "url": fields["media_content_id"]},
+                                   "fields": fields})
+        await service.group_command(sonos, "join", {"group_members": ["media_player.heos"]}, None)
+        # Своей очереди у участника больше нет — он играет поток ведущего и только его.
+        assert service._players.get("media_player.heos") is None
+        assert service._served["media_player.heos"] == streams.session("s1").token
+
+    asyncio.run(run())
+
+
+def test_снятие_отметки_гасит_и_вендорскую_колонку(tmp_path):
+    """`unjoin` вендорского участника гасит звук, а не уходит в HA пустым (живой отказ 2026-11-23).
+
+    ⚠ Колонка, сведённая вендором вокруг ведущего, вендорскую группу паузой не покидает: звук
+    возвращался на первом же воспроизведении. Её вывод — `unjoin` у неё самой.
+    """
+
+    async def run():
+        service, home, _catalog, streams = setup(tmp_path)
+        sonos = vendor_tile("media_player.sonos_head", "s1", "sync:sonos")
+        sonos_2 = vendor_tile("media_player.sonos_2", "s2", "sync:sonos")
+        heos = vendor_tile("media_player.heos", "h1", "sync:heos")
+        home.data["tiles"] += [sonos, sonos_2, heos]
+        for entity in ("media_player.sonos_head", "media_player.sonos_2", "media_player.heos"):
+            home.source.states[entity] = PlainState("idle")
+        fields = {"media_content_id": "https://cdn.example/rock.aac", "media_content_type": "audio/aac"}
+        await service.call(False, {"action": "play_station", "player": "s1",
+                                   "station": {"id": "rock", "title": "Рок", "url": fields["media_content_id"]},
+                                   "fields": fields})
+        await service.group_command(
+            sonos, "join", {"group_members": ["media_player.sonos_2", "media_player.heos"]}, None,
+        )
+        assert service._vendor == {"media_player.sonos_2": "media_player.sonos_head"}
+        # Отметку снимают со ВТОРОЙ колонки Sonos — она в группе, хоть и не ведущая.
+        answer = await service.group_command(
+            sonos_2, "unjoin", {}, None,
+        )
+        assert answer and answer["accepted"]
+        assert ("media_player", "unjoin", {"entity_id": "media_player.sonos_2"}) in home.source.calls
+        assert service._vendor == {}
+
+    asyncio.run(run())
+
+
+def test_вендорский_участник_виден_в_составе_группы(tmp_path):
+    """Галка обязана стоять на отмеченной колонке (живой отказ 2026-11-23).
+
+    ⚠ Колонки, сведённые вендором, не попадали в `group_members`: приложение показывало группу из
+    одного ведущего, и снять отметку с такой колонки было нечем.
+    """
+
+    async def run():
+        service, home, _catalog, streams = setup(tmp_path)
+        sonos = vendor_tile("media_player.sonos_head", "s1", "sync:sonos")
+        sonos_2 = vendor_tile("media_player.sonos_2", "s2", "sync:sonos")
+        heos = vendor_tile("media_player.heos", "h1", "sync:heos")
+        home.data["tiles"] += [sonos, sonos_2, heos]
+        for entity in ("media_player.sonos_head", "media_player.sonos_2", "media_player.heos"):
+            home.source.states[entity] = PlainState("idle")
+        fields = {"media_content_id": "https://cdn.example/rock.aac", "media_content_type": "audio/aac"}
+        await service.call(False, {"action": "play_station", "player": "s1",
+                                   "station": {"id": "rock", "title": "Рок", "url": fields["media_content_id"]},
+                                   "fields": fields})
+        await service.group_command(
+            sonos, "join", {"group_members": ["media_player.sonos_2", "media_player.heos"]}, None,
+        )
+        # Порядок — как жилец отметил: ведущий, затем отмеченные колонки по порядку.
+        line = ["media_player.sonos_head", "media_player.sonos_2", "media_player.heos"]
+        assert service.state_groups()["media_player.sonos_2"] == line
+        assert service.state_groups()["media_player.heos"] == line
+
+    asyncio.run(run())
+
+
+def test_смена_трека_не_переотдаёт_поток_участнику(tmp_path):
+    """Адрес один на сессию: элементы сменяются ВНУТРИ него (живой отказ 2026-11-23).
+
+    ⚠ Повторная `play_media` на каждой смене трека перезапускала плееру поток: колонки стартовали
+    вразнобой и расходились — «плееры играют разные источники».
+    """
+
+    async def run():
+        service, home, _catalog, streams = setup(tmp_path)
+        sonos = vendor_tile("media_player.sonos", "s1", "sync:sonos")
+        heos = vendor_tile("media_player.heos", "h1", "sync:heos")
+        home.data["tiles"] += [sonos, heos]
+        for entity in ("media_player.sonos", "media_player.heos"):
+            home.source.states[entity] = PlainState("idle")
+        fields = {"media_content_id": "https://cdn.example/rock.aac", "media_content_type": "audio/aac"}
+        await service.call(False, {"action": "play_station", "player": "s1",
+                                   "station": {"id": "rock", "title": "Рок", "url": fields["media_content_id"]},
+                                   "fields": fields})
+        await service.group_command(sonos, "join", {"group_members": ["media_player.heos"]}, None)
+        given = [c for c in home.source.calls if c[1] == "play_media" and c[2].get("entity_id") == "media_player.heos"]
+        assert len(given) == 1
+        # Поток читается (так его видит дом) — новый трек на ведущем не должен слать участнику команду.
+        streams.session("s1").reading = True
+        await service.call(False, {"action": "play_station", "player": "s1",
+                                   "station": {"id": "pop", "title": "Поп", "url": fields["media_content_id"]},
+                                   "fields": fields})
+        after = [c for c in home.source.calls if c[1] == "play_media" and c[2].get("entity_id") == "media_player.heos"]
+        assert len(after) == 1
+
+    asyncio.run(run())
+
+
 def station_tile(entity: str = "media_player.station") -> dict:
     """Яндекс Станция: объявляет СВОИ типы потока (`stream.mp3`/`stream.aac`), WAV ей не отдать."""
     return {
