@@ -324,12 +324,13 @@ def test_мультирум_даёт_участнику_тот_же_адрес_�
         view = ops.entity_view(flow_tile(), None, None, None, ops.groups_of(SimpleNamespace(music_playback=service)))
         assert view["attributes"]["group_members"] == line
 
-        # Сосед выходит: гаснет он, ведущий играет дальше.
+        # Сосед выходит: гаснет он, ведущий играет дальше. Служба — по маске прибора: у фикстуры
+        # бита STOP нет, значит пауза (`media_stop` HA принял бы только с битом STOP).
         await ops.command(
             SimpleNamespace(data=home.data, source=source, music_playback=service),
             {"id": "living", "command": "unjoin", "value": {}},
         )
-        assert source.calls[-1] == ("media_player", "media_stop", {"entity_id": "media_player.living"})
+        assert source.calls[-1] == ("media_player", "media_pause", {"entity_id": "media_player.living"})
         assert ops.groups_of(SimpleNamespace(music_playback=service)) == {}
         service.close()
 
@@ -347,9 +348,20 @@ def test_мультирум_ведущим_может_быть_плеер_без
         service, home, _catalog, streams = setup(tmp_path, flow=False)
         tile = home.data["tiles"][0]
         home.data["tiles"].append(station_tile())
+        # Музыку на ведущем включили НЕ из приложения (пульт, голос): очередь дома пуста. Такой
+        # ведущий группу собрать не может — участник получал бы адрес пустого потока и вечную тишину
+        # без единого отказа (живой симптом «отметка колонок ничего не включает»).
+        with pytest.raises(OpError, match="Сначала включите музыку"):
+            await service.group_command(tile, "join", {"group_members": ["media_player.station"]}, None)
+        assert service.groups == {}
+
+        # Включили из приложения — ведущий переведён на поток дома, и участник получает ТОТ ЖЕ адрес.
+        fields = {"media_content_id": "https://cdn.example/rock.aac", "media_content_type": "audio/aac"}
+        await service.call(False, {"action": "play_station", "player": "echo",
+                                   "station": {"id": "rock", "title": "Рок", "url": fields["media_content_id"]},
+                                   "fields": fields})
         answer = await service.group_command(tile, "join", {"group_members": ["media_player.station"]}, None)
         assert answer and answer["accepted"] and answer["group"][0] == "media_player.echo"
-        # Ведущий и участник получили адрес ОДНОГО потока дома.
         addresses = [str(call[2].get("media_content_id", "")) for call in home.source.calls]
         assert any("/mega-home/stream/" in address for address in addresses)
         # Участник без потока дома в группу не годится — отказ, а не тишина.
@@ -373,7 +385,7 @@ def test_мультирум_гасит_плеер_участника_без_по
             SimpleNamespace(data=home.data, source=source, music_playback=service),
             {"id": "station", "command": "unjoin", "value": {}},
         ))["accepted"]
-        assert source.calls[-1] == ("media_player", "media_stop", {"entity_id": "media_player.station"})
+        assert source.calls[-1] == ("media_player", "media_pause", {"entity_id": "media_player.station"})
         service.close()
 
     asyncio.run(run())

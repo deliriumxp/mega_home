@@ -11,18 +11,21 @@ from .core.ops_base import OpError, arguments, find
 from .providers.media_queue import PlayerQueue
 from .providers.music_catalog import queue_ids
 from .providers.music_flow import FLOW_CHANNELS, FLOW_RATE, FLOW_WIDTH, FlowSession, FlowStreams
-
-# Потолок задержки плеера, мс: как у MA (0–5000), больше — уже не выравнивание, а рассинхрон.
-MAX_DELAY_MS = 5000
 from .providers.music_pick import pick_stream
 from .providers.music_proxy import MusicStreamLinks
 from .providers.player_output import MediaItem, Output, native_output, number, stream_output
+
 if TYPE_CHECKING:
     from .providers.yandex_music import MusicService
     from .station_auth import StationAuth
 
 TOPIC = "media/playback"
 FAVORITES_TOPIC = "media/favorites"
+
+# Потолок задержки плеера, мс: как у MA (0–5000), больше — уже не выравнивание, а рассинхрон.
+MAX_DELAY_MS = 5000
+# Бит STOP в `supported_features` (`core-media-player-const.py`, `MediaPlayerEntityFeature.STOP`).
+_STOP_FEATURE = 4096
 
 
 class MusicPlayback:
@@ -139,12 +142,23 @@ class MusicPlayback:
                 profile.get("needsKnownState") and state.attributes.get("assumed_state") is True
             ):
                 raise OpError("Этот плеер сейчас недоступен", 409)
+            # ⚠ Нативная дорожка — только там, где плеер правда её играет. У станции `nativeTrackType`
+            # работает в ЛОКАЛЬНОМ режиме; в облачном её `play_media` типа `track` не принимает, и HA
+            # отвечает отказом — жилец видел «Home Assistant отклонил команду». Признак режима — тот же
+            # `assumed_state`, что у потока: облачный режим его ставит (README YandexStation).
+            native = native_output(item.id, profile)
+            if native is not None and profile.get("needsKnownState") and (
+                state.attributes.get("assumed_state") is True
+            ):
+                raise OpError(
+                    "Станция в облачном режиме: включите местное управление или выберите другую колонку", 409
+                )
             if session is not None:
                 # Плеер берёт поток ОДНИМ адресом на сессию: элементы сменяются внутри неё
                 # (`providers/music_flow.py`), новой команды на каждый трек не нужно.
                 return flow_output(self._flow, session, profile, opened, entity)
-            if output := native_output(item.id, profile):
-                return output
+            if native is not None:
+                return native
             answer = await self._music.call(False, {"action": "stream", "id": item.id})
             return stream_output(
                 item, profile, answer,
@@ -238,11 +252,28 @@ class MusicPlayback:
         return {"accepted": True}
 
     async def _stop_players(self, entities: list[str]) -> None:
+        """Погасить плееры — ТОЙ службой, которую прибор объявил в своей маске.
+
+        ⚠ `media_player.media_stop` HA принимает только у плеера с битом STOP
+        (`core-media-player-services.yaml`: `supported_features: …STOP`). Требуй мы его у всех,
+        плеер без STOP отвечал бы отказом службы — жилец видел бы «Home Assistant отклонил команду»
+        на снятии галки мультирума. У HEOS и станции STOP нет, пауза есть: гасим паузой.
+        """
         for entity in entities:
-            await call(self._home.source, "media_player", "media_stop", {"entity_id": entity})
+            state = self._home.source.get(entity)
+            mask = getattr(state, "attributes", {}).get("supported_features") if state else None
+            features = int(mask) if isinstance(mask, (int, float)) and not isinstance(mask, bool) else 0
+            service = "media_stop" if features & _STOP_FEATURE else "media_pause"
+            await call(self._home.source, "media_player", service, {"entity_id": entity})
 
     async def _wake_group(self, leader: str) -> None:
         """Участникам — ТОТ ЖЕ адрес сессии ведущего: их плеер забирает поток сам, без очереди.
+
+        ⚠ Пустой поток не отдаём НИКОГДА. Если у ведущего очередь не заведена (музыку включили не из
+        приложения — с пульта, голосом, у вендора), адрес его сессии существует, но за ним нет ни
+        одного элемента: участник получал бы вечную тишину без единого отказа — живой симптом
+        «отметка колонок ничего не включает». Такому ведущему — `unjoin`'ся и честный отказ, чтобы
+        приложение сказало, что включить музыку надо на ведущей колонке.
 
         ⚠ Команду зовём только когда поток ещё НЕ читают (`_play`/`_play_station`): у устройства,
         которое новый `media_url` поверх живого потока не берёт, повторная команда была бы
@@ -256,12 +287,19 @@ class MusicPlayback:
             return
         tile = self._tile_of(leader)
         session = self._flow.session(tile["id"]) if tile is not None else None
+        if session is None or session.current is None:
+            # Группа без звука — не группа: снимаем её, а жильцу говорим, что включить и где.
+            self.groups.pop(leader, None)
+            self._changed()
+            raise OpError(
+                "Сначала включите музыку на этой колонке — тогда к ней добавятся остальные", 409
+            )
         for member in members:
             member_tile = self._tile_of(member)
             if member_tile is None:
                 continue
             # Токен — СВОЙ у участника: по нему дом знает, чью задержку применить к чтению.
-            address = self._flow.address(session, member) if session is not None else None
+            address = self._flow.address(session, member)
             if address is None:
                 raise OpError("Дом не знает своего адреса для потока", 503)
             media_type = flow_content_type(member_tile.get("stream") or {})
