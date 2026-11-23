@@ -34,6 +34,7 @@ ALERTS = "alerts"
 PHOTOS = "photos"
 CROPS = "crops"
 APP = "app"
+MEDIA_GROUPS = "media/groups"
 
 
 class Topics:

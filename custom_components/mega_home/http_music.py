@@ -51,6 +51,7 @@ class MegaHomeMusicStreamView(_MegaHomeView):
 
     async def _stream_flow(
         self, request: web.Request, session: FlowSession, coordinator: Any, *, body: bool, player: str,
+        authorized: Callable[[], bool],
     ) -> web.StreamResponse:
         """Поток сессии плеера: один адрес на всю сессию, элементы сменяет дом.
 
@@ -66,6 +67,8 @@ class MegaHomeMusicStreamView(_MegaHomeView):
             return self.json_message(
                 "В этом доме нет ffmpeg — поток отдать нечем", HTTPStatus.SERVICE_UNAVAILABLE
             )
+        if not authorized():
+            return self.json_message("Поток больше не доступен", HTTPStatus.NOT_FOUND)
         response = web.StreamResponse(status=HTTPStatus.OK, headers=FLOW_HEADERS)
         await response.prepare(request)
 
@@ -73,9 +76,10 @@ class MegaHomeMusicStreamView(_MegaHomeView):
             await response.write(chunk)
 
         try:
-            await session.serve(
-                write, lambda url: ffmpeg_decoder(binary, url), lambda out: ffmpeg_encoder(binary, out), player,
-            )
+            if authorized():
+                await session.serve(
+                    write, lambda url: ffmpeg_decoder(binary, url), lambda out: ffmpeg_encoder(binary, out), player,
+                )
         except (ConnectionError, OSError):
             # Плеер закрыл поток (пауза, смена источника, выключение) — это норма, не ошибка.
             response.force_close()
@@ -94,7 +98,10 @@ class MegaHomeMusicStreamView(_MegaHomeView):
         found = playback.flow.find(token) if playback is not None else None
         if found is not None:
             session, player = found
-            return await self._stream_flow(request, session, coordinator, body=body, player=player)
+            return await self._stream_flow(
+                request, session, coordinator, body=body, player=player,
+                authorized=lambda: playback.flow.find(token) == found,
+            )
         links = getattr(coordinator, "music_links", None)
         track = links.track(token) if links is not None else None
         if track is None:

@@ -44,12 +44,14 @@ def marker_description(slots: int = 1) -> dict[str, Any]:
     }
 
 
-def cycle_pcm(slot: int, slots: int) -> bytes:
+def cycle_pcm(slot: int, slots: int, *, spacing_ms: int = SPACING_MS) -> bytes:
     """PCM 48 кГц моно одного КРУГА для этой колонки: тишина и её щелчок в её слоте.
 
     ⚠ Не бесконечная запись: поток крутит этот круг снова и снова (`music_measure.py`), поэтому
     кэшируется ровно один круг на колонку — сотни килобайт вместо мегабайтов файла.
     """
+    if spacing_ms != SPACING_MS:
+        return _build_cycle(slot, slots, spacing_ms)
     key = (slot, slots)
     cached = _CYCLES.get(key)
     if cached is None:
@@ -58,7 +60,7 @@ def cycle_pcm(slot: int, slots: int) -> bytes:
     return cached
 
 
-def _build_cycle(slot: int, slots: int) -> bytes:
+def _build_cycle(slot: int, slots: int, spacing_ms: int = SPACING_MS) -> bytes:
     rate = FLOW_RATE
     length = int(CLICK_MS / 1000 * rate)
     pitch = PITCHES[slot]
@@ -66,9 +68,9 @@ def _build_cycle(slot: int, slots: int) -> bytes:
         math.sin(2 * math.pi * pitch * index / rate) * (0.5 - 0.5 * math.cos(2 * math.pi * index / (length - 1)))
         for index in range(length)
     ]
-    total = int(slots * SPACING_MS / 1000 * rate)
+    total = int(slots * spacing_ms / 1000 * rate)
     samples = [0.0] * total
-    at = int(slot * SPACING_MS / 1000 * rate)
+    at = int(slot * spacing_ms / 1000 * rate)
     for index, value in enumerate(click):
         if at + index < total:
             samples[at + index] = value

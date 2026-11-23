@@ -56,7 +56,7 @@ class FlowPort(Protocol):
     играет, говорит очередь (`set_items`). Так «что играет» остаётся в одном месте.
     """
 
-    reading: bool
+    def reading_player(self, player: str) -> bool: ...
 
     def set_items(self, items: tuple[MediaItem, ...], index: int) -> None: ...
 
@@ -117,6 +117,21 @@ class PlayerQueue:
                 self._flow.set_items(tuple(items), index)
             self._unsubscribe = self._source.subscribe([self.entity], self._observe)
             await self._launch(self._queue)
+
+    @property
+    def flow(self) -> FlowPort | None:
+        return self._flow
+
+    async def promote(self, flow: FlowPort) -> bool:
+        async with self._lock:
+            queue = self._queue
+            if queue is None:
+                return False
+            self._discard_attempt(queue)
+            self._flow = flow
+            flow.set_items(queue.items, queue.index)
+            await self._launch(queue)
+            return True
 
     async def control(self, action: str) -> bool:
         async with self._lock:
@@ -216,7 +231,7 @@ class PlayerQueue:
             # ⚠ Поток сессии уже читается устройством: адрес тот же, команды плееру не нужно —
             # элемент сменён внутри открытого потока (`providers/music_flow.py`). Это и есть
             # переключение без «Стоп» у плеера, который новый `media_url` поверх потока не берёт.
-            if attempt.output.flow and self._flow is not None and self._flow.reading:
+            if attempt.output.flow and self._flow is not None and self._flow.reading_player(self.entity):
                 attempt.accepted = True
                 attempt.started = attempt.last = attempt.before
                 attempt.anchor = monotonic()

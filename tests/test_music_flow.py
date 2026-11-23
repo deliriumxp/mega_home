@@ -276,7 +276,7 @@ def test_трек_на_плеере_потока_переключается_бе
         assert session.current.id == "1"
         home.source.report("media_player.echo", "playing")
         # Устройство взяло поток: так это помечает `FlowSession.play` (дома — маршрут потока).
-        session.reading = True
+        session._readers[asyncio.Queue()] = "media_player.echo"
         session.on_read()
         assert (await view(service, "echo"))["started"] is True
 
@@ -348,12 +348,13 @@ def test_мультирум_ведущим_может_быть_плеер_без
         service, home, _catalog, streams = setup(tmp_path, flow=False)
         tile = home.data["tiles"][0]
         home.data["tiles"].append(station_tile())
+        home.source.states["media_player.station"] = PlainState("idle")
         # Музыку на ведущем включили НЕ из приложения (пульт, голос): очередь дома пуста. Такой
         # ведущий группу собрать не может — участник получал бы адрес пустого потока и вечную тишину
         # без единого отказа (живой симптом «отметка колонок ничего не включает»).
         with pytest.raises(OpError, match="Сначала включите музыку"):
             await service.group_command(tile, "join", {"group_members": ["media_player.station"]}, None)
-        assert service.groups == {}
+        assert service.multiroom.groups == {}
 
         # Включили из приложения — ведущий переведён на поток дома, и участник получает ТОТ ЖЕ адрес.
         fields = {"media_content_id": "https://cdn.example/rock.aac", "media_content_type": "audio/aac"}
@@ -380,7 +381,7 @@ def test_мультирум_гасит_плеер_участника_без_по
         home.data["tiles"].append(station_tile())
         source = home.source
         source.states["media_player.station"] = PlainState("playing")
-        service.groups["media_player.echo"] = ["media_player.station"]
+        service.multiroom.groups["media_player.echo"] = ["media_player.station"]
         assert (await ops.command(
             SimpleNamespace(data=home.data, source=source, music_playback=service),
             {"id": "station", "command": "unjoin", "value": {}},
@@ -427,7 +428,7 @@ def test_одна_система_группируется_вендором_че�
             sonos, "join", {"group_members": ["media_player.hall"]}, None,
         )
         assert answer is None
-        assert service.groups == {}
+        assert service.multiroom.groups == {}
         assert home.source.calls == []
 
     asyncio.run(run())
@@ -458,7 +459,7 @@ def test_разные_системы_группирует_наш_поток(tmp_
             sonos, "join", {"group_members": ["media_player.hall"]}, None,
         )
         assert answer and answer["accepted"]
-        assert service.groups == {"media_player.living": ["media_player.hall"]}
+        assert service.multiroom.groups == {"media_player.living": ["media_player.hall"]}
         # Ведущий HEOS получил ТОТ ЖЕ поток дома — синхронность между системами держим мы.
         assert home.source.calls[-1] == (
             "media_player", "play_media",
@@ -531,7 +532,7 @@ def test_яндекс_станция_своей_группой_идёт_наши
             home.data["tiles"][0], "join", {"group_members": ["media_player.station"]}, None,
         )
         assert answer and answer["accepted"]
-        assert service.groups == {"media_player.echo": ["media_player.station"]}
+        assert service.multiroom.groups == {"media_player.echo": ["media_player.station"]}
 
     asyncio.run(run())
 
@@ -557,10 +558,10 @@ def test_вторая_отметка_добавляется_к_группе_а_�
                                    "fields": fields})
         await service.group_command(sonos, "join", {"group_members": ["media_player.heos"]}, None)
         await service.group_command(sonos, "join", {"group_members": ["media_player.station"]}, None)
-        assert service.groups == {"media_player.sonos": ["media_player.heos", "media_player.station"]}
+        assert service.multiroom.groups == {"media_player.sonos": ["media_player.heos", "media_player.station"]}
         # Повторная отметка того же участника ничего не задваивает и не перезапускает его.
         await service.group_command(sonos, "join", {"group_members": ["media_player.heos"]}, None)
-        assert service.groups == {"media_player.sonos": ["media_player.heos", "media_player.station"]}
+        assert service.multiroom.groups == {"media_player.sonos": ["media_player.heos", "media_player.station"]}
 
     asyncio.run(run())
 
@@ -592,7 +593,7 @@ def test_участник_перестаёт_играть_свой_источн�
         await service.group_command(sonos, "join", {"group_members": ["media_player.heos"]}, None)
         # Своей очереди у участника больше нет — он играет поток ведущего и только его.
         assert service._players.get("media_player.heos") is None
-        assert service._served["media_player.heos"] == streams.session("s1").token
+        assert service.multiroom._served["media_player.heos"] == streams.session("s1").token
 
     asyncio.run(run())
 
@@ -619,14 +620,14 @@ def test_снятие_отметки_гасит_и_вендорскую_коло
         await service.group_command(
             sonos, "join", {"group_members": ["media_player.sonos_2", "media_player.heos"]}, None,
         )
-        assert service._vendor == {"media_player.sonos_2": "media_player.sonos_head"}
+        assert service.multiroom._vendor == {"media_player.sonos_2": "media_player.sonos_head"}
         # Отметку снимают со ВТОРОЙ колонки Sonos — она в группе, хоть и не ведущая.
         answer = await service.group_command(
             sonos_2, "unjoin", {}, None,
         )
         assert answer and answer["accepted"]
         assert ("media_player", "unjoin", {"entity_id": "media_player.sonos_2"}) in home.source.calls
-        assert service._vendor == {}
+        assert service.multiroom._vendor == {}
 
     asyncio.run(run())
 
@@ -683,7 +684,9 @@ def test_смена_трека_не_переотдаёт_поток_участн
         given = [c for c in home.source.calls if c[1] == "play_media" and c[2].get("entity_id") == "media_player.heos"]
         assert len(given) == 1
         # Поток читается (так его видит дом) — новый трек на ведущем не должен слать участнику команду.
-        streams.session("s1").reading = True
+        session = streams.session("s1")
+        session._readers[asyncio.Queue()] = "media_player.sonos"
+        session._readers[asyncio.Queue()] = "media_player.heos"
         await service.call(False, {"action": "play_station", "player": "s1",
                                    "station": {"id": "pop", "title": "Поп", "url": fields["media_content_id"]},
                                    "fields": fields})
@@ -904,5 +907,130 @@ def test_задержка_плеера_сдвигает_его_чтение_и_�
         assert elapsed >= 0.03
         # Сброшенная задержка выбросила хвост: байт записано меньше, чем отдал декодер.
         assert len(b"".join(written)) < 32
+
+    asyncio.run(run())
+
+
+def test_последовательные_отметки_сохраняют_ведущего_системы_и_перевыбирают_его(tmp_path):
+    async def run():
+        service, home, _, _ = setup(tmp_path)
+        lead = home.data["tiles"][0]
+        first = "media_player.heos_first"
+        second = "media_player.heos_second"
+        home.data["tiles"] += [vendor_tile(first, "h1", "sync:heos"), vendor_tile(second, "h2", "sync:heos")]
+        for entity in (first, second):
+            home.source.states[entity] = PlainState("idle")
+        await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1"], "index": 0})
+        for entity in (first, second):
+            await service.group_command(lead, "join", {"group_members": [entity]}, None)
+        assert ("media_player", "join", {"entity_id": first, "group_members": [second]}) in home.source.calls
+        assert not any(name == "play_media" and data["entity_id"] == second for _, name, data in home.source.calls)
+        assert service.state_groups()[second] == ["media_player.echo", first, second]
+        await service.group_command(home.data["tiles"][1], "unjoin", {}, None)
+        assert any(name == "play_media" and data["entity_id"] == second for _, name, data in home.source.calls)
+        assert service.state_groups()[second] == ["media_player.echo", second]
+
+    asyncio.run(run())
+
+
+def test_продвижение_в_группу_сохраняет_текущий_трек(tmp_path):
+    async def run():
+        service, home, _, streams = setup(tmp_path, flow=False)
+        lead = home.data["tiles"][0]
+        member = "media_player.heos"
+        home.data["tiles"].append(vendor_tile(member, "h1", "sync:heos"))
+        home.source.states[member] = PlainState("idle")
+        await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1", "2"], "index": 0})
+        await service.call(False, {"action": "queue_control", "player": "echo", "command": "next"})
+        await service.group_command(lead, "join", {"group_members": [member]}, None)
+        assert streams.session("echo").current.id == "2"
+
+    asyncio.run(run())
+
+
+def test_настройка_задержки_не_сбрасывает_очередь_и_адрес(tmp_path):
+    async def run():
+        service, home, _, streams = setup(tmp_path)
+        await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1"], "index": 0})
+        session = streams.session("echo")
+        home.data["tiles"][0]["stream"] = {**home.data["tiles"][0]["stream"], "delayMs": 360}
+        service.config_changed()
+        assert streams.session("echo") is session
+        assert session.current.id == "1"
+        assert session.delay_of("media_player.echo") == 360
+
+    asyncio.run(run())
+
+
+def test_замер_на_двух_выходах_раздаёт_кадры_одной_сессии_и_отзывает_адреса(tmp_path):
+    import shutil
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("Для проверки MP3 нужен ffmpeg")
+
+    async def run():
+        service, home, _, streams = setup(tmp_path)
+        heos = "media_player.heos"
+        home.data["tiles"][0]["stream"]["delayMs"] = 120
+        home.data["tiles"].append(vendor_tile(heos, "h1", "sync:heos"))
+        home.source.states[heos] = PlainState("idle")
+        start = await service.call(False, {"action": "calibration_start", "players": ["echo", "h1"]})
+        tokens = [data["media_content_id"].rsplit("/", 1)[-1] for _, name, data in home.source.calls if name == "play_media"]
+        first, second = (streams.find(token) for token in tokens)
+        assert first[0] is second[0]
+        assert first[1] == "media_player.echo" and second[1] == heos
+        assert start["delays"] == [120, 0]
+        assert start["marker"]["rotateMs"] == 2016
+        session = first[0]
+        for frames in session.marker_frames.values():
+            assert len(frames) == 84
+            assert all(len(frame) == 576 and frame[:2] == b"\xff\xfb" for frame in frames)
+        wrote = asyncio.Event()
+
+        async def writer(frame):
+            assert len(frame) == 576
+            wrote.set()
+
+        async def unused(*_):
+            pytest.fail("Круг уже закодирован, декодер для него не запускается")
+
+        reader = asyncio.create_task(session.serve(writer, unused, unused, player=heos))
+        await asyncio.wait_for(wrote.wait(), timeout=1)
+        await service.call(False, {"action": "calibration_stop", "session": start["session"]})
+        await asyncio.wait_for(reader, timeout=1)
+        assert all(streams.find(token) is None for token in tokens)
+        assert not session.reading
+
+    asyncio.run(run())
+
+
+def test_отказ_ha_сохраняет_подтверждённый_состав_и_даёт_повторить_отметку(tmp_path):
+    async def run():
+        service, home, _, streams = setup(tmp_path)
+        lead = home.data["tiles"][0]
+        accepted = "media_player.heos"
+        refused = "media_player.sonos"
+        home.data["tiles"] += [vendor_tile(accepted, "h1", "sync:heos"), vendor_tile(refused, "s1", "sync:sonos")]
+        for entity in (accepted, refused):
+            home.source.states[entity] = PlainState("idle")
+        original = home.source.call
+        attempted = []
+
+        async def reject(domain, name, data, response, by):
+            if name == "play_media" and data["entity_id"] == refused:
+                attempted.append(data["media_content_id"].rsplit("/", 1)[-1])
+                raise OpError("Колонка отклонила поток")
+            return await original(domain, name, data, response, by)
+
+        home.source.call = reject
+        await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1"], "index": 0})
+        with pytest.raises(OpError, match="отклонила поток"):
+            await service.group_command(lead, "join", {"group_members": [accepted, refused]}, None)
+        assert service.state_groups()["media_player.echo"] == ["media_player.echo", accepted]
+        assert streams.find(attempted[0]) is None
+
+        home.source.call = original
+        await service.group_command(lead, "join", {"group_members": [refused]}, None)
+        assert service.state_groups()[refused] == ["media_player.echo", accepted, refused]
 
     asyncio.run(run())

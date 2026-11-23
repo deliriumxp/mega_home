@@ -401,18 +401,23 @@ async def command(
     # `response` в описании — службе нужен её ОТВЕТ (`weather.get_forecasts`,
     # `calendar.get_events`, `todo.get_items`: этих данных нет в атрибутах).
     wants = spec.get("response") is True
-    answer = await call(
-        coordinator.source,
-        spec["domain"],
-        spec["service"],
-        {"entity_id": tile["entityId"], **data},
-        wants,
-        # Название действия — из описания команды менеджера (`label`); нет его —
-        # само имя команды. Прибор — как его зовёт плитка приложения.
-        signed(by, spec.get("label") or name, tile.get("name"))
-        if by is not None and changes_state(spec, state)
-        else None,
-    )
+    async def execute() -> dict[str, Any]:
+        return await call(
+            coordinator.source,
+            spec["domain"],
+            spec["service"],
+            {"entity_id": tile["entityId"], **data},
+            wants,
+            signed(by, spec.get("label") or name, tile.get("name"))
+            if by is not None and changes_state(spec, state)
+            else None,
+        )
+
+    replace_source = getattr(playback, "replace_player_source", None)
+    if name in ("play_stream", "set_source") and replace_source is not None:
+        answer = await replace_source(tile, execute)
+    else:
+        answer = await execute()
     # ⚠ Только «выполнено». Здесь отдавалось состояние сразу после вызова с
     # припиской «машина состояний уже обновлена» — это наша догадка, а не
     # контракт: HA обещает выполнение службы, а изменения велит слушать

@@ -8,9 +8,8 @@ HA player capabilities makes it the most reliable playback method»,
 music-assistant.io/player-support/home-assistant/). Ось «как устройство берёт поток» — свойство
 плеера (`stream.flow` описания плитки), а не обход бага.
 
-Звук — WAV 48 кГц моно s16: размеры в заголовке «неизвестно» (`0xFFFFFFFF`), склейка идёт на PCM,
-каждый элемент декодируется своим ffmpeg (`-f s16le`, только декодирование). Такой поток читает и
-HA (прокси ffmpeg у ESPHome-плеера по `supported_formats`), и плеер, который умеет WAV.
+Склейка и фейд идут на PCM 48 кГц. Выходы получают кадры MP3 без общего битового
+резервуара, поэтому выход может начать чтение на текущей позиции потока.
 
 ⚠ Сессия — только про ЗВУК и порядок элементов. Что играет (очередь, каталог, подписи, обложки)
 остаётся у очереди дома (`music_playback.py`, `providers/media_queue.py`): адрес сессии лишь ещё
@@ -33,9 +32,10 @@ FLOW_RATE = 48_000
 FLOW_CHANNELS = 1
 FLOW_WIDTH = 2
 FLOW_CHUNK = 64 * 1024
-# Очередь ОДНОГО читателя сессии (группа: у каждого участника своя). 64 куска ≈ 43 с звука:
-# живой прибор тянет поток в темпе воспроизведения и её не переполнит, а мёртвый не вешает группу.
-READER_QUEUE = 64
+# Буфер выхода вмещает до 5 с компенсации плюс запас на запись в сокет.
+MP3_FRAME_MS = 24
+MP3_FRAME_BYTES = 576
+READER_QUEUE = 320
 STOP_TIMEOUT_S = 5
 
 
@@ -78,6 +78,7 @@ class FlowSession:
         # (`media_queue.py`, `Attempt.opened`) — у плеера, который ничего о себе не сообщает,
         # другого подтверждения нет и быть не может.
         self.on_read: Callable[[], None] | None = None
+        self.on_read_player: str | None = None
         # Окно фейда на стыке элементов, байты PCM (0 — без фейда). Ставит владелец очереди из
         # описания плитки (`fadeMs`): фейд нужен и на смене ТРЕКА, и на смене станции.
         self.fade_bytes = 0
@@ -92,9 +93,13 @@ class FlowSession:
         # Элемент сменён (next/previous/замена очереди): текущий ffmpeg гасим, поток продолжается.
         self.switch = asyncio.Event()
         # Устройство читает прямо сейчас: с открытым потоком команда плееру не нужна.
-        self.reading = False
-        self._readers: set[asyncio.Queue[bytes | None]] = set()
+        self._readers: dict[asyncio.Queue[bytes | None], str] = {}
+        self._opened: set[str] = set()
+        self.retired = False
         self._pump: asyncio.Task[None] | None = None
+        self.marker_frames: dict[str, tuple[bytes, ...]] = {}
+        self._marker_cursor = -1
+        self.marker_epoch: float | None = None
 
     @property
     def current(self) -> MediaItem | None:
@@ -110,6 +115,36 @@ class FlowSession:
         """Снять звук: очередь снята или плеер оставлен. Поток закроется на ближайшем куске."""
         self.items, self.index = (), 0
         self.switch.set()
+
+    @property
+    def reading(self) -> bool:
+        return bool(self._readers)
+
+    def cancel_pump(self) -> None:
+        if self._pump is not None:
+            self._pump.cancel()
+
+    def has_opened(self, player: str) -> bool:
+        return player in self._opened
+
+    def reading_player(self, player: str) -> bool:
+        return player in self._readers.values()
+
+    def forget(self, player: str) -> None:
+        self.disconnect(player)
+        self._opened.discard(player)
+
+    def disconnect(self, player: str) -> None:
+        for queue, owner in list(self._readers.items()):
+            if owner == player:
+                self._readers.pop(queue)
+                self._finish_reader(queue, discard=True)
+
+    def _finish_reader(self, queue: asyncio.Queue[bytes | None], *, discard: bool = False) -> None:
+        if discard or queue.full():
+            while not queue.empty():
+                queue.get_nowait()
+        queue.put_nowait(None)
 
     async def serve(
         self, write: Callable[[bytes], Awaitable[None]], decoder: Decoder,
@@ -129,15 +164,19 @@ class FlowSession:
         останавливает группу. Живой прибор тянет поток в темпе воспроизведения — очередь в
         десятки секунд звука его не переполнит, а мёртвый (закрытый ответ) не должен вешать всех.
         """
+        if self.retired:
+            return
         queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=READER_QUEUE)
-        self._readers.add(queue)
-        self.reading = True
+        if player:
+            self.disconnect(player)
+        self._readers[queue] = player
+        self._opened.add(player)
         # Задержка ЭТОГО плеера, уже применённая к его чтению, и остаток звука, который надо выбросить.
         applied = 0.0
         drop = 0
         if self._pump is None or self._pump.done():
-            self._pump = asyncio.ensure_future(self._run(decoder, encoder))
-        if self.on_read is not None:
+            self._pump = asyncio.create_task(self._run_marker() if self.marker_frames else self._run(decoder, encoder))
+        if self.on_read is not None and self.on_read_player in (None, player):
             on_read, self.on_read = self.on_read, None
             on_read()
         try:
@@ -145,13 +184,23 @@ class FlowSession:
                 # ⚠ Задержка ЖИВАЯ: правка в составе слышна сразу. Больше — читаем позже (очередь
                 # ждёт), меньше — выбрасываем лишнее из уже полученного; перезапуска потока нет.
                 want = float(self.delay_of(player)) if self.delay_of is not None else 0.0
+                if encoder is not None:
+                    want = round(want / MP3_FRAME_MS) * MP3_FRAME_MS
                 if want > applied:
                     await asyncio.sleep((want - applied) / 1000)
+                    if queue not in self._readers:
+                        break
                     applied = want
                 elif want < applied:
-                    drop += int((applied - want) * FLOW_RATE * FLOW_CHANNELS * FLOW_WIDTH / 1000)
+                    if encoder is not None:
+                        drop += round((applied - want) / MP3_FRAME_MS)
+                    else:
+                        drop += int((applied - want) * FLOW_RATE / 1000) * FLOW_CHANNELS * FLOW_WIDTH
                     applied = want
                 if drop:
+                    if encoder is not None:
+                        drop -= 1
+                        continue
                     if len(chunk) <= drop:
                         drop -= len(chunk)
                         continue
@@ -160,27 +209,60 @@ class FlowSession:
         except (ConnectionError, OSError):
             return  # плеер ушёл — это норма (пауза, смена источника, выключение)
         finally:
-            self._readers.discard(queue)
-            self.reading = bool(self._readers)
+            self._readers.pop(queue, None)
+
+    async def _run_marker(self) -> None:
+        """Слот каждого выхода привязан к одной монотонной шкале дома."""
+        clock = asyncio.get_running_loop().time
+        frame_s = MP3_FRAME_MS / 1000
+        try:
+            while self._readers and not self.switch.is_set():
+                now = clock()
+                if self.marker_epoch is None:
+                    self.marker_epoch = now
+                cursor = max(self._marker_cursor + 1, int((now - self.marker_epoch) / frame_s))
+                self._marker_cursor = cursor
+                for queue, player in list(self._readers.items()):
+                    frames = self.marker_frames.get(player)
+                    if frames is None or queue.full():
+                        self._readers.pop(queue)
+                        self._finish_reader(queue, discard=True)
+                    else:
+                        queue.put_nowait(frames[cursor % len(frames)])
+                deadline = self.marker_epoch + (cursor + 1) * frame_s
+                await asyncio.sleep(max(0, deadline - clock()))
+        finally:
+            for queue in list(self._readers):
+                self._finish_reader(queue, discard=True)
 
     async def _run(self, decoder: Decoder, encoder: Callable[..., Awaitable["FlowProcess"]] | None) -> None:
         """Один декодер (и один кодировщик) на сессию: куски уходят ВСЕМ читателям."""
 
+        clock = asyncio.get_running_loop().time
+        deadline: float | None = None
+
         async def broadcast(chunk: bytes) -> None:
+            nonlocal deadline
+            if encoder is not None:
+                now = clock()
+                if deadline is None or now - deadline > 0.250:
+                    deadline = now
+                await asyncio.sleep(max(0, deadline - now))
+                deadline += MP3_FRAME_MS / 1000
             for queue in list(self._readers):
-                try:
+                if queue.full():
+                    self._finish_reader(queue, discard=True)
+                    self._readers.pop(queue)
+                else:
                     queue.put_nowait(chunk)
-                except asyncio.QueueFull:
-                    # Медленный или ушедший читатель: его куски теряются, группа играет дальше.
-                    continue
 
         pcm = broadcast
         sink: FlowProcess | None = None
-        if encoder is not None:
-            sink = await encoder(broadcast)
-            pcm = sink.write
         fader = _Fader(self.fade_bytes)
         try:
+            if encoder is not None:
+                sink = await encoder(broadcast)
+                pcm = sink.write
             while (item := self.current) is not None:
                 if self.source_of is None or not self._readers:
                     return
@@ -223,10 +305,7 @@ class FlowSession:
             if sink is not None:
                 await sink.stop()
             for queue in list(self._readers):
-                try:
-                    queue.put_nowait(None)  # поток кончился: читателям пора закрывать ответ
-                except asyncio.QueueFull:
-                    continue
+                self._finish_reader(queue)
 
 
 async def _stop(process: FlowProcess) -> None:
@@ -358,6 +437,14 @@ async def ffmpeg_decoder(binary: str, url: str) -> FlowProcess:
     ))
 
 
+MP3_ARGS = (
+        "-f", "s16le", "-ar", str(FLOW_RATE), "-ac", str(FLOW_CHANNELS), "-i", "pipe:",
+        "-f", "mp3", "-codec:a", "libmp3lame", "-b:a", "192k",
+        "-write_xing", "0", "-id3v2_version", "0", "-reservoir", "0",
+        "-loglevel", "error", "-nostats", "pipe:",
+)
+
+
 async def ffmpeg_encoder(binary: str, write: Callable[[bytes], Awaitable[None]]) -> FlowProcess:
     """PCM 48 кГц моно → MP3 (192 кбит/с): провод для участников, которые объявляют свой формат.
 
@@ -366,9 +453,7 @@ async def ffmpeg_encoder(binary: str, write: Callable[[bytes], Awaitable[None]])
     """
     process = await asyncio.create_subprocess_exec(
         binary,
-        "-f", "s16le", "-ar", str(FLOW_RATE), "-ac", str(FLOW_CHANNELS), "-i", "pipe:",
-        "-f", "mp3", "-codec:a", "libmp3lame", "-b:a", "192k",
-        "-loglevel", "error", "-nostats", "pipe:",
+        *MP3_ARGS,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
@@ -391,9 +476,10 @@ class Mp3Encoder(FlowProcess):
         if stdout is None:  # pragma: no cover — трубу заказывает сам кодировщик
             return
         try:
-            while chunk := await stdout.read(FLOW_CHUNK):
+            # 1152 отсчёта при 48 кГц, 192 кбит/с: ровно 576 байт на кадр.
+            while chunk := await stdout.readexactly(MP3_FRAME_BYTES):
                 await self._write(chunk)
-        except (ConnectionError, OSError):
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
             return  # плеер ушёл — остановку разберёт `stop`
 
     async def read(self, size: int) -> bytes:  # pragma: no cover — у кодировщика читает насос
@@ -461,6 +547,19 @@ class FlowStreams:
         # Тот же путь, что у короткого адреса трека (`http_music.py`).
         return f"{base.rstrip('/')}{URL_PREFIX}/stream/{token}"
 
+    def revoke(self, session: FlowSession, player: str) -> None:
+        if token := self._tokens.pop((session.token, player), None):
+            self._players.pop(token, None)
+        session.forget(player)
+
+    def retire(self, session: FlowSession) -> None:
+        session.retired = True
+        for token_session, player in list(self._tokens):
+            if token_session == session.token:
+                self.revoke(session, player)
+        session.stop()
+        session.cancel_pump()
+
     def find(self, token: str) -> tuple[FlowSession, str] | None:
         """Сессия и плеер по адресу; `None` — не наш токен."""
         return self._players.get(token)
@@ -468,15 +567,13 @@ class FlowStreams:
     def drop(self, player: str) -> None:
         session = self._by_player.pop(player, None)
         if session is not None:
-            for key, token in list(self._tokens.items()):
-                if key[0] == session.token:
-                    self._tokens.pop(key, None)
-                    self._players.pop(token, None)
-            session.stop()
+            self.retire(session)
 
     def close(self) -> None:
         for session in list(self._by_player.values()):
-            session.stop()
+            self.retire(session)
         self._by_player.clear()
+        self._tokens.clear()
+        self._players.clear()
         self._tokens.clear()
         self._players.clear()
