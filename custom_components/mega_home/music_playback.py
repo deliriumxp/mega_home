@@ -70,7 +70,7 @@ class MusicPlayback:
         if action in ("calibration_start", "calibration_stop"):
             async with self._group_lock:
                 if action == "calibration_start":
-                    return await self._start_calibration(request.get("players"))
+                    return await self._start_calibration(request.get("players"), request.get("raw") is True)
                 token = request.get("session")
                 await self._end_calibration(token)
                 return {"accepted": True}
@@ -120,7 +120,7 @@ class MusicPlayback:
                 queue.clear()
         return self._links.with_address(request.get("id"), answer) if action == "stream" else answer
 
-    async def _start_calibration(self, players: Any) -> dict:
+    async def _start_calibration(self, players: Any, raw: bool = False) -> dict:
         if self._calibration is not None:
             raise OpError("На этих колонках уже идёт акустический замер", 409)
         if not isinstance(players, list) or len(players) < 2 or len(players) > 8:
@@ -149,7 +149,7 @@ class MusicPlayback:
             session = await asyncio.wait_for(prepare(binary, entities), timeout=8)
         except (OSError, RuntimeError, TimeoutError) as error:
             raise OpError("Дом не смог подготовить маркеры", 503) from error
-        delays = {entity: self._delay(entity) for entity in entities}
+        delays = {entity: 0 if raw else self._delay(entity) for entity in entities}
         session.delay_of = delays.__getitem__
         self._calibration = session
         try:
@@ -180,7 +180,7 @@ class MusicPlayback:
         self._calibration_timer = asyncio.get_running_loop().call_later(
             300, lambda: asyncio.create_task(self._expire_calibration(session.token)),
         )
-        return {"session": session.token, "marker": layout(len(entities)), "delays": list(delays.values())}
+        return {"session": session.token, "marker": layout(len(entities)), "delays": list(delays.values()), "raw": raw}
 
     def _calibration_label(self, entity: str) -> str:
         return (self._tile_of(entity) or {}).get("name") or entity
