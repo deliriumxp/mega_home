@@ -19,7 +19,7 @@ import asyncio
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.components.cover import ATTR_POSITION, CoverEntity, CoverEntityFeature
+from homeassistant.components.cover import ATTR_POSITION, CoverDeviceClass, CoverEntity, CoverEntityFeature
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers import entity_platform, entity_registry as er
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -29,6 +29,16 @@ from .core.const import DOMAIN, LOGGER
 from .core.pulse_blind import BlindSpec, PulseBlind, spec_of
 
 SERVICE_CALIBRATE = "calibrate_position"
+
+
+def _device_class(value: str) -> CoverDeviceClass | None:
+    """Класс шторы из конфига объекта; неизвестный — None (без класса, как было до выбора)."""
+    if not value:
+        return None
+    try:
+        return CoverDeviceClass(value)
+    except ValueError:
+        return None
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: Any, async_add_entities: AddConfigEntryEntitiesCallback) -> None:
@@ -96,6 +106,10 @@ class MegaPulseCover(CoverEntity, RestoreEntity):
             # Реестр возьмёт этот id, если он свободен (прежняя штора снята).
             self.entity_id = spec.entity_id
         self.blind = PulseBlind(spec, coordinator.source.call, self._changed, self._settled)
+        # Класс — из конфига объекта (`covers[]`, менеджер). `curtain` — «Шторы, жалюзи» в Яндексе
+        # (`yandex_smart_home`: CoverDeviceClass.CURTAIN → devices.types.openable.curtain), без класса —
+        # «дверь, ворота, окно, ставни» (`openable`) с кнопками. Неизвестный класс не ставим: HA его не знает.
+        self._attr_device_class = _device_class(spec.device_class)
         self._unsub_knx: Any = None
 
     # --- состояние ----------------------------------------------------------

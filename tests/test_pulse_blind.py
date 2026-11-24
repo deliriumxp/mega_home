@@ -169,6 +169,16 @@ def test_мусорная_штора_не_роняет_конфиг() -> None:
     assert spec_of({"id": "x", "open": "a", "close": "b", "stopMethod": "??"}).stop_method == "pulse_both"
 
 
+def test_класс_шторы_из_конфига() -> None:
+    """Тип шторы — данные менеджера; дом только передаёт его сущности (`cover.py` → HA `device_class`).
+
+    `curtain` в Яндексе — «Шторы, жалюзи» (`devices.types.openable.curtain`), без класса — «ставни».
+    """
+    base = {"id": "x", "open": "a", "close": "b"}
+    assert spec_of({**base, "deviceClass": "Curtain"}).device_class == "curtain"
+    assert spec_of(base).device_class == ""
+
+
 def test_неоткалиброванная_штора_сообщает_положение_на_ходу(monkeypatch: pytest.MonkeyPatch) -> None:
     """⚠ Ползунок у жильца обязан идти и тогда, когда положение ещё неизвестно.
 

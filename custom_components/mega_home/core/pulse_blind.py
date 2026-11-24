@@ -53,6 +53,10 @@ class BlindSpec:
     stop_method: str = "pulse_both"
     # Групповой адрес KNX (DPT 5.001) общей с Control4 `knx_pulse_blind` позиции.
     position_address: str = ""
+    # Класс HA (`CoverDeviceClass`): `curtain` — шторы/жалюзи в Яндексе (`openable.curtain`).
+    # Пусто — без класса, как было до выбора. Проверяет класс адаптер HA (`cover.py`), ядро — нет:
+    # `core` не знает `homeassistant`.
+    device_class: str = ""
 
 
 def spec_of(block: Any) -> BlindSpec | None:
@@ -73,6 +77,7 @@ def spec_of(block: Any) -> BlindSpec | None:
             failsafe=max(float(block.get("failsafe") if block.get("failsafe") is not None else 3), 0.0),
             stop_method=str(block.get("stopMethod") or "pulse_both"),
             position_address=str(block.get("positionAddress") or "").strip(),
+            device_class=str(block.get("deviceClass") or "").strip().lower(),
         )
     except (KeyError, TypeError, ValueError):
         return None
