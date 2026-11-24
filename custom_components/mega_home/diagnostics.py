@@ -8,10 +8,10 @@ from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
 
 from .core import stream
-from .core.const import CONF_TOKEN
+from .core.const import CONF_MUSIC_ADMIN_TOKEN, CONF_TOKEN
 from .coordinator import MegaHomeConfigEntry
 
-TO_REDACT = [CONF_TOKEN]
+TO_REDACT = [CONF_TOKEN, CONF_MUSIC_ADMIN_TOKEN]
 
 
 def _go2rtc_state() -> dict[str, Any]:

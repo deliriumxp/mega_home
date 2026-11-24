@@ -19,10 +19,12 @@
         "data": {
           "manager_url": "Manager address",
           "token": "Object token",
-          "verify_ssl": "Verify the TLS certificate"
+          "verify_ssl": "Verify the TLS certificate",
+          "music_admin_token": "Music Assistant setup token"
         },
         "data_description": {
-          "manager_url": "For example http://manager.example.com:8055 — the inbound port, not the interface port."
+          "manager_url": "For example http://manager.example.com:8055 — the inbound port, not the interface port.",
+          "music_admin_token": "A Music Assistant administrator access token for connecting Yandex Music and speakers. Leave blank to keep the current token."
         }
       }
     },

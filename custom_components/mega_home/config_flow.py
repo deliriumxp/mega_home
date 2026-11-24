@@ -14,6 +14,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .core.api import ManagerAuthError, ManagerClient, ManagerError
 from .core.const import (
     CONF_MANAGER_URL,
+    CONF_MUSIC_ADMIN_TOKEN,
     CONF_TOKEN,
     CONF_VERIFY_SSL,
     DOMAIN,
@@ -118,6 +119,8 @@ class MegaHomeConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             data = self._clean(user_input)
+            if token := user_input.get(CONF_MUSIC_ADMIN_TOKEN, "").strip():
+                data[CONF_MUSIC_ADMIN_TOKEN] = token
             errors = await self._async_validate(data)
             if not errors:
                 # ⚠ Токен объекта менеджер может перевыпустить — и тогда личность
@@ -136,7 +139,8 @@ class MegaHomeConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="reconfigure",
             data_schema=self.add_suggested_values_to_schema(
-                STEP_USER, user_input or dict(entry.data)
+                STEP_USER.extend({vol.Optional(CONF_MUSIC_ADMIN_TOKEN): str}),
+                {key: value for key, value in (user_input or entry.data).items() if key != CONF_MUSIC_ADMIN_TOKEN},
             ),
             errors=errors,
         )

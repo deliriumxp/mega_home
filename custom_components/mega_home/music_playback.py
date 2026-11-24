@@ -47,6 +47,7 @@ class MusicPlayback:
         self.multiroom = MusicGroups(self)
         self._group_lock = asyncio.Lock()
         self._calibration = MusicCalibration(self)
+        self.assistant: Callable[[bool, dict], Awaitable[dict | None]] | None = None
         self._players: dict[str, PlayerQueue] = {}
         self._profiles: dict[str, tuple[str, dict]] = {}
         self._changed()
@@ -68,6 +69,16 @@ class MusicPlayback:
 
     async def call(self, can_manage: bool, request: dict) -> dict:
         action = request.get("action")
+        if self.assistant is not None:
+            answer = await self.assistant(can_manage, request)
+            if answer is not None:
+                if action == "playback_state":
+                    answer["players"] = {**self._views(), **answer["players"]}
+                elif action == "set_favorite":
+                    self._home.topics.bump(FAVORITES_TOPIC)
+                elif action in ("play_queue", "play_station", "queue_control"):
+                    self._changed()
+                return answer
         if action in ("calibration_start", "calibration_stop", "calibration_status"):
             async with self._group_lock:
                 if action == "calibration_start":
@@ -199,6 +210,8 @@ class MusicPlayback:
         return self.multiroom.state_groups()
 
     async def group_command(self, tile: dict, name: str, data: dict, by: Any) -> dict | None:
+        if (tile.get("stream") or {}).get("externalQueue"):
+            return None  # Команду группы исполнит интеграция плеера через HA.
         async with self._group_lock:
             return await self.multiroom.command(tile, name, data, by)
 

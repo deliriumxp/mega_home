@@ -26,11 +26,12 @@ LOGGER = logging.getLogger((__package__ or "").removesuffix(".core"))
 #
 # ⚠ Держится в паре с `manifest.json`, их сверяет `tests/test_version.py`:
 # поднимать ОБА, одним релизом.
-INTEGRATION_VERSION = "0.6.62"
+INTEGRATION_VERSION = "0.6.63"
 
 CONF_MANAGER_URL = "manager_url"
 CONF_TOKEN = "token"
 CONF_VERIFY_SSL = "verify_ssl"
+CONF_MUSIC_ADMIN_TOKEN = "music_admin_token"
 
 # Manager endpoints. The object identifies itself by its own webhook token, so
 # there is no id in any path — see the manager's inbound/home-config controller.

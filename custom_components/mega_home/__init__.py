@@ -185,6 +185,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     coordinator.shared = SharedDocs(coordinator.env)
     await coordinator.shared.async_load()
 
+    from .core.const import CONF_MUSIC_ADMIN_TOKEN
+    from .music_assistant_bridge import MusicAssistantBridge
     from .music_playback import MusicPlayback
     from .providers.music_flow import FlowStreams
     from .ha_sonos import create_sonos
@@ -205,6 +207,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     flow = FlowStreams(lambda: stream_origin(hass, coordinator.data))
 
     playback = MusicPlayback(coordinator, music, station, links, flow, create_sonos(hass))
+    assistant = MusicAssistantBridge(
+        hass, lambda: (coordinator.data or {}).get("tiles", []),
+        lambda: coordinator.topics.bump("media/playback"),
+        entry.data.get(CONF_MUSIC_ADMIN_TOKEN, ""),
+    )
+    entry.async_on_unload(assistant.close)
+    playback.assistant = assistant.call
     coordinator.music_playback = playback
     coordinator.resident_services = {"yandex-music": playback.call}
     # ⚠ Слушатель — синхронная обёртка: `config_changed` теперь coroutine и берёт

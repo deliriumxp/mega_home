@@ -19,10 +19,12 @@
         "data": {
           "manager_url": "Адрес менеджера",
           "token": "Токен объекта",
-          "verify_ssl": "Проверять TLS-сертификат"
+          "verify_ssl": "Проверять TLS-сертификат",
+          "music_admin_token": "Токен настройки Music Assistant"
         },
         "data_description": {
-          "manager_url": "Например http://manager.example.com:8055 — inbound-порт, а не порт интерфейса."
+          "manager_url": "Например http://manager.example.com:8055 — inbound-порт, а не порт интерфейса.",
+          "music_admin_token": "Токен доступа администратора MA для подключения Яндекс Музыки и Станций. Оставьте поле пустым, чтобы сохранить текущий токен."
         }
       }
     },
