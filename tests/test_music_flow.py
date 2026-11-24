@@ -1306,8 +1306,10 @@ def test_чистка_состава_убирает_вендорские_свя�
         await _station_group(service, home, "media_player.sonos")
         await service.group_command(home.data["tiles"][0], "join", {"group_members": ["media_player.sonos_2"]}, None)
         assert service.multiroom._vendor == {"media_player.sonos_2": "media_player.sonos"}
+        assert streams.current("echo") is not None
         home.data["tiles"] = [tile for tile in home.data["tiles"] if tile["id"] != "echo"]
         await service.config_changed()
+        assert streams.current("echo") is None
         assert service.multiroom.groups == {}
         assert service.multiroom._vendor == {}
         assert service.multiroom._served == {}

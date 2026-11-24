@@ -47,7 +47,7 @@ class MusicPlayback:
         self._calibration: FlowSession | None = None
         self._calibration_timer: asyncio.TimerHandle | None = None
         self._players: dict[str, PlayerQueue] = {}
-        self._profiles: dict[str, dict] = {}
+        self._profiles: dict[str, tuple[str, dict]] = {}
         self._changed()
 
     @property
@@ -239,14 +239,13 @@ class MusicPlayback:
         profile = tile["stream"]
         source = self._home.source
         queue = self._players.get(entity)
-        if queue is not None and self._profiles.get(entity) != output_profile(profile):
-            queue.close()
-            self._flow.drop(tile["id"])
+        if queue is not None and self._profiles.get(entity) != (tile["id"], output_profile(profile)):
+            self._drop_queue(entity, tile)
             queue = None
         if queue is None:
             queue = self._queue_for(tile, entity)
             self._players[entity] = queue
-            self._profiles[entity] = output_profile(profile)
+            self._profiles[entity] = (tile["id"], output_profile(profile))
         async def load() -> tuple[tuple[MediaItem, ...], int]:
             answer = await self._music.call(False, {"action": "track_details", "ids": ids})
             details = {item["id"]: _media(item) for item in answer["items"]}
@@ -344,7 +343,7 @@ class MusicPlayback:
         if queue is None:
             queue = self._queue_for(tile, entity)
             self._players[entity] = queue
-            self._profiles[entity] = output_profile(profile)
+            self._profiles[entity] = (tile["id"], output_profile(profile))
         async def load() -> tuple[tuple[MediaItem, ...], int]:
             return (item,), 0
         async def prepare(_item: MediaItem, opened: Callable[[], None]) -> Output:
@@ -369,8 +368,8 @@ class MusicPlayback:
         """
         if (queue := self._players.pop(entity, None)) is not None:
             queue.close()
-        self._profiles.pop(entity, None)
-        self._flow.drop(tile["id"])
+        previous = self._profiles.pop(entity, None)
+        self._flow.drop(previous[0] if previous is not None else tile["id"])
 
     def _system_of(self, entity: str) -> str | None:
         """Ключ системы вендора по описанию плитки; `None` — своего мультирума у плеера нет."""
@@ -415,14 +414,13 @@ class MusicPlayback:
         profile = tile["stream"]
         source = self._home.source
         queue = self._players.get(entity)
-        if queue is not None and self._profiles.get(entity) != output_profile(profile):
-            queue.close()
-            self._flow.drop(tile["id"])
+        if queue is not None and self._profiles.get(entity) != (tile["id"], output_profile(profile)):
+            self._drop_queue(entity, tile)
             queue = None
         if queue is None:
             queue = self._queue_for(tile, entity)
             self._players[entity] = queue
-            self._profiles[entity] = output_profile(profile)
+            self._profiles[entity] = (tile["id"], output_profile(profile))
         async def load() -> tuple[tuple[MediaItem, ...], int]:
             if not any(self._entity(current) == entity and output_profile(current["stream"]) == output_profile(profile) for current in self._tiles()):
                 raise OpError("Настройки плеера изменились. Включите станцию повторно", 409)
@@ -515,16 +513,14 @@ class MusicPlayback:
         # await'ами `join`/воспроизведения, и без блокировки он снимал очередь или ведущего
         # группы посреди операции — `KeyError` → 500 жильцу (ревью 2026-11-24).
         async with self._group_lock:
-            current = {entity: tile for tile in self._tiles() if (entity := self._entity(tile))}
-            self.multiroom.reconcile(set(current))
-            for entity, profile in list(self._profiles.items()):
-                tile = current.get(entity)
+            current = {(self._entity(tile), tile["id"]): tile for tile in self._tiles() if self._entity(tile)}
+            self.multiroom.reconcile({entity for entity, _ in current})
+            for entity, (tile_id, profile) in list(self._profiles.items()):
+                tile = current.get((entity, tile_id))
                 if tile is not None and output_profile(tile["stream"]) == profile:
                     continue
-                self._players.pop(entity).close()
-                if tile is not None:
-                    self._flow.drop(tile["id"])
-                del self._profiles[entity]
+                # Адрес потока принадлежит плитке, на которой открыли очередь.
+                self._drop_queue(entity, {"id": tile_id})
 
     async def play_configured(self, entity_ids: list[str], track: str) -> list[str]:
         """Запустить трек из сценария на известных выходах и вернуть остальные цели."""
