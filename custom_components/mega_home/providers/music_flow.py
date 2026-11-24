@@ -113,6 +113,7 @@ class FlowSession:
         self.marker_ready = asyncio.Event()
         self._marker_cursor = -1
         self.marker_epoch: float | None = None
+        self.marker_interrupted: str | None = None
 
     @property
     def current(self) -> MediaItem | None:
@@ -180,6 +181,8 @@ class FlowSession:
     def disconnect(self, player: str) -> None:
         for queue, owner in list(self._readers.items()):
             if owner == player:
+                if self.marker_epoch is not None and not self.retired:
+                    self.marker_interrupted = self.marker_interrupted or player
                 self._readers.pop(queue)
                 self._finish_reader(queue, discard=True)
 
@@ -208,6 +211,10 @@ class FlowSession:
         десятки секунд звука его не переполнит, а мёртвый (закрытый ответ) не должен вешать всех.
         """
         if self.retired:
+            return
+        if self.marker_epoch is not None and self.has_opened(player):
+            # Повторный GET после старта означает новый буфер на колонке.
+            self.marker_interrupted = self.marker_interrupted or player
             return
         queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=READER_QUEUE)
         if player:
@@ -261,6 +268,8 @@ class FlowSession:
             LOGGER.debug("Плеер %s: запись аудиопотока закрыта (%s)", player, type(error).__name__)
         finally:
             self._readers.pop(queue, None)
+            if self.marker_epoch is not None and not self.retired:
+                self.marker_interrupted = self.marker_interrupted or player
 
     def confirm_write(self, player: str) -> None:
         if self.on_read is not None and self.on_read_player in (None, player):
@@ -283,6 +292,7 @@ class FlowSession:
                     frames = self.marker_frames.get(player)
                     if queue.full():
                         LOGGER.warning("Маркеры: очередь плеера %s переполнена", player)
+                        self.marker_interrupted = self.marker_interrupted or player
                     if frames is None or queue.full():
                         self._readers.pop(queue)
                         self._finish_reader(queue, discard=True)

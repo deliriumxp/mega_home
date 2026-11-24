@@ -75,7 +75,7 @@ class MusicPlayback:
                 token = request.get("session")
                 if action == "calibration_status":
                     return self._calibration.status(token)
-                await self._calibration.end(token)
+                await self._calibration.end(token, validate=request.get("validate") is True)
                 return {"accepted": True}
         if action == "playback_state":
             return {"players": self._views()}

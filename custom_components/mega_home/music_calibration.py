@@ -93,11 +93,13 @@ class MusicCalibration:
         self._watch = asyncio.create_task(self._watch_players(session))
         return {
             "session": session.token, "marker": layout(len(entities)), "delays": list(delays.values()),
-            "raw": raw, "status": True,
+            "raw": raw, "status": True, "continuous": True,
         }
 
     def status(self, token: Any) -> dict:
         if self._session is not None and self._session.token == token:
+            if lost := self._session.marker_interrupted:
+                return {"active": False, "reason": self._lost_reason(lost)}
             return {"active": True}
         failed = self._last_failure
         return {"active": False, "reason": failed[1] if failed is not None and failed[0] == token
@@ -115,21 +117,24 @@ class MusicCalibration:
                     absent_since.pop(entity, None)
                 else:
                     absent_since.setdefault(entity, now)
-            lost = next((entity for entity, since in absent_since.items()
-                         if now - since >= MARKER_RECONNECT_TIMEOUT), None)
+            lost = session.marker_interrupted or next(
+                (entity for entity, since in absent_since.items() if now - since >= MARKER_RECONNECT_TIMEOUT), None,
+            )
             if lost is None and now < deadline:
                 continue
             async with self._playback._group_lock:
                 if self._session is not session:
                     return
-                if lost is not None and session.reading_player(lost):
+                if lost is not None and session.marker_interrupted is None and session.reading_player(lost):
                     continue
-                reason = (f"{self._label(lost)}: пропало подключение к потоку маркеров"
-                          if lost is not None else "Истекло время акустического замера")
+                reason = self._lost_reason(lost) if lost is not None else "Истекло время акустического замера"
                 self._last_failure = (session.token, reason)
                 LOGGER.warning("Маркеры: %s", reason)
                 await self.end(session.token)
                 return
+
+    def _lost_reason(self, entity: str) -> str:
+        return f"{self._label(entity)}: пропало подключение к потоку маркеров"
 
     def _label(self, entity: str) -> str:
         return (self._playback._tile_of(entity) or {}).get("name") or entity
@@ -150,9 +155,12 @@ class MusicCalibration:
                 raise OpError("Ведущая колонка системы недоступна для замера", 409)
         return entity
 
-    async def end(self, token: Any) -> None:
+    async def end(self, token: Any, *, validate: bool = False) -> None:
+        status = self.status(token) if validate else {"active": True}
         session = self._session
         if session is None or session.token != token:
+            if not status["active"]:
+                raise OpError(status["reason"], 409)
             return
         playing = [entity for entity in session.marker_frames if session.has_opened(entity)]
         self.close()
@@ -162,6 +170,8 @@ class MusicCalibration:
         for entity, result in zip(playing, results, strict=True):
             if isinstance(result, Exception):
                 LOGGER.warning("Не удалось остановить маркер на %s: %s", entity, result)
+        if not status["active"]:
+            raise OpError(status["reason"], 409)
 
     def close(self) -> None:
         watch, self._watch = self._watch, None

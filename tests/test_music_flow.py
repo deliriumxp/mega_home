@@ -1196,7 +1196,7 @@ def test_ffmpeg_восстанавливает_источник_после_от�
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("failure", [None, "missing", "lost"])
+@pytest.mark.parametrize("failure", [None, "missing", "lost", "reopened"])
 def test_замер_на_двух_выходах_раздаёт_кадры_одной_сессии_и_отзывает_адреса(tmp_path, monkeypatch, failure):
     if not shutil.which("ffmpeg"):
         pytest.skip("Для проверки MP3 нужен ffmpeg")
@@ -1254,12 +1254,15 @@ def test_замер_на_двух_выходах_раздаёт_кадры_од�
             assert len(frames) == 84
             assert all(len(frame) == 576 and frame[:2] == b"\xff\xfb" for frame in frames)
         await asyncio.wait_for(wrote.wait(), timeout=1)
-        if failure == "lost":
-            monkeypatch.setattr("mega_home.music_calibration.MARKER_RECONNECT_TIMEOUT", 0)
-            session.disconnect(heos)
-            await asyncio.sleep(1.1)
+        if failure in {"lost", "reopened"}:
+            if failure == "lost":
+                session.disconnect(heos)
+                await asyncio.sleep(1.1)
+            else:
+                await session.serve(writer, unused, unused, player=heos)
             status = await service.call(False, {"action": "calibration_status", "session": start["session"]})
             assert status == {"active": False, "reason": f"{heos}: пропало подключение к потоку маркеров"}
+            await service.call(False, {"action": "calibration_stop", "session": start["session"]})
         else:
             await service.call(False, {"action": "calibration_stop", "session": start["session"]})
         await asyncio.wait_for(asyncio.gather(*readers), timeout=1)
