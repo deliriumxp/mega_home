@@ -278,7 +278,7 @@ async def _mount(app: web.Application, view: http_music.MegaHomeMusicStreamView)
     app.router.add_route("GET", path, stream)
 
 
-def test_маркер_aac_отвечает_head_а_повторный_get_прерывает_замер(tmp_path):
+def test_повторный_get_маркера_aac_не_закрывает_играющий_поток(tmp_path):
     binary = shutil.which("ffmpeg")
     if not binary:
         pytest.skip("Для проверки AAC нужен ffmpeg")
@@ -307,9 +307,9 @@ def test_маркер_aac_отвечает_head_а_повторный_get_пре
                     assert await first.content.readexactly(2) == b"\xff\xf1"
                     assert opened.is_set()
                     async with client.get(url) as second:
-                        assert second.status == 200
-                        assert await second.read() == b""
-                        assert marker.marker_interrupted == player
+                        assert second.status == 409
+                    assert await first.content.readexactly(100)
+                    assert marker.marker_interrupted is None
                 assert marker.has_opened(player)
         finally:
             flow.retire(marker)

@@ -1259,6 +1259,7 @@ def test_замер_на_двух_выходах_раздаёт_кадры_од�
                 session.disconnect(heos)
                 await asyncio.sleep(1.1)
             else:
+                session.disconnect(heos)
                 await session.serve(writer, unused, unused, player=heos)
             status = await service.call(False, {"action": "calibration_status", "session": start["session"]})
             assert status == {"active": False, "reason": f"{heos}: пропало подключение к потоку маркеров"}

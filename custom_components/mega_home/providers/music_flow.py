@@ -114,6 +114,7 @@ class FlowSession:
         self._marker_cursor = -1
         self.marker_epoch: float | None = None
         self.marker_interrupted: str | None = None
+        self._marker_sent: set[str] = set()
 
     @property
     def current(self) -> MediaItem | None:
@@ -181,7 +182,7 @@ class FlowSession:
     def disconnect(self, player: str) -> None:
         for queue, owner in list(self._readers.items()):
             if owner == player:
-                if self.marker_epoch is not None and not self.retired:
+                if player in self._marker_sent and not self.retired:
                     self.marker_interrupted = self.marker_interrupted or player
                 self._readers.pop(queue)
                 self._finish_reader(queue, discard=True)
@@ -212,9 +213,8 @@ class FlowSession:
         """
         if self.retired:
             return
-        if self.marker_epoch is not None and self.has_opened(player):
-            # Повторный GET после старта означает новый буфер на колонке.
-            self.marker_interrupted = self.marker_interrupted or player
+        if self.marker_frames and (self.reading_player(player) or player in self._marker_sent):
+            # Параллельный GET может быть пробой формата. Первый ответ продолжает идти.
             return
         queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=READER_QUEUE)
         if player:
@@ -265,13 +265,18 @@ class FlowSession:
                 if confirm_write and queue in self._readers:
                     self.confirm_write(player)
         except (ConnectionError, OSError) as error:
-            LOGGER.debug("Плеер %s: запись аудиопотока закрыта (%s)", player, type(error).__name__)
+            if player in self._marker_sent and not self.retired:
+                LOGGER.warning("Маркеры: запись кадров для %s закрыта (%s)", player, type(error).__name__)
+            else:
+                LOGGER.debug("Плеер %s: запись аудиопотока закрыта (%s)", player, type(error).__name__)
         finally:
             self._readers.pop(queue, None)
-            if self.marker_epoch is not None and not self.retired:
+            if player in self._marker_sent and not self.retired:
                 self.marker_interrupted = self.marker_interrupted or player
 
     def confirm_write(self, player: str) -> None:
+        if self.marker_epoch is not None:
+            self._marker_sent.add(player)
         if self.on_read is not None and self.on_read_player in (None, player):
             on_read, self.on_read = self.on_read, None
             on_read()

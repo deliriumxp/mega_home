@@ -79,6 +79,9 @@ class MegaHomeMusicStreamView(_MegaHomeView):
             )
         if not authorized():
             return self.json_message("Поток больше не доступен", HTTPStatus.NOT_FOUND)
+        if session.marker_frames and session.reading_player(player):
+            LOGGER.debug("Маркеры: дополнительный GET от %s при открытом ответе", player)
+            return self.json_message("Поток маркеров уже открыт", HTTPStatus.CONFLICT)
         response = web.StreamResponse(status=HTTPStatus.OK, headers=headers)
         await response.prepare(request)
 
@@ -102,8 +105,10 @@ class MegaHomeMusicStreamView(_MegaHomeView):
                 await stream_aac(binary, serve, write)
             else:
                 await serve(write)
-        except (ConnectionError, OSError):
-            # Плеер закрыл поток (пауза, смена источника, выключение) — это норма, не ошибка.
+        except (ConnectionError, OSError) as error:
+            if session.marker_frames and not session.retired:
+                LOGGER.warning("Маркеры: выход %s (%s) завершил HTTP-ответ: %s",
+                               player, "AAC" if aac else "MP3", error)
             response.force_close()
             return response
         try:
