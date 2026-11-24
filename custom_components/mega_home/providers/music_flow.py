@@ -139,11 +139,17 @@ class FlowSession:
         self._playing.set()
 
     def stop(self) -> None:
-        """Снять звук: очередь снята или плеер оставлен. Поток закроется на ближайшем куске."""
+        """Остановить поток и декодер, в том числе при зависшем чтении источника."""
         self.items, self.index = (), 0
         self._radio_tail.clear()
+        self._radio_ready.clear()
         self._playing.set()
         self.switch.set()
+        pump = self._pump
+        if pump is not None and not pump.cancelling() and pump is not asyncio.current_task(loop=pump.get_loop()):
+            pump.cancel()
+        for queue in self._readers:
+            self._finish_reader(queue, discard=True)
 
     @property
     def reading(self) -> bool:
@@ -155,15 +161,11 @@ class FlowSession:
             return
         if self._pump is None or self._pump.done():
             self._pump = asyncio.create_task(self._run(
-                lambda url, start: ffmpeg_decoder(binary, url, start),
+                lambda url, start: ffmpeg_decoder(binary, url, start, radio=bool(self.current and self.current.source)),
                 lambda write: ffmpeg_encoder(binary, write),
             ))
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._radio_ready.wait(), timeout=0.8)
-
-    def cancel_pump(self) -> None:
-        if self._pump is not None:
-            self._pump.cancel()
 
     def has_opened(self, player: str) -> bool:
         return player in self._opened
@@ -190,7 +192,7 @@ class FlowSession:
     async def serve(
         self, write: Callable[[bytes], Awaitable[None]], decoder: Decoder,
         encoder: Callable[[Callable[[bytes], Awaitable[None]]], Awaitable["FlowProcess"]] | None = None,
-        player: str = "",
+        player: str = "", *, confirm_write: bool = True,
     ) -> None:
         """Подключить ОДНОГО читателя (устройство). Звук сессии общий, `_pump` — один на всех.
 
@@ -253,13 +255,17 @@ class FlowSession:
                         continue
                     chunk, drop = chunk[drop:], 0
                 await write(chunk)
-                if queue in self._readers and self.on_read is not None and self.on_read_player in (None, player):
-                    on_read, self.on_read = self.on_read, None
-                    on_read()
+                if confirm_write and queue in self._readers:
+                    self.confirm_write(player)
         except (ConnectionError, OSError) as error:
             LOGGER.debug("Плеер %s: запись аудиопотока закрыта (%s)", player, type(error).__name__)
         finally:
             self._readers.pop(queue, None)
+
+    def confirm_write(self, player: str) -> None:
+        if self.on_read is not None and self.on_read_player in (None, player):
+            on_read, self.on_read = self.on_read, None
+            on_read()
 
     async def _run_marker(self) -> None:
         """Слот каждого выхода привязан к одной монотонной шкале дома."""
@@ -492,7 +498,10 @@ class FfmpegProcess(FlowProcess):
     async def read(self, size: int) -> bytes:
         if self._process.stdout is None:  # pragma: no cover — трубу заказывает сам декодер
             return b""
-        return await self._process.stdout.read(size)
+        chunk = await self._process.stdout.read(size)
+        if not chunk and (exit_code := await self._process.wait()):
+            LOGGER.warning("Аудиопоток: FFmpeg завершил чтение источника с кодом %s", exit_code)
+        return chunk
 
     async def write(self, chunk: bytes) -> None:
         stdin = self._process.stdin
@@ -516,7 +525,7 @@ class FfmpegProcess(FlowProcess):
             await process.wait()
 
 
-async def ffmpeg_decoder(binary: str, url: str, start: float = 0.0) -> FlowProcess:
+async def ffmpeg_decoder(binary: str, url: str, start: float = 0.0, *, radio: bool = False) -> FlowProcess:
     """Элемент → PCM 48 кГц моно одной трубой: декодируем, а не перекодируем.
 
     `start` — перемотка внутри элемента: `-ss` до входа, ffmpeg ищет ближайший ключевой кадр и
@@ -529,9 +538,12 @@ async def ffmpeg_decoder(binary: str, url: str, start: float = 0.0) -> FlowProce
     # Политика HTTP-повторов Music Assistant для прямого входа ffmpeg.
     reconnect = (
         ["-reconnect", "1", "-reconnect_delay_max", "10", "-reconnect_streamed", "1",
-         "-reconnect_on_http_error", "5xx,429"]
+         "-reconnect_on_http_error", "5xx,429", "-reconnect_on_network_error", "1",
+         "-rw_timeout", "10000000"]
         if url.startswith(("http://", "https://")) else []
     )
+    if radio and reconnect:
+        reconnect += ["-reconnect_at_eof", "1"]
     return FfmpegProcess(await asyncio.create_subprocess_exec(
         binary,
         *seek,
@@ -645,7 +657,7 @@ class FlowStreams:
         иначе после каждой паузы/выхода оставался бы пустой зарегистрированный объект."""
         return self._by_player.get(player)
 
-    def address(self, session: FlowSession, player: str) -> str | None:
+    def address(self, session: FlowSession, player: str, *, aac: bool = False) -> str | None:
         """Абсолютный адрес сессии ДЛЯ ЭТОГО плеера; `None` — дом не знает своего адреса.
 
         ⚠ Токен — на (сессия, плеер), а не один на сессию: по нему маршрут узнаёт, ЧЬЁ это чтение,
@@ -655,7 +667,14 @@ class FlowStreams:
         base = self._origin()
         if not base:
             return None
-        token = self._tokens.setdefault((session.token, player), secrets.token_urlsafe(9))
+        key = (session.token, player)
+        suffix = ".aac" if aac else ""
+        token = self._tokens.get(key)
+        if token is not None and token.endswith(".aac") != aac:
+            self.revoke(session, player)
+            token = None
+        if token is None:
+            token = self._tokens[key] = secrets.token_urlsafe(9) + suffix
         self._players[token] = (session, player)
         # Тот же путь, что у короткого адреса трека (`http_music.py`).
         return f"{base.rstrip('/')}{URL_PREFIX}/stream/{token}"
@@ -671,7 +690,6 @@ class FlowStreams:
             if token_session == session.token:
                 self.revoke(session, player)
         session.stop()
-        session.cancel_pump()
 
     def find(self, token: str) -> tuple[FlowSession, str] | None:
         """Сессия и плеер по адресу; `None` — не наш токен."""

@@ -187,6 +187,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
 
     from .music_playback import MusicPlayback
     from .providers.music_flow import FlowStreams
+    from .ha_sonos import create_sonos
     from .providers.music_proxy import MusicStreamLinks
     from .providers.yandex_music import MusicService
     from .station_auth import StationAuth
@@ -203,7 +204,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # за ним живой поток, а элементы сменяет очередь.
     flow = FlowStreams(lambda: stream_origin(hass, coordinator.data))
 
-    playback = MusicPlayback(coordinator, music, station, links, flow)
+    playback = MusicPlayback(coordinator, music, station, links, flow, create_sonos(hass))
     coordinator.music_playback = playback
     coordinator.resident_services = {"yandex-music": playback.call}
     # ⚠ Слушатель — синхронная обёртка: `config_changed` теперь coroutine и берёт
@@ -407,6 +408,9 @@ async def _async_stop_processes(coordinator: MegaHomeCoordinator) -> None:
     5060 (Asterisk) и 8189 (слушатели) обязаны освободиться ДО новой записи.
     Осиротевший процесс держит порт, и следующий запуск его уже не поднимет.
     """
+    playback = getattr(coordinator, "music_playback", None)
+    if playback is not None and playback.sonos is not None:
+        await playback.sonos.close()
     sources = getattr(coordinator, "event_sources", None)
     if sources is not None:
         await sources.stop()

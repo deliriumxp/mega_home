@@ -7,7 +7,6 @@ import shutil
 from typing import TYPE_CHECKING, Any
 
 from .core.const import LOGGER
-from .core.ops import call
 from .core.ops_base import OpError, find
 from .providers.calibration import layout, prepare
 from .providers.music_flow import FlowSession
@@ -15,14 +14,17 @@ from .providers.music_flow import FlowSession
 if TYPE_CHECKING:
     from .music_playback import MusicPlayback
 
-MARKER_OPEN_TIMEOUT = 5
+MARKER_OPEN_TIMEOUT = 4
+MARKER_RECONNECT_TIMEOUT = 4
+CALIBRATION_TIMEOUT = 300
 
 
 class MusicCalibration:
     def __init__(self, playback: MusicPlayback) -> None:
         self._playback = playback
         self._session: FlowSession | None = None
-        self._timer: asyncio.TimerHandle | None = None
+        self._watch: asyncio.Task[None] | None = None
+        self._last_failure: tuple[str, str] | None = None
 
     async def interrupt(self, entity: str | None) -> None:
         if self._session is not None and entity in self._session.marker_frames:
@@ -61,17 +63,15 @@ class MusicCalibration:
         session.delay_of = delays.__getitem__
         self._session = session
         try:
-            fields = [(entity, self._playback._stream_output_fields(session, entity)) for entity in entities]
-            for entity, _ in fields:
+            for entity in entities:
                 tile = self._playback._tile_of(entity)
                 if tile is not None and not self._playback.multiroom.contains(entity):
                     self._playback._drop_queue(entity, tile)
             results = await asyncio.gather(*(
                 asyncio.wait_for(
-                    call(self._playback._home.source, "media_player", "play_media", {"entity_id": entity, **data}),
-                    timeout=8,
+                    self._playback.play_flow(session, entity), timeout=11,
                 )
-                for entity, data in fields
+                for entity in entities
             ), return_exceptions=True)
             for entity, result in zip(entities, results, strict=True):
                 if isinstance(result, Exception):
@@ -90,10 +90,46 @@ class MusicCalibration:
         except BaseException:
             await self.end(session.token)
             raise
-        self._timer = asyncio.get_running_loop().call_later(
-            300, lambda: asyncio.create_task(self._expire(session.token)),
-        )
-        return {"session": session.token, "marker": layout(len(entities)), "delays": list(delays.values()), "raw": raw}
+        self._watch = asyncio.create_task(self._watch_players(session))
+        return {
+            "session": session.token, "marker": layout(len(entities)), "delays": list(delays.values()),
+            "raw": raw, "status": True,
+        }
+
+    def status(self, token: Any) -> dict:
+        if self._session is not None and self._session.token == token:
+            return {"active": True}
+        failed = self._last_failure
+        return {"active": False, "reason": failed[1] if failed is not None and failed[0] == token
+                else "Сеанс акустического замера завершён"}
+
+    async def _watch_players(self, session: FlowSession) -> None:
+        clock = asyncio.get_running_loop().time
+        deadline = clock() + CALIBRATION_TIMEOUT
+        absent_since: dict[str, float] = {}
+        while True:
+            await asyncio.sleep(1)
+            now = clock()
+            for entity in session.marker_frames:
+                if session.reading_player(entity):
+                    absent_since.pop(entity, None)
+                else:
+                    absent_since.setdefault(entity, now)
+            lost = next((entity for entity, since in absent_since.items()
+                         if now - since >= MARKER_RECONNECT_TIMEOUT), None)
+            if lost is None and now < deadline:
+                continue
+            async with self._playback._group_lock:
+                if self._session is not session:
+                    return
+                if lost is not None and session.reading_player(lost):
+                    continue
+                reason = (f"{self._label(lost)}: пропало подключение к потоку маркеров"
+                          if lost is not None else "Истекло время акустического замера")
+                self._last_failure = (session.token, reason)
+                LOGGER.warning("Маркеры: %s", reason)
+                await self.end(session.token)
+                return
 
     def _label(self, entity: str) -> str:
         return (self._playback._tile_of(entity) or {}).get("name") or entity
@@ -114,10 +150,6 @@ class MusicCalibration:
                 raise OpError("Ведущая колонка системы недоступна для замера", 409)
         return entity
 
-    async def _expire(self, token: str) -> None:
-        async with self._playback._group_lock:
-            await self.end(token)
-
     async def end(self, token: Any) -> None:
         session = self._session
         if session is None or session.token != token:
@@ -132,9 +164,9 @@ class MusicCalibration:
                 LOGGER.warning("Не удалось остановить маркер на %s: %s", entity, result)
 
     def close(self) -> None:
-        if self._timer is not None:
-            self._timer.cancel()
-            self._timer = None
+        watch, self._watch = self._watch, None
+        if watch is not None and watch is not asyncio.current_task():
+            watch.cancel()
         if self._session is not None:
             self._playback._flow.retire(self._session)
             self._session = None

@@ -16,12 +16,21 @@ from homeassistant.core import HomeAssistant
 from .core.const import LOGGER, URL_PREFIX
 from .core.ops_base import OpError
 from .http_door import _MegaHomeView, _coordinator
+from .providers.music_aac import stream_aac
 from .providers.music_flow import FlowSession, ffmpeg_decoder, ffmpeg_encoder
 from .providers.music_pick import stream_content_type
 from .providers.music_proxy import MusicStreamLinks
 
 # Поток сессии: MP3 неизвестной длины — объявлять нечего, кэшировать нельзя (адрес — пропуск).
 FLOW_HEADERS = {"Content-Type": "audio/mpeg", "Cache-Control": "no-store"}
+AAC_HEADERS = {
+    **FLOW_HEADERS,
+    "Content-Type": "audio/aac",
+    "Accept-Ranges": "none",
+    "Connection": "close",
+    "transferMode.dlna.org": "Streaming",
+    "icy-name": "Mega Home",
+}
 
 # Поток трека: подключение к CDN и молчание в середине. Общего срока нет —
 # трек идёт минутами, а `Range` заставляет плеер ходить несколько раз.
@@ -51,7 +60,7 @@ class MegaHomeMusicStreamView(_MegaHomeView):
 
     async def _stream_flow(
         self, request: web.Request, session: FlowSession, coordinator: Any, *, body: bool, player: str,
-        authorized: Callable[[], bool],
+        authorized: Callable[[], bool], aac: bool = False,
     ) -> web.StreamResponse:
         """Поток сессии плеера: один адрес на всю сессию, элементы сменяет дом.
 
@@ -59,9 +68,10 @@ class MegaHomeMusicStreamView(_MegaHomeView):
         этого же ответа (`FlowSession.switch`). Так играет и плеер, который новый `media_url` поверх
         живого потока не берёт (прошитый Amazon Echo, живой случай 2026-11-22).
         """
+        headers = AAC_HEADERS if aac else FLOW_HEADERS
         if not body:
             # HEAD: у потока неизвестной длины объявлять нечего, тело не открываем.
-            return web.Response(status=HTTPStatus.OK, headers=FLOW_HEADERS)
+            return web.Response(status=HTTPStatus.OK, headers=headers)
         binary = await _ffmpeg(coordinator)
         if not binary:
             return self.json_message(
@@ -69,18 +79,29 @@ class MegaHomeMusicStreamView(_MegaHomeView):
             )
         if not authorized():
             return self.json_message("Поток больше не доступен", HTTPStatus.NOT_FOUND)
-        response = web.StreamResponse(status=HTTPStatus.OK, headers=FLOW_HEADERS)
+        response = web.StreamResponse(status=HTTPStatus.OK, headers=headers)
         await response.prepare(request)
 
         async def write(chunk: bytes) -> None:
             await response.write(chunk)
+            if aac and authorized():
+                session.confirm_write(player)
 
-        try:
+        async def decode(url: str, start: float = 0.0):
+            return await ffmpeg_decoder(binary, url, start, radio=bool(session.current and session.current.source))
+
+        async def serve(send) -> None:
             if authorized():
                 await session.serve(
-                    write, lambda url, start=0.0: ffmpeg_decoder(binary, url, start),
-                    lambda out: ffmpeg_encoder(binary, out), player,
+                    send, decode,
+                    lambda out: ffmpeg_encoder(binary, out), player, confirm_write=not aac,
                 )
+
+        try:
+            if aac:
+                await stream_aac(binary, serve, write)
+            else:
+                await serve(write)
         except (ConnectionError, OSError):
             # Плеер закрыл поток (пауза, смена источника, выключение) — это норма, не ошибка.
             response.force_close()
@@ -101,7 +122,7 @@ class MegaHomeMusicStreamView(_MegaHomeView):
             session, player = found
             return await self._stream_flow(
                 request, session, coordinator, body=body, player=player,
-                authorized=lambda: playback.flow.find(token) == found,
+                authorized=lambda: playback.flow.find(token) == found, aac=token.endswith(".aac"),
             )
         links = getattr(coordinator, "music_links", None)
         track = links.track(token) if links is not None else None

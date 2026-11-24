@@ -81,15 +81,50 @@ class MusicGroups:
         if entity is None:
             return None
         if name == "unjoin":
-            return await self.leave(entity) if self.contains(entity) else None
+            if self.contains(entity):
+                return await self.leave(entity)
+            if sonos := await self.playback.sonos_for(entity):
+                await sonos.leave(entity)
+                return {"accepted": True}
+            return None
         if name == "turn_off":
             return await self.leave(entity) if self.contains(entity) else None
         if name in ("play", "pause", "play_pause", "stop"):
             owner = self.owner(entity)
-            return await self.transport(owner, name, by) if owner is not None else None
+            if owner is not None:
+                return await self.transport(owner, name, by)
+            return await self._sonos_transport(tile, entity, name)
         if name != "join":
             return None
         return await self._join_group(tile, entity, data.get("group_members") or [])
+
+    async def _sonos_transport(self, tile: dict, entity: str, command: str) -> dict | None:
+        session = self.playback._flow.current(tile["id"])
+        if session is None or session.current is None or not session.has_opened(entity):
+            return None
+        sonos = await self.playback.sonos_for(entity)
+        if sonos is None:
+            return None
+        queue = self.playback._players.get(entity)
+        if command == "play_pause":
+            state = self.playback._home.source.get(entity)
+            paused = queue.group_paused if queue is not None else state is None or state.state == "paused"
+            command = "play" if paused else "pause"
+        if command == "play":
+            session.resume()
+            if session.reading_player(entity):
+                await sonos.transport(entity, command)
+            else:
+                await self.playback.play_flow(session, entity)
+        else:
+            await sonos.transport(entity, command)
+            if command == "stop":
+                self.playback._drop_queue(entity, tile)
+                return {"accepted": True}
+            session.pause()
+        if queue is not None:
+            queue.group_paused = command == "pause"
+        return {"accepted": True}
 
     async def _join_group(self, tile: dict, leader: str, requested: list[str]) -> dict | None:
         owner = self.owner(leader)
@@ -105,6 +140,9 @@ class MusicGroups:
         target = list(dict.fromkeys([*(existing or native), *requested]))
         target = [member for member in target if member != leader]
         if existing is None and self._same_system(leader, target):
+            if sonos := await self.playback.sonos_for(leader):
+                await sonos.join(leader, requested)
+                return {"accepted": True}
             return None
         for member in target:
             member_tile = self.playback._tile_of(member)
@@ -157,6 +195,12 @@ class MusicGroups:
         state = self.playback._home.source.get(entity)
         members = state.attributes.get("group_members") if state is not None else None
         if self.playback._system_of(entity) and isinstance(members, (list, tuple)) and len(members) > 1:
+            await self._leave_system(entity)
+
+    async def _leave_system(self, entity: str) -> None:
+        if sonos := await self.playback.sonos_for(entity):
+            await sonos.leave(entity)
+        else:
             await call(self.playback._home.source, "media_player", "unjoin", {"entity_id": entity})
 
     def _same_system(self, leader: str, members: list[str]) -> bool:
@@ -255,9 +299,7 @@ class MusicGroups:
         async def apply(entity: str) -> None:
             sign = by if entity == leader else None
             if resume:
-                fields = (self.playback._stream_output_fields(session, entity)
-                          if not session.reading_player(entity) else {})
-                service = "play_media" if fields else "media_play"
+                service = "media_play" if session.reading_player(entity) else "play_media"
             else:
                 current = source.get(entity)
                 mask = current.attributes.get("supported_features") if current is not None else None
@@ -269,8 +311,13 @@ class MusicGroups:
                     service = "media_stop" if features & _STOP_FEATURE else "media_pause"
                 else:
                     service = "media_pause" if features & _PAUSE_FEATURE or not features & _STOP_FEATURE else "media_stop"
-                fields = {}
-            await call(source, "media_player", service, {"entity_id": entity, **fields}, by=sign)
+            sonos = await self.playback.sonos_for(entity)
+            if service == "play_media":
+                await self.playback.play_flow(session, entity)
+            elif sonos is not None:
+                await sonos.transport(entity, "play" if resume else "stop" if command == "stop" else "pause")
+            else:
+                await call(source, "media_player", service, {"entity_id": entity}, by=sign)
             if service == "media_stop":
                 session.disconnect(entity)
 
@@ -302,7 +349,10 @@ class MusicGroups:
         mask = state.attributes.get("supported_features") if state is not None else None
         features = int(mask) if isinstance(mask, (int, float)) and not isinstance(mask, bool) else 0
         service = "media_stop" if features & _STOP_FEATURE else "media_pause"
-        await call(source, "media_player", service, {"entity_id": entity})
+        if sonos := await self.playback.sonos_for(entity):
+            await sonos.transport(entity, "stop")
+        else:
+            await call(source, "media_player", service, {"entity_id": entity})
         self._served.pop(entity, None)
 
     async def wake(self, leader: str, adding: str | None = None) -> None:
@@ -354,13 +404,12 @@ class MusicGroups:
                 session.reading_player(member) or not session.has_opened(member)
             ):
                 continue
-            fields = self.playback._stream_output_fields(session, member)
-            self.playback._drop_queue(member, member_tile)
             try:
-                await call(self.playback._home.source, "media_player", "play_media", {"entity_id": member, **fields})
+                await self.playback.play_flow(session, member)
             except BaseException:
                 self.playback._flow.revoke(session, member)
                 raise
+            self.playback._drop_queue(member, member_tile)
             self._served[member] = session.token
 
     async def _vendor_join(self, delegate: str, members: list[str]) -> None:
@@ -378,10 +427,13 @@ class MusicGroups:
         for member in members:
             if self._vendor.get(member) == delegate:
                 continue
-            await call(
-                self.playback._home.source, "media_player", "join",
-                {"entity_id": delegate, "group_members": [member]},
-            )
+            if sonos := await self.playback.sonos_for(delegate):
+                await sonos.join(delegate, [member])
+            else:
+                await call(
+                    self.playback._home.source, "media_player", "join",
+                    {"entity_id": delegate, "group_members": [member]},
+                )
             self._vendor[member] = delegate
             if (tile := self.playback._tile_of(member)) is not None:
                 self.playback._drop_queue(member, tile)
@@ -393,6 +445,6 @@ class MusicGroups:
             return False
         # `unjoin` — у самой колонки: так она выходит из группы, которую собрал вендор. Пауза
         # оставила бы её участником, и звук вернулся бы на первом же воспроизведении.
-        await call(self.playback._home.source, "media_player", "unjoin", {"entity_id": member})
+        await self._leave_system(member)
         self._vendor.pop(member, None)
         return True

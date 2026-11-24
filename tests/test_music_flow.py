@@ -15,6 +15,7 @@ import time
 import wave
 from array import array
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from aiohttp import web
@@ -230,7 +231,7 @@ def test_radio_prepares_frames_before_player_connects(monkeypatch):
         async def source_of(item):
             return item.source
 
-        async def decode(_binary, _url, _start):
+        async def decode(_binary, _url, _start, *, radio=False):
             return FakeProcess([b"frame" * 1000], piece=5)
 
         async def encode(_binary, write):
@@ -370,6 +371,58 @@ def test_радио_остаётся_источником_группы_посл�
         assert streams.session("echo").current.source == url
         assert service.state_groups()[member] == ["media_player.echo", member]
         service.close()
+
+    asyncio.run(run())
+
+
+def test_sonos_отказ_смены_станции_сохраняет_текущий_поток(tmp_path):
+    async def run():
+        service, home, _, streams = setup(tmp_path)
+        entity = "media_player.echo"
+        home.data["tiles"][0]["stream"]["sync"] = "sync:sonos"
+        service.sonos = SimpleNamespace(supports=AsyncMock(return_value=True), play=AsyncMock())
+        session = streams.session("echo")
+        session.warm_radio = AsyncMock()
+
+        async def play(station_id):
+            url = f"https://cdn.example/{station_id}.aac"
+            await service.call(False, {
+                "action": "play_station", "player": "echo",
+                "station": {"id": station_id, "title": station_id, "url": url},
+                "fields": {"media_content_id": url, "media_content_type": "audio/aac"},
+            })
+
+        class Decoder:
+            def __init__(self):
+                self.hold = asyncio.Event()
+
+            async def read(self, _size):
+                await self.hold.wait()
+                return b""
+
+            async def stop(self):
+                self.hold.set()
+
+        await play("первая")
+        first_url = service.sonos.play.await_args.args[1]
+        assert first_url.endswith(".aac")
+        assert not home.source.calls
+        reader = asyncio.create_task(session.serve(AsyncMock(), AsyncMock(return_value=Decoder()), player=entity))
+        try:
+            await asyncio.sleep(0)
+            assert session.reading_player(entity)
+            service.sonos.play.side_effect = OpError("Отказ Sonos")
+            with pytest.raises(OpError, match="Отказ Sonos"):
+                await play("вторая")
+            assert session.current.title == "первая"
+            assert session.reading_player(entity)
+            service.sonos.play.side_effect = None
+            await play("третья")
+            assert session.current.title == "третья"
+            assert service.sonos.play.await_count == 3
+        finally:
+            service.close()
+            await asyncio.wait_for(reader, timeout=1)
 
     asyncio.run(run())
 
@@ -1143,8 +1196,8 @@ def test_ffmpeg_восстанавливает_источник_после_от�
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("missing", [False, True])
-def test_замер_на_двух_выходах_раздаёт_кадры_одной_сессии_и_отзывает_адреса(tmp_path, monkeypatch, missing):
+@pytest.mark.parametrize("failure", [None, "missing", "lost"])
+def test_замер_на_двух_выходах_раздаёт_кадры_одной_сессии_и_отзывает_адреса(tmp_path, monkeypatch, failure):
     if not shutil.which("ffmpeg"):
         pytest.skip("Для проверки MP3 нужен ffmpeg")
 
@@ -1171,7 +1224,7 @@ def test_замер_на_двух_выходах_раздаёт_кадры_од�
                 token = data["media_content_id"].rsplit("/", 1)[-1]
                 session, player = streams.find(token)
                 if player == heos:
-                    if missing:
+                    if failure == "missing":
                         return
                     await asyncio.sleep(0.05)
                     assert not wrote.is_set()
@@ -1179,7 +1232,7 @@ def test_замер_на_двух_выходах_раздаёт_кадры_од�
 
         home.source.call = connect_player
         command = {"action": "calibration_start", "players": ["echo", "h1"]}
-        if missing:
+        if failure == "missing":
             monkeypatch.setattr("mega_home.music_calibration.MARKER_OPEN_TIMEOUT", 0.05)
             with pytest.raises(OpError, match="heos.*истекло ожидание подключения"):
                 await service.call(False, command)
@@ -1201,7 +1254,14 @@ def test_замер_на_двух_выходах_раздаёт_кадры_од�
             assert len(frames) == 84
             assert all(len(frame) == 576 and frame[:2] == b"\xff\xfb" for frame in frames)
         await asyncio.wait_for(wrote.wait(), timeout=1)
-        await service.call(False, {"action": "calibration_stop", "session": start["session"]})
+        if failure == "lost":
+            monkeypatch.setattr("mega_home.music_calibration.MARKER_RECONNECT_TIMEOUT", 0)
+            session.disconnect(heos)
+            await asyncio.sleep(1.1)
+            status = await service.call(False, {"action": "calibration_status", "session": start["session"]})
+            assert status == {"active": False, "reason": f"{heos}: пропало подключение к потоку маркеров"}
+        else:
+            await service.call(False, {"action": "calibration_stop", "session": start["session"]})
         await asyncio.wait_for(asyncio.gather(*readers), timeout=1)
         assert all(streams.find(token) is None for token in tokens)
         assert not session.reading
