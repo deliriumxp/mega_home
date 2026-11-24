@@ -526,9 +526,16 @@ async def ffmpeg_decoder(binary: str, url: str, start: float = 0.0) -> FlowProce
     MA платит тем же (он ещё и перекодирует в FLAC/MP3, у нас играет исходный звук).
     """
     seek = [] if start <= 0 else ["-ss", f"{start:.3f}"]
+    # Политика HTTP-повторов Music Assistant для прямого входа ffmpeg.
+    reconnect = (
+        ["-reconnect", "1", "-reconnect_delay_max", "10", "-reconnect_streamed", "1",
+         "-reconnect_on_http_error", "5xx,429"]
+        if url.startswith(("http://", "https://")) else []
+    )
     return FfmpegProcess(await asyncio.create_subprocess_exec(
         binary,
         *seek,
+        *reconnect,
         "-i", url,
         "-f", "s16le", "-ar", str(FLOW_RATE), "-ac", str(FLOW_CHANNELS),
         "-loglevel", "error", "-nostats",
