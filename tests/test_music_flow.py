@@ -215,6 +215,39 @@ def test_radio_reconnect_keeps_decoder_and_buffers_recent_audio():
     asyncio.run(run())
 
 
+def test_radio_prepares_frames_before_player_connects(monkeypatch):
+    async def run():
+        from mega_home.providers import music_flow
+
+        session = FlowSession("radio")
+        session.set_items((SimpleNamespace(source="radio"),), 0)
+
+        async def source_of(item):
+            return item.source
+
+        async def decode(_binary, _url, _start):
+            return FakeProcess([b"frame" * 1000], piece=5)
+
+        async def encode(_binary, write):
+            async def stop():
+                pass
+            return SimpleNamespace(write=write, stop=stop)
+
+        async def receive(chunk):
+            assert chunk == b"frame"
+            session.stop()
+
+        monkeypatch.setattr(music_flow, "ffmpeg_decoder", decode)
+        monkeypatch.setattr(music_flow, "ffmpeg_encoder", encode)
+        session.source_of = source_of
+        await session.warm_radio("ffmpeg")
+        assert not session.reading
+        assert len(session._radio_tail) == music_flow.RADIO_RECONNECT_FRAMES
+        await asyncio.wait_for(session.serve(receive, None, None, "sonos"), timeout=1)
+
+    asyncio.run(run())
+
+
 def test_смена_элемента_приходит_в_тот_же_поток():
     async def run():
         session = FlowSession("t")

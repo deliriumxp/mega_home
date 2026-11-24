@@ -40,6 +40,7 @@ READER_QUEUE = 320
 STOP_TIMEOUT_S = 5
 RADIO_RECONNECT_S = 10
 RADIO_RECONNECT_FRAMES = 20
+RADIO_PCM_CHUNKS = 22  # До 15 с моно PCM 48 кГц, по 64 КиБ.
 
 
 # Чем дом декодирует элемент: свой процесс на элемент, звук — PCM в трубу. Второй аргумент —
@@ -107,6 +108,7 @@ class FlowSession:
         self.retired = False
         self._pump: asyncio.Task[None] | None = None
         self._radio_tail: deque[bytes] = deque(maxlen=RADIO_RECONNECT_FRAMES)
+        self._radio_ready = asyncio.Event()
         self.marker_frames: dict[str, tuple[bytes, ...]] = {}
         self.marker_ready = asyncio.Event()
         self._marker_cursor = -1
@@ -121,6 +123,7 @@ class FlowSession:
         """Очередь и место в ней — от владельца (очереди дома). Меняет звук, не адрес."""
         self.items, self.index = tuple(items), index
         self._radio_tail.clear()
+        self._radio_ready.clear()
         self.seek_offset = 0.0
         self.switch.set()
 
@@ -145,6 +148,18 @@ class FlowSession:
     @property
     def reading(self) -> bool:
         return bool(self._readers)
+
+    async def warm_radio(self, binary: str) -> None:
+        """Подготовить начало эфира до команды play_media, с ограниченным ожиданием."""
+        if self.retired or self.reading or not self.current or not self.current.source:
+            return
+        if self._pump is None or self._pump.done():
+            self._pump = asyncio.create_task(self._run(
+                lambda url, start: ffmpeg_decoder(binary, url, start),
+                lambda write: ffmpeg_encoder(binary, write),
+            ))
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._radio_ready.wait(), timeout=0.8)
 
     def cancel_pump(self) -> None:
         if self._pump is not None:
@@ -291,6 +306,8 @@ class FlowSession:
                 deadline += MP3_FRAME_MS / 1000
                 if not self._readers and (item := self.current) is not None and item.source:
                     self._radio_tail.append(chunk)
+                    if len(self._radio_tail) == RADIO_RECONNECT_FRAMES:
+                        self._radio_ready.set()
             for queue, player in list(self._readers.items()):
                 if queue.full():
                     LOGGER.warning("Аудиопоток: очередь плеера %s переполнена", player)
@@ -307,7 +324,7 @@ class FlowSession:
                 sink = await encoder(broadcast)
                 pcm = sink.write
             while (item := self.current) is not None:
-                if self.source_of is None or not self._readers:
+                if self.source_of is None or (not self._readers and (encoder is None or not item.source)):
                     return
                 source = await self.source_of(item)
                 if source is None:
@@ -317,14 +334,21 @@ class FlowSession:
                 start = self.seek_offset
                 self.seek_offset = 0.0
                 process = await decoder(source, start)
+                pcm_buffer: asyncio.Queue[bytes] | None = None
+                producer: asyncio.Task[None] | None = None
                 try:
                     # Головку нового элемента читаем сразу: с ней микшуется придержанный хвост.
                     out = fader.join(await _read_head(process, self.fade_bytes))
                     if out:
                         await pcm(out)
+                    if item.source and encoder is not None:
+                        pcm_buffer = asyncio.Queue(RADIO_PCM_CHUNKS)
+                        producer = asyncio.create_task(_buffer_radio_pcm(process, pcm_buffer))
                     while True:
-                        chunk = await process.read(FLOW_CHUNK)
+                        chunk = await (process.read(FLOW_CHUNK) if pcm_buffer is None else pcm_buffer.get())
                         if not chunk:
+                            if producer is not None:
+                                await producer
                             break
                         out = fader.feed(chunk)
                         if out:
@@ -344,6 +368,9 @@ class FlowSession:
                             elif now - without_readers_since >= RADIO_RECONNECT_S:
                                 return
                 finally:
+                    if producer is not None:
+                        producer.cancel()
+                        await asyncio.gather(producer, return_exceptions=True)
                     await _stop(process)
                 if self.switch.is_set() or self.current is not item:
                     continue
@@ -364,6 +391,18 @@ class FlowSession:
             self._radio_tail.clear()
             for queue in list(self._readers):
                 self._finish_reader(queue)
+
+
+async def _buffer_radio_pcm(process: FlowProcess, buffer: asyncio.Queue[bytes]) -> None:
+    try:
+        while chunk := await process.read(FLOW_CHUNK):
+            await buffer.put(chunk)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        await buffer.put(b"")
+        raise
+    await buffer.put(b"")
 
 
 async def _stop(process: FlowProcess) -> None:

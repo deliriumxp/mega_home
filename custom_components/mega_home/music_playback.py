@@ -433,6 +433,8 @@ class MusicPlayback:
             ):
                 raise OpError("Этот плеер сейчас недоступен", 409)
             if isinstance(session := queue.flow, FlowSession):
+                if not session.reading and (binary := await self._home.env.run(shutil.which, "ffmpeg")):
+                    await session.warm_radio(binary)
                 return flow_output(self._flow, session, profile, opened, entity)
             # ⚠ Запуск подтверждает ВЛАДЕЛЕЦ, а не плеер: адрес у станции чужой (CDN источника), и
             # о себе такой плеер может не рассказывать вовсе. Команду приняла HA — этого довольно.
