@@ -23,6 +23,7 @@ import contextlib
 import secrets
 import sys
 from array import array
+from collections import deque
 from collections.abc import Awaitable, Callable
 
 from ..core.const import LOGGER, URL_PREFIX
@@ -37,6 +38,8 @@ MP3_FRAME_MS = 24
 MP3_FRAME_BYTES = 576
 READER_QUEUE = 320
 STOP_TIMEOUT_S = 5
+RADIO_RECONNECT_S = 10
+RADIO_RECONNECT_FRAMES = 20
 
 
 # Чем дом декодирует элемент: свой процесс на элемент, звук — PCM в трубу. Второй аргумент —
@@ -103,6 +106,7 @@ class FlowSession:
         self._opened: set[str] = set()
         self.retired = False
         self._pump: asyncio.Task[None] | None = None
+        self._radio_tail: deque[bytes] = deque(maxlen=RADIO_RECONNECT_FRAMES)
         self.marker_frames: dict[str, tuple[bytes, ...]] = {}
         self.marker_ready = asyncio.Event()
         self._marker_cursor = -1
@@ -116,6 +120,7 @@ class FlowSession:
     def set_items(self, items: tuple[MediaItem, ...], index: int) -> None:
         """Очередь и место в ней — от владельца (очереди дома). Меняет звук, не адрес."""
         self.items, self.index = tuple(items), index
+        self._radio_tail.clear()
         self.seek_offset = 0.0
         self.switch.set()
 
@@ -133,6 +138,7 @@ class FlowSession:
     def stop(self) -> None:
         """Снять звук: очередь снята или плеер оставлен. Поток закроется на ближайшем куске."""
         self.items, self.index = (), 0
+        self._radio_tail.clear()
         self._playing.set()
         self.switch.set()
 
@@ -189,6 +195,10 @@ class FlowSession:
         queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=READER_QUEUE)
         if player:
             self.disconnect(player)
+        if not self._readers:
+            for frame in self._radio_tail:
+                queue.put_nowait(frame)
+        self._radio_tail.clear()
         self._readers[queue] = player
         self._opened.add(player)
         if self.marker_frames and self.marker_frames.keys() <= set(self._readers.values()):
@@ -231,8 +241,8 @@ class FlowSession:
                         continue
                     chunk, drop = chunk[drop:], 0
                 await write(chunk)
-        except (ConnectionError, OSError):
-            return  # плеер ушёл — это норма (пауза, смена источника, выключение)
+        except (ConnectionError, OSError) as error:
+            LOGGER.debug("Плеер %s: запись аудиопотока закрыта (%s)", player, type(error).__name__)
         finally:
             self._readers.pop(queue, None)
 
@@ -250,6 +260,8 @@ class FlowSession:
                 self._marker_cursor = cursor
                 for queue, player in list(self._readers.items()):
                     frames = self.marker_frames.get(player)
+                    if queue.full():
+                        LOGGER.warning("Маркеры: очередь плеера %s переполнена", player)
                     if frames is None or queue.full():
                         self._readers.pop(queue)
                         self._finish_reader(queue, discard=True)
@@ -266,6 +278,7 @@ class FlowSession:
 
         clock = asyncio.get_running_loop().time
         deadline: float | None = None
+        without_readers_since: float | None = None
 
         async def broadcast(chunk: bytes) -> None:
             nonlocal deadline
@@ -276,8 +289,11 @@ class FlowSession:
                     deadline = now
                 await asyncio.sleep(max(0, deadline - now))
                 deadline += MP3_FRAME_MS / 1000
-            for queue in list(self._readers):
+                if not self._readers and (item := self.current) is not None and item.source:
+                    self._radio_tail.append(chunk)
+            for queue, player in list(self._readers.items()):
                 if queue.full():
+                    LOGGER.warning("Аудиопоток: очередь плеера %s переполнена", player)
                     self._finish_reader(queue, discard=True)
                     self._readers.pop(queue)
                 else:
@@ -316,8 +332,17 @@ class FlowSession:
                         # Смену элемента замечаем на ближайшем куске звука: он приходит постоянно.
                         if self.switch.is_set() or self.current is not item:
                             break
-                        if not self._readers:  # все ушли — декодировать некуда
+                        if self._readers:
+                            without_readers_since = None
+                        elif encoder is None or not item.source:
                             return
+                        else:
+                            # Короткое переподключение не должно перезапускать радиоисточник.
+                            now = clock()
+                            if without_readers_since is None:
+                                without_readers_since = now
+                            elif now - without_readers_since >= RADIO_RECONNECT_S:
+                                return
                 finally:
                     await _stop(process)
                 if self.switch.is_set() or self.current is not item:
@@ -336,6 +361,7 @@ class FlowSession:
         finally:
             if sink is not None:
                 await sink.stop()
+            self._radio_tail.clear()
             for queue in list(self._readers):
                 self._finish_reader(queue)
 

@@ -172,6 +172,49 @@ def test_поток_играет_элементы_подряд_одним_отв
     asyncio.run(run())
 
 
+def test_radio_reconnect_keeps_decoder_and_buffers_recent_audio():
+    async def run():
+        session = FlowSession("radio")
+        session.set_items((SimpleNamespace(source="radio"),), 0)
+        decoded = 0
+
+        class Decoder:
+            async def read(self, size):
+                return b"frame"
+
+            async def stop(self):
+                pass
+
+        async def source_of(item):
+            return item.source
+
+        async def decoder(url, start=0):
+            nonlocal decoded
+            decoded += 1
+            return Decoder()
+
+        async def encoder(write):
+            async def stop():
+                pass
+            return SimpleNamespace(write=write, stop=stop)
+
+        async def disconnect(_chunk):
+            raise ConnectionResetError()
+
+        async def receive(chunk):
+            assert chunk == b"frame"
+            session.stop()
+
+        session.source_of = source_of
+        await session.serve(disconnect, decoder, encoder, "sonos")
+        await asyncio.sleep(0.08)
+        assert session._radio_tail
+        await asyncio.wait_for(session.serve(receive, decoder, encoder, "sonos"), timeout=1)
+        assert decoded == 1
+
+    asyncio.run(run())
+
+
 def test_смена_элемента_приходит_в_тот_же_поток():
     async def run():
         session = FlowSession("t")
