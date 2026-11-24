@@ -307,10 +307,10 @@ class PlayerQueue:
         if attempt.started is None:
             reset = current.position is not None and current.position <= START_SLACK < (attempt.before.position or 0)
             changed = current.content != attempt.before.content or attempt.before.state not in ACTIVE or reset
-            if current.state == "playing" and (
+            if (output.flow and attempt.opened) or (current.state == "playing" and (
                 (owned and (changed or not output.native)) or
                 (output.opaque and attempt.opened and "://" not in current.content)
-            ):
+            )):
                 if attempt.timeout:
                     attempt.timeout.cancel()
                 attempt.started = attempt.last = current

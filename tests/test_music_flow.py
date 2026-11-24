@@ -304,6 +304,7 @@ def test_станция_на_плеере_потока_идёт_адресом_�
         # «устройство взяло поток дома» (о себе оно не рассказывает).
         home.source.report("media_player.echo", "playing")
         assert (await view(service, "echo"))["started"] is False
+        home.source.report("media_player.echo", "buffering")
         streams.session("echo").on_read()
         state = await view(service, "echo")
         assert state["started"] is True

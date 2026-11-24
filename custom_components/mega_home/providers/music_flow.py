@@ -223,9 +223,6 @@ class FlowSession:
         drop = 0
         if self._pump is None or self._pump.done():
             self._pump = asyncio.create_task(self._run_marker() if self.marker_frames else self._run(decoder, encoder))
-        if self.on_read is not None and self.on_read_player in (None, player):
-            on_read, self.on_read = self.on_read, None
-            on_read()
         try:
             while (chunk := await queue.get()) is not None:
                 await self._playing.wait()
@@ -256,6 +253,9 @@ class FlowSession:
                         continue
                     chunk, drop = chunk[drop:], 0
                 await write(chunk)
+                if queue in self._readers and self.on_read is not None and self.on_read_player in (None, player):
+                    on_read, self.on_read = self.on_read, None
+                    on_read()
         except (ConnectionError, OSError) as error:
             LOGGER.debug("Плеер %s: запись аудиопотока закрыта (%s)", player, type(error).__name__)
         finally:
