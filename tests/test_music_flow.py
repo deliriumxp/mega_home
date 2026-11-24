@@ -374,6 +374,42 @@ def test_радио_остаётся_источником_группы_посл�
     asyncio.run(run())
 
 
+def test_состав_одной_группы_не_переоткрывает_потоки_двух_групп(tmp_path):
+    async def run():
+        service, home, _, streams = setup(tmp_path)
+        first = home.data["tiles"][0]
+        second = {**flow_tile(entity="media_player.echo2"), "id": "echo2"}
+        heos = vendor_tile("media_player.heos", "h1", "sync:heos")
+        station = station_tile()
+        sonos = vendor_tile("media_player.sonos", "s1", "sync:sonos")
+        home.data["tiles"].extend([second, heos, station, sonos])
+        for tile in home.data["tiles"]:
+            home.source.states[tile["entityId"]] = PlainState("idle")
+        try:
+            for leader, member, track in ((first, heos, "1"), (second, station, "2")):
+                await service.call(False, {
+                    "action": "play_queue", "player": leader["id"], "ids": [track], "index": 0,
+                })
+                await service.group_command(leader, "join", {"group_members": [member["entityId"]]}, None)
+
+            original = {tile["id"]: streams.current(tile["id"]) for tile in (first, second)}
+            home.source.calls.clear()
+            await service.group_command(first, "join", {"group_members": [sonos["entityId"]]}, None)
+            await service.group_command(sonos, "unjoin", {}, None)
+
+            assert all(data["entity_id"] == sonos["entityId"] for _, _, data in home.source.calls)
+            assert any(name == "play_media" for _, name, _ in home.source.calls)
+            for leader, member, track in ((first, heos, "1"), (second, station, "2")):
+                session = streams.current(leader["id"])
+                assert session is original[leader["id"]]
+                assert session.current.id == track
+                assert service.state_groups()[leader["entityId"]] == [leader["entityId"], member["entityId"]]
+        finally:
+            service.close()
+
+    asyncio.run(run())
+
+
 def test_трек_на_плеере_потока_переключается_без_команды_плееру(tmp_path):
     async def run():
         service, home, _catalog, streams = setup(tmp_path)
