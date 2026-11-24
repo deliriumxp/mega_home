@@ -206,7 +206,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     playback = MusicPlayback(coordinator, music, station, links, flow)
     coordinator.music_playback = playback
     coordinator.resident_services = {"yandex-music": playback.call}
-    entry.async_on_unload(coordinator.async_add_listener(playback.config_changed))
+    # ⚠ Слушатель — синхронная обёртка: `config_changed` теперь coroutine и берёт
+    # `_group_lock`, а `async_add_listener` синхронные вызовы (ревью 2026-11-24).
+    entry.async_on_unload(coordinator.async_add_listener(
+        lambda: hass.async_create_task(playback.config_changed())
+    ))
     entry.async_on_unload(playback.close)
     entry.async_on_unload(music.stop)
 

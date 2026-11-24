@@ -568,6 +568,11 @@ class FlowStreams:
             self._by_player[player] = session
         return session
 
+    def current(self, player: str) -> FlowSession | None:
+        """Сессия плеера, только если она уже есть: для lookup'ов, где новую заводить не нужно —
+        иначе после каждой паузы/выхода оставался бы пустой зарегистрированный объект."""
+        return self._by_player.get(player)
+
     def address(self, session: FlowSession, player: str) -> str | None:
         """Абсолютный адрес сессии ДЛЯ ЭТОГО плеера; `None` — дом не знает своего адреса.
 

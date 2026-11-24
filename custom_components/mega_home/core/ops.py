@@ -394,7 +394,15 @@ async def command(
     # музыкальная служба дома и она же берёт такую команду себе (`join`/`unjoin`).
     playback = getattr(coordinator, "music_playback", None)
     if name in ("join", "unjoin", "play", "pause", "play_pause", "stop", "turn_off") and playback is not None:
-        handled = await playback.group_command(tile, name, data, by)
+        # Подпись считаем ЗДЕСЬ: у команд группы нет своего `execute`/`call`, и дом сам решает,
+        # меняют ли они состояние. Без подписи транспорт сгруппированного плеера не оставлял
+        # строки в журнале, хотя одиночный плеер её оставлял (ревью 2026-11-24).
+        group_by = (
+            signed(by, spec.get("label") or name, tile.get("name"))
+            if by is not None and changes_state(spec, state)
+            else None
+        )
+        handled = await playback.group_command(tile, name, data, group_by)
         if handled is not None:
             return handled
 

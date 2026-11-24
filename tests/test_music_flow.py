@@ -60,6 +60,7 @@ class Source:
         self.states = {entity: PlainState("idle")}
         self.callbacks = {}
         self.calls = []
+        self.bys = []
 
     def get(self, entity):
         return self.states.get(entity)
@@ -71,6 +72,7 @@ class Source:
 
     async def call(self, domain, service, data, response, by):
         self.calls.append((domain, service, data))
+        self.bys.append(by)
 
     def report(self, entity, state, **attrs):
         sample = self.states[entity] = PlainState(state, attrs)
@@ -978,7 +980,7 @@ def test_настройка_задержки_не_сбрасывает_очер�
         await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1"], "index": 0})
         session = streams.session("echo")
         home.data["tiles"][0]["stream"] = {**home.data["tiles"][0]["stream"], "delayMs": 360}
-        service.config_changed()
+        await service.config_changed()
         assert streams.session("echo") is session
         assert session.current.id == "1"
         assert session.delay_of("media_player.echo") == 360
@@ -1209,6 +1211,129 @@ def test_выключение_участника_снимает_его_с_гру
         assert answer == {"accepted": True}
         assert service.state_groups() == {}
         assert service.multiroom.contains(member) is False
+        service.close()
+
+    asyncio.run(run())
+
+
+# MediaPlayerEntityFeature.PAUSE|STOP — у прошитого Echo оба бита.
+_FEATURES_PAUSE_STOP = 1 | 4096
+_FEATURES_PAUSE_ONLY = 1
+
+
+async def _station_group(service, home, member: str):
+    """Ведущий echo играет станцию; member встаёт в нашу группу."""
+    home.source.states[member] = PlainState("idle")
+    station = {"id": "rock", "title": "Рок", "url": "https://cdn.example/rock.aac"}
+    await service.call(False, {"action": "play_station", "player": "echo", "station": station,
+                               "fields": {"media_content_id": station["url"], "media_content_type": "audio/aac"}})
+    await service.group_command(home.data["tiles"][0], "join", {"group_members": [member]}, None)
+
+
+def test_стоп_группы_гасит_плеер_со_стопом_а_не_ставит_на_паузу(tmp_path):
+    """Явный `stop` — маска STOP при бите (иначе pause), как у `_stop_players`.
+
+    Раньше транспорт брал PAUSE-first, и «стоп» группы оставлял прошитый Echo (PAUSE+STOP) на паузе.
+    """
+
+    async def run():
+        service, home, _catalog, _streams = setup(tmp_path)
+        source = home.source
+        home.data["tiles"].append(station_tile())
+        await _station_group(service, home, "media_player.station")
+        source.states["media_player.echo"] = PlainState("playing", {"supported_features": _FEATURES_PAUSE_STOP})
+        source.states["media_player.station"] = PlainState("playing", {"supported_features": _FEATURES_PAUSE_ONLY})
+        assert (await service.group_command(home.data["tiles"][0], "stop", {}, None))["accepted"]
+        assert ("media_player", "media_stop", {"entity_id": "media_player.echo"}) in source.calls
+        # У станции STOP нет — честная пауза по маске.
+        assert ("media_player", "media_pause", {"entity_id": "media_player.station"}) in source.calls
+        service.close()
+
+    asyncio.run(run())
+
+
+def test_транспорт_группы_подписывается_в_журнале_по_ведущему(tmp_path):
+    """Транспорт сгруппированного плеера — со строкой журнала, как у одиночного (ревью 2026-11-24)."""
+
+    async def run():
+        service, home, _catalog, _streams = setup(tmp_path)
+        source = home.source
+        home.data["tiles"].append(station_tile())
+        await _station_group(service, home, "media_player.station")
+        source.states["media_player.echo"] = PlainState("playing", {"supported_features": _FEATURES_PAUSE_STOP})
+        by = {"id": "resident", "via": "test"}
+        source.bys.clear()
+        assert (await service.group_command(home.data["tiles"][0], "pause", {}, by))["accepted"]
+        # Одна подпись — у ведущего; участники без своих строк, иначе журнал дублирует действие.
+        assert source.bys == [by, None]
+        service.close()
+
+    asyncio.run(run())
+
+
+def test_стоп_очереди_ведущего_разъединяет_группу(tmp_path):
+    """«Стоп» очереди кончает сессию: отметки группы снимаются, участники гаснут (ревью 2026-11-24)."""
+
+    async def run():
+        service, home, _catalog, _streams = setup(tmp_path)
+        source = home.source
+        home.data["tiles"].append(station_tile())
+        await _station_group(service, home, "media_player.station")
+        source.states["media_player.echo"] = PlainState("playing", {"supported_features": _FEATURES_PAUSE_STOP})
+        source.states["media_player.station"] = PlainState("playing", {"supported_features": _FEATURES_PAUSE_ONLY})
+        # Команда от УЧАСТНИКА: очередь его нет, стоп переводится на ведущего, группа снимается.
+        assert (await service.call(False, {"action": "queue_control", "player": "station", "command": "stop"}))["handled"]
+        assert service.multiroom.groups == {}
+        assert service.state_groups() == {}
+        assert ("media_player", "media_pause", {"entity_id": "media_player.station"}) in source.calls
+        service.close()
+
+    asyncio.run(run())
+
+
+def test_чистка_состава_убирает_вендорские_связи_пропавшего_ведущего(tmp_path):
+    """Пропавший ведущий снимает группу ВЕСТЬ: и `_vendor`, и `_served` её участников (ревью 2026-11-24)."""
+
+    async def run():
+        service, home, _catalog, streams = setup(tmp_path)
+        sonos = vendor_tile("media_player.sonos", "s1", "sync:sonos")
+        sonos_2 = vendor_tile("media_player.sonos_2", "s2", "sync:sonos")
+        home.data["tiles"] += [sonos, sonos_2]
+        source = home.source
+        for entity in ("media_player.sonos", "media_player.sonos_2"):
+            source.states[entity] = PlainState("idle")
+        # Смешанная группа: обе Sonos участвуют, вторая — вендорской связью вокруг головы системы.
+        await _station_group(service, home, "media_player.sonos")
+        await service.group_command(home.data["tiles"][0], "join", {"group_members": ["media_player.sonos_2"]}, None)
+        assert service.multiroom._vendor == {"media_player.sonos_2": "media_player.sonos"}
+        home.data["tiles"] = [tile for tile in home.data["tiles"] if tile["id"] != "echo"]
+        await service.config_changed()
+        assert service.multiroom.groups == {}
+        assert service.multiroom._vendor == {}
+        assert service.multiroom._served == {}
+        service.close()
+
+    asyncio.run(run())
+
+
+def test_пустая_запись_группы_не_блокирует_вендорский_join(tmp_path):
+    """Пустой список участников (старое следствие чистки состава) — как отсутствие группы:
+    односистемная пара снова идёт штатному `join` HA, а не нашему потоку (ревью 2026-11-24)."""
+
+    async def run():
+        service, home, _catalog, _streams = setup(tmp_path)
+        sonos = vendor_tile("media_player.sonos", "s1", "sync:sonos")
+        sonos_2 = vendor_tile("media_player.sonos_2", "s2", "sync:sonos")
+        home.data["tiles"] += [sonos, sonos_2]
+        for entity in ("media_player.sonos", "media_player.sonos_2"):
+            home.source.states[entity] = PlainState("idle")
+        # След старой чистки: запись есть, участников нет.
+        service.multiroom.groups["media_player.sonos"] = []
+        answer = await service.group_command(sonos, "join", {"group_members": ["media_player.sonos_2"]}, None)
+        assert answer is None
+        assert ("media_player", "join", {
+            "entity_id": "media_player.sonos", "group_members": ["media_player.sonos_2"],
+        }) not in home.source.calls
         service.close()
 
     asyncio.run(run())

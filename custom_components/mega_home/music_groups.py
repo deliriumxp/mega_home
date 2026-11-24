@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .core.ops import call
 from .core.ops_base import OpError
@@ -45,25 +45,37 @@ class MusicGroups:
         return groups
 
     def reconcile(self, alive: set[str]) -> None:
-        """Убрать из наших записей выходы, которых больше нет в составе."""
+        """Убрать из наших записей выходы, которых больше нет в составе.
+
+        ⚠ Пропавший ведущий убирает ВСЮ связанную запись — и вендорские связи его участников:
+        иначе `_vendor`/`_served` ссылались на группу, которой нет, а пустой список участников
+        молча блокировал ранний возврат HA для односистемной группы (`existing is None` уже
+        ложь) — «сонос+сонос» собирался нашим потоком вместо вендора (ревью 2026-11-24).
+        """
         for leader, members in list(self.groups.items()):
             if leader not in alive:
                 self.groups.pop(leader, None)
+                for member in members:
+                    self._vendor.pop(member, None)
+                    self._served.pop(member, None)
                 continue
             live = [member for member in members if member in alive]
             if live != members:
-                self.groups[leader] = live
-            for member in members:
-                if member not in alive:
-                    self._vendor.pop(member, None)
-                    self._served.pop(member, None)
+                if live:
+                    self.groups[leader] = live
+                else:
+                    self.groups.pop(leader, None)
+                for member in members:
+                    if member not in alive:
+                        self._vendor.pop(member, None)
+                        self._served.pop(member, None)
 
     def _available(self, entity: str) -> bool:
         tile = self.playback._tile_of(entity)
         state = self.playback._home.source.get(entity)
         return tile is not None and state is not None and state.state not in ("unknown", "unavailable")
 
-    async def command(self, tile: dict, name: str, data: dict) -> dict | None:
+    async def command(self, tile: dict, name: str, data: dict, by: Any = None) -> dict | None:
         """Перестройка смешанной группы выполняется целиком одним вызовом."""
         entity = self.playback._entity(tile)
         if entity is None:
@@ -74,7 +86,7 @@ class MusicGroups:
             return await self.leave(entity) if self.contains(entity) else None
         if name in ("play", "pause", "play_pause", "stop"):
             owner = self.owner(entity)
-            return await self.transport(owner, name) if owner is not None else None
+            return await self.transport(owner, name, by) if owner is not None else None
         if name != "join":
             return None
         return await self._join_group(tile, entity, data.get("group_members") or [])
@@ -86,7 +98,9 @@ class MusicGroups:
             if owner_tile is None:
                 raise OpError("Ведущая колонка сейчас недоступна", 409)
             return await self._join_group(owner_tile, owner, requested)
-        existing = self.groups.get(leader)
+        # Пустая запись (все участники выбыли) — как отсутствующая: иначе односистемная
+        # группа после чистки состава шла нашим потоком, а не вендору HA (ревью 2026-11-24).
+        existing = self.groups.get(leader) or None
         native = self._native_members(leader) if existing is None else []
         target = list(dict.fromkeys([*(existing or native), *requested]))
         target = [member for member in target if member != leader]
@@ -123,9 +137,10 @@ class MusicGroups:
                 await self.wake(leader, adding=member)
                 self.groups[leader].append(member)
         finally:
-            confirmed = self.groups[leader]
+            # `.get`, а не `[...]`: запись могла снять чистка состава между await'ами.
+            confirmed = self.groups.get(leader) or []
             if not confirmed or self._same_system(leader, confirmed):
-                self.groups.pop(leader)
+                self.groups.pop(leader, None)
                 for member in confirmed:
                     self._vendor.pop(member, None)
             self.playback._home.topics.bump(MEDIA_GROUPS)
@@ -173,7 +188,8 @@ class MusicGroups:
             return {"accepted": True}
         members = self.groups[leader]
         tile = self.playback._tile_of(leader)
-        session = self.playback._flow.session(tile["id"]) if tile is not None else None
+        # Только lookup: выход из группы не заводит пустую сессию (ревью 2026-11-24).
+        session = self.playback._flow.current(tile["id"]) if tile is not None else None
 
         async def detach(member: str) -> None:
             if not await self._vendor_leave(member):
@@ -215,12 +231,15 @@ class MusicGroups:
             self.playback._home.topics.bump(MEDIA_GROUPS)
         return {"accepted": True}
 
-    async def transport(self, leader: str, command: str) -> dict:
+    async def transport(self, leader: str, command: str, by: Any = None) -> dict:
         tile = self.playback._tile_of(leader)
         if tile is None:
             raise OpError("Ведущая колонка сейчас недоступна", 409)
         source = self.playback._home.source
-        session = self.playback._flow.session(tile["id"])
+        # Только lookup: заводить пустую сессию ради паузы не нужно (ревью 2026-11-24).
+        session = self.playback._flow.current(tile["id"])
+        if session is None:
+            raise OpError("Сначала включите музыку на ведущей колонке", 409)
         queue = self.playback._players.get(leader)
         state = source.get(leader)
         resume = command == "play" or (command == "play_pause" and (
@@ -234,6 +253,7 @@ class MusicGroups:
             session.pause()
 
         async def apply(entity: str) -> None:
+            sign = by if entity == leader else None
             if resume:
                 fields = (self.playback._stream_output_fields(session, entity)
                           if not session.reading_player(entity) else {})
@@ -242,9 +262,15 @@ class MusicGroups:
                 current = source.get(entity)
                 mask = current.attributes.get("supported_features") if current is not None else None
                 features = int(mask) if type(mask) in (int, float) else 0
-                service = "media_pause" if features & _PAUSE_FEATURE or not features & _STOP_FEATURE else "media_stop"
+                if command == "stop":
+                    # ⚠ Явный «стоп» гасит, а не ставит на паузу: маска STOP при бите, иначе
+                    # пауза (у HEOS и станции STOP нет — правило `_stop_players`). Раньше здесь
+                    # всегда брался PAUSE-first, и «стоп» группы не останавливал плеер с паузой.
+                    service = "media_stop" if features & _STOP_FEATURE else "media_pause"
+                else:
+                    service = "media_pause" if features & _PAUSE_FEATURE or not features & _STOP_FEATURE else "media_stop"
                 fields = {}
-            await call(source, "media_player", service, {"entity_id": entity, **fields})
+            await call(source, "media_player", service, {"entity_id": entity, **fields}, by=sign)
             if service == "media_stop":
                 session.disconnect(entity)
 
@@ -287,7 +313,8 @@ class MusicGroups:
         if not members:
             return
         tile = self.playback._tile_of(leader)
-        session = self.playback._flow.session(tile["id"]) if tile is not None else None
+        # Только lookup: пересчёт ведущих не заводит пустую сессию (ревью 2026-11-24).
+        session = self.playback._flow.current(tile["id"]) if tile is not None else None
         if session is None or session.current is None:
             raise OpError("Сначала включите музыку на этой колонке — тогда к ней добавятся остальные", 409)
 

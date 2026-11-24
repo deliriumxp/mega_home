@@ -163,7 +163,7 @@ def test_очереди_двух_плееров_независимы_соста�
         assert source.calls[-1][2]["media_content_id"] == "2"
         assert (await view(service, "receiver"))["track"]["id"] == "2"
         home.data["tiles"].pop()
-        service.config_changed()
+        await service.config_changed()
         assert "media_player.receiver" not in source.callbacks
         assert await view(service, "receiver") is None
         service.close()

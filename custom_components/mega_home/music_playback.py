@@ -103,7 +103,13 @@ class MusicPlayback:
                 # «назад/вперёд/стоп/перемотка» переводим на его очередь, а не шлём напрямую в HA.
                 owner = self.multiroom.owner(entity) if entity else None
                 queue = self._players.get(owner or entity) if entity else None
-                return {"handled": await queue.control(command, position) if queue else False}
+                handled = await queue.control(command, position) if queue else False
+                # «Стоп» очереди кончает сессию: отметки группы больше не о чем держать —
+                # иначе приложение показывало «играют вместе» над молчащими колонками
+                # (ревью 2026-11-24). Пауза группу НЕ разъединяет: это делает только стоп.
+                if handled and command == "stop" and owner is not None:
+                    await self.multiroom.leave(owner)
+                return {"handled": handled}
         if action == "track_details":
             raise OpError("Неизвестное действие Яндекс Музыки", 404)
         answer = await self._station.call(can_manage, request)
@@ -295,7 +301,7 @@ class MusicPlayback:
 
     async def group_command(self, tile: dict, name: str, data: dict, by: Any) -> dict | None:
         async with self._group_lock:
-            return await self.multiroom.command(tile, name, data)
+            return await self.multiroom.command(tile, name, data, by)
 
     async def replace_player_source(
         self, tile: dict, name: str, data: dict, execute: Callable[[], Awaitable[dict]],
@@ -504,17 +510,21 @@ class MusicPlayback:
                 players[tile["id"]] = view
         return players
 
-    def config_changed(self) -> None:
-        current = {entity: tile for tile in self._tiles() if (entity := self._entity(tile))}
-        self.multiroom.reconcile(set(current))
-        for entity, profile in list(self._profiles.items()):
-            tile = current.get(entity)
-            if tile is not None and output_profile(tile["stream"]) == profile:
-                continue
-            self._players.pop(entity).close()
-            if tile is not None:
-                self._flow.drop(tile["id"])
-            del self._profiles[entity]
+    async def config_changed(self) -> None:
+        # ⚠ Только под `_group_lock`: слушатель зовётся из задачи координатора между
+        # await'ами `join`/воспроизведения, и без блокировки он снимал очередь или ведущего
+        # группы посреди операции — `KeyError` → 500 жильцу (ревью 2026-11-24).
+        async with self._group_lock:
+            current = {entity: tile for tile in self._tiles() if (entity := self._entity(tile))}
+            self.multiroom.reconcile(set(current))
+            for entity, profile in list(self._profiles.items()):
+                tile = current.get(entity)
+                if tile is not None and output_profile(tile["stream"]) == profile:
+                    continue
+                self._players.pop(entity).close()
+                if tile is not None:
+                    self._flow.drop(tile["id"])
+                del self._profiles[entity]
 
     async def play_configured(self, entity_ids: list[str], track: str) -> list[str]:
         """Запустить трек из сценария на известных выходах и вернуть остальные цели."""
@@ -546,6 +556,7 @@ def flow_address(profile: Mapping[str, Any], address: str) -> str:
     отклонил команду» (живой разбор 2026-11-23: «сонос+сонос не работает»). Sonos нужен
     `x-rincon-mp3radio://`, и `https` остаётся ВНУТРИ схемы: без неё он идёт по http, а Яндекс-CDN
     отдаёт только https. То же правило в приложении — `streamAddress` (`core/radio-play.ts`).
+    Адрес не по http(s) не трогаем: чужую схему переписать нельзя, и HA отдаст его плееру как есть.
     """
     scheme = profile.get("scheme")
     if not isinstance(scheme, str) or not scheme:
