@@ -7,11 +7,10 @@ import shutil
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
-from .core.const import LOGGER
 from .core.ops import call, command_spec
 from .core.ops_base import OpError, arguments, find
+from .music_calibration import MusicCalibration
 from .music_groups import MusicGroups
-from .providers.calibration import layout, prepare
 from .providers.media_queue import PlayerQueue
 from .providers.music_catalog import queue_ids
 from .providers.music_flow import FLOW_CHANNELS, FLOW_RATE, FLOW_WIDTH, FlowSession, FlowStreams
@@ -44,8 +43,7 @@ class MusicPlayback:
         self._flow = flow if flow is not None else FlowStreams(lambda: None)
         self.multiroom = MusicGroups(self)
         self._group_lock = asyncio.Lock()
-        self._calibration: FlowSession | None = None
-        self._calibration_timer: asyncio.TimerHandle | None = None
+        self._calibration = MusicCalibration(self)
         self._players: dict[str, PlayerQueue] = {}
         self._profiles: dict[str, tuple[str, dict]] = {}
         self._changed()
@@ -70,17 +68,16 @@ class MusicPlayback:
         if action in ("calibration_start", "calibration_stop"):
             async with self._group_lock:
                 if action == "calibration_start":
-                    return await self._start_calibration(request.get("players"), request.get("raw") is True)
+                    return await self._calibration.start(request.get("players"), request.get("raw") is True)
                 token = request.get("session")
-                await self._end_calibration(token)
+                await self._calibration.end(token)
                 return {"accepted": True}
         if action == "playback_state":
             return {"players": self._views()}
         if action in ("play_queue", "play_station"):
             entity = self._entity(find(self._tiles(), request.get("player")))
             async with self._group_lock:
-                if self._calibration is not None and entity in self._calibration.marker_frames:
-                    await self._end_calibration(self._calibration.token)
+                await self._calibration.interrupt(entity)
                 # Выбор музыки у участника меняет общий источник группы через её ведущего:
                 # открытый поток остаётся тем же, разъединение — только явный `unjoin`.
                 owner = self.multiroom.owner(entity) if entity else None
@@ -119,112 +116,6 @@ class MusicPlayback:
             for queue in self._players.values():
                 queue.clear()
         return self._links.with_address(request.get("id"), answer) if action == "stream" else answer
-
-    async def _start_calibration(self, players: Any, raw: bool = False) -> dict:
-        if self._calibration is not None:
-            raise OpError("На этих колонках уже идёт акустический замер", 409)
-        if not isinstance(players, list) or len(players) < 2 or len(players) > 8:
-            raise OpError("Выберите от двух до восьми систем")
-        entities: list[str] = []
-        systems: set[str] = set()
-        for player in players:
-            tile = find(self._tiles(), player)
-            entity = self._entity(tile)
-            if entity is None:
-                raise OpError("Колонка для замера не найдена", 404)
-            system = self._system_of(entity) or entity
-            if system in systems:
-                raise OpError("Для замера выберите одну колонку каждой системы")
-            entity = self.calibration_output(entity)
-            state = self._home.source.get(entity)
-            if state is None or state.state in ("unknown", "unavailable") or state.attributes.get("assumed_state") is True:
-                raise OpError("Колонка для замера недоступна", 409)
-            systems.add(system)
-            entities.append(entity)
-
-        binary = await self._home.env.run(shutil.which, "ffmpeg")
-        if binary is None:
-            raise OpError("В доме нет ffmpeg для акустического замера", 503)
-        try:
-            session = await asyncio.wait_for(prepare(binary, entities), timeout=8)
-        except (OSError, RuntimeError, TimeoutError) as error:
-            raise OpError("Дом не смог подготовить маркеры", 503) from error
-        delays = {entity: 0 if raw else self._delay(entity) for entity in entities}
-        session.delay_of = delays.__getitem__
-        self._calibration = session
-        try:
-            fields = [(entity, self._stream_output_fields(session, entity)) for entity in entities]
-            for entity, _ in fields:
-                tile = self._tile_of(entity)
-                if tile is not None and not self.multiroom.contains(entity):
-                    self._drop_queue(entity, tile)
-            results = await asyncio.gather(*(
-                asyncio.wait_for(
-                    call(self._home.source, "media_player", "play_media", {"entity_id": entity, **data}),
-                    timeout=8,
-                )
-                for entity, data in fields
-            ), return_exceptions=True)
-            for entity, result in zip(entities, results, strict=True):
-                if isinstance(result, Exception):
-                    label = self._calibration_label(entity)
-                    reason = "колонка не ответила" if isinstance(result, TimeoutError) else str(result)
-                    raise OpError(f"{label}: {reason}", 409) from result
-                if isinstance(result, BaseException):
-                    raise result
-            # Запись уже идёт: не ждём, пока ВСЕ плееры откроют поток. Медленная колонка
-            # не должна задерживать разбор щелчков тех, кто уже звучит.
-        except BaseException:
-            self._stop_calibration()
-            raise
-        self._calibration_timer = asyncio.get_running_loop().call_later(
-            300, lambda: asyncio.create_task(self._expire_calibration(session.token)),
-        )
-        return {"session": session.token, "marker": layout(len(entities)), "delays": list(delays.values()), "raw": raw}
-
-    def _calibration_label(self, entity: str) -> str:
-        return (self._tile_of(entity) or {}).get("name") or entity
-
-    def calibration_output(self, entity: str) -> str:
-        owner = self.multiroom.owner(entity)
-        if owner is not None:
-            queue = self._players.get(owner)
-            if queue is not None and not queue.group_paused and (view := queue.view()) and view.get("track"):
-                raise OpError("Остановите музыку в группе перед замером", 409)
-        if self._system_of(entity) is not None:
-            state = self._home.source.get(entity)
-            native = state.attributes.get("group_members") if state is not None else None
-            if isinstance(native, (list, tuple)) and native and native[0] != entity:
-                delegate = native[0]
-                if isinstance(delegate, str) and self._system_of(delegate) == self._system_of(entity):
-                    return delegate
-                raise OpError("Ведущая колонка системы недоступна для замера", 409)
-        return entity
-
-    async def _expire_calibration(self, token: str) -> None:
-        async with self._group_lock:
-            await self._end_calibration(token)
-
-    async def _end_calibration(self, token: Any) -> None:
-        session = self._calibration
-        if session is None or session.token != token:
-            return
-        playing = [entity for entity in session.marker_frames if session.reading_player(entity)]
-        self._stop_calibration()
-        results = await asyncio.gather(*(
-            asyncio.wait_for(self.multiroom.stop_player(entity), timeout=5) for entity in playing
-        ), return_exceptions=True)
-        for entity, result in zip(playing, results, strict=True):
-            if isinstance(result, Exception):
-                LOGGER.warning("Не удалось остановить маркер на %s: %s", entity, result)
-
-    def _stop_calibration(self) -> None:
-        if self._calibration_timer is not None:
-            self._calibration_timer.cancel()
-            self._calibration_timer = None
-        if self._calibration is not None:
-            self._flow.retire(self._calibration)
-            self._calibration = None
 
     async def _play(self, request: dict) -> None:
         tile = find(self._tiles(), request.get("player"))
@@ -309,8 +200,7 @@ class MusicPlayback:
         if entity is None:
             return await execute()
         async with self._group_lock:
-            if self._calibration is not None and entity in self._calibration.marker_frames:
-                await self._end_calibration(self._calibration.token)
+            await self._calibration.interrupt(entity)
             # Выбор у участника меняет общую группу, а не выводит его из неё молча.
             owner = self.multiroom.owner(entity)
             if owner is not None and owner != entity:
@@ -534,7 +424,7 @@ class MusicPlayback:
         return [entity for entity in entity_ids if entity not in known]
 
     def close(self) -> None:
-        self._stop_calibration()
+        self._calibration.close()
         for queue in self._players.values():
             queue.close()
         self._players.clear()

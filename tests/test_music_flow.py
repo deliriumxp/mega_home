@@ -9,11 +9,16 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import shutil
 import time
+import wave
 from array import array
 from types import SimpleNamespace
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 from mega_home.core import ops
 from mega_home.core.host import PlainHost
@@ -21,7 +26,7 @@ from mega_home.core.ops_base import OpError
 from mega_home.core.source import PlainState
 from mega_home.core.topics import Topics
 from mega_home.music_playback import MusicPlayback
-from mega_home.providers.music_flow import FlowSession, FlowStreams
+from mega_home.providers.music_flow import FlowSession, FlowStreams, ffmpeg_decoder
 from mega_home.providers.music_proxy import MusicStreamLinks
 
 
@@ -1065,9 +1070,45 @@ def test_настройка_задержки_не_сбрасывает_очер�
     asyncio.run(run())
 
 
-def test_замер_на_двух_выходах_раздаёт_кадры_одной_сессии_и_отзывает_адреса(tmp_path):
-    import shutil
+def test_ffmpeg_восстанавливает_источник_после_ответа_503():
+    binary = shutil.which("ffmpeg")
+    if not binary:
+        pytest.skip("Для проверки HTTP-источника нужен ffmpeg")
 
+    async def run():
+        audio = io.BytesIO()
+        pcm = b"\x00\x10" * 48000
+        with wave.open(audio, "wb") as file:
+            file.setparams((1, 2, 48000, 0, "NONE", "not compressed"))
+            file.writeframes(pcm)
+        calls = 0
+
+        async def station(_request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return web.Response(status=503)
+            return web.Response(body=audio.getvalue(), content_type="audio/wav")
+
+        app = web.Application()
+        app.router.add_get("/station", station)
+        async with TestServer(app) as server:
+            decoder = await ffmpeg_decoder(binary, str(server.make_url("/station")))
+            try:
+                result = bytearray()
+                async with asyncio.timeout(10):
+                    while chunk := await decoder.read(4096):
+                        result.extend(chunk)
+                assert calls == 2
+                assert result == pcm
+            finally:
+                await decoder.stop()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_замер_на_двух_выходах_раздаёт_кадры_одной_сессии_и_отзывает_адреса(tmp_path, monkeypatch, missing):
     if not shutil.which("ffmpeg"):
         pytest.skip("Для проверки MP3 нужен ffmpeg")
 
@@ -1094,12 +1135,25 @@ def test_замер_на_двух_выходах_раздаёт_кадры_од�
                 token = data["media_content_id"].rsplit("/", 1)[-1]
                 session, player = streams.find(token)
                 if player == heos:
+                    if missing:
+                        return
                     await asyncio.sleep(0.05)
                     assert not wrote.is_set()
                 readers.append(asyncio.create_task(session.serve(writer, unused, unused, player=player)))
 
         home.source.call = connect_player
-        start = await service.call(False, {"action": "calibration_start", "players": ["echo", "h1"]})
+        command = {"action": "calibration_start", "players": ["echo", "h1"]}
+        if missing:
+            monkeypatch.setattr("mega_home.music_calibration.MARKER_OPEN_TIMEOUT", 0.05)
+            with pytest.raises(OpError, match="heos.*истекло ожидание подключения"):
+                await service.call(False, command)
+            await asyncio.wait_for(asyncio.gather(*readers), timeout=1)
+            assert not wrote.is_set()
+            for _, name, data in home.source.calls:
+                if name == "play_media":
+                    assert streams.find(data["media_content_id"].rsplit("/", 1)[-1]) is None
+            return
+        start = await service.call(False, command)
         tokens = [data["media_content_id"].rsplit("/", 1)[-1] for _, name, data in home.source.calls if name == "play_media"]
         first, second = (streams.find(token) for token in tokens)
         assert first[0] is second[0]
