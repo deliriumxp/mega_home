@@ -23,11 +23,11 @@ from dataclasses import dataclass
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from .core.const import LOGGER
-from .core.ops_base import OpError, find
-from .providers.music_melody import MelodyProcess, loop_pcm, melody_description
-from .providers.music_flow import FlowSession
-from .providers.player_output import MediaItem
+from ..core.const import LOGGER
+from ..core.ops_base import OpError, find
+from .music_melody import MelodyProcess, loop_pcm, melody_description
+from .music_flow import FlowSession
+from .player_output import MediaItem
 
 if TYPE_CHECKING:
     from .music_playback import MusicPlayback

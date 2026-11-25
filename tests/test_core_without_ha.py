@@ -49,3 +49,33 @@ def test_ядро_не_пустое() -> None:
 @pytest.mark.parametrize("path", MODULES, ids=lambda p: p.name)
 def test_модуль_ядра_не_выходит_наружу(path: Path) -> None:
     assert _offences(path) == [], f"{path.name} тянет наружу ядра"
+
+
+# Поставщики (`providers/`: музыка, каталоги, потоки) — тот же уровень, что ядро: без HA и без адаптера.
+# Им можно ядро (`..core`) и соседей; связка с HA — модули корня (`music_services.py`, `station_auth.py`,
+# `http_music.py`), а не поставщик. Иначе логика музыки не поднялась бы без HA и молча срослась бы с адаптером.
+PROVIDERS = CORE.parent / "providers"
+PROVIDER_MODULES = sorted(PROVIDERS.glob("*.py"))
+
+
+def _provider_offences(path: Path) -> list[str]:
+    found: list[str] = []
+    for node in ast.walk(ast.parse(path.read_text("utf-8"))):
+        if isinstance(node, ast.Import):
+            found += [a.name for a in node.names if a.name.split(".")[0] in FORBIDDEN]
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level == 0 and module.split(".")[0] in FORBIDDEN:
+                found.append(module)
+            elif node.level == 2 and module.split(".")[0] != "core" or node.level > 2:
+                found.append("." * node.level + module)
+    return found
+
+
+def test_поставщиков_не_пусто() -> None:
+    assert len(PROVIDER_MODULES) > 10
+
+
+@pytest.mark.parametrize("path", PROVIDER_MODULES, ids=lambda p: p.name)
+def test_поставщик_не_знает_ha_и_адаптера(path: Path) -> None:
+    assert _provider_offences(path) == [], f"{path.name} тянет HA или адаптер"

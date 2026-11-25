@@ -13,7 +13,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .core.const import LOGGER
 from .core.ops_base import OpError, find
-from .music_assistant_auth import AUTH_ACTIONS, MusicAssistantAuth
+from .providers.music_assistant_auth import AUTH_ACTIONS, MusicAssistantAuth
 from .providers.music_catalog import QUEUE_LIMIT
 
 DOMAIN = "music_assistant"

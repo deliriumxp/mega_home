@@ -19,7 +19,7 @@ from aiohttp import web
 from mega_home import http as mega_http, http_music
 from mega_home.core.host import PlainHost
 from mega_home.providers import music_proxy
-from mega_home.providers.music_flow import FlowStreams
+from mega_home.providers.music_flow_streams import FlowStreams
 from mega_home.providers.music_proxy import MusicStreamLinks
 
 BODY = bytes(range(256)) * 4

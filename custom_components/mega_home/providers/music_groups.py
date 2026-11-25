@@ -6,11 +6,11 @@ import asyncio
 
 from typing import TYPE_CHECKING, Any
 
-from .core.ops import call
-from .core.ops_base import OpError
-from .core.topics import MEDIA_GROUPS
-from .providers.media_queue import pause_native
-from .providers.music_flow import FlowSession
+from ..core.ops import call
+from ..core.ops_base import OpError
+from ..core.topics import MEDIA_GROUPS
+from .media_queue import pause_native
+from .music_flow import FlowSession
 
 if TYPE_CHECKING:
     from .music_playback import MusicPlayback

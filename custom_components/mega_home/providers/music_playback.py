@@ -5,24 +5,31 @@ from __future__ import annotations
 import asyncio
 import shutil
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
-from .core.ops import call
-from .core.ops_base import OpError, find
+from ..core.ops import call
+from ..core.ops_base import OpError, find
 from .music_latency import MAX_LATENCY_MS, MusicLatency
 from .music_groups import MusicGroups
 from .music_output import flow_address, flow_content_type, flow_output, member_accepts, output_profile, stream_fields
-from .providers.media_queue import PlayerQueue
-from .providers.music_catalog import queue_ids
-from .providers.music_flow import FlowSession, FlowStreams
-from .providers.music_flow_feed import fade_window
-from .providers.music_pick import pick_stream
-from .providers.music_proxy import MusicStreamLinks
-from .providers.player_output import MediaItem, Output, native_output, number, stream_output
+from .media_queue import PlayerQueue
+from .music_catalog import queue_ids
+from .music_flow import FlowSession
+from .music_flow_streams import FlowStreams
+from .music_flow_feed import fade_window
+from .music_pick import pick_stream
+from .music_proxy import MusicStreamLinks
+from .player_output import MediaItem, Output, native_output, number, stream_output
 
 if TYPE_CHECKING:
-    from .providers.yandex_music import MusicService
-    from .station_auth import StationAuth
+    from .yandex_music import MusicService
+
+
+class StationGate(Protocol):
+    """Действия колонок поверх службы музыки (`station_auth.py` адаптера HA): модулю музыки нужен только вызов."""
+
+    async def call(self, can_manage: bool, request: dict) -> dict: ...
+
 
 TOPIC = "media/playback"
 FAVORITES_TOPIC = "media/favorites"
@@ -34,7 +41,7 @@ MAX_DELAY_MS = MAX_LATENCY_MS
 
 class MusicPlayback:
     def __init__(
-        self, coordinator: Any, music: MusicService, station: StationAuth, links: MusicStreamLinks,
+        self, coordinator: Any, music: MusicService, station: StationGate, links: MusicStreamLinks,
         flow: FlowStreams | None = None,
     ) -> None:
         self._home = coordinator

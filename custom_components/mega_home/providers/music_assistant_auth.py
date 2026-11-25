@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from xml.etree import ElementTree
 
-from .core.ops_base import OpError
+from ..core.ops_base import OpError
 
 PROVIDER = "yandex_music"
 AUTH_ACTIONS = frozenset({"status", "start", "cancel", "disconnect"})

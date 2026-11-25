@@ -187,8 +187,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
 
     from .core.const import CONF_MUSIC_ADMIN_TOKEN
     from .music_assistant_bridge import MusicAssistantBridge
-    from .music_playback import MusicPlayback
-    from .providers.music_flow import FlowStreams
+    from .providers.music_playback import MusicPlayback
+    from .providers.music_flow_streams import FlowStreams
     from .providers.music_proxy import MusicStreamLinks
     from .providers.yandex_music import MusicService
     from .station_auth import StationAuth

@@ -5,11 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from .core.ops import command_spec
-from .core.ops_base import OpError, arguments
+from ..core.ops import command_spec
+from ..core.ops_base import OpError, arguments
 
-from .providers.music_flow import FlowSession, FlowStreams
-from .providers.player_output import Output
+from .music_flow import FlowSession
+from .music_flow_streams import FlowStreams
+from .player_output import Output
 
 
 def output_profile(profile: Mapping[str, Any]) -> dict:

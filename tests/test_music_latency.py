@@ -198,7 +198,7 @@ def test_замер_отдаёт_ноты_по_ходу_и_гасит_колон
 
 
 def test_брошенный_замер_гасит_сторож(tmp_path, monkeypatch):
-    monkeypatch.setattr("mega_home.music_latency.IDLE_S", 0)
+    monkeypatch.setattr("mega_home.providers.music_latency.IDLE_S", 0)
 
     async def run():
         service, home, readers = _measure_env(tmp_path)
@@ -213,7 +213,7 @@ def test_брошенный_замер_гасит_сторож(tmp_path, monkeyp
 
 
 def test_колонка_не_подключилась_за_пятнадцать_секунд(tmp_path, monkeypatch):
-    monkeypatch.setattr("mega_home.music_latency.CONNECT_TIMEOUT_S", 0)
+    monkeypatch.setattr("mega_home.providers.music_latency.CONNECT_TIMEOUT_S", 0)
 
     async def run():
         service, *_ = setup(tmp_path)
@@ -446,7 +446,7 @@ def test_переподключение_колонки_не_обрыв(tmp_path,
         session.disconnect("media_player.echo")
         # Миг без чтения — замер идёт дальше.
         assert (await service.call(False, {"action": "calibration_result", "token": token}))["done"] is False
-        monkeypatch.setattr("mega_home.music_latency.RECONNECT_GRACE_S", 0)
+        monkeypatch.setattr("mega_home.providers.music_latency.RECONNECT_GRACE_S", 0)
         answer = await service.call(False, {"action": "calibration_result", "token": token})
         assert answer == {"done": True, "error": "Колонка прервала поток дома"}
         await asyncio.wait_for(asyncio.gather(*readers, return_exceptions=True), timeout=2)

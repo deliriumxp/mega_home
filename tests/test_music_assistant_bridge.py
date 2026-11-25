@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from mega_home.core.ops_base import OpError
-from mega_home.music_assistant_auth import MusicAssistantAuth
+from mega_home.providers.music_assistant_auth import MusicAssistantAuth
 from mega_home.music_assistant_bridge import MusicAssistantBridge, entity_registry
 
 

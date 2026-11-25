@@ -26,10 +26,11 @@ from mega_home.core.host import PlainHost
 from mega_home.core.ops_base import OpError
 from mega_home.core.source import PlainState
 from mega_home.core.topics import Topics
-from mega_home.music_playback import MusicPlayback
+from mega_home.providers.music_playback import MusicPlayback
 from mega_home.providers.music_ffmpeg import ffmpeg_decoder
-from mega_home.music_latency import SOLO_BURST_MS
-from mega_home.providers.music_flow import PREROLL_FRAMES, FlowSession, FlowStreams
+from mega_home.providers.music_latency import SOLO_BURST_MS
+from mega_home.providers.music_flow import PREROLL_FRAMES, FlowSession
+from mega_home.providers.music_flow_streams import FlowStreams
 from mega_home.providers.music_proxy import MusicStreamLinks
 
 

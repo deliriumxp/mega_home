@@ -15,7 +15,8 @@ import asyncio
 
 
 from mega_home.core import stream as stream_mod
-from mega_home.core.stream import HEADER, Streams, frame
+from mega_home.core.stream import HEADER, Streams
+from mega_home.core.stream_sessions import frame
 
 
 class FakeSocket:

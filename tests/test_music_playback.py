@@ -12,8 +12,8 @@ from mega_home.core.host import PlainHost
 from mega_home.core.ops_base import OpError
 from mega_home.core.source import PlainState
 from mega_home.core.topics import Topics
-from mega_home.providers.music_flow import FlowStreams
-from mega_home.music_playback import MusicPlayback, TOPIC
+from mega_home.providers.music_flow_streams import FlowStreams
+from mega_home.providers.music_playback import MusicPlayback, TOPIC
 from mega_home.providers.music_catalog import _cover_uri
 from mega_home.providers.music_proxy import MusicStreamLinks
 
