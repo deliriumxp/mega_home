@@ -17,7 +17,7 @@ from aiohttp import web
 from .core.const import URL_PREFIX
 from .http_door import _MegaHomeView, _coordinator
 from .providers.marker import SLOTS_MAX, cycle_pcm, marker_description
-from .providers.music_flow import ffmpeg_encoder
+from .providers.music_ffmpeg import ffmpeg_encoder
 
 MARKER_HEADERS = {"Content-Type": "audio/mpeg", "Cache-Control": "no-store"}
 

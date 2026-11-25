@@ -143,14 +143,7 @@ class MusicPlayback:
         cursor = _cursor(request.get("continuation"))
         profile = tile["stream"]
         source = self._home.source
-        queue = self._players.get(entity)
-        if queue is not None and self._profiles.get(entity) != (tile["id"], output_profile(profile)):
-            self._drop_queue(entity, tile)
-            queue = None
-        if queue is None:
-            queue = self._queue_for(tile, entity)
-            self._players[entity] = queue
-            self._profiles[entity] = (tile["id"], output_profile(profile))
+        queue = self._queue_of(tile, entity)
         async def load() -> tuple[tuple[MediaItem, ...], int]:
             answer = await self._music.call(False, {"action": "track_details", "ids": ids})
             details = {item["id"]: _media(item) for item in answer["items"]}
@@ -245,11 +238,7 @@ class MusicPlayback:
             album=metadata.get("album") or "", image=metadata.get("imageUrl") or "", source=url,
         )
         profile = tile["stream"]
-        queue = self._players.get(entity)
-        if queue is None:
-            queue = self._queue_for(tile, entity)
-            self._players[entity] = queue
-            self._profiles[entity] = (tile["id"], output_profile(profile))
+        queue = self._queue_of(tile, entity)
         async def load() -> tuple[tuple[MediaItem, ...], int]:
             return (item,), 0
         async def prepare(_item: MediaItem, opened: Callable[[], None]) -> Output:
@@ -323,14 +312,7 @@ class MusicPlayback:
         fields = stream_fields(tile, entity, request.get("fields"), self._home.source)
         profile = tile["stream"]
         source = self._home.source
-        queue = self._players.get(entity)
-        if queue is not None and self._profiles.get(entity) != (tile["id"], output_profile(profile)):
-            self._drop_queue(entity, tile)
-            queue = None
-        if queue is None:
-            queue = self._queue_for(tile, entity)
-            self._players[entity] = queue
-            self._profiles[entity] = (tile["id"], output_profile(profile))
+        queue = self._queue_of(tile, entity)
         async def load() -> tuple[tuple[MediaItem, ...], int]:
             if not any(self._entity(current) == entity and output_profile(current["stream"]) == output_profile(profile) for current in self._tiles()):
                 raise OpError("Настройки плеера изменились. Включите станцию повторно", 409)
@@ -357,11 +339,27 @@ class MusicPlayback:
         if self.multiroom.groups.get(entity):
             await self.multiroom.wake(entity)
 
+    def _queue_of(self, tile: dict, entity: str) -> PlayerQueue:
+        """Очередь плеера под ТЕКУЩЕЕ описание плитки: сменился профиль выхода — заводим заново.
+
+        ⚠ Одно место на трек, станцию и прямой поток группы: правило в трёх копиях уже разошлось —
+        поток группы брал очередь со старым профилем как есть.
+        """
+        queue = self._players.get(entity)
+        if queue is not None and self._profiles.get(entity) != (tile["id"], output_profile(tile["stream"])):
+            self._drop_queue(entity, tile)
+            queue = None
+        if queue is None:
+            queue = self._queue_for(tile, entity)
+            self._players[entity] = queue
+            self._profiles[entity] = (tile["id"], output_profile(tile["stream"]))
+        return queue
+
     def _queue_for(self, tile: dict, entity: str) -> PlayerQueue:
         """Очередь плеера; у `flow`-плеера — с его сессией потока (`providers/music_flow.py`)."""
         profile = tile["stream"]
         # ⚠ Сессию потока заводим ЛЮБОМУ плееру со `stream`, а не только «потоковому»: источник звука —
-        # дом (заказчик 2026-11-22), поэтому вести группу может любой плеер («выбрал любой плеер, включил
+        # дом, поэтому вести группу может любой плеер («выбрал любой плеер, включил
         # музыку, добавил другие»), а участникам нужно, чтобы ведущий уже играл поток дома.
         session = (
             self._flow.session(tile["id"])

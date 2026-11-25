@@ -90,10 +90,21 @@ class MusicGroups:
             owner = self.owner(entity)
             if owner is not None:
                 return await self.transport(owner, name, by)
+            # Одиночный плеер нашего потока — та же группа из одной колонки. Пауза мимо дома
+            # останавливала только плеер, а поток шёл дальше: через секунды читателя снимали по
+            # переполнению, дорожка гасла, и «пуск» возобновлять было уже нечего.
+            if name != "stop" and self._streaming(tile, entity):
+                return await self.transport(entity, name, by)
             return None
         if name != "join":
             return None
         return await self._join_group(tile, entity, data.get("group_members") or [])
+
+    def _streaming(self, tile: dict, entity: str) -> bool:
+        """Плеер играет очередь дома нашим потоком (элемент есть, устройство его читает или читало)."""
+        session = self.playback._flow.current(tile["id"])
+        queue = self.playback._players.get(entity)
+        return session is not None and session.current is not None and queue is not None and queue.flow is session
 
     async def _join_group(self, tile: dict, leader: str, requested: list[str]) -> dict | None:
         owner = self.owner(leader)
@@ -281,18 +292,14 @@ class MusicGroups:
             if service == "media_stop":
                 session.disconnect(entity)
 
-        delegates = [leader, *(member for member in self.groups[leader] if member not in self._vendor)]
+        delegates = [leader, *(member for member in self.groups.get(leader, []) if member not in self._vendor)]
         results = await asyncio.gather(*(apply(entity) for entity in delegates), return_exceptions=True)
         leader_ok = bool(results) and not isinstance(results[0], BaseException)
         if leader_ok:
             # Состояние очереди фиксируем только по ведущему: участник мог не ответить, но это
             # повод докомандовать ему при следующем нажатии, а не считать группу в другой фазе.
-            if resume:
-                if queue is not None:
-                    queue.group_paused = False
-            else:
-                if queue is not None:
-                    queue.group_paused = True
+            if queue is not None:
+                queue.set_paused(not resume)
         elif resume:
             # Ведущий не возобновился: общий поток снова держим на паузе, следующий play_pause
             # сделает resume, а не лишний проход по уже играющим участникам.

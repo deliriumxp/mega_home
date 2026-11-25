@@ -18,7 +18,7 @@ from aiohttp import web
 
 from mega_home.core.const import URL_PREFIX
 from mega_home.music_measure import MegaHomeMarkerSpecView, MegaHomeMarkerView
-from mega_home.providers.music_flow import ffmpeg_encoder
+from mega_home.providers.music_ffmpeg import ffmpeg_encoder
 from mega_home.providers.marker import (
     CLICK_MS,
     PITCHES,

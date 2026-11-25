@@ -21,44 +21,31 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import secrets
-import sys
-from array import array
 from collections import deque
 from collections.abc import Awaitable, Callable
 
 from ..core.const import LOGGER, URL_PREFIX
+from .music_fade import _Fader
+from .music_ffmpeg import (
+    FLOW_CHANNELS, FLOW_CHUNK, FLOW_RATE, FLOW_WIDTH, MP3_FRAME_MS, STOP_TIMEOUT_S, FlowProcess,
+    ffmpeg_decoder, ffmpeg_encoder,
+)
 from .player_output import MediaItem
 
-FLOW_RATE = 48_000
-FLOW_CHANNELS = 1
-FLOW_WIDTH = 2
-FLOW_CHUNK = 64 * 1024
 # Буфер выхода вмещает до 5 с компенсации плюс запас на запись в сокет.
-MP3_FRAME_MS = 24
-MP3_FRAME_BYTES = 576
 READER_QUEUE = 320
-STOP_TIMEOUT_S = 5
 RADIO_RECONNECT_S = 10
 RADIO_RECONNECT_FRAMES = 20
-RADIO_PCM_CHUNKS = 22  # До 15 с моно PCM 48 кГц, по 64 КиБ.
+RADIO_PCM_CHUNKS = 44  # До 15 с стерео PCM 48 кГц, по 64 КиБ.
+# Сколько единственный читатель может стоять (пауза с пульта), прежде чем его снимут, сек.
+SOLE_READER_STALL_S = 30
+# Сколько элементов подряд без звука пропускаем, прежде чем закрыть поток.
+MAX_SKIPPED = 5
 
 
 # Чем дом декодирует элемент: свой процесс на элемент, звук — PCM в трубу. Второй аргумент —
 # стартовая позиция элемента, сек (перемотка внутри уже открытого потока). Тесты подменяют это.
 Decoder = Callable[[str, float], Awaitable["FlowProcess"]]
-
-
-class FlowProcess:
-    """Процесс потока: чтение звука (декодер) или запись (кодировщик) и остановка."""
-
-    async def read(self, size: int) -> bytes:  # pragma: no cover — интерфейс
-        raise NotImplementedError
-
-    async def write(self, chunk: bytes) -> None:  # pragma: no cover — интерфейс
-        raise NotImplementedError
-
-    async def stop(self) -> None:  # pragma: no cover — интерфейс
-        raise NotImplementedError
 
 
 class FlowSession:
@@ -329,7 +316,18 @@ class FlowSession:
                     self._radio_tail.append(chunk)
                     if len(self._radio_tail) == RADIO_RECONNECT_FRAMES:
                         self._radio_ready.set()
-            for queue, player in list(self._readers.items()):
+            readers = list(self._readers.items())
+            if len(readers) == 1 and readers[0][0].full():
+                # ⚠ Единственный читатель — не повод снимать: плеер встал на паузу с пульта или из
+                # приложения вендора. Ждём его (декодер встаёт вместе с нами, трек не убегает), а
+                # снимаем только мёртвого. В группе медленный участник не держит остальных.
+                queue, player = readers[0]
+                with contextlib.suppress(TimeoutError, asyncio.TimeoutError):  # noqa: UP041 — 3.10
+                    await asyncio.wait_for(queue.put(chunk), SOLE_READER_STALL_S)
+                    return
+            for queue, player in readers:
+                if queue not in self._readers:
+                    continue
                 if queue.full():
                     LOGGER.warning("Аудиопоток: очередь плеера %s переполнена", player)
                     self._finish_reader(queue, discard=True)
@@ -340,6 +338,7 @@ class FlowSession:
         pcm = broadcast
         sink: FlowProcess | None = None
         fader = _Fader(self.fade_bytes)
+        skipped = 0
         try:
             if encoder is not None:
                 sink = await encoder(broadcast)
@@ -349,8 +348,17 @@ class FlowSession:
                     return
                 source = await self.source_of(item)
                 if source is None:
-                    LOGGER.warning("Поток сессии %s: источник не отдал ссылку", self.token)
-                    return
+                    # Трек без ссылки (снят у правообладателя, регион) — пропуск, а не конец музыки:
+                    # раньше один такой трек гасил весь поток и группу.
+                    skipped += 1
+                    LOGGER.warning("Поток сессии %s: источник не отдал ссылку на %s", self.token, item.id)
+                    if skipped > MAX_SKIPPED or self.on_end is None:
+                        return
+                    await self.on_end()
+                    if self.current is item:
+                        return
+                    continue
+                skipped = 0
                 self.switch.clear()
                 start = self.seek_offset
                 self.seek_offset = 0.0
@@ -446,205 +454,6 @@ async def _read_head(process: FlowProcess, size: int) -> bytes:
         head += chunk
     return head
 
-
-class _Fader:
-    """Фейд на стыке элементов: хвост придерживается и микшуется с головкой следующего.
-
-    ⚠ Хвост держим ВСЕГДА (в размере окна фейда): к моменту стыка его иначе уже не вернуть — звук
-    ушёл плееру. Цена — задержка первого звука сессии на окно фейда (сотни миллисекунд).
-
-    Фейд делается и когда элемент сменили на ходу (другая станция, «дальше»): это тот же стык.
-    """
-
-    def __init__(self, fade: int) -> None:
-        self._fade = max(0, fade)
-        self._held = b""
-
-    def feed(self, chunk: bytes) -> bytes:
-        """Отдать всё, кроме хвоста окна: он ждёт стыка."""
-        if not self._fade:
-            return chunk
-        data = self._held + chunk
-        if len(data) <= self._fade:
-            self._held = data
-            return b""
-        self._held = data[-self._fade :]
-        return data[: -self._fade]
-
-    def join(self, head: bytes) -> bytes:
-        """Смешать придержанный хвост с головкой нового элемента: микс и остатки обоих кусков."""
-        held, self._held = self._held, b""
-        if not held:
-            return head
-        border = min(len(held), len(head)) // 2 * 2
-        rest = held[border:] if len(held) > len(head) else head[border:]
-        return mix_pcm(held[:border], head[:border]) + rest
-
-    def flush(self) -> bytes:
-        """Поток кончился: придержанное дописываем как есть."""
-        held, self._held = self._held, b""
-        return held
-
-
-def mix_pcm(tail: bytes, head: bytes) -> bytes:
-    """Кроссфейд кусков PCM s16le: хвост гаснет, головка нарастает (линейно).
-
-    ⚠ `array('h')` читает РОДНОЙ порядок байт: PCM у нас little-endian, и на x86/ARM (где живут
-    дома) это одно и то же. Дом на big-endian — фейда не делаем: отдаём хвост как есть (шум хуже
-    стыка). Длина микса — по короткому куску, байты не теряются.
-    """
-    count = min(len(tail), len(head)) // 2
-    if not count or sys.byteorder != "little":  # pragma: no cover — второе недостижимо на парке
-        return tail[: count * 2]
-    out, incoming = array("h"), array("h")
-    out.frombytes(tail[: count * 2])
-    incoming.frombytes(head[: count * 2])
-    for index in range(count):
-        out[index] = (out[index] * (count - index) + incoming[index] * index) // count
-    return out.tobytes()
-
-
-class FfmpegProcess(FlowProcess):
-    """Процесс ffmpeg: декодер (PCM в трубе чтения) или кодировщик (PCM в трубе записи)."""
-
-    def __init__(self, process: asyncio.subprocess.Process) -> None:
-        self._process = process
-
-    async def read(self, size: int) -> bytes:
-        if self._process.stdout is None:  # pragma: no cover — трубу заказывает сам декодер
-            return b""
-        chunk = await self._process.stdout.read(size)
-        if not chunk and (exit_code := await self._process.wait()):
-            LOGGER.warning("Аудиопоток: FFmpeg завершил чтение источника с кодом %s", exit_code)
-        return chunk
-
-    async def write(self, chunk: bytes) -> None:
-        stdin = self._process.stdin
-        if stdin is None:  # pragma: no cover — трубу заказывает сам кодировщик
-            return
-        try:
-            stdin.write(chunk)
-            await stdin.drain()
-        except (ConnectionError, BrokenPipeError):
-            # Плеер ушёл — дописывать некуда; закрытие разберёт `stop`.
-            return
-
-    async def stop(self) -> None:
-        process = self._process
-        if process.stdin is not None and not process.stdin.is_closing():
-            process.stdin.close()
-        if process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
-        with contextlib.suppress(ProcessLookupError):
-            await process.wait()
-
-
-async def ffmpeg_decoder(binary: str, url: str, start: float = 0.0, *, radio: bool = False) -> FlowProcess:
-    """Элемент → PCM 48 кГц моно одной трубой: декодируем, а не перекодируем.
-
-    `start` — перемотка внутри элемента: `-ss` до входа, ffmpeg ищет ближайший ключевой кадр и
-    докодирует до точного места. Плееру при этом команда не нужна — поток продолжается внутри.
-    Так звук не теряет качества на стыке, а склейка элементов идёт на PCM: ей формат источника не
-    важен (MP3 Яндекса и AAC станции в одном потоке). Цена — процессор дома на играющий плеер;
-    MA платит тем же (он ещё и перекодирует в FLAC/MP3, у нас играет исходный звук).
-    """
-    seek = [] if start <= 0 else ["-ss", f"{start:.3f}"]
-    # Политика HTTP-повторов Music Assistant для прямого входа ffmpeg.
-    reconnect = (
-        ["-reconnect", "1", "-reconnect_delay_max", "10", "-reconnect_streamed", "1",
-         "-reconnect_on_http_error", "5xx,429", "-reconnect_on_network_error", "1",
-         "-rw_timeout", "10000000"]
-        if url.startswith(("http://", "https://")) else []
-    )
-    if radio and reconnect:
-        reconnect += ["-reconnect_at_eof", "1"]
-    return FfmpegProcess(await asyncio.create_subprocess_exec(
-        binary,
-        *seek,
-        *reconnect,
-        "-i", url,
-        "-f", "s16le", "-ar", str(FLOW_RATE), "-ac", str(FLOW_CHANNELS),
-        "-loglevel", "error", "-nostats",
-        "pipe:",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    ))
-
-
-MP3_ARGS = (
-        "-f", "s16le", "-ar", str(FLOW_RATE), "-ac", str(FLOW_CHANNELS), "-i", "pipe:",
-        "-f", "mp3", "-codec:a", "libmp3lame", "-b:a", "192k",
-        "-write_xing", "0", "-id3v2_version", "0", "-reservoir", "0",
-        "-loglevel", "error", "-nostats", "pipe:",
-)
-
-
-async def ffmpeg_encoder(binary: str, write: Callable[[bytes], Awaitable[None]]) -> FlowProcess:
-    """PCM 48 кГц моно → MP3 (192 кбит/с): провод для участников, которые объявляют свой формат.
-
-    ⚠ Один на сессию: склейка и фейд идут на PCM, а провод у группы один (Яндекс Станция берёт
-    только `stream.mp3`/`stream.aac`; ESPHome и Sonos читают что дадут — HA им перекодирует сам).
-    """
-    process = await asyncio.create_subprocess_exec(
-        binary,
-        *MP3_ARGS,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    return Mp3Encoder(process, write)
-
-
-class Mp3Encoder(FlowProcess):
-    """Кодировщик сессии: PCM в трубу записи, MP3 из трубы чтения — насосом плееру."""
-
-    def __init__(
-        self, process: asyncio.subprocess.Process, write: Callable[[bytes], Awaitable[None]]
-    ) -> None:
-        self._process = process
-        self._write = write
-        self._pump = asyncio.ensure_future(self._run())
-
-    async def _run(self) -> None:
-        stdout = self._process.stdout
-        if stdout is None:  # pragma: no cover — трубу заказывает сам кодировщик
-            return
-        try:
-            # 1152 отсчёта при 48 кГц, 192 кбит/с: ровно 576 байт на кадр.
-            while chunk := await stdout.readexactly(MP3_FRAME_BYTES):
-                await self._write(chunk)
-        except (asyncio.IncompleteReadError, ConnectionError, OSError):
-            return  # плеер ушёл — остановку разберёт `stop`
-
-    async def read(self, size: int) -> bytes:  # pragma: no cover — у кодировщика читает насос
-        return b""
-
-    async def write(self, chunk: bytes) -> None:
-        stdin = self._process.stdin
-        if stdin is None or stdin.is_closing():  # pragma: no cover
-            return
-        try:
-            stdin.write(chunk)
-            await stdin.drain()
-        except (ConnectionError, BrokenPipeError):
-            return
-
-    async def stop(self) -> None:
-        process = self._process
-        if process.stdin is not None and not process.stdin.is_closing():
-            process.stdin.close()
-        try:
-            await asyncio.wait_for(self._pump, STOP_TIMEOUT_S)
-        except (TimeoutError, asyncio.TimeoutError):
-            self._pump.cancel()
-        if process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
-        with contextlib.suppress(ProcessLookupError):
-            await process.wait()
-
-
 class FlowStreams:
     """Адреса сессий: токен → сессия, один на плеер (адрес не меняется между элементами).
 
@@ -720,6 +529,3 @@ class FlowStreams:
             self.retire(session)
         self._by_player.clear()
         self._tokens.clear()
-        self._players.clear()
-        self._tokens.clear()
-        self._players.clear()

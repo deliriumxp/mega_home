@@ -7,7 +7,8 @@ from typing import Any
 
 from .core.ops import command_spec
 from .core.ops_base import OpError, arguments
-from .providers.music_flow import FLOW_CHANNELS, FLOW_RATE, FLOW_WIDTH, FlowSession, FlowStreams
+from .providers.music_ffmpeg import FLOW_CHANNELS, FLOW_RATE, FLOW_WIDTH
+from .providers.music_flow import FlowSession, FlowStreams
 from .providers.player_output import Output
 
 

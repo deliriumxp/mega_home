@@ -17,7 +17,8 @@ from .core.const import LOGGER, URL_PREFIX
 from .core.ops_base import OpError
 from .http_door import _MegaHomeView, _coordinator
 from .providers.music_aac import stream_aac
-from .providers.music_flow import FlowSession, ffmpeg_decoder, ffmpeg_encoder
+from .providers.music_ffmpeg import ffmpeg_decoder, ffmpeg_encoder
+from .providers.music_flow import FlowSession
 from .providers.music_pick import stream_content_type
 from .providers.music_proxy import MusicStreamLinks
 

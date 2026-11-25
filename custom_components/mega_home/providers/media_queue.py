@@ -82,6 +82,8 @@ class PlayerQueue:
         self._unwatch_stream = unwatch_stream
         self._flow = flow
         self.group_paused = False
+        # Когда поток встал на паузу (`monotonic`): позиция элемента на паузе не идёт.
+        self._paused_at: float | None = None
         self._lock = asyncio.Lock()
         self._queue: Queue | None = None
         self._unsubscribe: Callable[[], None] | None = None
@@ -98,7 +100,8 @@ class PlayerQueue:
         attempt = queue.attempt
         position = None
         if attempt and attempt.started and attempt.output and attempt.output.flow:
-            position = int(queue.position + max(0, monotonic() - attempt.anchor))
+            now = self._paused_at if self._paused_at is not None else monotonic()
+            position = int(queue.position + max(0, now - attempt.anchor))
         return {
             "track": {
                 "id": track.id, "title": track.title, "artist": track.artist, "album": track.album,
@@ -130,6 +133,7 @@ class PlayerQueue:
             # адрес, и смена очереди обязана пройти внутри уже открытого потока, а не оборвать его.
             if self._flow is not None:
                 self.group_paused = False
+                self._paused_at = None
                 self._flow.resume()
                 self._flow.set_items(tuple(items), index)
             self._unsubscribe = self._source.subscribe([self.entity], self._observe)
@@ -138,6 +142,27 @@ class PlayerQueue:
     @property
     def flow(self) -> FlowPort | None:
         return self._flow
+
+    def set_paused(self, paused: bool) -> None:
+        """Пауза потока сессии (группа или одиночный плеер потока): позиция элемента стоит.
+
+        ⚠ Позиция потока — это время от якоря запуска (`view`). Без учёта паузы она шла и на паузе, и
+        после пуска шкала приложения убегала вперёд на длительность паузы.
+        """
+        if paused == self.group_paused:
+            return
+        self.group_paused = paused
+        self._hold(paused)
+        self._changed()
+
+    def _hold(self, paused: bool) -> None:
+        attempt = self._queue.attempt if self._queue else None
+        if paused:
+            self._paused_at = self._paused_at or monotonic()
+            return
+        if self._paused_at is not None and attempt is not None:
+            attempt.anchor += monotonic() - self._paused_at
+        self._paused_at = None
 
     async def promote(self, flow: FlowPort) -> bool:
         async with self._lock:
@@ -173,7 +198,6 @@ class PlayerQueue:
                     attempt.anchor = monotonic()
                 self._changed()
                 return True
-            queue.position = 0.0
             await self._move(queue, 1 if action == "next" else -1)
             return True
 
@@ -200,6 +224,11 @@ class PlayerQueue:
             return False
         self._discard_attempt(queue)
         queue.index = index
+        # Сдвиг перемотки — у прежнего элемента: новый начинается с нуля и при естественном переходе
+        # (`flow_end`), а не только по кнопке. Иначе после перемотки следующий трек показывал позицию
+        # с перемотанного места.
+        queue.position = 0.0
+        self._paused_at = None
         if self._flow is not None:
             self._flow.set_items(tuple(queue.items), index)
         await self._launch(queue)
@@ -330,7 +359,9 @@ class PlayerQueue:
             return
         if output.flow:
             # Позицию очереди меняет декодер. HA сообщает позицию своего HTTP-выхода,
-            # которая может обнулиться при буферизации или переподключении.
+            # которая может обнулиться при буферизации или переподключении. Пауза самого плеера
+            # (пульт, приложение вендора) останавливает и позицию элемента.
+            self._hold(current.state == "paused")
             attempt.last = current
             return
         opaque_match = output.opaque and current.identity == attempt.started.identity

@@ -6,7 +6,13 @@ import asyncio
 import secrets
 
 from .marker import SLOTS_MAX, cycle_pcm, marker_description
-from .music_flow import MP3_ARGS, MP3_FRAME_BYTES, MP3_FRAME_MS, FlowSession
+from .music_ffmpeg import FLOW_RATE, MP3_FRAME_MS, mp3_args
+from .music_flow import FlowSession
+
+# Маркеры — свой формат: моно 192 кбит/с, кадр 576 байт (`marker.cycle_pcm` даёт моно PCM).
+MARKER_CHANNELS = 1
+MARKER_BITRATE_K = 192
+MP3_FRAME_BYTES = 1152 * MARKER_BITRATE_K * 1000 // 8 // FLOW_RATE
 
 # Стык круга приходится на границу MP3-кадра.
 SPACING_MS = 42 * MP3_FRAME_MS
@@ -19,7 +25,7 @@ def layout(slots: int) -> dict:
 
 async def _encode(binary: str, slot: int, slots: int) -> tuple[bytes, ...]:
     process = await asyncio.create_subprocess_exec(
-        binary, *MP3_ARGS, stdin=asyncio.subprocess.PIPE,
+        binary, *mp3_args(MARKER_CHANNELS, MARKER_BITRATE_K), stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
     )
     try:

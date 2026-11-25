@@ -27,7 +27,8 @@ from mega_home.core.ops_base import OpError
 from mega_home.core.source import PlainState
 from mega_home.core.topics import Topics
 from mega_home.music_playback import MusicPlayback
-from mega_home.providers.music_flow import FlowSession, FlowStreams, ffmpeg_decoder
+from mega_home.providers.music_ffmpeg import ffmpeg_decoder
+from mega_home.providers.music_flow import FlowSession, FlowStreams
 from mega_home.providers.music_proxy import MusicStreamLinks
 
 
@@ -1137,7 +1138,9 @@ def test_ffmpeg_восстанавливает_источник_после_от�
                     while chunk := await decoder.read(4096):
                         result.extend(chunk)
                 assert calls == 2
-                assert result == pcm
+                # Провод — стерео: моно-источник ffmpeg раскладывает в оба канала с равной мощностью
+                # (−3 дБ на канал: 0x1000 → 0x0B50), как и у Music Assistant (`-ac 2`).
+                assert result == b"\x50\x0b\x50\x0b" * 48000
             finally:
                 await decoder.stop()
 
@@ -1516,5 +1519,120 @@ def test_пустая_запись_группы_не_блокирует_венд
             "entity_id": "media_player.sonos", "group_members": ["media_player.sonos_2"],
         }) not in home.source.calls
         service.close()
+
+    asyncio.run(run())
+
+
+def test_переход_после_перемотки_начинает_следующий_трек_с_нуля(tmp_path):
+    async def run():
+        service, _home, _, streams = setup(tmp_path)
+        await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1", "2"], "index": 0})
+        # Устройство читает поток: следующий элемент начинается внутри него, без команды плееру.
+        streams.session("echo")._readers[asyncio.Queue()] = "media_player.echo"
+        await service.call(False, {"action": "queue_control", "player": "echo", "command": "seek", "value": 40})
+        # Трек доигран внутри потока — следующий элемент, без кнопки.
+        assert await service._players["media_player.echo"].flow_end()
+        view = service._views()["echo"]
+        assert view["track"]["id"] == "2"
+        assert view["position"] <= 1
+        service.close()
+
+    asyncio.run(run())
+
+
+def test_пауза_останавливает_позицию_элемента(tmp_path, monkeypatch):
+    async def run():
+        service, _home, _, _ = setup(tmp_path)
+        await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1"], "index": 0})
+        queue = service._players["media_player.echo"]
+        queue._queue.attempt.started = queue._queue.attempt.before
+        clock = [100.0]
+        monkeypatch.setattr("mega_home.providers.media_queue.monotonic", lambda: clock[0])
+        queue._queue.attempt.anchor = 100.0
+        clock[0] = 110.0
+        queue.set_paused(True)
+        clock[0] = 170.0
+        assert service._views()["echo"]["position"] == 10
+        queue.set_paused(False)
+        clock[0] = 175.0
+        assert service._views()["echo"]["position"] == 15
+        service.close()
+
+    asyncio.run(run())
+
+
+def test_пауза_одиночного_плеера_потока_идёт_через_дом(tmp_path):
+    async def run():
+        service, home, _, streams = setup(tmp_path)
+        await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1"], "index": 0})
+        session = streams.session("echo")
+        session._readers[asyncio.Queue()] = "media_player.echo"
+        tile = home.data["tiles"][0]
+        answer = await service.group_command(tile, "pause", {}, None)
+        # Поток встал вместе с плеером: иначе дом гнал бы звук дальше, и читателя сняли бы по переполнению.
+        assert answer == {"accepted": True}
+        assert not session._playing.is_set()
+        assert home.source.calls[-1][1] == "media_pause"
+        assert service._players["media_player.echo"].group_paused is True
+        await service.group_command(tile, "play", {}, None)
+        assert session._playing.is_set()
+        assert home.source.calls[-1][1] == "media_play"
+        service.close()
+
+    asyncio.run(run())
+
+
+def test_трек_без_ссылки_пропускается_а_не_гасит_поток():
+    async def run():
+        session = FlowSession("t")
+        items = tuple(SimpleNamespace(id=str(i), source=f"src{i}") for i in range(3))
+        session.set_items(items, 0)
+        written: list[bytes] = []
+
+        async def source_of(item):
+            return None if item.source == "src1" else item.source
+
+        async def decoder(url, start=0.0):
+            return FakeProcess([url.encode()])
+
+        async def write(chunk):
+            written.append(chunk)
+            await asyncio.sleep(0)
+
+        async def on_end():
+            if session.index + 1 < len(session.items):
+                session.set_items(session.items, session.index + 1)
+
+        session.source_of, session.on_end = source_of, on_end
+        await session.serve(write, decoder)
+        assert b"".join(written) == b"src0src2"
+
+    asyncio.run(run())
+
+
+def test_единственный_читатель_на_паузе_не_снимается():
+    async def run():
+        session = FlowSession("t")
+        session.set_items((SimpleNamespace(source="src"),), 0)
+        reader: asyncio.Queue = asyncio.Queue(maxsize=1)
+        session._readers[reader] = "media_player.echo"
+        reader.put_nowait(b"old")
+
+        async def source_of(item):
+            return item.source
+
+        async def decoder(url, start=0.0):
+            return FakeProcess([b"x" * 4], piece=2)
+
+        session.source_of = source_of
+        pump = asyncio.create_task(session._run(decoder, None))
+        await asyncio.sleep(0.05)
+        # Очередь читателя полна, а он один: насос ждёт его, а не снимает.
+        assert reader in session._readers
+        assert reader.get_nowait() == b"old"
+        await asyncio.sleep(0.05)
+        assert reader in session._readers
+        pump.cancel()
+        await asyncio.gather(pump, return_exceptions=True)
 
     asyncio.run(run())

@@ -17,7 +17,7 @@ import math
 import struct
 from typing import Any
 
-from .music_flow import FLOW_RATE
+from .music_ffmpeg import FLOW_RATE
 
 # Пауза между щелчками круга, мс.
 SPACING_MS = 1000
