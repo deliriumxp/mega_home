@@ -16,13 +16,13 @@ from typing import Any
 class OpError(Exception):
     """A refusal the resident should read, with the status that fits it."""
 
-    def __init__(self, message: str, status: int = HTTPStatus.BAD_REQUEST, detail: str | None = None) -> None:
+    def __init__(self, message: str, status: int = HTTPStatus.BAD_REQUEST, cause: str | None = None) -> None:
         super().__init__(message)
         self.message = message
         self.status = int(status)
         # Сырая причина от источника (текст отказа службы) — как пришла, без толкования: слова для
         # жильца по ней выбирает приложение, иначе каждое новое «так отказывает прибор» стоило бы релиза.
-        self.detail = detail
+        self.cause = cause
 
 
 def json_body(body: bytes | str) -> dict[str, Any]:

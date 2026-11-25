@@ -132,11 +132,11 @@ def test_отказ_едет_ответом_а_не_молчанием():
 
 def test_сырая_причина_отказа_едет_рядом_с_текстом():
     def refuse(op, payload):
-        raise ops.OpError("Home Assistant отклонил команду", detail="Read timed out")
+        raise ops.OpError("Home Assistant отклонил команду", cause="Read timed out")
 
     sent = answer(link(refuse), {"t": "req", "id": "r9", "op": "http"})
     assert sent == [
-        {"t": "res", "id": "r9", "ok": False, "error": "Home Assistant отклонил команду", "status": 400, "detail": "Read timed out"}
+        {"t": "res", "id": "r9", "ok": False, "error": "Home Assistant отклонил команду", "status": 400, "cause": "Read timed out"}
     ]
 
 
