@@ -95,6 +95,16 @@ def test_щелчки_идут_с_шагом_секунды_и_без_лишне
     assert any(pcm[offsets[0] : offsets[0] + 9600])
 
 
+def test_хвост_тишины_дослушивает_колонку_с_предельной_задержкой():
+    # Конец элемента гасит колонку и запись: Яндекс Станция с буфером в секунды молчала при хвосте 1 с.
+    from mega_home.music_playback import MAX_DELAY_MS
+
+    pcm, offsets = music_chirp.calibration_pcm()
+    tail_s = (len(pcm) - offsets[-1]) / (FLOW_RATE * 4)
+    assert tail_s > MAX_DELAY_MS / 1000
+    assert not any(pcm[offsets[-1] + 9600 :])
+
+
 def test_замер_отдаёт_времена_пяти_щелчков_и_гасит_плеер(tmp_path, monkeypatch):
     monkeypatch.setattr(music_chirp, "LEAD_S", 1.5)  # длиннее предзапаса: щелчки — уже в темпе эфира
     monkeypatch.setattr(music_chirp, "STEP_S", 0.2)
