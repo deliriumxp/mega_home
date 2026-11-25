@@ -79,10 +79,12 @@ class MusicPlayback:
                 return answer
         if action == "calibration_ping":
             return self._latency.ping()
-        if action in ("calibration_measure", "calibration_result"):
+        if action in ("calibration_measure", "calibration_result", "calibration_stop"):
             async with self._group_lock:
                 if action == "calibration_measure":
                     return await self._latency.measure(request.get("player"))
+                if action == "calibration_stop":
+                    return await self._latency.stop(request.get("token"))
                 return await self._latency.result(request.get("token"))
         if action == "playback_state":
             return {"players": self._views()}

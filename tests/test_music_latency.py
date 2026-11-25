@@ -86,70 +86,102 @@ def test_калибровка_пинг_отвечает_числом(tmp_path):
     asyncio.run(run())
 
 
-def test_щелчки_идут_с_шагом_секунды_и_без_лишнего_звука():
-    offsets = music_chirp.click_offsets()
-    assert len(offsets) == 5
-    assert {b - a for a, b in zip(offsets, offsets[1:])} == {FLOW_RATE * 4}
-    pcm, _ = music_chirp.calibration_pcm()
-    assert not any(pcm[: offsets[0]])
-    assert any(pcm[offsets[0] : offsets[0] + 9600])
+def test_тоны_идут_без_конца_с_неравными_интервалами():
+    async def run():
+        process = music_chirp.ChirpProcess(seed=7)
+        frame = 4
+        at = 0
+        marks: list[int] = []
+        tone = None
+        # 30 с звука: поток не кончается, тон звучит с отмеченного куска.
+        while at < 30 * FLOW_RATE * frame:
+            chunk = await process.read(65536)
+            assert chunk
+            if process.mark_hit:
+                marks.append(at)
+                tone = tone or chunk
+            at += len(chunk)
+        assert marks[0] == music_chirp.LEAD_S * FLOW_RATE * frame
+        gaps = [(b - a) / frame / FLOW_RATE * 1000 for a, b in zip(marks, marks[1:])]
+        assert all(music_chirp.GAP_MIN_MS - 1 <= gap <= music_chirp.GAP_MAX_MS + 1 for gap in gaps)
+        assert len({round(gap) for gap in gaps}) > len(gaps) // 2
+        assert any(tone)
+        await process.stop()
+        assert await process.read(65536) == b""
+
+    asyncio.run(run())
 
 
-def test_хвост_тишины_дослушивает_колонку_с_предельной_задержкой():
-    # Конец элемента гасит колонку и запись: Яндекс Станция с буфером в секунды молчала при хвосте 1 с.
-    from mega_home.music_playback import MAX_DELAY_MS
+def _measure_env(tmp_path):
+    service, home, _, streams = setup(tmp_path)
+    source_call = home.source.call
+    readers = []
 
-    pcm, offsets = music_chirp.calibration_pcm()
-    tail_s = (len(pcm) - offsets[-1]) / (FLOW_RATE * 4)
-    assert tail_s > MAX_DELAY_MS / 1000
-    assert not any(pcm[offsets[-1] + 9600 :])
+    async def encoder(write):
+        async def stop():
+            pass
+        return SimpleNamespace(write=write, stop=stop)
+
+    async def unused(*_):
+        pytest.fail("Звук калибровки делает дом, декодер не нужен")
+
+    async def sink(_chunk):
+        return None
+
+    async def connect(domain, name, data, response, by):
+        await source_call(domain, name, data, response, by)
+        if name == "play_media":
+            session, player = streams.find(data["media_content_id"].rsplit("/", 1)[-1])
+            readers.append(asyncio.create_task(session.serve(sink, unused, encoder, player=player)))
+
+    home.source.call = connect
+    return service, home, readers
 
 
-def test_замер_отдаёт_времена_пяти_щелчков_и_гасит_плеер(tmp_path, monkeypatch):
-    monkeypatch.setattr(music_chirp, "LEAD_S", 1.5)  # длиннее предзапаса: щелчки — уже в темпе эфира
-    monkeypatch.setattr(music_chirp, "STEP_S", 0.2)
-    monkeypatch.setattr(music_chirp, "TAIL_S", 0.1)
+def test_замер_отдаёт_тоны_по_ходу_и_гасит_колонку_по_команде(tmp_path, monkeypatch):
+    monkeypatch.setattr(music_chirp, "LEAD_S", 1.5)  # длиннее предзапаса: тоны — уже в темпе эфира
+    monkeypatch.setattr(music_chirp, "GAP_MIN_MS", 150)
+    monkeypatch.setattr(music_chirp, "GAP_MAX_MS", 250)
 
     async def run():
-        service, home, _, streams = setup(tmp_path)
-        source_call = home.source.call
-        readers = []
-
-        async def encoder(write):
-            async def stop():
-                pass
-            return SimpleNamespace(write=write, stop=stop)
-
-        async def unused(*_):
-            pytest.fail("Звук калибровки делает дом, декодер не нужен")
-
-        async def sink(_chunk):
-            return None
-
-        async def connect(domain, name, data, response, by):
-            await source_call(domain, name, data, response, by)
-            if name == "play_media":
-                session, player = streams.find(data["media_content_id"].rsplit("/", 1)[-1])
-                readers.append(asyncio.create_task(session.serve(sink, unused, encoder, player=player)))
-
-        home.source.call = connect
+        service, home, readers = _measure_env(tmp_path)
         with pytest.raises(OpError) as unknown:
             await service.call(False, {"action": "calibration_result", "token": "нет"})
         assert unknown.value.status == 404
         token = (await service.call(False, {"action": "calibration_measure", "player": "echo"}))["token"]
-        assert (await service.call(False, {"action": "calibration_result", "token": token})) == {"done": False}
+        answer = await service.call(False, {"action": "calibration_result", "token": token})
+        assert answer["done"] is False
         for _ in range(100):
             await asyncio.sleep(0.05)
             answer = await service.call(False, {"action": "calibration_result", "token": token})
-            if answer["done"]:
+            if len(answer["sent"]) >= 6:
                 break
+        assert answer["done"] is False
         assert answer["chirp"] == {"fromHz": 2000, "toHz": 6000, "ms": 50}
         sent = answer["sent"]
-        assert len(sent) == 5 and sent == sorted(sent)
-        assert all(190 <= later - earlier <= 260 for earlier, later in zip(sent, sent[1:]))
+        assert sent == sorted(sent)
+        assert all(140 <= later - earlier <= 300 for earlier, later in zip(sent, sent[1:]))
+        assert not any(name in ("media_stop", "media_pause") for _, name, _ in home.source.calls)
+        assert await service.call(False, {"action": "calibration_stop", "token": token}) == {"stopped": True}
         assert any(name in ("media_stop", "media_pause") for _, name, _ in home.source.calls)
-        assert await service.call(False, {"action": "calibration_result", "token": token}) == answer
-        await asyncio.gather(*readers)
+        assert await service.call(False, {"action": "calibration_result", "token": token}) == {"done": True, "stopped": True}
+        assert await service.call(False, {"action": "calibration_stop", "token": token}) == {"stopped": True}
+        await asyncio.wait_for(asyncio.gather(*readers), timeout=2)
+
+    asyncio.run(run())
+
+
+def test_брошенный_замер_гасит_сторож(tmp_path, monkeypatch):
+    monkeypatch.setattr("mega_home.music_latency.IDLE_S", 0)
+
+    async def run():
+        service, home, readers = _measure_env(tmp_path)
+        token = (await service.call(False, {"action": "calibration_measure", "player": "echo"}))["token"]
+        await asyncio.sleep(1.3)
+        answer = await service.call(False, {"action": "calibration_result", "token": token})
+        assert answer == {"done": True, "error": "Замер остановлен: приложение перестало его спрашивать"}
+        assert any(name in ("media_stop", "media_pause") for _, name, _ in home.source.calls)
+        await asyncio.wait_for(asyncio.gather(*readers), timeout=2)
 
     asyncio.run(run())
 
