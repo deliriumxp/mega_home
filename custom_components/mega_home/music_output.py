@@ -34,7 +34,7 @@ def flow_address(profile: Mapping[str, Any], address: str) -> str:
 
 def flow_output(
     flow: FlowStreams, session: FlowSession, profile: Mapping[str, Any], opened: Callable[[], None],
-    player: str, *, aac: bool = False,
+    player: str,
 ) -> Output:
     """Выход потока-сессии: адрес один на сессию, содержимое меняет дом (`providers/music_flow.py`).
 
@@ -42,14 +42,14 @@ def flow_output(
     он без схемы не принимается. Подтверждение запуска — начало чтения потока (`on_read` →
     `Attempt.opened`): у плеера, который о себе не рассказывает, другого свидетельства не бывает.
     """
-    address = flow.address(session, player, aac=aac)
+    address = flow.address(session, player)
     if address is None:
         raise OpError("Дом не знает своего адреса для потока", 503)
     session.on_read = opened
     session.on_read_player = player
     return Output(
-        address if aac else flow_address(profile, address), "audio/aac" if aac else flow_content_type(profile),
-        opaque=profile.get("opaqueTrackId") is True, flow=True, native_stream=aac,
+        flow_address(profile, address), flow_content_type(profile),
+        opaque=profile.get("opaqueTrackId") is True, flow=True,
     )
 
 

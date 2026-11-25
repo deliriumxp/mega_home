@@ -79,7 +79,6 @@ class Output:
     # ⚠ Содержимое НАШЕ (станция каталога: адрес у плеера чужой, наш — только команда): запуск
     # подтверждает владелец, а не плеер. Свидетельства от устройства тут не будет ни у кого.
     owner: bool = False
-    native_stream: bool = False
 
     def matches(self, sample: Sample) -> bool:
         if self.native:

@@ -74,7 +74,6 @@ class PlayerQueue:
         self, entity: str, source: StateSource, host: Host, changed: Callable[[], None],
         unwatch_stream: Callable[[str], None],
         flow: FlowPort | None = None,
-        launch: Callable[[str, Output, MediaItem], Awaitable[None]] | None = None,
     ) -> None:
         self.entity = entity
         self._source = source
@@ -82,7 +81,6 @@ class PlayerQueue:
         self._changed = changed
         self._unwatch_stream = unwatch_stream
         self._flow = flow
-        self._launch_output = launch
         self.group_paused = False
         self._lock = asyncio.Lock()
         self._queue: Queue | None = None
@@ -114,7 +112,7 @@ class PlayerQueue:
         }
 
     async def replace(
-        self, load: Load, prepare: Prepare, more: LoadMore | None = None, *, accepted: bool = False,
+        self, load: Load, prepare: Prepare, more: LoadMore | None = None,
     ) -> None:
         self._replace_revision += 1
         revision = self._replace_revision
@@ -135,7 +133,7 @@ class PlayerQueue:
                 self._flow.resume()
                 self._flow.set_items(tuple(items), index)
             self._unsubscribe = self._source.subscribe([self.entity], self._observe)
-            await self._launch(self._queue, accepted=accepted)
+            await self._launch(self._queue)
 
     @property
     def flow(self) -> FlowPort | None:
@@ -248,7 +246,7 @@ class PlayerQueue:
             if attempt.output and attempt.output.proxy:
                 self._unwatch_stream(attempt.output.proxy)
 
-    async def _launch(self, queue: Queue, *, accepted: bool = False) -> None:
+    async def _launch(self, queue: Queue) -> None:
         attempt = queue.attempt = Attempt(Sample.read(self._source.get(self.entity)))
         self._changed()
 
@@ -267,18 +265,15 @@ class PlayerQueue:
             # элемент сменён внутри открытого потока (`providers/music_flow.py`). Это и есть
             # переключение без «Стоп» у плеера, который новый `media_url` поверх потока не берёт.
             if (attempt.output.flow and self._flow is not None
-                    and (accepted or self._flow.reading_player(self.entity))):
+                    and self._flow.reading_player(self.entity)):
                 attempt.accepted = True
                 attempt.started = attempt.last = attempt.before
                 attempt.anchor = monotonic()
                 self._changed()
                 return
-            if self._launch_output is not None:
-                await self._launch_output(self.entity, attempt.output, queue.item)
-            else:
-                await call(self._source, "media_player", "play_media", {
-                    "entity_id": self.entity, **attempt.output.data(queue.item),
-                })
+            await call(self._source, "media_player", "play_media", {
+                "entity_id": self.entity, **attempt.output.data(queue.item),
+            })
             if self._queue is not queue:
                 return
             attempt.accepted = True

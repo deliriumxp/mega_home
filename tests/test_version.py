@@ -74,3 +74,8 @@ def test_hello_carries_both_versions() -> None:
     # старые кнопки» разбирается по скриншотам, а не по карточке объекта.
     assert frame["app_version"] == "561c5d8137ae5536"
     assert frame["app_error"] is None
+
+
+def test_music_assistant_does_not_require_direct_sonos_client() -> None:
+    manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    assert not any(requirement.startswith("aiosonos") for requirement in manifest["requirements"])

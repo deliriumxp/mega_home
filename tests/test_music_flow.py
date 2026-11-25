@@ -375,58 +375,6 @@ def test_радио_остаётся_источником_группы_посл�
     asyncio.run(run())
 
 
-def test_sonos_отказ_смены_станции_сохраняет_текущий_поток(tmp_path):
-    async def run():
-        service, home, _, streams = setup(tmp_path)
-        entity = "media_player.echo"
-        home.data["tiles"][0]["stream"]["sync"] = "sync:sonos"
-        service.sonos = SimpleNamespace(supports=AsyncMock(return_value=True), play=AsyncMock())
-        session = streams.session("echo")
-        session.warm_radio = AsyncMock()
-
-        async def play(station_id):
-            url = f"https://cdn.example/{station_id}.aac"
-            await service.call(False, {
-                "action": "play_station", "player": "echo",
-                "station": {"id": station_id, "title": station_id, "url": url},
-                "fields": {"media_content_id": url, "media_content_type": "audio/aac"},
-            })
-
-        class Decoder:
-            def __init__(self):
-                self.hold = asyncio.Event()
-
-            async def read(self, _size):
-                await self.hold.wait()
-                return b""
-
-            async def stop(self):
-                self.hold.set()
-
-        await play("первая")
-        first_url = service.sonos.play.await_args.args[1]
-        assert first_url.endswith(".aac")
-        assert not home.source.calls
-        reader = asyncio.create_task(session.serve(AsyncMock(), AsyncMock(return_value=Decoder()), player=entity))
-        try:
-            await asyncio.sleep(0)
-            assert session.reading_player(entity)
-            service.sonos.play.side_effect = OpError("Отказ Sonos")
-            with pytest.raises(OpError, match="Отказ Sonos"):
-                await play("вторая")
-            assert session.current.title == "первая"
-            assert session.reading_player(entity)
-            service.sonos.play.side_effect = None
-            await play("третья")
-            assert session.current.title == "третья"
-            assert service.sonos.play.await_count == 3
-        finally:
-            service.close()
-            await asyncio.wait_for(reader, timeout=1)
-
-    asyncio.run(run())
-
-
 def test_состав_одной_группы_не_переоткрывает_потоки_двух_групп(tmp_path):
     async def run():
         service, home, _, streams = setup(tmp_path)

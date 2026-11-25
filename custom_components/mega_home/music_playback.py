@@ -20,7 +20,6 @@ from .providers.music_proxy import MusicStreamLinks
 from .providers.player_output import MediaItem, Output, native_output, number, stream_output
 
 if TYPE_CHECKING:
-    from .providers.sonos import Sonos
     from .providers.yandex_music import MusicService
     from .station_auth import StationAuth
 
@@ -34,7 +33,7 @@ MAX_DELAY_MS = 5000
 class MusicPlayback:
     def __init__(
         self, coordinator: Any, music: MusicService, station: StationAuth, links: MusicStreamLinks,
-        flow: FlowStreams | None = None, sonos: Sonos | None = None,
+        flow: FlowStreams | None = None,
     ) -> None:
         self._home = coordinator
         self._music = music
@@ -43,7 +42,6 @@ class MusicPlayback:
         # Сессии потока: у `flow`-плеера адрес один на всю сессию (`providers/music_flow.py`).
         # Без адреса дома (`origin` = None) сессию не отдать — плееру ответит честный отказ.
         self._flow = flow if flow is not None else FlowStreams(lambda: None)
-        self.sonos = sonos
         self.multiroom = MusicGroups(self)
         self._group_lock = asyncio.Lock()
         self._calibration = MusicCalibration(self)
@@ -116,10 +114,6 @@ class MusicPlayback:
                 # «назад/вперёд/стоп/перемотка» переводим на его очередь, а не шлём напрямую в HA.
                 owner = self.multiroom.owner(entity) if entity else None
                 queue = self._players.get(owner or entity) if entity else None
-                if command == "stop" and owner is None and queue is not None and entity:
-                    tile = self._tile_of(entity)
-                    if tile is not None and await self.multiroom._sonos_transport(tile, entity, "stop"):
-                        return {"handled": True}
                 handled = await queue.control(command, position) if queue else False
                 # «Стоп» очереди кончает сессию: отметки группы больше не о чем держать —
                 # иначе приложение показывало «играют вместе» над молчащими колонками
@@ -186,7 +180,7 @@ class MusicPlayback:
             if isinstance(session := queue.flow, FlowSession):
                 # Плеер берёт поток ОДНИМ адресом на сессию: элементы сменяются внутри неё
                 # (`providers/music_flow.py`), новой команды на каждый трек не нужно.
-                return await self._flow_output(session, profile, opened, entity)
+                return flow_output(self._flow, session, profile, opened, entity)
             if native is not None:
                 return native
             answer = await self._music.call(False, {"action": "stream", "id": item.id})
@@ -263,7 +257,7 @@ class MusicPlayback:
             if not state or state.state in ("unknown", "unavailable"):
                 raise OpError("Этот плеер сейчас недоступен", 409)
             if isinstance(session := queue.flow, FlowSession):
-                return await self._flow_output(session, profile, opened, entity)
+                return flow_output(self._flow, session, profile, opened, entity)
             return Output(url, str(data.get("media_content_type") or "music"))
         await queue.replace(load, prepare, None)
         await self.multiroom.wake(entity)
@@ -306,31 +300,7 @@ class MusicPlayback:
             "media_content_type": media_type,
         }, self._home.source)
 
-    async def sonos_for(self, entity: str) -> Sonos | None:
-        if self.sonos is not None and self._system_of(entity) == "sync:sonos" and await self.sonos.supports(entity):
-            return self.sonos
-        return None
-
-    async def _flow_output(
-        self, session: FlowSession, profile: dict, opened: Callable[[], None], entity: str,
-    ) -> Output:
-        aac = await self.sonos_for(entity) is not None
-        return flow_output(self._flow, session, profile, opened, entity, aac=aac)
-
-    async def _launch_output(self, entity: str, output: Output, item: MediaItem) -> None:
-        if output.native_stream and self.sonos is not None:
-            await self.sonos.play(entity, output.content, item.title, item.image)
-            return
-        await call(self._home.source, "media_player", "play_media", {"entity_id": entity, **output.data(item)})
-
     async def play_flow(self, session: FlowSession, entity: str) -> None:
-        if sonos := await self.sonos_for(entity):
-            address = self._flow.address(session, entity, aac=True)
-            if address is None:
-                raise OpError("Дом не знает своего адреса для потока", 503)
-            item = session.current
-            await sonos.play(entity, address, item.title if item else "Акустический замер", item.image if item else "")
-            return
         fields = self._stream_output_fields(session, entity)
         await call(self._home.source, "media_player", "play_media", {"entity_id": entity, **fields})
 
@@ -375,7 +345,7 @@ class MusicPlayback:
             if isinstance(session := queue.flow, FlowSession):
                 if not session.reading and (binary := await self._home.env.run(shutil.which, "ffmpeg")):
                     await session.warm_radio(binary)
-                return await self._flow_output(session, profile, opened, entity)
+                return flow_output(self._flow, session, profile, opened, entity)
             # ⚠ Запуск подтверждает ВЛАДЕЛЕЦ, а не плеер: адрес у станции чужой (CDN источника), и
             # о себе такой плеер может не рассказывать вовсе. Команду приняла HA — этого довольно.
             return Output(
@@ -383,17 +353,7 @@ class MusicPlayback:
                 opaque=profile.get("opaqueTrackId") is True, owner=True,
             )
 
-        accepted = False
-        if isinstance(session := queue.flow, FlowSession) and session.current is not None and session.reading_player(entity):
-            if sonos := await self.sonos_for(entity):
-                # Sonos обновляет подпись только при новом load. До ответа оставляем старый звук
-                # в сессии, чтобы отказ или пауза сети не остановили ни один действующий выход.
-                address = self._flow.address(session, entity, aac=True)
-                if address is None:
-                    raise OpError("Дом не знает своего адреса для потока", 503)
-                await sonos.play(entity, address, item.title, item.image)
-                accepted = True
-        await queue.replace(load, prepare, None, accepted=accepted)
+        await queue.replace(load, prepare, None)
         if self.multiroom.groups.get(entity):
             await self.multiroom.wake(entity)
 
@@ -410,7 +370,7 @@ class MusicPlayback:
         )
         queue = PlayerQueue(
             entity, self._home.source, self._home.env, self._changed, self._links.unwatch,
-            flow=session, launch=self._launch_output,
+            flow=session,
         )
         if session is not None:
             self._configure_flow(session, queue, profile)
