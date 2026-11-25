@@ -28,7 +28,8 @@ from mega_home.core.source import PlainState
 from mega_home.core.topics import Topics
 from mega_home.music_playback import MusicPlayback
 from mega_home.providers.music_ffmpeg import ffmpeg_decoder
-from mega_home.providers.music_flow import FlowSession, FlowStreams
+from mega_home.music_latency import SOLO_BURST_MS
+from mega_home.providers.music_flow import PREROLL_FRAMES, FlowSession, FlowStreams
 from mega_home.providers.music_proxy import MusicStreamLinks
 
 
@@ -412,7 +413,9 @@ def test_состав_одной_группы_не_переоткрывает_п
     asyncio.run(run())
 
 
-def test_трек_на_плеере_потока_переключается_без_команды_плееру(tmp_path):
+def test_ручная_смена_у_одиночной_колонки_перекомандует_её_с_пачкой(tmp_path):
+    """Как у Music Assistant: Станция иначе доигрывала свой буфер (~10 с) прежнего трека или станции."""
+
     async def run():
         service, home, _catalog, streams = setup(tmp_path)
         await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1", "2"], "index": 0})
@@ -428,10 +431,15 @@ def test_трек_на_плеере_потока_переключается_бе
 
         calls = len(home.source.calls)
         assert (await service.call(False, {"action": "queue_control", "player": "echo", "command": "next"}))["handled"]
-        # Новая команда плееру НЕ ушла: играет тот же поток, а элемент внутри сменился.
-        assert len(home.source.calls) == calls
+        # Тот же адрес заново: колонка сбрасывает буфер, насос ждёт её и отдаёт начало пачкой.
+        assert home.source.calls[calls:] == [("media_player", "play_media", first)]
         assert session.current.id == "2"
-        assert (await view(service, "echo"))["track"]["id"] == "2"
+        assert session._burst_for == "media_player.echo" and session._burst_frames > PREROLL_FRAMES
+        assert not session._released.is_set()
+        # Доигранный трек — внутри потока, без команды: там стык с кроссфейдом.
+        calls = len(home.source.calls)
+        assert await service._players["media_player.echo"].flow_end() is False
+        assert len(home.source.calls) == calls
         service.close()
 
     asyncio.run(run())
@@ -1294,9 +1302,17 @@ def test_команды_участника_группы_идут_в_очеред
         await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1", "2"], "index": 0})
         await service.group_command(home.data["tiles"][0], "join", {"group_members": [member]}, None)
         assert service.state_groups()[member] == ["media_player.echo", member]
+        session = streams.session("echo")
+        session._readers[asyncio.Queue()] = "media_player.echo"
+        session._readers[asyncio.Queue()] = member
+        calls = len(home.source.calls)
         answer = await service.call(False, {"action": "queue_control", "player": "kitchen", "command": "next"})
         assert answer == {"handled": True}
         assert streams.session("echo").current.id == "2"
+        # В группе смена — внутри общего потока, без команды и без пачки: пачка сменила бы глубину
+        # буферов колонок, и выравнивание по замерам разошлось бы.
+        assert not any(name == "play_media" for _, name, _ in home.source.calls[calls:])
+        assert session._burst_for is None
         await service.call(False, {"action": "play_queue", "player": "kitchen", "ids": ["3"], "index": 0})
         assert service.state_groups()[member] == ["media_player.echo", member]
         assert streams.session("echo").current.id == "3"
@@ -1463,7 +1479,8 @@ def test_переход_после_перемотки_начинает_след�
         # «Играет» — когда трек слышно: до ухода его первого кадра колонке позиции нет.
         assert view["started"] is False and "position" not in view
         session = streams.session("echo")
-        session.on_item_start(session.current, asyncio.get_running_loop().time() * 1000)
+        # Одиночная колонка без замера держит пачку `SOLO_BURST_MS`: кадр слышно через неё после срока.
+        session.on_item_start(session.current, asyncio.get_running_loop().time() * 1000 - SOLO_BURST_MS)
         await asyncio.sleep(0.01)
         view = service._views()["echo"]
         assert view["started"] is True

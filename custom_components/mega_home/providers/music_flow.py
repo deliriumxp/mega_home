@@ -35,8 +35,11 @@ from .music_ffmpeg import (
 )
 from .player_output import MediaItem
 
-# Буфер выхода вмещает до 5 с компенсации плюс запас на запись в сокет.
-READER_QUEUE = 320
+# Буфер выхода вмещает сдвиг колонки группы до 20 с (`MAX_DELAY_MS`) плюс запас на запись в сокет:
+# пока колонке уходят кадры тишины сдвига, насос кладёт ей звук в эту очередь.
+READER_QUEUE = 1000
+# Сколько насос ждёт, пока одиночная колонка переподключится после ручной смены (`prime_solo`).
+RECONNECT_HOLD_S = 5.0
 RADIO_RECONNECT_S = 10
 RADIO_RECONNECT_FRAMES = 20
 # Предзапас каждого читателя: последние кадры провода, ~1 с (кадр MP3 = 24 мс). ⚠ Одинаковый у всех:
@@ -124,6 +127,19 @@ class FlowSession:
         self.probe_sent: list[dict] = []
         # Ждущие отметки: (номер кадра MP3, доля кадра до отметки, мс, что сделать с моментом ухода).
         self._frame_marks: deque[tuple[int, float, Callable[[float], None]]] = deque()
+        # Пачка одиночной колонке, мс (схема Music Assistant): колонка набирает свой буфер сразу, а не
+        # в темпе эфира. Ставит владелец (`MusicPlayback`): замеренная задержка колонки или умолчание.
+        # `None` — пачек нет (замер, спеки).
+        self.solo_burst_of: Callable[[str], int] | None = None
+        self._burst_for: str | None = None
+        self._burst_frames = 0
+        # Кадров к отправке по расписанию из прошлого (предзапас, пачка) — берёт насос на ближайшем кадре.
+        self._reschedule = 0
+        # Насос стоит, пока одиночная колонка переподключается: иначе начало нового ушло бы в старое
+        # соединение и пропало.
+        self._released = asyncio.Event()
+        self._released.set()
+        self._release_timer: asyncio.TimerHandle | None = None
 
     @property
     def current(self) -> MediaItem | None:
@@ -143,6 +159,40 @@ class FlowSession:
         self.seek_offset = max(0.0, position)
         self.switch.set()
 
+    def prime_solo(self, player: str) -> bool:
+        """Ручной запуск или смена у ОДИНОЧНОЙ колонки: перекомандовать её и дать начало пачкой.
+
+        Так делает Music Assistant: при смене плеер получает `play_media` заново и сбрасывает свой буфер,
+        а звук ему отдаётся быстрее эфира, пока буфер не набран. Иначе Станция (буфер ~10 с) доигрывала
+        прежнюю станцию 10 с, а первый запуск ждала столько же: буфер в темпе эфира копится в темпе эфира.
+
+        ⚠ Только одиночной: в группе пачка сменила бы глубину буфера колонок, и выравнивание по замерам
+        (`delay_of`) разошлось бы. И не замеру (`generated`): он меряет колонку в темпе эфира.
+        `True` — колонку надо перекомандовать (`play_media`), даже если она уже читает поток.
+        """
+        # Прежний неиспользованный заказ снимаем: иначе колонка получила бы его, подключившись уже в группе.
+        self._burst_for, self._burst_frames = None, 0
+        if self.generated is not None or self.solo_burst_of is None:
+            return False
+        if any(owner != player for owner in self._readers.values()):
+            return False
+        burst_ms = self.solo_burst_of(player)
+        if burst_ms <= 0:
+            return False
+        self._burst_for, self._burst_frames = player, round(burst_ms / MP3_FRAME_MS)
+        if self.reading_player(player):
+            self._released.clear()
+            if self._release_timer is not None:
+                self._release_timer.cancel()
+            self._release_timer = asyncio.get_running_loop().call_later(RECONNECT_HOLD_S, self._release)
+        return True
+
+    def _release(self) -> None:
+        if self._release_timer is not None:
+            self._release_timer.cancel()
+            self._release_timer = None
+        self._released.set()
+
     def pause(self) -> None:
         self._playing.clear()
 
@@ -155,6 +205,8 @@ class FlowSession:
         self._preroll.clear()
         self._radio_ready.clear()
         self._playing.set()
+        self._burst_for, self._burst_frames = None, 0
+        self._release()
         self.switch.set()
         pump = self._pump
         if pump is not None and not pump.cancelling() and pump is not asyncio.current_task(loop=pump.get_loop()):
@@ -227,6 +279,13 @@ class FlowSession:
             queue.put_nowait(frame)
         self._readers[queue] = player
         self._opened.add(player)
+        if player and player == self._burst_for:
+            # Одиночная колонка переподключилась (`prime_solo`): начало — пачкой, насос снова идёт.
+            # Кто-то ещё уже читает — это группа, пачки нет.
+            if all(owner == player for owner in self._readers.values()):
+                self._reschedule = max(self._reschedule, self._burst_frames)
+            self._burst_for, self._burst_frames = None, 0
+            self._release()
         # Задержка ЭТОГО плеера, уже применённая к его чтению, и остаток звука, который надо выбросить.
         applied = 0.0
         drop = 0
@@ -296,28 +355,41 @@ class FlowSession:
         # ⚠ Первые `PREROLL_FRAMES` кадров сессии уходят без темпа — тот же предзапас, что получает
         # подключившийся позже из хвоста. Иначе первый читатель играл бы у живого края, а остальные
         # на секунду позже, и замер задержки зависел бы от того, кто подключился первым.
-        burst = PREROLL_FRAMES
+        # Пачка одиночной колонке (`prime_solo`) — тот же приём, только длиннее.
+        self._reschedule = max(self._reschedule, PREROLL_FRAMES)
+        # Сколько кадров ещё идёт по расписанию из прошлого: в это время отставание от часов — замысел.
+        catchup = 0
         # Кадров MP3, ушедших в рассылку, и отсчётов PCM, ушедших в кодировщик.
         frames_out = 0
         samples_in = 0
         drained = asyncio.Event()
 
         async def broadcast(chunk: bytes) -> None:
-            nonlocal deadline, burst, frames_out
+            nonlocal deadline, catchup, frames_out
             await self._playing.wait()
+            await self._released.wait()
             if encoder is not None:
                 now = clock()
-                if burst > 0:
-                    burst -= 1
+                if self._reschedule:
+                    # Предзапас и пачка — расписание, начатое в прошлом: кадры, чей срок уже прошёл,
+                    # уходят сразу, дальше — темп эфира. Источник медленнее эфира (радио) пачку не
+                    # наберёт — тогда кадры просто уходят по мере появления.
+                    catchup, self._reschedule = self._reschedule, 0
+                    deadline = now - catchup * MP3_FRAME_MS / 1000
+                if catchup > 0:
+                    catchup -= 1
+                elif deadline is None or now - deadline > 0.250:
                     deadline = now
-                else:
-                    if deadline is None or now - deadline > 0.250:
-                        deadline = now
-                    await asyncio.sleep(max(0, deadline - now))
-                    deadline += MP3_FRAME_MS / 1000
+                await asyncio.sleep(max(0, deadline - now))
+                # ⚠ Отметка — срок кадра ПО РАСПИСАНИЮ, а не миг отправки: колонка играет кадры подряд,
+                # и кадр пачки звучит тогда же, когда звучал бы, уйди он в темпе эфира. Так правило
+                # «слышно через задержку колонки» (`flow_started`, замер) верно и для пачки; для кадра
+                # в темпе срок и есть миг отправки.
+                scheduled = deadline
+                deadline += MP3_FRAME_MS / 1000
                 while self._frame_marks and self._frame_marks[0][0] <= frames_out:
                     _, rest_ms, mark = self._frame_marks.popleft()
-                    mark(clock() * 1000 + rest_ms)
+                    mark(scheduled * 1000 + rest_ms)
                 frames_out += 1
                 drained.set()
                 self._preroll.append(chunk)

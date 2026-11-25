@@ -60,6 +60,8 @@ class FlowPort(Protocol):
 
     def reading_player(self, player: str) -> bool: ...
 
+    def prime_solo(self, player: str) -> bool: ...
+
     def resume(self) -> None: ...
 
     def seek(self, position: float) -> None: ...
@@ -172,7 +174,8 @@ class PlayerQueue:
             self._discard_attempt(queue)
             self._flow = flow
             flow.set_items(queue.items, queue.index)
-            await self._launch(queue)
+            # Группа собирается вокруг уже играющей колонки: пачка сменила бы глубину её буфера.
+            await self._launch(queue, manual=False)
             return True
 
     async def control(self, action: str, position: float | None = None) -> bool:
@@ -192,7 +195,14 @@ class PlayerQueue:
                 seek = min(max(0.0, position), max(0.0, queue.item.duration - 0.5))
                 queue.position = seek
                 self._flow.seek(seek)
-                if (attempt := queue.attempt) is not None:
+                attempt = queue.attempt
+                if (attempt is not None and attempt.output is not None
+                        and self._flow.reading_player(self.entity) and self._flow.prime_solo(self.entity)):
+                    # Одиночная колонка доиграла бы свой буфер с прежнего места: перекомандовать.
+                    await call(self._source, "media_player", "play_media", {
+                        "entity_id": self.entity, **attempt.output.data(queue.item),
+                    })
+                if attempt is not None:
                     now = Sample.read(self._source.get(self.entity))
                     attempt.started = attempt.last = now
                     attempt.anchor = monotonic()
@@ -201,7 +211,7 @@ class PlayerQueue:
             await self._move(queue, 1 if action == "next" else -1)
             return True
 
-    async def _move(self, queue: Queue, step: int) -> bool:
+    async def _move(self, queue: Queue, step: int, *, manual: bool = True) -> bool:
         # Следующая страница нужна лишь у конца очереди. Пустые страницы могут
         # содержать удалённые треки, поэтому пробуем ещё, когда каталог сообщил продолжение.
         if step == 1 and queue.index + 1 == len(queue.items) and queue.more:
@@ -231,7 +241,7 @@ class PlayerQueue:
         self._paused_at = None
         if self._flow is not None:
             self._flow.set_items(tuple(queue.items), index)
-        await self._launch(queue)
+        await self._launch(queue, manual=manual)
         return True
 
     def flow_started(self, item: MediaItem, at_ms: float, audible_ms: int) -> None:
@@ -265,7 +275,7 @@ class PlayerQueue:
             queue = self._queue
             if queue is None:
                 return False
-            return await self._move(queue, 1)
+            return await self._move(queue, 1, manual=False)
 
     def clear(self, error: str | None = None) -> None:
         """Снять очередь. Владелец очереди остановлен — поток сессии закрывается тоже."""
@@ -300,7 +310,8 @@ class PlayerQueue:
             if attempt.output and attempt.output.proxy:
                 self._unwatch_stream(attempt.output.proxy)
 
-    async def _launch(self, queue: Queue) -> None:
+    async def _launch(self, queue: Queue, *, manual: bool = True) -> None:
+        """Запустить текущий элемент. `manual=False` — доигранный трек: он сменяется внутри потока."""
         attempt = queue.attempt = Attempt(Sample.read(self._source.get(self.entity)))
         self._changed()
 
@@ -315,10 +326,15 @@ class PlayerQueue:
                 self._discard_attempt(queue)
                 return
             attempt.before = Sample.read(self._source.get(self.entity))
+            # Одиночная колонка при ручном запуске и смене перекомандуется и получает начало пачкой
+            # (`FlowSession.prime_solo`, схема Music Assistant): свой буфер она иначе доигрывала бы.
+            primed = bool(manual and attempt.output.flow and self._flow is not None
+                          and self._flow.prime_solo(self.entity))
             # ⚠ Поток сессии уже читается устройством: адрес тот же, команды плееру не нужно —
             # элемент сменён внутри открытого потока (`providers/music_flow.py`). Это и есть
             # переключение без «Стоп» у плеера, который новый `media_url` поверх потока не берёт.
-            if (attempt.output.flow and self._flow is not None
+            # Так идут доигранный трек и смена в группе.
+            if (attempt.output.flow and self._flow is not None and not primed
                     and self._flow.reading_player(self.entity)):
                 # ⚠ «Играет» — не здесь, а когда его СЛЫШНО (`flow_started`): первый кадр уходит колонке
                 # через загрузку трека, а слышен ещё через её задержку. Раньше «Сейчас играет»

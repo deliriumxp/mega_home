@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from .core.ops import call
 from .core.ops_base import OpError, find
-from .music_latency import MusicLatency
+from .music_latency import MAX_LATENCY_MS, MusicLatency
 from .music_groups import MusicGroups
 from .music_output import flow_address, flow_content_type, flow_output, member_accepts, output_profile, stream_fields
 from .providers.media_queue import PlayerQueue
@@ -27,8 +27,9 @@ if TYPE_CHECKING:
 TOPIC = "media/playback"
 FAVORITES_TOPIC = "media/favorites"
 
-# Потолок задержки плеера, мс: как у MA (0–5000), больше — уже не выравнивание, а рассинхрон.
-MAX_DELAY_MS = 5000
+# Потолок сдвига плеера, мс — тот же, что у замера (`MAX_LATENCY_MS`): Станция держит ~10 с, и
+# прежние 5000 (как у MA) не давали задержать остальные колонки её группы на нужное.
+MAX_DELAY_MS = MAX_LATENCY_MS
 
 
 class MusicPlayback:
@@ -382,6 +383,8 @@ class MusicPlayback:
         session.on_end = queue.flow_end
         session.fade_bytes = fade_window()
         session.delay_of = self._delay
+        # Одиночной колонке при ручном запуске и смене — начало пачкой (`FlowSession.prime_solo`).
+        session.solo_burst_of = self._solo_burst
         entity = queue.entity
         # Трек зазвучит, когда колонке ушёл его первый кадр, плюс её задержка: группа выровнена по
         # самой поздней системе, поэтому слышно всех через `max(latencyMs)` группы.
@@ -404,6 +407,14 @@ class MusicPlayback:
         задержка — свойство модели колонки, которое менеджер кладёт всем колонкам системы.
         """
         return self._latency.delay(entity, MAX_DELAY_MS)
+
+    def _solo_burst(self, entity: str) -> int:
+        """Пачка одиночной колонке, мс; в группе — 0 (сдвиг держит выравнивание, а не пачка)."""
+        multiroom = self.multiroom
+        owner = multiroom.owner(entity) or entity
+        if any(member not in multiroom._vendor for member in multiroom.groups.get(owner, [])):
+            return 0
+        return self._latency.solo_burst(entity)
 
     async def _flow_source(self, item: MediaItem) -> str | None:
         """Звук элемента для потока сессии: у станции адрес дан бандлом, у трека — из Яндекса."""

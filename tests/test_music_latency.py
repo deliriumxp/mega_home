@@ -113,11 +113,15 @@ def test_мелодия_идёт_без_конца_и_отмечает_кажд�
     asyncio.run(run())
 
 
-def test_круг_мелодии_длиннее_предела_задержки_и_без_повтора_фразы():
+def test_восемь_нот_укладываются_в_круг_и_фраза_не_повторяется():
     # Сдвиг на повтор фразы набрал бы голоса наравне с верной задержкой (`estimateLatency` приложения).
+    # Сдвиг на круг вперёд не наберёт голосов, пока замер не кончился: 8 нот (`DONE_TONES`) — внутри круга.
     loop_ms = music_melody.loop_samples() * 1000 / FLOW_RATE
-    assert loop_ms > 8000
     onsets = [(start * 1000 // FLOW_RATE, note) for start, note in music_melody.score_onsets()]
+    starts = [at for at, _ in onsets]
+    for index in range(len(starts)):
+        eighth = starts[(index + 7) % len(starts)] + (loop_ms if index + 7 >= len(starts) else 0)
+        assert eighth - starts[index] < loop_ms / 2, index
     for shift in range(1, int(loop_ms)):
         same = sum(
             1 for at, note in onsets for other, other_note in onsets
@@ -258,6 +262,54 @@ def test_первый_читатель_получает_предзапас_ср�
     asyncio.run(run())
 
 
+def test_одиночная_колонка_получает_начало_пачкой_а_группа_нет():
+    """Схема Music Assistant: буфер Станции (~10 с) набирается сразу, а не в темпе эфира."""
+
+    async def run():
+        from mega_home.providers.music_flow import PREROLL_FRAMES
+
+        async def source_of(item):
+            return item.source
+
+        data = b"".join(bytes([index % 256]) * 5 for index in range(4000))
+
+        async def decoder(_url, _start=0.0):
+            return FakeProcess([data], piece=5)
+
+        async def encoder(write):
+            async def stop():
+                pass
+            return SimpleNamespace(write=write, stop=stop)
+
+        async def frames_in(session: FlowSession, prime: bool) -> int:
+            session.set_items((SimpleNamespace(source="a"),), 0)
+            session.source_of = source_of
+            session.solo_burst_of = lambda _player: 3000  # 125 кадров
+            if prime:
+                assert session.prime_solo("one") is True
+            got: list[bytes] = []
+
+            async def write(chunk):
+                got.append(chunk)
+
+            task = asyncio.create_task(session.serve(write, decoder, encoder, "one"))
+            await asyncio.sleep(0.3)
+            session.stop()
+            await asyncio.wait_for(task, timeout=2)
+            return len(got)
+
+        # Без пачки — только предзапас (1 с); с пачкой — её 3 с, хотя в темпе эфира прошло 0,3 с.
+        assert await frames_in(FlowSession("plain"), prime=False) < PREROLL_FRAMES + 20
+        assert await frames_in(FlowSession("solo"), prime=True) >= 125
+        # Замер меряет колонку в темпе эфира — ему пачки нет.
+        calibration = FlowSession("cal")
+        calibration.generated = lambda _item: None
+        calibration.solo_burst_of = lambda _player: 3000
+        assert calibration.prime_solo("one") is False
+
+    asyncio.run(run())
+
+
 def test_отметка_ноты_когда_кадр_ушёл_плееру_а_не_когда_pcm_ушёл_в_кодировщик(monkeypatch):
     """Кодировщик держит в себе запас кадров (трубы и очереди ffmpeg): отметка не должна убегать вперёд."""
     monkeypatch.setattr(music_melody, "LEAD_S", 1.5)
@@ -325,7 +377,7 @@ def test_проверка_играет_мелодию_на_колонках_со
             await service.call(False, {"action": "calibration_check", "players": [{"player": "echo", "latencyMs": 100}]})
         with pytest.raises(OpError):
             await service.call(False, {"action": "calibration_check", "players": [
-                {"player": "echo", "latencyMs": 100}, {"player": "s1", "latencyMs": 9000}]})
+                {"player": "echo", "latencyMs": 100}, {"player": "s1", "latencyMs": 25000}]})
         token = (await service.call(False, {"action": "calibration_check", "players": [
             {"player": "echo", "latencyMs": 100}, {"player": "s1", "latencyMs": 340}]}))["token"]
         played = [data["entity_id"] for _, name, data in home.source.calls if name == "play_media"]

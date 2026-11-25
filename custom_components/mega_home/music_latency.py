@@ -44,7 +44,12 @@ DISCONNECTED = "Колонка прервала поток дома"
 INTERRUPTED = "Замер прерван: на колонке включили другое воспроизведение"
 ABANDONED = "Замер остановлен: приложение перестало его спрашивать"
 CHECK_LIMIT = 8
-MAX_LATENCY_MS = 5000
+# Яндекс Станция на потоке в темпе эфира держит ~10 с (замер на объекте 11): 5 с не хватало на сдвиг
+# остальных колонок её группы.
+MAX_LATENCY_MS = 20000
+# Пачка одиночной колонке без замера (`FlowSession.prime_solo`): не меньше буфера Станции, иначе она
+# ждёт недостающее в темпе эфира.
+SOLO_BURST_MS = 10000
 STOPPED = {"done": True, "stopped": True}
 
 
@@ -83,11 +88,22 @@ class MusicLatency:
         return max(0, min(int(shift), max_ms))
 
     def audible(self, entity: str) -> int:
-        """Через сколько мс после ухода кадра колонке его слышно: самая поздняя система группы."""
+        """Через сколько мс после срока кадра его слышно: самая поздняя система группы; у одиночной
+        колонки — её пачка (`solo_burst`): буфер она набрала пачкой и держит его глубину."""
         multiroom = self._playback.multiroom
         owner = multiroom.owner(entity) or entity
         members = [owner, *(m for m in multiroom.groups.get(owner, []) if m not in multiroom._vendor)]
+        if len(members) < 2:
+            return self.solo_burst(entity)
         return max(latency_of(self._playback._tile_of(member)) for member in members)
+
+    def solo_burst(self, entity: str) -> int:
+        """Пачка одиночной колонке, мс: её замеренная задержка, без замера — `SOLO_BURST_MS`.
+
+        ⚠ Пачка равна замеру, чтобы глубина буфера колонки осталась той, что намерена: колонка,
+        вошедшая потом в группу, выравнивается по тому же числу.
+        """
+        return latency_of(self._playback._tile_of(entity)) or SOLO_BURST_MS
 
     @staticmethod
     def ping() -> dict:
@@ -105,7 +121,7 @@ class MusicLatency:
         for row in players:
             latency = row.get("latencyMs") if isinstance(row, dict) else None
             if type(latency) is not int or not 0 <= latency <= MAX_LATENCY_MS:
-                raise OpError("Задержка колонки — целое от 0 до 5000 мс")
+                raise OpError("Задержка колонки — целое от 0 до 20000 мс")
             tile, entity = self._speaker(row.get("player"))
             if entity in latencies:
                 raise OpError("Колонка указана дважды")
