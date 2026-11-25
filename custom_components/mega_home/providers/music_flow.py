@@ -41,6 +41,9 @@ RADIO_RECONNECT_FRAMES = 20
 # хвост получал только первый читатель радио, и замер статической задержки зависел от порядка.
 PREROLL_FRAMES = 42
 RADIO_PCM_CHUNKS = 44  # До 15 с стерео PCM 48 кГц, по 64 КиБ.
+# Отсчётов PCM в кадре MP3 (CBR 48 кГц без резервуара): отсчёт N уходит плееру в кадре N // 1152.
+MP3_FRAME_SAMPLES = 1152
+_PCM_FRAME = FLOW_CHANNELS * FLOW_WIDTH
 # Сколько единственный читатель может стоять (пауза с пульта), прежде чем его снимут, сек.
 SOLE_READER_STALL_S = 30
 # Сколько элементов подряд без звука пропускаем, прежде чем закрыть поток.
@@ -103,7 +106,12 @@ class FlowSession:
         # Свой звук элемента вместо декодера (калибровка: PCM делает дом). `None` — обычный декодер.
         self.generated: Callable[[MediaItem], FlowProcess | None] | None = None
         # Время рассылки отмеченных кусков (`FlowProcess.mark_hit`), мс по часам цикла событий.
+        # ⚠ Отметка — когда ПЛЕЕРУ ушёл кадр MP3 с началом тона, а не когда PCM ушёл в кодировщик:
+        # между ними трубы и очереди ffmpeg с плавающим запасом в секунды, и замер на объекте не сходился
+        # (телефон слышал 22 тона, отметки дома убегали вперёд).
         self.probe_sent: list[float] = []
+        # Ждущие отметки: (номер кадра MP3, доля кадра до начала тона, мс).
+        self._probe_frames: deque[tuple[int, float]] = deque()
 
     @property
     def current(self) -> MediaItem | None:
@@ -264,9 +272,12 @@ class FlowSession:
         # подключившийся позже из хвоста. Иначе первый читатель играл бы у живого края, а остальные
         # на секунду позже, и замер задержки зависел бы от того, кто подключился первым.
         burst = PREROLL_FRAMES
+        # Кадров MP3, ушедших в рассылку, и отсчётов PCM, ушедших в кодировщик.
+        frames_out = 0
+        samples_in = 0
 
         async def broadcast(chunk: bytes) -> None:
-            nonlocal deadline, burst
+            nonlocal deadline, burst, frames_out
             await self._playing.wait()
             if encoder is not None:
                 now = clock()
@@ -278,6 +289,9 @@ class FlowSession:
                         deadline = now
                     await asyncio.sleep(max(0, deadline - now))
                     deadline += MP3_FRAME_MS / 1000
+                while self._probe_frames and self._probe_frames[0][0] <= frames_out:
+                    self.probe_sent.append(clock() * 1000 + self._probe_frames.popleft()[1])
+                frames_out += 1
                 self._preroll.append(chunk)
                 if not self._readers and (item := self.current) is not None and item.source:
                     if len(self._preroll) >= RADIO_RECONNECT_FRAMES:
@@ -336,6 +350,7 @@ class FlowSession:
                     out = fader.join(await _read_head(process, self.fade_bytes))
                     if out:
                         await pcm(out)
+                        samples_in += len(out) // _PCM_FRAME
                     if item.source and encoder is not None:
                         pcm_buffer = asyncio.Queue(RADIO_PCM_CHUNKS)
                         producer = asyncio.create_task(_buffer_radio_pcm(process, pcm_buffer))
@@ -350,8 +365,13 @@ class FlowSession:
                             # ⚠ Время берём ДО записи: запись ждёт кодировщик, а его задержка у всех
                             # систем одна и в разнице замеров сокращается.
                             if getattr(process, "mark_hit", False):
-                                self.probe_sent.append(clock() * 1000)
+                                if encoder is None:
+                                    self.probe_sent.append(clock() * 1000)
+                                else:
+                                    frame, rest = divmod(samples_in, MP3_FRAME_SAMPLES)
+                                    self._probe_frames.append((frame, rest * 1000 / FLOW_RATE))
                             await pcm(out)
+                            samples_in += len(out) // _PCM_FRAME
                         # Смену элемента замечаем на ближайшем куске звука: он приходит постоянно.
                         if self.switch.is_set() or self.current is not item:
                             break

@@ -234,3 +234,61 @@ def test_первый_читатель_получает_предзапас_ср�
         await asyncio.wait_for(task, timeout=2)
 
     asyncio.run(run())
+
+
+def test_отметка_тона_когда_кадр_ушёл_плееру_а_не_когда_pcm_ушёл_в_кодировщик(monkeypatch):
+    """Кодировщик держит в себе запас кадров (трубы и очереди ffmpeg): отметка не должна убегать вперёд."""
+    monkeypatch.setattr(music_chirp, "LEAD_S", 1.5)
+    monkeypatch.setattr(music_chirp, "GAP_MIN_MS", 200)
+    monkeypatch.setattr(music_chirp, "GAP_MAX_MS", 200)
+    from collections import deque
+
+    from mega_home.providers.music_flow import MP3_FRAME_SAMPLES
+
+    hold = 40
+    frame_bytes = MP3_FRAME_SAMPLES * 4
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        session = FlowSession("t")
+        session.set_items((SimpleNamespace(id="calibration", source=None),), 0)
+
+        async def source_of(_item):
+            return "calibration"
+
+        async def unused(*_):
+            pytest.fail("декодер не нужен")
+
+        async def encoder(write):
+            buffer = bytearray()
+            frames: deque[bytes] = deque()
+
+            async def push(chunk):
+                buffer.extend(chunk)
+                while len(buffer) >= frame_bytes:
+                    frames.append(bytes(buffer[:frame_bytes]))
+                    del buffer[:frame_bytes]
+                while len(frames) > hold:
+                    await write(frames.popleft())
+
+            async def stop():
+                pass
+
+            return SimpleNamespace(write=push, stop=stop)
+
+        received: list[tuple[float, bytes]] = []
+
+        async def sink(chunk):
+            received.append((loop.time() * 1000, chunk))
+            if len(session.probe_sent) >= 3:
+                session.stop()
+
+        session.source_of = source_of
+        session.generated = lambda _item: music_chirp.ChirpProcess(seed=1)
+        await asyncio.wait_for(session.serve(sink, unused, encoder, "one"), timeout=10)
+        # Кадр, где начинается первый тон, — первый ненулевой кадр провода (заглушка не кодирует).
+        first_tone = next(at for at, chunk in received if any(chunk))
+        assert abs(session.probe_sent[0] - first_tone) < 30
+        assert all(abs(later - earlier - 200) < 30 for earlier, later in zip(session.probe_sent, session.probe_sent[1:]))
+
+    asyncio.run(run())
