@@ -17,7 +17,9 @@ CHIRP_FROM_HZ = 2000
 CHIRP_TO_HZ = 6000
 CHIRP_MS = 50
 CHIRP_AMPLITUDE = 0.5
-LEAD_S = 3.0
+# Тишина до первого щелчка: колонка на первом старте потока часто глотает начало звука (буферизация,
+# прогрев усилителя, плавный вход) — щелчки должны начаться, когда она уже точно играет.
+LEAD_S = 5.0
 STEP_S = 1.0
 CLICKS = 5
 TAIL_S = 1.0
@@ -49,7 +51,7 @@ def _chirp() -> array:
 
 
 def calibration_pcm() -> tuple[bytes, list[int]]:
-    """Весь элемент и смещения щелчков: 3 с тишины, 5 щелчков с шагом 1 с, 1 с тишины."""
+    """Весь элемент и смещения щелчков: 5 с тишины, 5 щелчков с шагом 1 с, 1 с тишины."""
     total = round((LEAD_S + CLICKS * STEP_S + TAIL_S) * FLOW_RATE) * _FRAME
     data = bytearray(total)
     click = _chirp().tobytes()
