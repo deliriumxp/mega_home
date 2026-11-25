@@ -11,10 +11,11 @@ from .core.ops import call
 from .core.ops_base import OpError, find
 from .music_latency import MusicLatency
 from .music_groups import MusicGroups
-from .music_output import fade_bytes, flow_address, flow_content_type, flow_output, member_accepts, output_profile, stream_fields
+from .music_output import flow_address, flow_content_type, flow_output, member_accepts, output_profile, stream_fields
 from .providers.media_queue import PlayerQueue
 from .providers.music_catalog import queue_ids
 from .providers.music_flow import FlowSession, FlowStreams
+from .providers.music_flow_feed import fade_window
 from .providers.music_pick import pick_stream
 from .providers.music_proxy import MusicStreamLinks
 from .providers.player_output import MediaItem, Output, native_output, number, stream_output
@@ -379,8 +380,12 @@ class MusicPlayback:
     def _configure_flow(self, session: FlowSession, queue: PlayerQueue, profile: dict) -> None:
         session.source_of = self._flow_source
         session.on_end = queue.flow_end
-        session.fade_bytes = fade_bytes(profile)
+        session.fade_bytes = fade_window()
         session.delay_of = self._delay
+        entity = queue.entity
+        # Трек зазвучит, когда колонке ушёл его первый кадр, плюс её задержка: группа выровнена по
+        # самой поздней системе, поэтому слышно всех через `max(latencyMs)` группы.
+        session.on_item_start = lambda item, at: queue.flow_started(item, at, self._latency.audible(entity))
 
     async def group_flow(self, tile: dict, entity: str) -> FlowSession:
         session = self._flow.session(tile["id"])

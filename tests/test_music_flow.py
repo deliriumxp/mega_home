@@ -974,13 +974,14 @@ async def view(service, player):
     return (await service.call(False, {"action": "playback_state"}))["players"].get(player)
 
 
-def test_поток_фейдит_стык_и_на_смене_станции(tmp_path):
-    """Фейд — на ЛЮБОМ стыке элементов: и трек доигран, и станцию сменили на ходу."""
+def test_ручная_смена_гасит_старое_и_включает_новое_без_фейда(tmp_path):
+    """Ручная смена (станция, «дальше»): хвост старого гаснет, новое звучит сразу — без кроссфейда.
+    Окно фейда у потока одно на все колонки: его ставит очередь дома, а не описание плитки."""
 
     async def run():
         service, home, _catalog, streams = setup(tmp_path)
         session = streams.session("echo")
-        session.fade_bytes = 8  # 4 отсчёта PCM — короткое окно, чтобы посчитать ожидаемое
+        session.fade_bytes = 8  # 2 кадра стерео PCM — короткое окно, чтобы посчитать ожидаемое
         first = pcm(1000, 8)
         second = pcm(2000, 8)
         session.set_items((SimpleNamespace(id="station:a", source="a"),), 0)
@@ -1007,11 +1008,13 @@ def test_поток_фейдит_стык_и_на_смене_станции(tmp_
         await asyncio.sleep(0)
 
         audio = b"".join(written)
-        # Бананов не теряем: 16 + 16 байт минус окно фейда (8) = 24.
-        assert len(audio) == 24
-        # Первая станция гаснет, вторая нарастает: 1000 → 1000, 1250, 1500, 1750.
-        assert samples(audio[8:16]) == [1000, 1250, 1500, 1750]
-        assert samples(audio[16:]) == [2000] * 4
+        # Звук не теряется и не смешивается: 16 + 16 байт.
+        assert len(audio) == 32
+        # Хвост первой станции гаснет: 1000, 1000 → 500, 500.
+        assert samples(audio[8:16]) == [1000, 1000, 500, 500]
+        # Вторая — сразу в полную громкость (её хвост гаснет уже в конце очереди).
+        assert samples(audio[16:24]) == [2000] * 4
+        assert samples(audio[24:]) == [2000, 2000, 1000, 1000]
         service.close()
 
     asyncio.run(run())
@@ -1457,6 +1460,13 @@ def test_переход_после_перемотки_начинает_след�
         assert await service._players["media_player.echo"].flow_end()
         view = service._views()["echo"]
         assert view["track"]["id"] == "2"
+        # «Играет» — когда трек слышно: до ухода его первого кадра колонке позиции нет.
+        assert view["started"] is False and "position" not in view
+        session = streams.session("echo")
+        session.on_item_start(session.current, asyncio.get_running_loop().time() * 1000)
+        await asyncio.sleep(0.01)
+        view = service._views()["echo"]
+        assert view["started"] is True
         assert view["position"] <= 1
         service.close()
 
@@ -1557,5 +1567,116 @@ def test_единственный_читатель_на_паузе_не_сним
         assert reader in session._readers
         pump.cancel()
         await asyncio.gather(pump, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_доигранный_трек_сходится_со_следующим_кроссфейдом_если_тот_открыт_заранее():
+    """Следующий элемент открывается за `PREFETCH_S` до конца — к стыку он уже звучит, и стык — кроссфейд."""
+
+    async def run():
+        session = FlowSession("t")
+        session.fade_bytes = 8
+        first, second = pcm(1000, 8), pcm(2000, 8)
+        items = (SimpleNamespace(id="1", source="a", duration=1), SimpleNamespace(id="2", source="b", duration=1))
+        session.set_items(items, 0)
+        opened: list[str] = []
+
+        async def source_of(item):
+            return item.source
+
+        async def decoder(url, start=0.0):
+            opened.append(url)
+            return FakeProcess([first if url == "a" else second])
+
+        async def on_end():
+            if session.index + 1 < len(session.items):
+                session.set_items(session.items, session.index + 1)
+
+        written: list[bytes] = []
+
+        async def write(chunk):
+            written.append(chunk)
+            await asyncio.sleep(0)
+
+        session.source_of, session.on_end = source_of, on_end
+        await session.serve(write, decoder)
+        audio = b"".join(written)
+        # Второй открыт заранее (трек короче `PREFETCH_S`) — открытие ровно одно на элемент.
+        assert opened == ["a", "b"]
+        # 16 + 16 байт минус окно (8): хвост первого смешан с головкой второго.
+        assert len(audio) == 24
+        assert samples(audio[8:16]) == [1000, 1250, 1500, 1750]
+
+    asyncio.run(run())
+
+
+def test_пока_новый_трек_открывается_поток_идёт_тишиной():
+    """Поток к колонке не прерывается: иначе она опустошала буфер и набирала его заново."""
+
+    async def run():
+        from mega_home.providers import music_flow_feed
+
+        session = FlowSession("t")
+        session.fade_bytes = 8
+        session.set_items((SimpleNamespace(id="a", source="a"),), 0)
+        pcm_in: list[bytes] = []
+
+        async def source_of(item):
+            if item.source == "b":
+                await asyncio.sleep(0.35)  # ссылка у Яндекса и запуск декодера
+            return item.source
+
+        async def decoder(url, start=0.0):
+            # Первый трек длинный: его сменяют, не доиграв.
+            return FakeProcess([pcm(1000 if url == "a" else 2000, 200000)], piece=4000)
+
+        async def encoder(write):
+            async def push(chunk):
+                pcm_in.append(chunk)
+                await write(b"x" * 1044)
+
+            async def stop():
+                pass
+
+            return SimpleNamespace(write=push, stop=stop)
+
+        switched = False
+
+        async def sink(_chunk):
+            nonlocal switched
+            await asyncio.sleep(0)
+            if not switched and len(pcm_in) >= 2:
+                switched = True
+                session.set_items((SimpleNamespace(id="b", source="b"),), 0)
+            if any(chunk and samples(chunk[:2]) == [2000] for chunk in pcm_in):
+                session.stop()
+
+        session.source_of = source_of
+        await asyncio.wait_for(session.serve(sink, decoder, encoder, "one"), timeout=5)
+        silent = [chunk for chunk in pcm_in if chunk and not any(chunk)]
+        assert silent, "между треками должна идти тишина"
+        assert all(len(chunk) == len(music_flow_feed.silence(music_flow_feed.SILENCE_MS)) for chunk in silent)
+
+    asyncio.run(run())
+
+
+def test_играет_не_раньше_чем_слышно_с_учётом_задержки_колонки(tmp_path):
+    """Приложение показывает «Сейчас играет», когда трек СЛЫШНО: первый кадр ушёл колонке плюс её задержка."""
+
+    async def run():
+        service, home, _, streams = setup(tmp_path)
+        home.data["tiles"][0]["stream"]["latencyMs"] = 200
+        await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1", "2"], "index": 0})
+        streams.session("echo")._readers[asyncio.Queue()] = "media_player.echo"
+        await service.call(False, {"action": "queue_control", "player": "echo", "command": "next"})
+        assert service._views()["echo"]["started"] is False
+        session = streams.session("echo")
+        session.on_item_start(session.current, asyncio.get_running_loop().time() * 1000)
+        await asyncio.sleep(0.05)
+        assert service._views()["echo"]["started"] is False
+        await asyncio.sleep(0.25)
+        assert service._views()["echo"]["started"] is True
+        service.close()
 
     asyncio.run(run())

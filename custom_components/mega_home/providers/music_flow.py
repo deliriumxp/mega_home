@@ -26,9 +26,12 @@ from collections.abc import Awaitable, Callable
 
 from ..core.const import LOGGER, URL_PREFIX
 from .music_fade import _Fader
+from .music_flow_feed import (
+    PREFETCH_S, PREFETCH_WAIT_S, SILENCE_MS, Prefetch, buffer_radio_pcm, fade_out, read_head, silence, stop_process,
+)
 from .music_ffmpeg import (
-    FLOW_CHANNELS, FLOW_CHUNK, FLOW_RATE, FLOW_WIDTH, MP3_FRAME_MS, STOP_TIMEOUT_S, FlowProcess,
-    ffmpeg_decoder, ffmpeg_encoder,
+    FLOW_CHANNELS, FLOW_CHUNK, FLOW_RATE, FLOW_WIDTH, MP3_FRAME_MS, FlowProcess,
+    ffmpeg_decoder, ffmpeg_encoder, silent_frame,
 )
 from .player_output import MediaItem
 
@@ -44,6 +47,10 @@ RADIO_PCM_CHUNKS = 44  # До 15 с стерео PCM 48 кГц, по 64 КиБ.
 # Отсчётов PCM в кадре MP3 (CBR 48 кГц без резервуара): отсчёт N уходит плееру в кадре N // 1152.
 MP3_FRAME_SAMPLES = 1152
 _PCM_FRAME = FLOW_CHANNELS * FLOW_WIDTH
+# Запас PCM перед кодировщиком: больше — смена трека доигрывает старое, меньше — кодировщик голодает.
+ENCODER_LEAD_S = 0.3
+# Кодировщик не отдал кадр за столько — не ждём его (иначе насос и кодировщик ждали бы друг друга).
+ENCODER_STALL_S = 0.5
 # Сколько единственный читатель может стоять (пауза с пульта), прежде чем его снимут, сек.
 SOLE_READER_STALL_S = 30
 # Сколько элементов подряд без звука пропускаем, прежде чем закрыть поток.
@@ -81,9 +88,14 @@ class FlowSession:
         # другого подтверждения нет и быть не может.
         self.on_read: Callable[[], None] | None = None
         self.on_read_player: str | None = None
-        # Окно фейда на стыке элементов, байты PCM (0 — без фейда). Ставит владелец очереди из
-        # описания плитки (`fadeMs`): фейд нужен и на смене ТРЕКА, и на смене станции.
+        # Окно фейда, байты PCM (0 — без него): кроссфейд доигранных элементов и гашение при ручной
+        # смене. Очередь дома ставит одно на все колонки (`fade_window`, `FADE_MS`). ⚠ Раньше бралось из
+        # описания ведущей плитки (`fadeMs`) и было только у Echo — остаток времён, когда через поток
+        # дома играл один Echo. Калибровка оставляет 0.
         self.fade_bytes = 0
+        # Первый кадр элемента ушёл колонке (элемент, мс по часам цикла): очередь узнаёт, когда трек
+        # зазвучит, — «играет» в приложении не раньше, чем его слышно (`media_queue.flow_started`).
+        self.on_item_start: Callable[[MediaItem, float], None] | None = None
         # Задержка КОНКРЕТНОГО плеера, мс: дом выводит её на лету из замеров систем группы
         # (`MusicPlayback._delay`). Читается на каждый кусок: состав группы меняется на ходу.
         self.delay_of: Callable[[str], int] | None = None
@@ -110,8 +122,8 @@ class FlowSession:
         # между ними трубы и очереди ffmpeg с плавающим запасом в секунды, и замер на объекте не сходился
         # (телефон слышал 22 тона, отметки дома убегали вперёд).
         self.probe_sent: list[dict] = []
-        # Ждущие отметки: (номер кадра MP3, доля кадра до начала ноты, мс, номер ноты).
-        self._probe_frames: deque[tuple[int, float, int]] = deque()
+        # Ждущие отметки: (номер кадра MP3, доля кадра до отметки, мс, что сделать с моментом ухода).
+        self._frame_marks: deque[tuple[int, float, Callable[[float], None]]] = deque()
 
     @property
     def current(self) -> MediaItem | None:
@@ -225,13 +237,21 @@ class FlowSession:
                 await self._playing.wait()
                 if queue not in self._readers:
                     break
-                # ⚠ Задержка ЖИВАЯ: правка в составе слышна сразу. Больше — читаем позже (очередь
-                # ждёт), меньше — выбрасываем лишнее из уже полученного; перезапуска потока нет.
+                # ⚠ Задержка ЖИВАЯ: правка в составе слышна сразу. Больше — колонке уходят кадры
+                # тишины, меньше — выбрасываем лишнее из уже полученного; перезапуска потока нет.
+                # ⚠⚠ Сдвиг — ДАННЫМИ, а не паузой записи: колонка начинает играть, набрав в буфер
+                # свой запас, и пауза с последующей пачкой накопленного давала ей тот же запас в то
+                # же время — сдвиг пропадал (проверка на объекте: Яндекс + HEOS заметно врозь).
                 want = float(self.delay_of(player)) if self.delay_of is not None else 0.0
                 if encoder is not None:
                     want = round(want / MP3_FRAME_MS) * MP3_FRAME_MS
                 if want > applied:
-                    await asyncio.sleep((want - applied) / 1000)
+                    pad = silent_frame() if encoder is not None else None
+                    if pad is not None:
+                        for _ in range(round((want - applied) / MP3_FRAME_MS)):
+                            await write(pad)
+                    else:
+                        await asyncio.sleep((want - applied) / 1000)
                     if queue not in self._readers:
                         break
                     applied = want
@@ -263,7 +283,12 @@ class FlowSession:
             on_read()
 
     async def _run(self, decoder: Decoder, encoder: Callable[..., Awaitable["FlowProcess"]] | None) -> None:
-        """Один декодер (и один кодировщик) на сессию: куски уходят ВСЕМ читателям."""
+        """Один декодер (и один кодировщик) на сессию: куски уходят ВСЕМ читателям.
+
+        Подача — как у Music Assistant и Snapcast (`music_flow_feed.py`): поток не прерывается, ручная
+        смена гасит старое плавно и включает новое сразу, доигранный элемент сходится со следующим
+        кроссфейдом, если тот открыт заранее.
+        """
 
         clock = asyncio.get_running_loop().time
         deadline: float | None = None
@@ -275,6 +300,7 @@ class FlowSession:
         # Кадров MP3, ушедших в рассылку, и отсчётов PCM, ушедших в кодировщик.
         frames_out = 0
         samples_in = 0
+        drained = asyncio.Event()
 
         async def broadcast(chunk: bytes) -> None:
             nonlocal deadline, burst, frames_out
@@ -289,10 +315,11 @@ class FlowSession:
                         deadline = now
                     await asyncio.sleep(max(0, deadline - now))
                     deadline += MP3_FRAME_MS / 1000
-                while self._probe_frames and self._probe_frames[0][0] <= frames_out:
-                    _, rest_ms, note = self._probe_frames.popleft()
-                    self.probe_sent.append({"at": clock() * 1000 + rest_ms, "note": note})
+                while self._frame_marks and self._frame_marks[0][0] <= frames_out:
+                    _, rest_ms, mark = self._frame_marks.popleft()
+                    mark(clock() * 1000 + rest_ms)
                 frames_out += 1
+                drained.set()
                 self._preroll.append(chunk)
                 if not self._readers and (item := self.current) is not None and item.source:
                     if len(self._preroll) >= RADIO_RECONNECT_FRAMES:
@@ -316,19 +343,73 @@ class FlowSession:
                 else:
                     queue.put_nowait(chunk)
 
-        pcm = broadcast
         sink: FlowProcess | None = None
+
+        def mark_at(mark: Callable[[float], None]) -> None:
+            """Отметка на ТЕКУЩЕМ отсчёте: сработает, когда колонке уйдёт кадр MP3 с ним."""
+            if encoder is None:
+                mark(clock() * 1000)
+                return
+            frame, rest = divmod(samples_in, MP3_FRAME_SAMPLES)
+            self._frame_marks.append((frame, rest * 1000 / FLOW_RATE, mark))
+
+        async def push(out: bytes) -> None:
+            """PCM в кодировщик с запасом не больше `ENCODER_LEAD_S` (см. `mp3_args`)."""
+            nonlocal samples_in
+            if not out:
+                return
+            if sink is None:
+                await broadcast(out)
+            else:
+                while samples_in - frames_out * MP3_FRAME_SAMPLES > ENCODER_LEAD_S * FLOW_RATE:
+                    drained.clear()
+                    try:
+                        await asyncio.wait_for(drained.wait(), ENCODER_STALL_S)
+                    except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041 — 3.10
+                        break
+                await sink.write(out)
+            samples_in += len(out) // _PCM_FRAME
+
+        async def open_item(item: MediaItem, start: float) -> tuple[FlowProcess, bytes] | None:
+            """Открыть элемент: ссылка, декодер и головка окна фейда; `None` — у элемента нет звука."""
+            generated = self.generated(item) if self.generated is not None else None
+            if generated is None:
+                source = await self.source_of(item) if self.source_of is not None else None
+                if source is None:
+                    return None
+                generated = await decoder(source, start)
+            return generated, await read_head(generated, self.fade_bytes)
+
+        prefetch = Prefetch(open_item)
         fader = _Fader(self.fade_bytes)
         skipped = 0
+        # Прежний элемент сменили вручную (а не доиграли): его хвост гасится, новый — без фейда.
+        switched = False
+        # Звук уже шёл: на смене тишина держит поток, а до первого элемента колонка и так ждёт.
+        played = False
         try:
             if encoder is not None:
                 sink = await encoder(broadcast)
-                pcm = sink.write
             while (item := self.current) is not None:
                 if self.source_of is None or (not self._readers and (encoder is None or not item.source)):
                     return
-                source = await self.source_of(item)
-                if source is None:
+                self.switch.clear()
+                start = self.seek_offset
+                self.seek_offset = 0.0
+                prefetched = prefetch.take(item, start)
+                opening = prefetched or asyncio.create_task(open_item(item, start))
+                if prefetched is not None and not switched:
+                    # Доигранный трек, следующий открывается заранее: дождаться его ради кроссфейда.
+                    await asyncio.wait({opening}, timeout=PREFETCH_WAIT_S)
+                if switched or not opening.done():
+                    # Ручная смена или следующий не готов: старое гаснет сразу, пока новое открывается —
+                    # тишина. Поток не прерывается: колонка не опустошает буфер и не набирает его заново.
+                    await push(fade_out(fader.flush()))
+                    while played and not opening.done() and encoder is not None and self._readers:
+                        await push(silence(SILENCE_MS))
+                switched = False
+                opened = await opening
+                if opened is None:
                     # Трек без ссылки (снят у правообладателя, регион) — пропуск, а не конец музыки:
                     # раньше один такой трек гасил весь поток и группу.
                     skipped += 1
@@ -340,21 +421,23 @@ class FlowSession:
                         return
                     continue
                 skipped = 0
-                self.switch.clear()
-                start = self.seek_offset
-                self.seek_offset = 0.0
-                process = (self.generated(item) if self.generated is not None else None) or await decoder(source, start)
+                process, head = opened
+                played = True
                 pcm_buffer: asyncio.Queue[bytes] | None = None
                 producer: asyncio.Task[None] | None = None
+                item_samples = 0
                 try:
-                    # Головку нового элемента читаем сразу: с ней микшуется придержанный хвост.
-                    out = fader.join(await _read_head(process, self.fade_bytes))
-                    if out:
-                        await pcm(out)
-                        samples_in += len(out) // _PCM_FRAME
+                    if self.on_item_start is not None:
+                        started = self.on_item_start
+                        mark_at(lambda at, item=item: started(item, at))
+                    # С головкой микшуется придержанный хвост доигранного (кроссфейд); после ручной
+                    # смены хвоста нет — новое звучит сразу.
+                    out = fader.join(head)
+                    await push(out)
+                    item_samples += len(out) // _PCM_FRAME
                     if item.source and encoder is not None:
                         pcm_buffer = asyncio.Queue(RADIO_PCM_CHUNKS)
-                        producer = asyncio.create_task(_buffer_radio_pcm(process, pcm_buffer))
+                        producer = asyncio.create_task(buffer_radio_pcm(process, pcm_buffer))
                     while True:
                         chunk = await (process.read(FLOW_CHUNK) if pcm_buffer is None else pcm_buffer.get())
                         if not chunk:
@@ -363,18 +446,17 @@ class FlowSession:
                             break
                         out = fader.feed(chunk)
                         if out:
-                            # ⚠ Время берём ДО записи: запись ждёт кодировщик, а его задержка у всех
-                            # систем одна и в разнице замеров сокращается.
                             if (note := getattr(process, "mark", None)) is not None:
-                                if encoder is None:
-                                    self.probe_sent.append({"at": clock() * 1000, "note": note})
-                                else:
-                                    frame, rest = divmod(samples_in, MP3_FRAME_SAMPLES)
-                                    self._probe_frames.append((frame, rest * 1000 / FLOW_RATE, note))
-                            await pcm(out)
-                            samples_in += len(out) // _PCM_FRAME
+                                mark_at(lambda at, note=note: self.probe_sent.append({"at": at, "note": note}))
+                            await push(out)
+                            item_samples += len(out) // _PCM_FRAME
+                        duration = getattr(item, "duration", 0) or 0
+                        if duration > 0 and item_samples >= (duration - PREFETCH_S) * FLOW_RATE:
+                            if self.generated is None and 0 <= self.index + 1 < len(self.items):
+                                prefetch.start(self.items[self.index + 1])
                         # Смену элемента замечаем на ближайшем куске звука: он приходит постоянно.
                         if self.switch.is_set() or self.current is not item:
+                            switched = True
                             break
                         if self._readers:
                             without_readers_since = None
@@ -391,59 +473,28 @@ class FlowSession:
                     if producer is not None:
                         producer.cancel()
                         await asyncio.gather(producer, return_exceptions=True)
-                    await _stop(process)
-                if self.switch.is_set() or self.current is not item:
+                    await stop_process(process)
+                if switched:
                     continue
                 await self._playing.wait()
                 if self.switch.is_set() or self.current is not item:
+                    switched = True
                     continue
                 if self.on_end is not None:
                     await self.on_end()
                 if self.current is item:  # очередь кончилась: дописываем придержанное и закрываем
-                    if tail := fader.flush():
-                        await pcm(tail)
+                    await push(fade_out(fader.flush()))
                     return
         except Exception:  # noqa: BLE001 — упавший поток не должен вешать читателей молча
             LOGGER.exception("Поток сессии %s упал", self.token)
         finally:
+            prefetch.drop()
             if sink is not None:
                 await sink.stop()
             self._preroll.clear()
             for queue in list(self._readers):
                 self._finish_reader(queue)
 
-
-async def _buffer_radio_pcm(process: FlowProcess, buffer: asyncio.Queue[bytes]) -> None:
-    try:
-        while chunk := await process.read(FLOW_CHUNK):
-            await buffer.put(chunk)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        await buffer.put(b"")
-        raise
-    await buffer.put(b"")
-
-
-async def _stop(process: FlowProcess) -> None:
-    """Погасить декодер: элемент доигран, сменён или плеер ушёл."""
-    try:
-        await asyncio.wait_for(process.stop(), STOP_TIMEOUT_S)
-    except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041 — 3.10 и 3.11 зовут по-разному
-        LOGGER.warning("Поток сессии: ffmpeg не остановился за %s с", STOP_TIMEOUT_S)
-
-
-async def _read_head(process: FlowProcess, size: int) -> bytes:
-    """Первые `size` байт элемента: с ними микшуется придержанный хвост прежнего."""
-    if size <= 0:
-        return b""
-    head = b""
-    while len(head) < size:
-        chunk = await process.read(size - len(head))
-        if not chunk:
-            break
-        head += chunk
-    return head
 
 class FlowStreams:
     """Адреса сессий: токен → сессия, один на плеер (адрес не меняется между элементами).

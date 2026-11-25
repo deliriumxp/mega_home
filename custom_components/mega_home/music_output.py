@@ -7,7 +7,7 @@ from typing import Any
 
 from .core.ops import command_spec
 from .core.ops_base import OpError, arguments
-from .providers.music_ffmpeg import FLOW_CHANNELS, FLOW_RATE, FLOW_WIDTH
+
 from .providers.music_flow import FlowSession, FlowStreams
 from .providers.player_output import Output
 
@@ -68,18 +68,6 @@ def member_accepts(tile: dict) -> list[str] | None:
     spec = command_spec(tile, "play_stream") or {}
     options = ((spec.get("fields") or {}).get("media_content_type") or {}).get("options")
     return options if isinstance(options, list) else None
-
-
-def fade_bytes(profile: Mapping[str, Any]) -> int:
-    """Окно фейда на стыке элементов, байты PCM: `fadeMs` описания плитки, не больше 3 с.
-
-    ⚠ Фейд делает ДОМ (`providers/music_flow.py`, `_Fader`), и только у потока: у плеера, который
-    берёт ссылку на элемент, смешивать нечего — там стык как был. Нет `fadeMs` — стык как был.
-    """
-    value = profile.get("fadeMs")
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
-        return 0
-    return min(int(value), 3000) * FLOW_CHANNELS * FLOW_WIDTH * FLOW_RATE // 1000
 
 
 def stream_fields(tile: dict, entity: str, value: Any, source: Any) -> dict[str, str]:

@@ -234,6 +234,31 @@ class PlayerQueue:
         await self._launch(queue)
         return True
 
+    def flow_started(self, item: MediaItem, at_ms: float, audible_ms: int) -> None:
+        """Первый кадр элемента ушёл колонке (`at_ms` — часы цикла): через её задержку он зазвучит.
+
+        Позиция трека считается с того же мига — шкала в приложении идёт вместе со звуком.
+        """
+        queue = self._queue
+        attempt = queue.attempt if queue else None
+        if queue is None or attempt is None or attempt.started is not None or queue.item.id != item.id:
+            return
+        loop = asyncio.get_running_loop()
+        delay = max(0.0, (at_ms + audible_ms) / 1000 - loop.time())
+
+        def audible() -> None:
+            if self._queue is not queue or queue.attempt is not attempt or attempt.started is not None:
+                return
+            if attempt.timeout:
+                attempt.timeout.cancel()
+                attempt.timeout = None
+            attempt.started = attempt.last = Sample.read(self._source.get(self.entity))
+            attempt.opened = True
+            attempt.anchor = monotonic()
+            self._changed()
+
+        loop.call_later(delay, audible)
+
     async def flow_end(self) -> bool:
         """Элемент доигран ВНУТРИ потока сессии: дальше по очереди, без команды плееру."""
         async with self._lock:
@@ -295,9 +320,12 @@ class PlayerQueue:
             # переключение без «Стоп» у плеера, который новый `media_url` поверх потока не берёт.
             if (attempt.output.flow and self._flow is not None
                     and self._flow.reading_player(self.entity)):
+                # ⚠ «Играет» — не здесь, а когда его СЛЫШНО (`flow_started`): первый кадр уходит колонке
+                # через загрузку трека, а слышен ещё через её задержку. Раньше «Сейчас играет»
+                # загоралось на новом треке, пока колонка секундами доигрывала старый, и жилец тыкал
+                # во все треки подряд.
                 attempt.accepted = True
-                attempt.started = attempt.last = attempt.before
-                attempt.anchor = monotonic()
+                attempt.timeout = asyncio.get_running_loop().call_later(START_TIMEOUT, self._timed_out, attempt)
                 self._changed()
                 return
             await call(self._source, "media_player", "play_media", {
@@ -306,6 +334,11 @@ class PlayerQueue:
             if self._queue is not queue:
                 return
             attempt.accepted = True
+            if attempt.output.flow:
+                # Поток дома: «играет» — когда трек слышно (`flow_started`), как и при смене внутри потока.
+                attempt.timeout = asyncio.get_running_loop().call_later(START_TIMEOUT, self._timed_out, attempt)
+                self._changed()
+                return
             if attempt.output.owner:
                 # Содержимое наше, свидетельства от плеера не будет: команду приняла HA — этого
                 # довольно, и ждать подтверждения нечем (`Output.owner`).

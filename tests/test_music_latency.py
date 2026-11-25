@@ -266,7 +266,7 @@ def test_отметка_ноты_когда_кадр_ушёл_плееру_а_н
 
     from mega_home.providers.music_flow import MP3_FRAME_SAMPLES
 
-    hold = 40
+    hold = 10  # насос держит запас не больше 0,3 с (12 кадров): заглушка — в его пределах
     frame_bytes = MP3_FRAME_SAMPLES * 4
 
     async def run():
@@ -337,5 +337,66 @@ def test_проверка_играет_мелодию_на_колонках_со
         stopped = [data["entity_id"] for _, name, data in home.source.calls if name in ("media_stop", "media_pause")]
         assert set(stopped) == {"media_player.echo", "media_player.sonos"}
         await asyncio.wait_for(asyncio.gather(*readers), timeout=2)
+
+    asyncio.run(run())
+
+
+def test_сдвиг_колонки_в_группе_кадрами_тишины_а_не_паузой(monkeypatch):
+    """Пауза записи с пачкой накопленного давала колонке тот же запас в то же время — сдвиг пропадал."""
+    from mega_home.providers import music_ffmpeg
+
+    monkeypatch.setattr(music_ffmpeg, "_silent_frame", b"S" * 960)
+
+    async def run():
+        session = FlowSession("t")
+        session.set_items((SimpleNamespace(id="a", source="a"),), 0)
+        session.delay_of = lambda player: 48 if player == "late" else 0
+
+        async def source_of(item):
+            return item.source
+
+        async def decoder(_url, _start=0.0):
+            return FakeProcess([b"\x01" * 4608 * 4], piece=4608)
+
+        async def encoder(write):
+            async def push(chunk):
+                await write(b"F" * 960)
+
+            async def stop():
+                pass
+
+            return SimpleNamespace(write=push, stop=stop)
+
+        got: list[bytes] = []
+
+        async def sink(chunk):
+            got.append(chunk)
+            if len(got) >= 3:
+                session.stop()
+
+        session.source_of = source_of
+        await asyncio.wait_for(session.serve(sink, decoder, encoder, "late"), timeout=2)
+        # 48 мс = два кадра тишины ДО звука, сразу, без паузы.
+        assert got[:3] == [b"S" * 960, b"S" * 960, b"F" * 960]
+
+    asyncio.run(run())
+
+
+def test_переподключение_колонки_не_обрыв(tmp_path, monkeypatch):
+    async def run():
+        service, home, readers = _measure_env(tmp_path)
+        token = (await service.call(False, {"action": "calibration_measure", "player": "echo"}))["token"]
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            if service._latency._measures[token].session.reading:
+                break
+        session = service._latency._measures[token].session
+        session.disconnect("media_player.echo")
+        # Миг без чтения — замер идёт дальше.
+        assert (await service.call(False, {"action": "calibration_result", "token": token}))["done"] is False
+        monkeypatch.setattr("mega_home.music_latency.RECONNECT_GRACE_S", 0)
+        answer = await service.call(False, {"action": "calibration_result", "token": token})
+        assert answer == {"done": True, "error": "Колонка прервала поток дома"}
+        await asyncio.wait_for(asyncio.gather(*readers, return_exceptions=True), timeout=2)
 
     asyncio.run(run())

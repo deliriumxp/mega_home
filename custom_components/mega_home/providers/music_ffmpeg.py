@@ -109,13 +109,46 @@ async def ffmpeg_decoder(binary: str, url: str, start: float = 0.0, *, radio: bo
 
 def mp3_args(channels: int = FLOW_CHANNELS, bitrate_k: int = MP3_BITRATE_K) -> tuple[str, ...]:
     """Кодирование PCM s16le 48 кГц из трубы в MP3 CBR без резервуара: кадры независимы, выход
-    может начать чтение с любого кадра потока."""
+    может начать чтение с любого кадра потока.
+
+    ⚠ Вход — без разбора (`-probesize 32 -analyzeduration 0 -fflags nobuffer`) и выход — кадр за
+    кадром (`-flush_packets 1`): иначе ffmpeg копит у себя секунды PCM до первого кадра. Замер на
+    ffmpeg 7.1: без этих ключей в кодировщике стояло 6–7 с звука — смена трека доигрывала столько
+    старого, а отметки замера задержки убегали вперёд; с ними и запасом насоса 0,3 с — 0,29 с.
+    """
     return (
+        "-probesize", "32", "-analyzeduration", "0", "-fflags", "nobuffer",
         "-f", "s16le", "-ar", str(FLOW_RATE), "-ac", str(channels), "-i", "pipe:",
         "-f", "mp3", "-codec:a", "libmp3lame", "-b:a", f"{bitrate_k}k",
-        "-write_xing", "0", "-id3v2_version", "0", "-reservoir", "0",
+        "-write_xing", "0", "-id3v2_version", "0", "-reservoir", "0", "-flush_packets", "1",
         "-loglevel", "error", "-nostats", "pipe:",
     )
+
+
+# Кадр MP3 с тишиной — теми же ключами, что провод сессии; `None` — ещё не закодирован.
+_silent_frame: bytes | None = None
+
+
+def silent_frame() -> bytes | None:
+    """Кадр тишины провода: им сдвигают колонку группы ДАННЫМИ, а не паузой (`FlowSession.serve`)."""
+    return _silent_frame
+
+
+async def _encode_silent_frame(binary: str) -> None:
+    """Закодировать кадр тишины один раз на процесс. У LAME CBR без резервуара кадры тишины одинаковы
+    (проверено на ffmpeg 7.1: все средние кадры секунды тишины совпадают байт в байт); крайние кадры
+    несут задержку кодировщика, поэтому берём средний."""
+    global _silent_frame
+    if _silent_frame is not None:
+        return
+    process = await asyncio.create_subprocess_exec(
+        binary, *mp3_args(), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await process.communicate(bytes(FLOW_RATE // 4 * FLOW_CHANNELS * FLOW_WIDTH))
+    frames = [out[i : i + MP3_FRAME_BYTES] for i in range(0, len(out) - MP3_FRAME_BYTES + 1, MP3_FRAME_BYTES)]
+    if len(frames) > 6 and frames[4] == frames[5]:
+        _silent_frame = frames[5]
 
 
 async def ffmpeg_encoder(binary: str, write: Callable[[bytes], Awaitable[None]]) -> FlowProcess:
@@ -124,6 +157,10 @@ async def ffmpeg_encoder(binary: str, write: Callable[[bytes], Awaitable[None]])
     ⚠ Один на сессию: склейка и фейд идут на PCM, а провод у группы один (Яндекс Станция берёт
     только `stream.mp3`/`stream.aac`; ESPHome и Sonos читают что дадут — HA им перекодирует сам).
     """
+    try:
+        await _encode_silent_frame(binary)
+    except (OSError, ValueError) as error:  # без кадра тишины сдвиг группы — паузой, как раньше
+        LOGGER.warning("Кадр тишины MP3 не закодирован: %s", error)
     process = await asyncio.create_subprocess_exec(
         binary,
         *mp3_args(),

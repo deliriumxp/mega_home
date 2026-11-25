@@ -33,6 +33,9 @@ if TYPE_CHECKING:
     from .music_playback import MusicPlayback
 
 CONNECT_TIMEOUT_S = 15
+# Sonos и HEOS по ходу переподключаются к потоку (новый запрос вместо старого): миг без чтения — не
+# обрыв. Раньше первый же такой миг кончал замер ошибкой «прервала поток» — через раз на объекте.
+RECONNECT_GRACE_S = 10
 IDLE_S = 10
 LIMIT_S = 120
 STALE_S = 300
@@ -54,6 +57,8 @@ class _Measure:
     polled: float
     result: dict | None = None
     watchdog: asyncio.Task | None = None
+    # С какого мига ни одна колонка не читает поток (часы цикла); `None` — читают.
+    lost_since: float | None = None
 
 
 def latency_of(tile: dict | None) -> int:
@@ -76,6 +81,13 @@ class MusicLatency:
         latencies = [latency_of(self._playback._tile_of(member)) for member in members]
         shift = max(latencies) - latency_of(self._playback._tile_of(entity))
         return max(0, min(int(shift), max_ms))
+
+    def audible(self, entity: str) -> int:
+        """Через сколько мс после ухода кадра колонке его слышно: самая поздняя система группы."""
+        multiroom = self._playback.multiroom
+        owner = multiroom.owner(entity) or entity
+        members = [owner, *(m for m in multiroom.groups.get(owner, []) if m not in multiroom._vendor)]
+        return max(latency_of(self._playback._tile_of(member)) for member in members)
 
     @staticmethod
     def ping() -> dict:
@@ -159,7 +171,11 @@ class MusicLatency:
             if clock - measure.started < CONNECT_TIMEOUT_S:
                 return {"done": False, "sent": [], "notes": melody_description()}
             return await self._end(measure, {"done": True, "error": NOT_CONNECTED})
-        if not session.reading:
+        if session.reading:
+            measure.lost_since = None
+        elif measure.lost_since is None:
+            measure.lost_since = clock
+        elif clock - measure.lost_since >= RECONNECT_GRACE_S:
             return await self._end(measure, {"done": True, "error": DISCONNECTED})
         return {"done": False, "sent": list(session.probe_sent), "notes": melody_description()}
 
