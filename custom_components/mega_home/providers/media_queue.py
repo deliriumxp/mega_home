@@ -24,6 +24,14 @@ Load = Callable[[], Awaitable[tuple[tuple[MediaItem, ...], int]]]
 LoadMore = Callable[[], Awaitable[tuple[tuple[MediaItem, ...], bool]]]
 
 
+async def pause_native(source: StateSource, entity: str) -> None:
+    """Пауза своего воспроизведения колонки перед нашим потоком; отказ HA сборку группы не срывает."""
+    try:
+        await call(source, "media_player", "media_pause", {"entity_id": entity})
+    except OpError as err:
+        LOGGER.warning("Колонка %s не встала на паузу перед потоком дома: %s", entity, err.message)
+
+
 @dataclass
 class Attempt:
     before: Sample
@@ -171,12 +179,37 @@ class PlayerQueue:
             queue = self._queue
             if queue is None:
                 return False
+            attempt = queue.attempt
+            native = attempt is not None and attempt.output is not None and attempt.output.native
+            position = self._native_position() if native else None
             self._discard_attempt(queue)
+            if native:
+                # ⚠⚠ Своё воспроизведение колонки (Станция, `playMusic`) сначала ставим на паузу. Иначе
+                # оно оставалось «прерванным на ходу» под нашим потоком, и когда поток кончался (колонку
+                # сняли с группы — дом закрывает её адрес), Станция возвращалась к нему сама: музыка
+                # начинала играть на только что отключённой колонке.
+                await pause_native(self._source, self.entity)
             self._flow = flow
             flow.set_items(queue.items, queue.index)
+            if position:
+                # Трек продолжается с того же места, а не с начала: группа собирается вокруг играющей.
+                queue.position = position
+                flow.seek(position)
             # Группа собирается вокруг уже играющей колонки: пачка сменила бы глубину её буфера.
             await self._launch(queue, manual=False)
             return True
+
+    def _native_position(self) -> float | None:
+        """Где сейчас трек на самой колонке, сек; `None` — колонка позицию не сообщает."""
+        current = Sample.read(self._source.get(self.entity))
+        if current.position is None or current.state not in ("playing", "paused"):
+            return None
+        return current.elapsed(monotonic()) if current.state == "playing" else current.position
+
+    def plays_native(self) -> bool:
+        """Колонка играет СВОЁ (нативная дорожка), а не адрес дома."""
+        attempt = self._queue.attempt if self._queue else None
+        return attempt is not None and attempt.output is not None and attempt.output.native
 
     async def control(self, action: str, position: float | None = None) -> bool:
         async with self._lock:

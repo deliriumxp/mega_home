@@ -1526,7 +1526,9 @@ def test_пауза_одиночного_плеера_потока_идёт_че
         assert service._players["media_player.echo"].group_paused is True
         await service.group_command(tile, "play", {}, None)
         assert session._playing.is_set()
-        assert home.source.calls[-1][1] == "media_play"
+        # Пуск — заново адрес сессии, а не `media_play`: Станция на `media_play` перезапускает свой адрес
+        # с типом `music` и отвергает его (журнал HA obj36).
+        assert home.source.calls[-1][1] == "play_media"
         service.close()
 
     asyncio.run(run())
@@ -1695,5 +1697,52 @@ def test_играет_не_раньше_чем_слышно_с_учётом_за
         await asyncio.sleep(0.25)
         assert service._views()["echo"]["started"] is True
         service.close()
+
+    asyncio.run(run())
+
+
+def test_станции_группа_без_возврата_к_своему_и_прямой_запуск_после_разгруппировки(tmp_path):
+    """Две Станции (своего мультирума у них нет): группа идёт потоком дома, одна колонка — напрямую.
+
+    ⚠ Живой разбор obj36: снятая с группы Станция сама начинала играть — она возвращалась к своему
+    воспроизведению (`playMusic`), прерванному нашим потоком на ходу. И после первой группировки
+    колонка навсегда оставалась на потоке.
+    """
+    from datetime import datetime, timezone
+
+    async def run():
+        service, home, _catalog, _streams = setup(tmp_path, flow=False)
+        first, second = station_tile("media_player.a"), station_tile("media_player.b")
+        first["id"], second["id"] = "a", "b"
+        home.data["tiles"] = [first, second]
+        source = home.source
+        source.states["media_player.a"] = PlainState("idle")
+        source.states["media_player.b"] = PlainState("idle")
+
+        await service.call(False, {"action": "play_queue", "player": "a", "ids": ["1"], "index": 0})
+        assert source.calls[-1][1:] == ("play_media", {
+            "entity_id": "media_player.a", "media_content_id": "1", "media_content_type": "track"})
+        source.report("media_player.a", "playing", media_content_id="1", media_position=30,
+                      media_position_updated_at=datetime.now(timezone.utc))
+
+        source.calls.clear()
+        await service.group_command(first, "join", {"group_members": ["media_player.b"]}, None)
+        services = [(call[1], call[2]["entity_id"]) for call in source.calls]
+        # Своё воспроизведение ведущего — на паузу ДО нашего потока, иначе Станция вернётся к нему.
+        assert services[:2] == [("media_pause", "media_player.a"), ("play_media", "media_player.a")]
+        assert ("play_media", "media_player.b") in services
+        assert all("/mega-home/stream/" in call[2]["media_content_id"] and call[2]["media_content_type"] == "stream.mp3"
+                   for call in source.calls if call[1] == "play_media")
+        # Трек продолжается с того же места, а не с начала.
+        assert 29 <= service._players["media_player.a"]._queue.position <= 32
+
+        await service.group_command(second, "unjoin", {}, None)
+        assert service.multiroom.groups == {}
+        source.calls.clear()
+        await service.call(False, {"action": "play_queue", "player": "a", "ids": ["2"], "index": 0})
+        # Группы нет — снова прямой запуск, а не поток дома.
+        assert source.calls[-1][1:] == ("play_media", {
+            "entity_id": "media_player.a", "media_content_id": "2", "media_content_type": "track"})
+        assert service._players["media_player.a"].flow is None
 
     asyncio.run(run())

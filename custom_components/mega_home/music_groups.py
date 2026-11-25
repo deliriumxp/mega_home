@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from .core.ops import call
 from .core.ops_base import OpError
 from .core.topics import MEDIA_GROUPS
+from .providers.media_queue import pause_native
 from .providers.music_flow import FlowSession
 
 if TYPE_CHECKING:
@@ -270,10 +271,21 @@ class MusicGroups:
         else:
             session.pause()
 
+        delegates = [leader, *(member for member in self.groups.get(leader, []) if member not in self._vendor)]
+        if resume and delegates == [leader]:
+            # Одиночная колонка набирает буфер пачкой, а не в темпе эфира (`prime_solo`): иначе пуск
+            # после паузы у Станции ждал бы её ~10 с буфера.
+            session.prime_solo(leader)
+
         async def apply(entity: str) -> None:
             sign = by if entity == leader else None
             if resume:
-                service = "media_play" if session.reading_player(entity) else "play_media"
+                # ⚠⚠ Пуск после паузы — ВСЕГДА заново адрес сессии, а не `media_play`. Станция на
+                # `media_play` перезапускает свой адрес с типом, который сообщает сама (`music`), и
+                # такой запуск отвергает молча (журнал HA obj36: «Unsupported local media: …/stream/…
+                # music»); прежнее правило «читает — значит `media_play`» срабатывало лишь до того,
+                # как колонка закрывала соединение на паузе, — отсюда «пуск то работает, то нет».
+                service = "play_media"
             else:
                 current = source.get(entity)
                 mask = current.attributes.get("supported_features") if current is not None else None
@@ -292,7 +304,6 @@ class MusicGroups:
             if service == "media_stop":
                 session.disconnect(entity)
 
-        delegates = [leader, *(member for member in self.groups.get(leader, []) if member not in self._vendor)]
         results = await asyncio.gather(*(apply(entity) for entity in delegates), return_exceptions=True)
         leader_ok = bool(results) and not isinstance(results[0], BaseException)
         if leader_ok:
@@ -368,6 +379,11 @@ class MusicGroups:
                 session.reading_player(member) or not session.has_opened(member)
             ):
                 continue
+            own = self.playback._players.get(member)
+            if own is not None and own.plays_native():
+                # То же, что у ведущего (`PlayerQueue.promote`): своё воспроизведение колонки — на паузу
+                # до нашего потока, иначе она вернётся к нему, когда её снимут с группы.
+                await pause_native(self.playback._home.source, member)
             try:
                 await self.playback.play_flow(session, member)
             except BaseException:

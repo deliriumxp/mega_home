@@ -350,7 +350,14 @@ class MusicPlayback:
         поток группы брал очередь со старым профилем как есть.
         """
         queue = self._players.get(entity)
-        if queue is not None and self._profiles.get(entity) != (tile["id"], output_profile(tile["stream"])):
+        if queue is not None and (
+            self._profiles.get(entity) != (tile["id"], output_profile(tile["stream"]))
+            # ⚠ Поток дома у плеера без `stream.flow` — только на время группы (`group_flow`). Группа
+            # распалась — новая музыка идёт снова напрямую (Станция — `playMusic`): иначе колонка после
+            # первой же группировки навсегда оставалась на потоке, с его буфером на каждом старте.
+            or (queue.flow is not None and tile["stream"].get("flow") is not True
+                and not self.multiroom.contains(entity))
+        ):
             self._drop_queue(entity, tile)
             queue = None
         if queue is None:
