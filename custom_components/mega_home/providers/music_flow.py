@@ -260,16 +260,24 @@ class FlowSession:
         clock = asyncio.get_running_loop().time
         deadline: float | None = None
         without_readers_since: float | None = None
+        # ⚠ Первые `PREROLL_FRAMES` кадров сессии уходят без темпа — тот же предзапас, что получает
+        # подключившийся позже из хвоста. Иначе первый читатель играл бы у живого края, а остальные
+        # на секунду позже, и замер задержки зависел бы от того, кто подключился первым.
+        burst = PREROLL_FRAMES
 
         async def broadcast(chunk: bytes) -> None:
-            nonlocal deadline
+            nonlocal deadline, burst
             await self._playing.wait()
             if encoder is not None:
                 now = clock()
-                if deadline is None or now - deadline > 0.250:
+                if burst > 0:
+                    burst -= 1
                     deadline = now
-                await asyncio.sleep(max(0, deadline - now))
-                deadline += MP3_FRAME_MS / 1000
+                else:
+                    if deadline is None or now - deadline > 0.250:
+                        deadline = now
+                    await asyncio.sleep(max(0, deadline - now))
+                    deadline += MP3_FRAME_MS / 1000
                 self._preroll.append(chunk)
                 if not self._readers and (item := self.current) is not None and item.source:
                     if len(self._preroll) >= RADIO_RECONNECT_FRAMES:

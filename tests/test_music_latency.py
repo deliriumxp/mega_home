@@ -96,7 +96,7 @@ def test_щелчки_идут_с_шагом_секунды_и_без_лишне
 
 
 def test_замер_отдаёт_времена_пяти_щелчков_и_гасит_плеер(tmp_path, monkeypatch):
-    monkeypatch.setattr(music_chirp, "LEAD_S", 0.2)
+    monkeypatch.setattr(music_chirp, "LEAD_S", 1.5)  # длиннее предзапаса: щелчки — уже в темпе эфира
     monkeypatch.setattr(music_chirp, "STEP_S", 0.2)
     monkeypatch.setattr(music_chirp, "TAIL_S", 0.1)
 
@@ -152,5 +152,43 @@ def test_колонка_не_подключилась_за_пятнадцать_
         token = (await service.call(False, {"action": "calibration_measure", "player": "echo"}))["token"]
         answer = await service.call(False, {"action": "calibration_result", "token": token})
         assert answer == {"done": True, "error": "Колонка не начала играть поток дома"}
+
+    asyncio.run(run())
+
+
+def test_первый_читатель_получает_предзапас_сразу():
+    """Первому читателю — тот же секундный предзапас, что позднему из хвоста: сразу, без темпа."""
+
+    async def run():
+        from mega_home.providers.music_flow import PREROLL_FRAMES
+
+        session = FlowSession("t")
+        session.set_items((SimpleNamespace(source="a"),), 0)
+        data = b"".join(bytes([index % 256]) * 5 for index in range(400))
+
+        async def source_of(item):
+            return item.source
+
+        async def decoder(_url, _start=0.0):
+            return FakeProcess([data], piece=5)
+
+        async def encoder(write):
+            async def stop():
+                pass
+            return SimpleNamespace(write=write, stop=stop)
+
+        got: list[bytes] = []
+
+        async def write(chunk):
+            got.append(chunk)
+
+        session.source_of = source_of
+        task = asyncio.create_task(session.serve(write, decoder, encoder, "one"))
+        # В темпе эфира 42 кадра — это 1 с; предзапас обязан прийти заметно быстрее.
+        await asyncio.sleep(0.3)
+        assert len(got) >= PREROLL_FRAMES
+        assert len(got) < PREROLL_FRAMES + 20
+        session.stop()
+        await asyncio.wait_for(task, timeout=2)
 
     asyncio.run(run())
