@@ -116,14 +116,44 @@ class PulseBlind:
         return self._move is not None and not self._move.done()
 
     # --- команды ------------------------------------------------------------
+    #
+    # ⚠ Каждая команда — СВОЯ задача под общим замком (`_command`), и вызывающий ждёт её через `shield`.
+    # Вызывающий — служба HA, а за ней автоматизация клавиши в `mode: restart`: следующая телеграмма
+    # отменяет идущее действие. Прежде команда сама ждала ход, и отмена вызывающего обрывала ход посреди
+    # стоп-импульса до записи состояния: HA навсегда оставалась с «Закрывается», и каждое следующее
+    # нажатие шло в «стоп» (объект 11, штора в промежуточном положении). Теперь отмена вызывающего
+    # отменяет только его ожидание. Замок общий и для «стопа»: прежде «стоп» шёл мимо него и мог
+    # разминуться с разворотом.
 
     async def open(self) -> None:
-        await self._start(OPEN, None)
+        await self._command(lambda: self._start(OPEN, None))
 
     async def close(self) -> None:
-        await self._start(CLOSE, None)
+        await self._command(lambda: self._start(CLOSE, None))
 
     async def set_position(self, target: int) -> None:
+        await self._command(lambda: self._set_position(target))
+
+    async def stop(self) -> None:
+        await self._command(self._stop)
+
+    async def toggle(self) -> None:
+        """Нажатие клавиши: решает САМА штора по своему ходу, а не шаблон по состоянию в HA.
+
+        Едет — стоп; стоит — в сторону, противоположную последнему ходу; хода ещё не было — открыть
+        закрытую, иначе закрыть. ⚠ Прежде это решал шаблон автоматизации по `states(...)` HA, то есть по
+        записи, которая могла отстать от шторы, — второй владелец одного решения.
+        """
+        await self._command(self._toggle)
+
+    async def _command(self, action: Callable[[], Awaitable[None]]) -> None:
+        async def locked() -> None:
+            async with self._lock:
+                await action()
+
+        await asyncio.shield(asyncio.ensure_future(locked()))
+
+    async def _set_position(self, target: int) -> None:
         target = min(max(int(target), 0), 100)
         if self.position is not None:
             if target != self.position:
@@ -143,10 +173,22 @@ class PulseBlind:
             return
         await self._start(OPEN if target > 50 else CLOSE, None, then=target)
 
-    async def stop(self) -> None:
+    async def _stop(self) -> None:
         if self.moving:
             self._cancel.set()
             await self._move  # type: ignore[misc]
+            return
+        # Хода нет, а HA могла остаться с «едет»: сбросить и записать заново.
+        self.opening = self.closing = False
+        self._on_change()
+
+    async def _toggle(self) -> None:
+        if self.moving:
+            await self._stop()
+        elif self.last_direction is not None:
+            await self._start(CLOSE if self.last_direction == OPEN else OPEN, None)
+        else:
+            await self._start(OPEN if self.position == 0 else CLOSE, None)
 
     def calibrate(self, position: int) -> bool:
         """Сказать, где штора на самом деле, без движения. На ходу — отказ."""
@@ -182,19 +224,19 @@ class PulseBlind:
         target: int | None,
         then: int | None = None,
     ) -> None:
-        # ⚠ Без «уже едем туда — пропустить»: цель частичного хода и полный ход —
-        # разные длительности; пропуск оставил бы штору не доехавшей. Текущий ход
-        # отменяется и ДОЖИДАЕТСЯ своего стоп-импульса — это и есть пауза перед
-        # новым стартом (третьего тайминга у эталонного драйвера нет).
-        # ⚠ Под замком: две команды подряд (открыть, затем закрыть в окне
-        # стоп-импульса) обе ждали бы один ход и обе заводили бы новый — первый
-        # осиротел бы и ехал параллельно второму.
-        async with self._lock:
-            if self.moving:
-                self._cancel.set()
-                await self._move  # type: ignore[misc]
-            self._cancel = asyncio.Event()
-            self._move = asyncio.ensure_future(self._run(direction, target, then))
+        """Новый ход; зовётся только под замком (`_command`).
+
+        ⚠ Без «уже едем туда — пропустить»: цель частичного хода и полный ход — разные длительности;
+        пропуск оставил бы штору не доехавшей. Текущий ход отменяется и ДОЖИДАЕТСЯ своего стоп-импульса —
+        это и есть пауза перед новым стартом (третьего тайминга у эталонного драйвера нет). Замок не даёт
+        двум командам подряд (открыть, затем закрыть в окне стоп-импульса) ждать один ход и обеим заводить
+        новый — первый осиротел бы и ехал параллельно второму.
+        """
+        if self.moving:
+            self._cancel.set()
+            await self._move  # type: ignore[misc]
+        self._cancel = asyncio.Event()
+        self._move = asyncio.ensure_future(self._run(direction, target, then))
 
     async def _run(self, direction: str, target: int | None, then: int | None = None) -> None:
         full = target is None
@@ -279,10 +321,14 @@ class PulseBlind:
                 self.calibrated = calibrate
             self.last_direction = direction
             self.opening = self.closing = False
-            # На концевике мотор уже стоит; лишний импульс может запустить его обратно.
-            if interrupted or not calibrate:
-                await self._stop_pulse()
-            self._on_change()
+            try:
+                # На концевике мотор уже стоит; лишний импульс может запустить его обратно.
+                if interrupted or not calibrate:
+                    await self._stop_pulse()
+            finally:
+                # Состояние — при любом исходе стоп-импульса (отказ реле, отмена): без записи HA
+                # оставалась с «едет».
+                self._on_change()
         return not interrupted
 
     def _relay(self, direction: str) -> str:

@@ -211,6 +211,12 @@ class MegaPulseCover(CoverEntity, RestoreEntity):
     async def async_stop_cover(self, **kwargs: Any) -> None:
         await self.blind.stop()
 
+    async def async_toggle(self, **kwargs: Any) -> None:
+        # Служба `cover.toggle` зовёт этот метод (`homeassistant/components/cover/services.py`:
+        # SERVICE_TOGGLE → "async_toggle"). Решение — у шторы (`PulseBlind.toggle`), по её ходу, а не по
+        # `is_opening`/`is_closing` записанного в HA состояния, как в `CoverEntity._get_toggle_function`.
+        await self.blind.toggle()
+
     async def async_calibrate_position(self, position: int) -> None:
         if not self.blind.calibrate(position):
             LOGGER.warning("%s: калибровка на ходу не принимается", self.entity_id)

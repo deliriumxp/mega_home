@@ -48,6 +48,74 @@ def ons(calls: list[tuple[float, str, str]]) -> list[str]:
     return [c[2] for c in calls if c[1] == "turn_on"]
 
 
+def test_отмена_вызвавшего_стоп_не_оставляет_штору_едущей_для_ha() -> None:
+    """Объект 11: клавиша в `mode: restart` прерывала «стоп» следующей телеграммой — ход умирал до
+    записи состояния, HA навсегда показывала «Закрывается», и нажатия больше не двигали штору."""
+
+    async def run() -> None:
+        changes: list[tuple[bool, bool]] = []
+        blind, calls, _ = make(pulseStop=200)
+        blind._on_change = lambda: changes.append((blind.opening, blind.closing))
+        await blind.close()
+        await asyncio.sleep(0.15)
+        stopping = asyncio.create_task(blind.stop())
+        await asyncio.sleep(0.05)  # посреди стоп-импульса
+        stopping.cancel()
+        await asyncio.gather(stopping, return_exceptions=True)
+        await done(blind)
+        # Ход доведён: стоп-импульс отпущен, последнее записанное состояние — «стоит».
+        assert changes[-1] == (False, False)
+        assert [c[1] for c in calls].count("turn_off") >= 2
+        # Следующее нажатие двигает штору.
+        await blind.open()
+        await asyncio.sleep(0.15)  # «едет» — после стартового импульса
+        assert blind.opening
+        await blind.stop()
+        await done(blind)
+
+    asyncio.run(run())
+
+
+def test_переключение_решает_штора_по_своему_ходу() -> None:
+    """Клавиша зовёт `cover.toggle`: едет — стоп, стоит — в обратную сторону от последнего хода."""
+
+    async def run() -> None:
+        blind, calls, _ = make(travelUp=2.0, travelDown=2.0, stopMethod="pulse_last")
+        blind.position = 40
+        await blind.toggle()  # хода ещё не было, не закрыта — закрыть
+        await asyncio.sleep(0.15)
+        assert blind.closing
+        await blind.toggle()  # едет — стоп
+        assert not blind.moving and blind.last_direction == "close"
+        await blind.toggle()  # стоит в промежуточном положении — в обратную сторону
+        await asyncio.sleep(0.15)
+        assert blind.opening
+        await blind.toggle()
+        assert not blind.moving
+        assert ons(calls) == ["switch.down", "switch.down", "switch.up", "switch.up"]
+        closed, _, _ = make()
+        closed.position = 0
+        await closed.toggle()  # закрытая без прежнего хода — открыть
+        await asyncio.sleep(0.1)
+        assert closed.opening
+        await closed.stop()
+
+    asyncio.run(run())
+
+
+def test_стоп_стоящей_шторы_сбрасывает_зависшее_едет() -> None:
+    async def run() -> None:
+        changes: list[tuple[bool, bool]] = []
+        blind, calls, _ = make()
+        blind._on_change = lambda: changes.append((blind.opening, blind.closing))
+        blind.closing = True  # прерванная запись оставила «едет»
+        await blind.stop()
+        assert changes == [(False, False)]
+        assert not ons(calls)  # реле не тронуты: штора и так стоит
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("direction, final, relay", [("open", 100, "switch.up"), ("close", 0, "switch.down")])
 @pytest.mark.parametrize("method", STOP_METHODS)
 def test_полный_ход_без_стоп_импульса_калибрует(direction: str, final: int, relay: str, method: str) -> None:
