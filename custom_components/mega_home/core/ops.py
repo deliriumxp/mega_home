@@ -478,7 +478,7 @@ async def call(
         ) from err
     except CommandRejected as err:
         LOGGER.warning("Service %s.%s rejected the payload: %s", domain, service, err)
-        raise OpError("Home Assistant отклонил команду") from err
+        raise OpError("Home Assistant отклонил команду", detail=str(err) or None) from err
     return {"accepted": True, "response": result}
 
 def command_spec(tile: dict[str, Any], name: Any) -> dict[str, Any] | None:

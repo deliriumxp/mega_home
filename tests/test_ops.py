@@ -15,7 +15,7 @@ from homeassistant.core import State
 
 from fake_host import FakeHost, FakeSource
 from mega_home.core import ops
-from mega_home.core.source import CommandUnknown
+from mega_home.core.source import CommandRejected, CommandUnknown
 
 
 class _Bundle:
@@ -147,6 +147,17 @@ def test_отсутствующая_служба_это_понятный_отк�
     with pytest.raises(ops.OpError) as err:
         run(source, _Coordinator(), "command", {"id": "t1", "command": "turn_on"})
     assert err.value.status == HTTPStatus.NOT_FOUND
+
+
+def test_отказ_службы_несёт_сырую_причину_рядом_с_прежним_текстом():
+    # Колонка не ответила службе (Sonos: Read timed out) — понятные слова выбирает приложение по `detail`;
+    # `message` прежний: приложения, не знающие `detail`, показывают его как раньше.
+    source = FakeSource(raises=CommandRejected("Error on media_player.x: Read timed out. (read timeout=9.5)"))
+    with pytest.raises(ops.OpError) as err:
+        run(source, _Coordinator(), "command", {"id": "t1", "command": "turn_on"})
+    assert err.value.message == "Home Assistant отклонил команду"
+    assert err.value.detail == "Error on media_player.x: Read timed out. (read timeout=9.5)"
+    assert ops.OpError("Ожидается JSON").detail is None
 
 
 def test_сценарий_запускает_скрипт():

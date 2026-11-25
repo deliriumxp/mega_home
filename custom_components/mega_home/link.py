@@ -181,6 +181,7 @@ class ManagerLink:
                 "ok": False,
                 "error": err.message,
                 "status": err.status,
+                **({"detail": err.detail} if err.detail else {}),
             }
         except Exception as err:  # noqa: BLE001 - an answer must always come back
             LOGGER.exception("Request from the manager failed: %s", err)

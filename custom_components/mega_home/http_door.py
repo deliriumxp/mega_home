@@ -128,7 +128,9 @@ class _RoutedView(_MegaHomeView):
                 coordinator, request.method, path, body, dict(request.query), resident_access=access,
             )
         except ops.OpError as err:
-            return _keyed(self.json_message(err.message, err.status), key, fresh)
+            # `message` — для приложений, не знающих `detail` (сырой причины от источника).
+            refusal = {"message": err.message, **({"detail": err.detail} if err.detail else {})}
+            return _keyed(self.json(refusal, err.status), key, fresh)
         headers = {"Content-Type": content_type, **({"Cache-Control": cache} if cache else {}), **CONTAINED}
         if isinstance(raw, Path):
             return _keyed(web.FileResponse(raw, headers=headers), key, fresh)
