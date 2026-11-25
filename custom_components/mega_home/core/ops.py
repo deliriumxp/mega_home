@@ -149,6 +149,13 @@ async def run(coordinator: Any, op: str, payload: dict[str, Any] | None) -> Any:
         if switch is None:
             raise OpError("Этот дом не управляет службами хоста", HTTPStatus.NOT_IMPLEMENTED)
         return await switch(str(data.get("unit") or ""), bool(data.get("on")))
+    if op == "ha-token":
+        # Токен HA для менеджера (`ha_token.py`). Только канал менеджера: эту ветку зовёт
+        # `ops.run` из кадра канала, а у бандла и локального контура пути сюда нет.
+        issue = getattr(coordinator, "ha_token", None)
+        if issue is None:
+            raise OpError("Этот дом не выпускает токены Home Assistant", HTTPStatus.NOT_IMPLEMENTED)
+        return await issue()
     raise OpError("Неизвестная операция", HTTPStatus.NOT_FOUND)
 
 async def connect(

@@ -3,26 +3,28 @@
     "step": {
       "user": {
         "title": "Mega Home",
-        "description": "Enter the Mega Manager address and this object's token. The token is the object's webhook token, the same one the router already uses.",
+        "description": "Paste the setup key from Mega Manager. It looks like https://manager.example.com#abc123 — the manager address, a # sign, then the object's token.",
         "data": {
-          "manager_url": "Manager address",
-          "token": "Object token",
+          "key": "Setup key",
+          "manager_url": "Manager address (only if the key is a bare token)",
           "verify_ssl": "Verify the TLS certificate"
         },
         "data_description": {
+          "key": "The whole key as the manager shows it. A bare token without an address also works — then fill in the manager address below.",
           "manager_url": "For example http://manager.example.com:8055 — the inbound port, not the interface port."
         }
       },
       "reconfigure": {
         "title": "Mega Home",
-        "description": "Change the manager address or this object's token. The object keeps its history and entities.",
+        "description": "Change the setup key (manager address and object token). The object keeps its history and entities.",
         "data": {
-          "manager_url": "Manager address",
-          "token": "Object token",
+          "key": "Setup key",
+          "manager_url": "Manager address (only if the key is a bare token)",
           "verify_ssl": "Verify the TLS certificate",
           "music_admin_token": "Music Assistant setup token"
         },
         "data_description": {
+          "key": "The whole key as the manager shows it: address, a # sign, token.",
           "manager_url": "For example http://manager.example.com:8055 — the inbound port, not the interface port.",
           "music_admin_token": "A Music Assistant administrator access token for connecting Yandex Music and speakers. Leave blank to keep the current token."
         }
@@ -31,7 +33,8 @@
     "error": {
       "cannot_connect": "The manager did not answer. Check the address, the port and that the object can reach it.",
       "invalid_auth": "The manager rejected this token.",
-      "invalid_url": "The address must start with http:// or https://."
+      "invalid_key": "The key is not complete: it needs the manager address and the token. Paste it whole, or fill in the address.",
+      "invalid_url":"The address must start with http:// or https://."
     },
     "abort": {
       "already_configured": "This object is already set up.",

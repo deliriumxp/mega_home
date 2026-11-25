@@ -20,11 +20,17 @@ from .core.const import (
     DOMAIN,
     LOGGER,
 )
+from .setup_key import parse_key
+
+# Поле ключа настройки (`setup_key.py`) живёт только в форме: в записи по-прежнему адрес, токен и
+# проверка сертификата — ⚠ их хранение и `unique_id` (хэш токена) не менялись, миграции записи нет.
+CONF_KEY = "key"
 
 STEP_USER = vol.Schema(
     {
-        vol.Required(CONF_MANAGER_URL): str,
-        vol.Required(CONF_TOKEN): str,
+        vol.Required(CONF_KEY): str,
+        # Нужен только когда в поле ключа голый токен без адреса (прежний способ).
+        vol.Optional(CONF_MANAGER_URL): str,
         vol.Optional(CONF_VERIFY_SSL, default=True): bool,
     }
 )
@@ -71,11 +77,27 @@ class MegaHomeConfigFlow(ConfigFlow, domain=DOMAIN):
         return {}
 
     @staticmethod
-    def _clean(user_input: dict[str, Any]) -> dict[str, Any]:
+    def _clean(user_input: dict[str, Any]) -> dict[str, Any] | None:
+        """Запись из формы; `None` — ключ не разобрать (нет токена или адреса)."""
+        parsed = parse_key(user_input.get(CONF_KEY, ""), user_input.get(CONF_MANAGER_URL, ""))
+        if parsed is None:
+            return None
         return {
-            CONF_MANAGER_URL: user_input[CONF_MANAGER_URL].strip().rstrip("/"),
-            CONF_TOKEN: user_input[CONF_TOKEN].strip(),
+            CONF_MANAGER_URL: parsed[0],
+            CONF_TOKEN: parsed[1],
             CONF_VERIFY_SSL: user_input.get(CONF_VERIFY_SSL, True),
+        }
+
+    @staticmethod
+    def _field_errors(user_input: dict[str, Any], errors: dict[str, str]) -> dict[str, str]:
+        """Ошибки проверки — на поля ФОРМЫ: токена и адреса из ключа в форме нет, подсвечивается ключ.
+
+        Адрес подсвечивается своим полем, только когда он взят из него (голый токен в ключе).
+        """
+        own_url = "#" not in user_input.get(CONF_KEY, "")
+        return {
+            ("base" if name == "base" else CONF_MANAGER_URL if name == CONF_MANAGER_URL and own_url else CONF_KEY): text
+            for name, text in errors.items()
         }
 
     async def async_step_user(
@@ -84,7 +106,11 @@ class MegaHomeConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             data = self._clean(user_input)
-            errors = await self._async_validate(data)
+            errors = (
+                {CONF_KEY: "invalid_key"}
+                if data is None
+                else self._field_errors(user_input, await self._async_validate(data))
+            )
             if not errors:
                 # One entry per object token: re-adding the same object updates
                 # the address instead of creating a second home. ⚠ verify_ssl
@@ -119,9 +145,12 @@ class MegaHomeConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             data = self._clean(user_input)
-            if token := user_input.get(CONF_MUSIC_ADMIN_TOKEN, "").strip():
-                data[CONF_MUSIC_ADMIN_TOKEN] = token
-            errors = await self._async_validate(data)
+            if data is None:
+                errors = {CONF_KEY: "invalid_key"}
+            else:
+                if token := user_input.get(CONF_MUSIC_ADMIN_TOKEN, "").strip():
+                    data[CONF_MUSIC_ADMIN_TOKEN] = token
+                errors = self._field_errors(user_input, await self._async_validate(data))
             if not errors:
                 # ⚠ Токен объекта менеджер может перевыпустить — и тогда личность
                 # записи (`unique_id` — хэш токена) обязана смениться вместе с ним.
@@ -140,7 +169,12 @@ class MegaHomeConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="reconfigure",
             data_schema=self.add_suggested_values_to_schema(
                 STEP_USER.extend({vol.Optional(CONF_MUSIC_ADMIN_TOKEN): str}),
-                {key: value for key, value in (user_input or entry.data).items() if key != CONF_MUSIC_ADMIN_TOKEN},
+                user_input
+                or {
+                    # Ключ целиком из записи: то, что в ней хранится, форма не показывала бы иначе.
+                    CONF_KEY: f"{entry.data[CONF_MANAGER_URL]}#{entry.data[CONF_TOKEN]}",
+                    CONF_VERIFY_SSL: entry.data.get(CONF_VERIFY_SSL, True),
+                },
             ),
             errors=errors,
         )

@@ -193,6 +193,14 @@ _module(
     ConfigFlow=_ConfigFlow,
     ConfigFlowResult=dict,
 )
+# Типы токенов — значения ядра (`homeassistant/auth/models.py`): модуль `ha_token.py` берёт тип
+# долгоживущего токена оттуда, а не пишет строку сам.
+_module("homeassistant.auth")
+_module(
+    "homeassistant.auth.models",
+    TOKEN_TYPE_NORMAL="normal",
+    TOKEN_TYPE_LONG_LIVED_ACCESS_TOKEN="long_lived_access_token",
+)
 _module("homeassistant.data_entry_flow", UnknownHandler=type("UnknownHandler", (Exception,), {}))
 # `voluptuous` и клиентская сессия нужны только для импорта модуля потока:
 # проверяется в нём функция разбора адреса, а не формы Home Assistant.

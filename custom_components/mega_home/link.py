@@ -336,7 +336,19 @@ class ManagerLink:
             # Своя сеть дома — адреса, шлюз, маршруты (`core/netinfo.py`): менеджер берёт из
             # неё подсети сканирования и показывает, где дом стоит, вместо догадки по карточке.
             "net": await self._net(),
+            # Порт и https веб-сервера HA: по ним менеджер строит адрес входа (`ha_token.py`).
+            "ha": self._ha(),
         }
+
+    def _ha(self) -> dict[str, Any] | None:
+        """Веб-сервер HA для hello; любая ошибка — `None`, канал важнее подсказки."""
+        from .ha_token import web_facts
+
+        try:
+            return web_facts(self._hass)
+        except Exception as err:  # noqa: BLE001 - канал важнее подсказки
+            LOGGER.debug("Web server facts are unavailable: %s", err)
+            return None
 
     async def _net(self) -> dict[str, Any] | None:
         """Сеть дома для hello; любая ошибка — `None`, канал важнее подсказки."""

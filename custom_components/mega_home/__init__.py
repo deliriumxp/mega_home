@@ -40,6 +40,7 @@ from .core.observe import Observer
 from .link import ManagerLink
 from .ha_update import async_self_update, async_watch_update_entity
 from .ha_api import NAME as HA_SERVICE, HaApi
+from .ha_token import issue as issue_ha_token
 from .host_system import switch_unit
 from .core.sip_bridge import SipBridge
 
@@ -255,6 +256,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     # Службы хоста по кнопке менеджера (операция `host-unit`): systemd по D-Bus,
     # без HA — `host_system.py`.
     coordinator.host_unit = switch_unit
+    # Токен HA для менеджера (операция `ha-token`): только канал менеджера, `ha_token.py`.
+    coordinator.ha_token = partial(issue_ha_token, hass)
 
     # Сам Home Assistant — служба дома для `connect`, как go2rtc. Картинки
     # сущностей (`entity_picture` плеера, домен `image`) HA отдаёт по своему
