@@ -9,7 +9,7 @@ import pytest
 
 from mega_home.core.ops_base import OpError
 from mega_home.core.source import PlainState
-from mega_home.providers import music_chirp
+from mega_home.providers import music_melody
 from mega_home.providers.music_flow import FlowSession
 from mega_home.providers.music_ffmpeg import FLOW_RATE
 
@@ -86,30 +86,50 @@ def test_калибровка_пинг_отвечает_числом(tmp_path):
     asyncio.run(run())
 
 
-def test_тоны_идут_без_конца_с_неравными_интервалами():
+def test_мелодия_идёт_без_конца_и_отмечает_каждую_ноту():
     async def run():
-        process = music_chirp.ChirpProcess(seed=7)
+        process = music_melody.MelodyProcess()
         frame = 4
         at = 0
-        marks: list[int] = []
-        tone = None
-        # 30 с звука: поток не кончается, тон звучит с отмеченного куска.
-        while at < 30 * FLOW_RATE * frame:
+        marks: list[tuple[int, int]] = []
+        heard = None
+        loop_s = music_melody.loop_samples() / FLOW_RATE
+        # Два круга с лишним: поток не кончается, ноты идут по партитуре и после конца круга.
+        while at < (music_melody.LEAD_S + 2 * loop_s + 1) * FLOW_RATE * frame:
             chunk = await process.read(65536)
             assert chunk
-            if process.mark_hit:
-                marks.append(at)
-                tone = tone or chunk
+            if process.mark is not None:
+                marks.append((at, process.mark))
+                heard = heard or chunk
             at += len(chunk)
-        assert marks[0] == music_chirp.LEAD_S * FLOW_RATE * frame
-        gaps = [(b - a) / frame / FLOW_RATE * 1000 for a, b in zip(marks, marks[1:])]
-        assert all(music_chirp.GAP_MIN_MS - 1 <= gap <= music_chirp.GAP_MAX_MS + 1 for gap in gaps)
-        assert len({round(gap) for gap in gaps}) > len(gaps) // 2
-        assert any(tone)
+        onsets = music_melody.score_onsets()
+        lead = music_melody.LEAD_S * FLOW_RATE * frame
+        expected = [(lead + (cycle * music_melody.loop_samples() + start) * frame, note) for cycle in range(3) for start, note in onsets]
+        assert marks == [mark for mark in expected if mark[0] < at]
+        assert any(heard)
         await process.stop()
         assert await process.read(65536) == b""
 
     asyncio.run(run())
+
+
+def test_круг_мелодии_длиннее_предела_задержки_и_без_повтора_фразы():
+    # Сдвиг на повтор фразы набрал бы голоса наравне с верной задержкой (`estimateLatency` приложения).
+    loop_ms = music_melody.loop_samples() * 1000 / FLOW_RATE
+    assert loop_ms > 8000
+    onsets = [(start * 1000 // FLOW_RATE, note) for start, note in music_melody.score_onsets()]
+    for shift in range(1, int(loop_ms)):
+        same = sum(
+            1 for at, note in onsets for other, other_note in onsets
+            if note == other_note and (other - at) % int(loop_ms) == shift
+        )
+        assert same * 2 < len(onsets), shift
+
+
+def test_ноты_описаны_для_телефона():
+    notes = music_melody.melody_description()
+    assert len(notes) == len(music_melody.NOTES_HZ)
+    assert notes[0] == {"hz": 523.25, "ms": 200, "harmonics": [1.0, 0.6, 0.4, 0.3, 0.2, 0.15], "attackMs": 2, "decayMs": 60}
 
 
 def _measure_env(tmp_path):
@@ -138,10 +158,9 @@ def _measure_env(tmp_path):
     return service, home, readers
 
 
-def test_замер_отдаёт_тоны_по_ходу_и_гасит_колонку_по_команде(tmp_path, monkeypatch):
-    monkeypatch.setattr(music_chirp, "LEAD_S", 1.5)  # длиннее предзапаса: тоны — уже в темпе эфира
-    monkeypatch.setattr(music_chirp, "GAP_MIN_MS", 150)
-    monkeypatch.setattr(music_chirp, "GAP_MAX_MS", 250)
+def test_замер_отдаёт_ноты_по_ходу_и_гасит_колонку_по_команде(tmp_path, monkeypatch):
+    monkeypatch.setattr(music_melody, "LEAD_S", 1.5)  # длиннее предзапаса: ноты — уже в темпе эфира
+    monkeypatch.setattr(music_melody, "BEAT_MS", 100)
 
     async def run():
         service, home, readers = _measure_env(tmp_path)
@@ -157,10 +176,13 @@ def test_замер_отдаёт_тоны_по_ходу_и_гасит_колон
             if len(answer["sent"]) >= 6:
                 break
         assert answer["done"] is False
-        assert answer["chirp"] == {"fromHz": 2000, "toHz": 6000, "ms": 50}
+        assert answer["notes"] == music_melody.melody_description()
         sent = answer["sent"]
-        assert sent == sorted(sent)
-        assert all(140 <= later - earlier <= 300 for earlier, later in zip(sent, sent[1:]))
+        expected = music_melody.score_onsets()
+        assert [item["note"] for item in sent] == [note for _, note in expected[: len(sent)]]
+        times = [item["at"] for item in sent]
+        gaps = [(b - a) * 1000 / FLOW_RATE for (a, _), (b, _) in zip(expected, expected[1:])]
+        assert all(abs(later - earlier - gap) < 40 for earlier, later, gap in zip(times, times[1:], gaps))
         assert not any(name in ("media_stop", "media_pause") for _, name, _ in home.source.calls)
         assert await service.call(False, {"action": "calibration_stop", "token": token}) == {"stopped": True}
         assert any(name in ("media_stop", "media_pause") for _, name, _ in home.source.calls)
@@ -236,11 +258,10 @@ def test_первый_читатель_получает_предзапас_ср�
     asyncio.run(run())
 
 
-def test_отметка_тона_когда_кадр_ушёл_плееру_а_не_когда_pcm_ушёл_в_кодировщик(monkeypatch):
+def test_отметка_ноты_когда_кадр_ушёл_плееру_а_не_когда_pcm_ушёл_в_кодировщик(monkeypatch):
     """Кодировщик держит в себе запас кадров (трубы и очереди ffmpeg): отметка не должна убегать вперёд."""
-    monkeypatch.setattr(music_chirp, "LEAD_S", 1.5)
-    monkeypatch.setattr(music_chirp, "GAP_MIN_MS", 200)
-    monkeypatch.setattr(music_chirp, "GAP_MAX_MS", 200)
+    monkeypatch.setattr(music_melody, "LEAD_S", 1.5)
+    monkeypatch.setattr(music_melody, "BEAT_MS", 200)
     from collections import deque
 
     from mega_home.providers.music_flow import MP3_FRAME_SAMPLES
@@ -284,11 +305,37 @@ def test_отметка_тона_когда_кадр_ушёл_плееру_а_н
                 session.stop()
 
         session.source_of = source_of
-        session.generated = lambda _item: music_chirp.ChirpProcess(seed=1)
+        session.generated = lambda _item: music_melody.MelodyProcess()
         await asyncio.wait_for(session.serve(sink, unused, encoder, "one"), timeout=10)
-        # Кадр, где начинается первый тон, — первый ненулевой кадр провода (заглушка не кодирует).
-        first_tone = next(at for at, chunk in received if any(chunk))
-        assert abs(session.probe_sent[0] - first_tone) < 30
-        assert all(abs(later - earlier - 200) < 30 for earlier, later in zip(session.probe_sent, session.probe_sent[1:]))
+        # Кадр, где начинается первая нота, — первый ненулевой кадр провода (заглушка не кодирует).
+        first = next(at for at, chunk in received if any(chunk))
+        assert abs(session.probe_sent[0]["at"] - first) < 30
+        onsets = music_melody.score_onsets()
+        for (a, _), (b, _), earlier, later in zip(onsets, onsets[1:], session.probe_sent, session.probe_sent[1:]):
+            assert abs(later["at"] - earlier["at"] - (b - a) * 1000 / FLOW_RATE) < 30
+
+    asyncio.run(run())
+
+
+def test_проверка_играет_мелодию_на_колонках_со_сдвигом_по_задержкам(tmp_path):
+    async def run():
+        service, home, readers = _measure_env(tmp_path)
+        home.data["tiles"].append(vendor_tile("media_player.sonos", "s1", "sync:sonos"))
+        with pytest.raises(OpError):
+            await service.call(False, {"action": "calibration_check", "players": [{"player": "echo", "latencyMs": 100}]})
+        with pytest.raises(OpError):
+            await service.call(False, {"action": "calibration_check", "players": [
+                {"player": "echo", "latencyMs": 100}, {"player": "s1", "latencyMs": 9000}]})
+        token = (await service.call(False, {"action": "calibration_check", "players": [
+            {"player": "echo", "latencyMs": 100}, {"player": "s1", "latencyMs": 340}]}))["token"]
+        played = [data["entity_id"] for _, name, data in home.source.calls if name == "play_media"]
+        assert played == ["media_player.echo", "media_player.sonos"]
+        measure = service._latency._measures[token]
+        assert measure.session.delay_of("media_player.echo") == 240
+        assert measure.session.delay_of("media_player.sonos") == 0
+        assert await service.call(False, {"action": "calibration_stop", "token": token}) == {"stopped": True}
+        stopped = [data["entity_id"] for _, name, data in home.source.calls if name in ("media_stop", "media_pause")]
+        assert set(stopped) == {"media_player.echo", "media_player.sonos"}
+        await asyncio.wait_for(asyncio.gather(*readers), timeout=2)
 
     asyncio.run(run())

@@ -105,13 +105,13 @@ class FlowSession:
         self._radio_ready = asyncio.Event()
         # Свой звук элемента вместо декодера (калибровка: PCM делает дом). `None` — обычный декодер.
         self.generated: Callable[[MediaItem], FlowProcess | None] | None = None
-        # Время рассылки отмеченных кусков (`FlowProcess.mark_hit`), мс по часам цикла событий.
+        # Отмеченные куски (`FlowProcess.mark` — номер ноты замера): `{at, note}`, `at` — мс по часам цикла событий.
         # ⚠ Отметка — когда ПЛЕЕРУ ушёл кадр MP3 с началом тона, а не когда PCM ушёл в кодировщик:
         # между ними трубы и очереди ffmpeg с плавающим запасом в секунды, и замер на объекте не сходился
         # (телефон слышал 22 тона, отметки дома убегали вперёд).
-        self.probe_sent: list[float] = []
-        # Ждущие отметки: (номер кадра MP3, доля кадра до начала тона, мс).
-        self._probe_frames: deque[tuple[int, float]] = deque()
+        self.probe_sent: list[dict] = []
+        # Ждущие отметки: (номер кадра MP3, доля кадра до начала ноты, мс, номер ноты).
+        self._probe_frames: deque[tuple[int, float, int]] = deque()
 
     @property
     def current(self) -> MediaItem | None:
@@ -290,7 +290,8 @@ class FlowSession:
                     await asyncio.sleep(max(0, deadline - now))
                     deadline += MP3_FRAME_MS / 1000
                 while self._probe_frames and self._probe_frames[0][0] <= frames_out:
-                    self.probe_sent.append(clock() * 1000 + self._probe_frames.popleft()[1])
+                    _, rest_ms, note = self._probe_frames.popleft()
+                    self.probe_sent.append({"at": clock() * 1000 + rest_ms, "note": note})
                 frames_out += 1
                 self._preroll.append(chunk)
                 if not self._readers and (item := self.current) is not None and item.source:
@@ -364,12 +365,12 @@ class FlowSession:
                         if out:
                             # ⚠ Время берём ДО записи: запись ждёт кодировщик, а его задержка у всех
                             # систем одна и в разнице замеров сокращается.
-                            if getattr(process, "mark_hit", False):
+                            if (note := getattr(process, "mark", None)) is not None:
                                 if encoder is None:
-                                    self.probe_sent.append(clock() * 1000)
+                                    self.probe_sent.append({"at": clock() * 1000, "note": note})
                                 else:
                                     frame, rest = divmod(samples_in, MP3_FRAME_SAMPLES)
-                                    self._probe_frames.append((frame, rest * 1000 / FLOW_RATE))
+                                    self._probe_frames.append((frame, rest * 1000 / FLOW_RATE, note))
                             await pcm(out)
                             samples_in += len(out) // _PCM_FRAME
                         # Смену элемента замечаем на ближайшем куске звука: он приходит постоянно.
