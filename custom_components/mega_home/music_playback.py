@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from .core.ops import call
 from .core.ops_base import OpError, find
-from .music_calibration import MusicCalibration
+from .music_latency import MusicLatency
 from .music_groups import MusicGroups
 from .music_output import fade_bytes, flow_address, flow_content_type, flow_output, member_accepts, output_profile, stream_fields
 from .providers.media_queue import PlayerQueue
@@ -44,7 +44,7 @@ class MusicPlayback:
         self._flow = flow if flow is not None else FlowStreams(lambda: None)
         self.multiroom = MusicGroups(self)
         self._group_lock = asyncio.Lock()
-        self._calibration = MusicCalibration(self)
+        self._latency = MusicLatency(self)
         self.assistant: Callable[[bool, dict], Awaitable[dict | None]] | None = None
         self._players: dict[str, PlayerQueue] = {}
         self._profiles: dict[str, tuple[str, dict]] = {}
@@ -77,21 +77,19 @@ class MusicPlayback:
                 elif action in ("play_queue", "play_station", "queue_control"):
                     self._changed()
                 return answer
-        if action in ("calibration_start", "calibration_stop", "calibration_status"):
+        if action == "calibration_ping":
+            return self._latency.ping()
+        if action in ("calibration_measure", "calibration_result"):
             async with self._group_lock:
-                if action == "calibration_start":
-                    return await self._calibration.start(request.get("players"), request.get("raw") is True)
-                token = request.get("session")
-                if action == "calibration_status":
-                    return self._calibration.status(token)
-                await self._calibration.end(token, validate=request.get("validate") is True)
-                return {"accepted": True}
+                if action == "calibration_measure":
+                    return await self._latency.measure(request.get("player"))
+                return await self._latency.result(request.get("token"))
         if action == "playback_state":
             return {"players": self._views()}
         if action in ("play_queue", "play_station"):
             entity = self._entity(find(self._tiles(), request.get("player")))
             async with self._group_lock:
-                await self._calibration.interrupt(entity)
+                self._latency.interrupt(entity)
                 # Выбор музыки у участника меняет общий источник группы через её ведущего:
                 # открытый поток остаётся тем же, разъединение — только явный `unjoin`.
                 owner = self.multiroom.owner(entity) if entity else None
@@ -209,7 +207,7 @@ class MusicPlayback:
         if entity is None:
             return await execute()
         async with self._group_lock:
-            await self._calibration.interrupt(entity)
+            self._latency.interrupt(entity)
             # Выбор у участника меняет общую группу, а не выводит его из неё молча.
             owner = self.multiroom.owner(entity)
             if owner is not None and owner != entity:
@@ -391,16 +389,12 @@ class MusicPlayback:
         return session
 
     def _delay(self, entity: str) -> int:
-        """Задержка плеера, мс — из ТЕКУЩЕГО состава, а не из снимка на старте потока.
+        """Сдвиг плеера, мс: по ТЕКУЩЕМУ составу группы и замерам её систем (`stream.latencyMs`).
 
-        ⚠ Инсталлятор включает музыку и крутит задержку в свойствах плеера: значение обязано
-        доехать до играющего потока без перезапуска (просьба заказчика 2026-11-22).
+        ⚠ Считается на каждый кусок, а не берётся из снимка: состав группы меняется на ходу, а
+        задержка — свойство модели колонки, которое менеджер кладёт всем колонкам системы.
         """
-        tile = self._tile_of(entity)
-        value = ((tile or {}).get("stream") or {}).get("delayMs")
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
-            return 0
-        return min(int(value), MAX_DELAY_MS)
+        return self._latency.delay(entity, MAX_DELAY_MS)
 
     async def _flow_source(self, item: MediaItem) -> str | None:
         """Звук элемента для потока сессии: у станции адрес дан бандлом, у трека — из Яндекса."""
@@ -442,7 +436,7 @@ class MusicPlayback:
         return [entity for entity in entity_ids if entity not in known]
 
     def close(self) -> None:
-        self._calibration.close()
+        self._latency.close()
         for queue in self._players.values():
             queue.close()
         self._players.clear()

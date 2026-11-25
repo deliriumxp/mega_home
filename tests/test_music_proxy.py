@@ -18,7 +18,6 @@ from aiohttp import web
 
 from mega_home import http as mega_http, http_music
 from mega_home.core.host import PlainHost
-from mega_home.providers.calibration import prepare
 from mega_home.providers import music_proxy
 from mega_home.providers.music_flow import FlowStreams
 from mega_home.providers.music_proxy import MusicStreamLinks
@@ -276,46 +275,6 @@ async def _mount(app: web.Application, view: http_music.MegaHomeMusicStreamView)
     # `add_get` сам добавляет HEAD на GET-обработчик — здесь маршруты разные.
     app.router.add_route("HEAD", path, head)
     app.router.add_route("GET", path, stream)
-
-
-def test_повторный_get_маркера_aac_не_закрывает_играющий_поток(tmp_path):
-    binary = shutil.which("ffmpeg")
-    if not binary:
-        pytest.skip("Для проверки AAC нужен ffmpeg")
-
-    async def run():
-        player = "media_player.sonos"
-        flow = FlowStreams(lambda: "http://home")
-        marker = await prepare(binary, [player, "heos"])
-        del marker.marker_frames["heos"]
-        opened = asyncio.Event()
-        marker.on_read, marker.on_read_player = opened.set, player
-        token = _token(flow.address(marker, player, aac=True))
-        coordinator = SimpleNamespace(music_playback=SimpleNamespace(flow=flow), env=PlainHost(tmp_path))
-        app, view = _view_app(coordinator)
-        await _mount(app, view)
-        runner, port = await _serve(app)
-        url = f"http://127.0.0.1:{port}/mega-home/stream/{token}"
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as client:
-                async with client.head(url) as head:
-                    assert head.status == 200
-                    assert head.headers["Content-Type"] == "audio/aac"
-                    assert not marker.has_opened(player)
-                async with client.get(url) as first:
-                    assert first.status == 200
-                    assert await first.content.readexactly(2) == b"\xff\xf1"
-                    assert opened.is_set()
-                    async with client.get(url) as second:
-                        assert second.status == 409
-                    assert await first.content.readexactly(100)
-                    assert marker.marker_interrupted is None
-                assert marker.has_opened(player)
-        finally:
-            flow.retire(marker)
-            await runner.cleanup()
-
-    asyncio.run(run())
 
 
 async def _case() -> None:

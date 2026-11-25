@@ -36,6 +36,10 @@ from .player_output import MediaItem
 READER_QUEUE = 320
 RADIO_RECONNECT_S = 10
 RADIO_RECONNECT_FRAMES = 20
+# Предзапас каждого читателя: последние кадры провода, ~1 с (кадр MP3 = 24 мс). ⚠ Одинаковый у всех:
+# задержка колонки должна быть свойством МОДЕЛИ, а не того, подключилась ли она первой. Раньше
+# хвост получал только первый читатель радио, и замер статической задержки зависел от порядка.
+PREROLL_FRAMES = 42
 RADIO_PCM_CHUNKS = 44  # До 15 с стерео PCM 48 кГц, по 64 КиБ.
 # Сколько единственный читатель может стоять (пауза с пульта), прежде чем его снимут, сек.
 SOLE_READER_STALL_S = 30
@@ -77,8 +81,8 @@ class FlowSession:
         # Окно фейда на стыке элементов, байты PCM (0 — без фейда). Ставит владелец очереди из
         # описания плитки (`fadeMs`): фейд нужен и на смене ТРЕКА, и на смене станции.
         self.fade_bytes = 0
-        # Задержка КОНКРЕТНОГО плеера, мс (`stream.delayMs` состава). Читается на каждый кусок:
-        # инсталлятор крутит её в свойствах плеера, музыка играет — и сдвиг слышен сразу.
+        # Задержка КОНКРЕТНОГО плеера, мс: дом выводит её на лету из замеров систем группы
+        # (`MusicPlayback._delay`). Читается на каждый кусок: состав группы меняется на ходу.
         self.delay_of: Callable[[str], int] | None = None
         # ⚠ Провод у сессии ОДИН и он MP3 — всегда: группе нельзя менять формат на ходу (открытый
         # ответ уже несёт свой), а участник может объявлять свои типы (Яндекс Станция берёт только
@@ -94,14 +98,12 @@ class FlowSession:
         self._opened: set[str] = set()
         self.retired = False
         self._pump: asyncio.Task[None] | None = None
-        self._radio_tail: deque[bytes] = deque(maxlen=RADIO_RECONNECT_FRAMES)
+        self._preroll: deque[bytes] = deque(maxlen=PREROLL_FRAMES)
         self._radio_ready = asyncio.Event()
-        self.marker_frames: dict[str, tuple[bytes, ...]] = {}
-        self.marker_ready = asyncio.Event()
-        self._marker_cursor = -1
-        self.marker_epoch: float | None = None
-        self.marker_interrupted: str | None = None
-        self._marker_sent: set[str] = set()
+        # Свой звук элемента вместо декодера (калибровка: PCM делает дом). `None` — обычный декодер.
+        self.generated: Callable[[MediaItem], FlowProcess | None] | None = None
+        # Время рассылки отмеченных кусков (`FlowProcess.mark_hit`), мс по часам цикла событий.
+        self.probe_sent: list[float] = []
 
     @property
     def current(self) -> MediaItem | None:
@@ -111,7 +113,7 @@ class FlowSession:
     def set_items(self, items: tuple[MediaItem, ...], index: int) -> None:
         """Очередь и место в ней — от владельца (очереди дома). Меняет звук, не адрес."""
         self.items, self.index = tuple(items), index
-        self._radio_tail.clear()
+        self._preroll.clear()
         self._radio_ready.clear()
         self.seek_offset = 0.0
         self.switch.set()
@@ -130,7 +132,7 @@ class FlowSession:
     def stop(self) -> None:
         """Остановить поток и декодер, в том числе при зависшем чтении источника."""
         self.items, self.index = (), 0
-        self._radio_tail.clear()
+        self._preroll.clear()
         self._radio_ready.clear()
         self._playing.set()
         self.switch.set()
@@ -169,8 +171,6 @@ class FlowSession:
     def disconnect(self, player: str) -> None:
         for queue, owner in list(self._readers.items()):
             if owner == player:
-                if player in self._marker_sent and not self.retired:
-                    self.marker_interrupted = self.marker_interrupted or player
                 self._readers.pop(queue)
                 self._finish_reader(queue, discard=True)
 
@@ -200,25 +200,18 @@ class FlowSession:
         """
         if self.retired:
             return
-        if self.marker_frames and (self.reading_player(player) or player in self._marker_sent):
-            # Параллельный GET может быть пробой формата. Первый ответ продолжает идти.
-            return
         queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=READER_QUEUE)
         if player:
             self.disconnect(player)
-        if not self._readers:
-            for frame in self._radio_tail:
-                queue.put_nowait(frame)
-        self._radio_tail.clear()
+        for frame in self._preroll:
+            queue.put_nowait(frame)
         self._readers[queue] = player
         self._opened.add(player)
-        if self.marker_frames and self.marker_frames.keys() <= set(self._readers.values()):
-            self.marker_ready.set()
         # Задержка ЭТОГО плеера, уже применённая к его чтению, и остаток звука, который надо выбросить.
         applied = 0.0
         drop = 0
         if self._pump is None or self._pump.done():
-            self._pump = asyncio.create_task(self._run_marker() if self.marker_frames else self._run(decoder, encoder))
+            self._pump = asyncio.create_task(self._run(decoder, encoder))
         try:
             while (chunk := await queue.get()) is not None:
                 await self._playing.wait()
@@ -252,49 +245,14 @@ class FlowSession:
                 if confirm_write and queue in self._readers:
                     self.confirm_write(player)
         except (ConnectionError, OSError) as error:
-            if player in self._marker_sent and not self.retired:
-                LOGGER.warning("Маркеры: запись кадров для %s закрыта (%s)", player, type(error).__name__)
-            else:
-                LOGGER.debug("Плеер %s: запись аудиопотока закрыта (%s)", player, type(error).__name__)
+            LOGGER.debug("Плеер %s: запись аудиопотока закрыта (%s)", player, type(error).__name__)
         finally:
             self._readers.pop(queue, None)
-            if player in self._marker_sent and not self.retired:
-                self.marker_interrupted = self.marker_interrupted or player
 
     def confirm_write(self, player: str) -> None:
-        if self.marker_epoch is not None:
-            self._marker_sent.add(player)
         if self.on_read is not None and self.on_read_player in (None, player):
             on_read, self.on_read = self.on_read, None
             on_read()
-
-    async def _run_marker(self) -> None:
-        """Слот каждого выхода привязан к одной монотонной шкале дома."""
-        clock = asyncio.get_running_loop().time
-        frame_s = MP3_FRAME_MS / 1000
-        try:
-            await self.marker_ready.wait()
-            while self._readers and not self.switch.is_set():
-                now = clock()
-                if self.marker_epoch is None:
-                    self.marker_epoch = now
-                cursor = max(self._marker_cursor + 1, int((now - self.marker_epoch) / frame_s))
-                self._marker_cursor = cursor
-                for queue, player in list(self._readers.items()):
-                    frames = self.marker_frames.get(player)
-                    if queue.full():
-                        LOGGER.warning("Маркеры: очередь плеера %s переполнена", player)
-                        self.marker_interrupted = self.marker_interrupted or player
-                    if frames is None or queue.full():
-                        self._readers.pop(queue)
-                        self._finish_reader(queue, discard=True)
-                    else:
-                        queue.put_nowait(frames[cursor % len(frames)])
-                deadline = self.marker_epoch + (cursor + 1) * frame_s
-                await asyncio.sleep(max(0, deadline - clock()))
-        finally:
-            for queue in list(self._readers):
-                self._finish_reader(queue, discard=True)
 
     async def _run(self, decoder: Decoder, encoder: Callable[..., Awaitable["FlowProcess"]] | None) -> None:
         """Один декодер (и один кодировщик) на сессию: куски уходят ВСЕМ читателям."""
@@ -312,9 +270,9 @@ class FlowSession:
                     deadline = now
                 await asyncio.sleep(max(0, deadline - now))
                 deadline += MP3_FRAME_MS / 1000
+                self._preroll.append(chunk)
                 if not self._readers and (item := self.current) is not None and item.source:
-                    self._radio_tail.append(chunk)
-                    if len(self._radio_tail) == RADIO_RECONNECT_FRAMES:
+                    if len(self._preroll) >= RADIO_RECONNECT_FRAMES:
                         self._radio_ready.set()
             readers = list(self._readers.items())
             if len(readers) == 1 and readers[0][0].full():
@@ -362,7 +320,7 @@ class FlowSession:
                 self.switch.clear()
                 start = self.seek_offset
                 self.seek_offset = 0.0
-                process = await decoder(source, start)
+                process = (self.generated(item) if self.generated is not None else None) or await decoder(source, start)
                 pcm_buffer: asyncio.Queue[bytes] | None = None
                 producer: asyncio.Task[None] | None = None
                 try:
@@ -381,6 +339,10 @@ class FlowSession:
                             break
                         out = fader.feed(chunk)
                         if out:
+                            # ⚠ Время берём ДО записи: запись ждёт кодировщик, а его задержка у всех
+                            # систем одна и в разнице замеров сокращается.
+                            if getattr(process, "mark_hit", False):
+                                self.probe_sent.append(clock() * 1000)
                             await pcm(out)
                         # Смену элемента замечаем на ближайшем куске звука: он приходит постоянно.
                         if self.switch.is_set() or self.current is not item:
@@ -417,7 +379,7 @@ class FlowSession:
         finally:
             if sink is not None:
                 await sink.stop()
-            self._radio_tail.clear()
+            self._preroll.clear()
             for queue in list(self._readers):
                 self._finish_reader(queue)
 

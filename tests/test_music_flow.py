@@ -215,7 +215,7 @@ def test_radio_reconnect_keeps_decoder_and_buffers_recent_audio():
         session.source_of = source_of
         await session.serve(disconnect, decoder, encoder, "sonos")
         await asyncio.sleep(0.08)
-        assert session._radio_tail
+        assert session._preroll
         await asyncio.wait_for(session.serve(receive, decoder, encoder, "sonos"), timeout=1)
         assert decoded == 1
 
@@ -249,7 +249,7 @@ def test_radio_prepares_frames_before_player_connects(monkeypatch):
         session.source_of = source_of
         await session.warm_radio("ffmpeg")
         assert not session.reading
-        assert len(session._radio_tail) == music_flow.RADIO_RECONNECT_FRAMES
+        assert len(session._preroll) >= music_flow.RADIO_RECONNECT_FRAMES
         await asyncio.wait_for(session.serve(receive, None, None, "sonos"), timeout=1)
 
     asyncio.run(run())
@@ -1099,11 +1099,11 @@ def test_настройка_задержки_не_сбрасывает_очер�
         service, home, _, streams = setup(tmp_path)
         await service.call(False, {"action": "play_queue", "player": "echo", "ids": ["1"], "index": 0})
         session = streams.session("echo")
-        home.data["tiles"][0]["stream"] = {**home.data["tiles"][0]["stream"], "delayMs": 360}
+        home.data["tiles"][0]["stream"] = {**home.data["tiles"][0]["stream"], "latencyMs": 360}
         await service.config_changed()
         assert streams.session("echo") is session
         assert session.current.id == "1"
-        assert session.delay_of("media_player.echo") == 360
+        assert session.delay_of("media_player.echo") == 0
 
     asyncio.run(run())
 
@@ -1143,83 +1143,6 @@ def test_ffmpeg_восстанавливает_источник_после_от�
                 assert result == b"\x50\x0b\x50\x0b" * 48000
             finally:
                 await decoder.stop()
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("failure", [None, "missing", "lost", "reopened"])
-def test_замер_на_двух_выходах_раздаёт_кадры_одной_сессии_и_отзывает_адреса(tmp_path, monkeypatch, failure):
-    if not shutil.which("ffmpeg"):
-        pytest.skip("Для проверки MP3 нужен ffmpeg")
-
-    async def run():
-        service, home, _, streams = setup(tmp_path)
-        heos = "media_player.heos"
-        home.data["tiles"][0]["stream"]["delayMs"] = 120
-        home.data["tiles"].append(vendor_tile(heos, "h1", "sync:heos"))
-        home.source.states[heos] = PlainState("idle")
-        readers = []
-        wrote = asyncio.Event()
-        source_call = home.source.call
-
-        async def writer(frame):
-            assert len(frame) == 576
-            wrote.set()
-
-        async def unused(*_):
-            pytest.fail("Круг уже закодирован, декодер для него не запускается")
-
-        async def connect_player(domain, name, data, response, by):
-            await source_call(domain, name, data, response, by)
-            if name == "play_media":
-                token = data["media_content_id"].rsplit("/", 1)[-1]
-                session, player = streams.find(token)
-                if player == heos:
-                    if failure == "missing":
-                        return
-                    await asyncio.sleep(0.05)
-                    assert not wrote.is_set()
-                readers.append(asyncio.create_task(session.serve(writer, unused, unused, player=player)))
-
-        home.source.call = connect_player
-        command = {"action": "calibration_start", "players": ["echo", "h1"]}
-        if failure == "missing":
-            monkeypatch.setattr("mega_home.music_calibration.MARKER_OPEN_TIMEOUT", 0.05)
-            with pytest.raises(OpError, match="heos.*истекло ожидание подключения"):
-                await service.call(False, command)
-            await asyncio.wait_for(asyncio.gather(*readers), timeout=1)
-            assert not wrote.is_set()
-            for _, name, data in home.source.calls:
-                if name == "play_media":
-                    assert streams.find(data["media_content_id"].rsplit("/", 1)[-1]) is None
-            return
-        start = await service.call(False, command)
-        tokens = [data["media_content_id"].rsplit("/", 1)[-1] for _, name, data in home.source.calls if name == "play_media"]
-        first, second = (streams.find(token) for token in tokens)
-        assert first[0] is second[0]
-        assert first[1] == "media_player.echo" and second[1] == heos
-        assert start["delays"] == [120, 0]
-        assert start["marker"]["rotateMs"] == 2016
-        session = first[0]
-        for frames in session.marker_frames.values():
-            assert len(frames) == 84
-            assert all(len(frame) == 576 and frame[:2] == b"\xff\xfb" for frame in frames)
-        await asyncio.wait_for(wrote.wait(), timeout=1)
-        if failure in {"lost", "reopened"}:
-            if failure == "lost":
-                session.disconnect(heos)
-                await asyncio.sleep(1.1)
-            else:
-                session.disconnect(heos)
-                await session.serve(writer, unused, unused, player=heos)
-            status = await service.call(False, {"action": "calibration_status", "session": start["session"]})
-            assert status == {"active": False, "reason": f"{heos}: пропало подключение к потоку маркеров"}
-            await service.call(False, {"action": "calibration_stop", "session": start["session"]})
-        else:
-            await service.call(False, {"action": "calibration_stop", "session": start["session"]})
-        await asyncio.wait_for(asyncio.gather(*readers), timeout=1)
-        assert all(streams.find(token) is None for token in tokens)
-        assert not session.reading
 
     asyncio.run(run())
 

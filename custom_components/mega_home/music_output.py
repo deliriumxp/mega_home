@@ -13,7 +13,7 @@ from .providers.player_output import Output
 
 
 def output_profile(profile: Mapping[str, Any]) -> dict:
-    return {key: value for key, value in profile.items() if key != "delayMs"}
+    return {key: value for key, value in profile.items() if key != "latencyMs"}
 
 
 def flow_address(profile: Mapping[str, Any], address: str) -> str:
