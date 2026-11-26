@@ -296,8 +296,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
     if coordinator.data:
         coordinator.event_sources.apply(coordinator.accesses.descriptors())
 
-    # Лог разработки (`dev_log.py`): один обработчик на логгер интеграции —
-    # весь код покрыт без правки мест логирования.
+    # Лог разработки (`dev_log.py`): один обработчик на логгер интеграции — весь код покрыт без
+    # правки мест логирования; в журнал HA с логгера уходят только ошибки.
     from .core.const import INTEGRATION_VERSION
     from .core.dev_log import DevLog
 
@@ -306,8 +306,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MegaHomeConfigEntry) -> 
         lambda: {"homeVersion": INTEGRATION_VERSION, "bundleVersion": coordinator.bundle.version},
     )
     await coordinator.dev_log.async_load()
-    LOGGER.addHandler(coordinator.dev_log.handler)
-    entry.async_on_unload(lambda: LOGGER.removeHandler(coordinator.dev_log.handler))
+    entry.async_on_unload(coordinator.dev_log.install())
     coordinator.apply_config(coordinator.data)
 
     # SIP-мост домофонии (`sip_bridge.py`): поднимается только конфигом объекта,

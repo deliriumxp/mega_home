@@ -88,8 +88,9 @@ def test_неподтверждённое_уходит_повторно_по_п�
     assert sent[-1]["t"] == "dev-log" and sent[-1]["record"]["message"] == "третья"
 
 
-def test_подробный_лог_опускает_порог_логгера_и_возвращает_его() -> None:
-    """HA держит логгеры интеграций на WARNING: без этого `LOGGER.info` не доходил до обработчика."""
+def test_порог_логгера_задаёт_лог_разработки() -> None:
+    """Логгер с порогом выше отбрасывает запись до обработчиков: подробный лог не получал `LOGGER.info`,
+    а `logger:` в HA с уровнем `error` срезал бы и предупреждения."""
     import logging
 
     from mega_home.core.const import LOGGER
@@ -98,7 +99,8 @@ def test_подробный_лог_опускает_порог_логгера_и
     log.apply({"devLog": {"level": "debug"}})
     assert LOGGER.level == logging.DEBUG
     log.apply({})
-    assert LOGGER.level == logging.NOTSET
+    assert LOGGER.level == logging.WARNING
+    LOGGER.setLevel(logging.NOTSET)
 
 
 def test_flush_пишет_отложенное_сейчас() -> None:
@@ -111,3 +113,48 @@ def test_flush_пишет_отложенное_сейчас() -> None:
     assert disk._pending is not None  # noqa: SLF001 — запись отложена
     asyncio.run(log.flush())
     assert disk._pending is None and disk._data["queue"][0]["message"] == "запись"  # noqa: SLF001
+
+
+def test_в_журнал_ha_уходят_только_ошибки_а_лог_разработки_получает_всё() -> None:
+    """Предупреждения дома жилец в журнале HA не читает — их разбирают по логу разработки."""
+    from mega_home.core.const import LOGGER
+
+    class Collect(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__(logging.DEBUG)
+            self.messages: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.messages.append(record.getMessage())
+
+    journal = Collect()
+    parent = LOGGER.parent
+    assert parent is not None
+    parent.addHandler(journal)
+    log = _log()
+    log.apply({})
+    uninstall = log.install()
+
+    async def go() -> None:
+        log._loop = asyncio.get_running_loop()  # noqa: SLF001
+        LOGGER.info("сведение")
+        LOGGER.warning("предупреждение")
+        LOGGER.error("ошибка")
+        await asyncio.sleep(0)
+
+    try:
+        asyncio.run(go())
+        assert journal.messages == ["ошибка"]
+        assert [r["message"] for r in log._queue] == ["предупреждение", "ошибка"]  # noqa: SLF001
+    finally:
+        uninstall()
+        parent.removeHandler(journal)
+
+    # Снятие возвращает логгер HA: запись снова идёт наверх как обычно.
+    assert LOGGER.propagate is True and LOGGER.level == logging.NOTSET
+    parent.addHandler(journal)
+    try:
+        LOGGER.warning("после снятия")
+    finally:
+        parent.removeHandler(journal)
+    assert journal.messages[-1] == "после снятия"

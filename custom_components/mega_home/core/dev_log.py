@@ -84,6 +84,7 @@ class DevLog:
         self.sample = 1.0
         self.dropped = 0
         self.handler = _Handler(self)
+        self.journal = _Journal()
 
     async def async_load(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -96,11 +97,11 @@ class DevLog:
         block = (config or {}).get("devLog")
         block = block if isinstance(block, dict) else {}
         self.level = LEVELS.get(str(block.get("level") or "warn"), logging.WARNING)
-        # ⚠ Порог обработчика мало: HA держит логгеры интеграций на WARNING, и `LOGGER.info`
-        # отбрасывается ДО обработчиков — подробный лог не получал от дома ни строки. Подробный
-        # опускает порог нашего логгера (наш INFO редок; в журнал HA он идёт, пока включён),
-        # обычный возвращает его HA (`NOTSET` — как настроено в `logger:`).
-        LOGGER.setLevel(self.level if self.level < logging.WARNING else logging.NOTSET)
+        # ⚠ Порог обработчика мало: логгер с порогом выше отбрасывает запись ДО обработчиков —
+        # подробный лог не получал от дома ни строки, а `logger:` в HA с уровнем `error` для
+        # интеграции срезал бы и предупреждения. Порог логгера — наш; журнал HA он не шумит:
+        # туда идут только ошибки (`install`).
+        LOGGER.setLevel(self.level)
         modules = block.get("modules")
         self.modules = {str(m) for m in modules} if isinstance(modules, list) else set()
         try:
@@ -162,6 +163,26 @@ class DevLog:
         data = {"trace": logging.Formatter().formatException(record.exc_info)} if record.exc_info else None
         self._loop.call_soon_threadsafe(self.add, "home", level, record.module, record.getMessage(), data)
 
+    def install(self) -> Callable[[], None]:
+        """Повесить лог на логгер интеграции; вернуть снятие.
+
+        ⚠ В журнал Home Assistant уходят только ОШИБКИ: предупреждения и сведения дома (конфиг не
+        применился, иконка не скачалась) жилец и инсталлятор там не читают, а разбор идёт по логу
+        разработки — он получает всё по своему уровню. Поэтому логгер не передаёт записи наверх
+        сам, а ошибки отдаёт журналу HA отдельным обработчиком.
+        """
+        LOGGER.addHandler(self.handler)
+        LOGGER.addHandler(self.journal)
+        LOGGER.propagate = False
+
+        def uninstall() -> None:
+            LOGGER.removeHandler(self.handler)
+            LOGGER.removeHandler(self.journal)
+            LOGGER.propagate = True
+            LOGGER.setLevel(logging.NOTSET)
+
+        return uninstall
+
     def attach(self, sender: Callable[[dict[str, Any]], None]) -> list[dict[str, Any]]:
         """Канал поднялся: вернуть неподтверждённое в исходном порядке."""
         self._sender = sender
@@ -206,3 +227,15 @@ class _Handler(logging.Handler):
             self._log.add_threadsafe(record)
         except Exception:  # noqa: BLE001 — лог разработки не роняет дом
             self.handleError(record)
+
+
+class _Journal(logging.Handler):
+    """Ошибки дома — в журнал Home Assistant: обработчикам логгеров выше нашего, как при передаче наверх."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.ERROR)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        parent = LOGGER.parent
+        if parent is not None:
+            parent.handle(record)
